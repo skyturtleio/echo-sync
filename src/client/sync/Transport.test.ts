@@ -311,14 +311,23 @@ it.effect("a transport built with headers sends them on push, pull and the pokes
  */
 const credentials = Effect.gen(function* () {
   // `failNext`: that many next `syncHeaders` evaluations die (the app's token store throws).
-  const state = { valid: "t1", client: "t1", evaluations: 0, failNext: 0, fetches: 0 }
+  // `pullUnavailable`: pulls fail `ServerUnavailable`; `stopPush`: pushes process nothing (a stopped batch).
+  const state = {
+    valid: "t1",
+    client: "t1",
+    evaluations: 0,
+    failNext: 0,
+    fetches: 0,
+    pullUnavailable: false,
+    stopPush: false
+  }
   const seen: Array<string> = []
   const authenticate = (rpc: string, headers: Readonly<Record<string, string | undefined>>) =>
     Effect.suspend(() => {
       const token = headers["authorization"] ?? "none"
       const ok = token === state.valid
       seen.push(`${rpc}:${token}${ok ? "" : ":rejected"}`)
-      return ok ? Effect.void : Effect.fail(new Protocol.Unauthorized({ message: `stale ${token}` }))
+      return ok ? Effect.void : Effect.fail(new Protocol.Unauthorized({ message: "credential rejected" }))
     })
   const app = RpcServer.layerHttp({ group: Protocol.SyncRpcs, path: "/rpc", protocol: "http" }).pipe(
     Layer.provide([
@@ -327,16 +336,25 @@ const credentials = Effect.gen(function* () {
           Effect.as(
             authenticate(`push(${request.mutations.map((m) => `${m.mutationId}#${m.seq}`).join(",")})`, headers),
             {
-              results: request.mutations.map((m) => ({
-                mutationId: m.mutationId,
-                position,
-                outcome: { _tag: "Applied" as const }
-              }))
+              results: state.stopPush
+                ? []
+                : request.mutations.map((m) => ({
+                    mutationId: m.mutationId,
+                    position,
+                    outcome: { _tag: "Applied" as const }
+                  }))
             }
           ),
         pull: (_, { headers }) =>
           Effect.as(
-            authenticate("pull", headers),
+            Effect.andThen(
+              authenticate("pull", headers),
+              Effect.suspend(() =>
+                state.pullUnavailable
+                  ? Effect.fail(new Protocol.ServerUnavailable({ message: "database is restarting" }))
+                  : Effect.void
+              )
+            ),
             Schema.decodeUnknownSync(Protocol.PullDone)({
               _tag: "PullDone",
               changes: [],
@@ -548,4 +566,85 @@ it.live(
       expect(state.evaluations).toBe(2)
     }).pipe(Effect.scoped),
   15_000
+)
+
+/** The first `lastError` the loop reported. */
+const firstError = (statuses: ReadonlyArray<SyncLoop.SyncStatus>) =>
+  statuses.find((s) => s.lastError !== null)?.lastError
+
+/** Runs the real loop over the fixture until it reports an error, and returns that error. */
+const errorOf = (fixture: Effect.Success<typeof credentials>, transport = fixture.transport) =>
+  Effect.gen(function* () {
+    const { loop, statuses } = yield* loopOver(transport)
+    yield* Effect.forkChild(loop.run.pipe(Effect.provideService(FetchHttpClient.Fetch, fixture.fetch)))
+    yield* eventually(() => firstError(statuses) !== undefined, "a lastError")
+    return firstError(statuses)
+  })
+
+const secret = "Bearer secret-4f9c2e"
+
+it.live(
+  "a syncHeaders that dies is reported as kind credentials, with the app's error text and none of its header values",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* credentials
+      fixture.state.client = secret
+      fixture.state.valid = secret
+      fixture.state.failNext = 1
+      const error = yield* errorOf(fixture)
+      expect(error?.kind).toBe("credentials")
+      // The wrapping RpcClientError's own text ("HttpError: ") must not hide the inner cause.
+      expect(error?.message).toContain("token store unavailable")
+      expect(error?.message).not.toContain("secret-4f9c2e")
+    }).pipe(Effect.scoped),
+  15_000
+)
+
+it.live(
+  "a refused connection is reported as kind network, and the request's headers never reach the message",
+  () =>
+    Effect.gen(function* () {
+      // Nothing listens on port 1: the request carries the headers and fails before any response. A
+      // custom header name, since Effect's HTTP headers already redact `authorization`.
+      const refused = yield* Transport.make.pipe(
+        Effect.provide(
+          Transport.layerProtocolHttp("http://127.0.0.1:1/rpc", Effect.succeed({ "x-app-session": secret }))
+        )
+      )
+      const { loop, statuses } = yield* loopOver(refused)
+      yield* Effect.forkChild(loop.run)
+      yield* eventually(() => firstError(statuses) !== undefined, "a lastError")
+      const error = firstError(statuses)
+      expect(error?.kind).toBe("network")
+      expect(error?.message.trim().length).toBeGreaterThan(0)
+      expect(error?.message).not.toContain("secret-4f9c2e")
+    }).pipe(Effect.scoped),
+  15_000
+)
+
+it.live("a server Unauthorized is reported as kind unauthorized", () =>
+  Effect.gen(function* () {
+    const fixture = yield* credentials
+    fixture.state.valid = "t2" // the client still sends t1
+    expect((yield* errorOf(fixture))?.kind).toBe("unauthorized")
+  }).pipe(Effect.scoped)
+)
+
+it.live("a server ServerUnavailable is reported as kind unavailable", () =>
+  Effect.gen(function* () {
+    const fixture = yield* credentials
+    fixture.state.pullUnavailable = true
+    expect(yield* errorOf(fixture)).toMatchObject({
+      kind: "unavailable",
+      message: expect.stringContaining("restarting")
+    })
+  }).pipe(Effect.scoped)
+)
+
+it.live("a push batch the server stopped is reported as kind server", () =>
+  Effect.gen(function* () {
+    const fixture = yield* credentials
+    fixture.state.stopPush = true
+    expect((yield* errorOf(fixture))?.kind).toBe("server")
+  }).pipe(Effect.scoped)
 )

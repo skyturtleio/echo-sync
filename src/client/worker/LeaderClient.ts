@@ -32,6 +32,7 @@ import { RpcClient } from "effect/rpc"
 import { RpcClientError } from "effect/rpc/RpcClientError"
 import type { LocallyRejected } from "../sync/Engine.ts"
 import type { SyncStatus } from "../sync/SyncLoop.ts"
+export type { SyncError, SyncErrorKind, SyncStatus } from "../sync/SyncLoop.ts"
 import {
   type Enqueued,
   type LeaderInfo,

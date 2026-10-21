@@ -255,6 +255,9 @@ tables and replica schema, one transaction) and builds `Engine.make` over the SQ
 - Without `syncUrl` the replica is local-only: enqueue still applies and persists; `syncStatus` fails
   with `SyncDisabled`.
 - `syncStatus` is `{ push, lastError, pendingMutations, lastSyncedAt, phase, nextRetryAt }` (DESIGN §9.1).
+  `lastError` is `null | { kind, message }`: `kind` is `credentials` (`syncHeaders` raised),
+  `unauthorized`, `unavailable` (`ServerUnavailable`), `network` (no server response) or `server`;
+  `message` walks the cause chain and reads only `message` strings, never header values or bodies.
   `pendingMutations` is a recount of unreleased `echo_outbox` rows taken under the storage permit after
   every write to that table (`SqliteSyncStorage.pendingCount`, reactive on the connection's update hook),
   so it follows each enqueue and release, not only cycle ends, and cannot drift. A leader publishes no

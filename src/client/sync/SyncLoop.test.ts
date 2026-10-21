@@ -191,7 +191,8 @@ it.effect(
       const status = yield* loop.status
       expect(status.push._tag).toBe("Halted")
       // The loop survived the pull defect and reports it as a transient failure.
-      expect(status.lastError).toContain("bad page")
+      expect(status.lastError).toMatchObject({ kind: "server" })
+      expect(status.lastError?.message).toContain("bad page")
       expect(fiber.pollUnsafe()).toBeUndefined()
       yield* TestClock.adjust("1 minute")
       yield* settle
@@ -243,7 +244,8 @@ it.effect("a pull that fails with MalformedChange is retried with backoff and ne
     yield* settle
     const failed = yield* loop.status
     expect(failed.push).toEqual({ _tag: "Active" })
-    expect(failed.lastError).toContain("MalformedChange")
+    expect(failed.lastError).toMatchObject({ kind: "server" })
+    expect(failed.lastError?.message).toContain("MalformedChange")
     yield* TestClock.adjust("999 millis")
     yield* settle
     expect(calls.pull).toBe(1)

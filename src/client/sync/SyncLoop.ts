@@ -9,7 +9,20 @@
  * exportable. The engine writes nothing durable when its transport fails, so classifying in the caller
  * (who owns the transport's error union) loses nothing.
  */
-import { Cause, Clock, Deferred, Duration, Effect, Exit, Option, Queue, Schema, Stream, SubscriptionRef } from "effect"
+import {
+  Cause,
+  Clock,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Option,
+  Predicate,
+  Queue,
+  Schema,
+  Stream,
+  SubscriptionRef
+} from "effect"
 import type { Errors } from "echo-sync"
 import type * as Engine from "./Engine.ts"
 
@@ -23,11 +36,28 @@ export type PushState = typeof PushState.Type
 export const SyncPhase = Schema.Literals(["idle", "pushing", "pulling", "backoff"])
 export type SyncPhase = typeof SyncPhase.Type
 
+/**
+ * What kind of transient failure `lastError` reports (DESIGN §9.1), so an app can tell "sign in again"
+ * from "you are offline" without parsing text:
+ * - `credentials`: `syncHeaders` raised; nothing was sent.
+ * - `unauthorized`: the server rejected the credential (`Unauthorized`).
+ * - `unavailable`: the server reported `ServerUnavailable`.
+ * - `network`: the request failed before a server response (transport, HTTP, an RPC response that
+ *   never arrived or could not be read).
+ * - `server`: any other transient failure, the server stopping a push batch included.
+ */
+export const SyncErrorKind = Schema.Literals(["credentials", "unauthorized", "unavailable", "network", "server"])
+export type SyncErrorKind = typeof SyncErrorKind.Type
+
+/** A transient failure: its kind and a readable description (never header values, bodies or tokens). */
+export const SyncError = Schema.Struct({ kind: SyncErrorKind, message: Schema.String })
+export type SyncError = typeof SyncError.Type
+
 /** The leader's sync state (DESIGN §9.1). No `connected` flag: a finished cycle proves nothing about now. */
 export const SyncStatus = Schema.Struct({
   push: PushState,
   /** Last transient failure, cleared by the next cycle that completes cleanly. */
-  lastError: Schema.NullOr(Schema.String),
+  lastError: Schema.NullOr(SyncError),
   /** Unreleased outbox entries (pushed-but-not-installed included); follows every append and release. */
   pendingMutations: Schema.Int,
   /** Epoch ms of the last cycle whose push and `PullDone` install both completed; `null` until one in this leader. */
@@ -50,8 +80,59 @@ export interface SyncLoop {
   readonly run: Effect.Effect<never>
 }
 
+/**
+ * The error and what it wraps, outermost first: an `RpcClientError`'s `reason`, an `HttpClientError`'s
+ * `reason`, then each `cause` (the pinned `HttpClientErrorSchema` and `TransportError` keep the inner
+ * error there). Bounded, and stops at a repeat.
+ */
+const chain = (error: unknown): ReadonlyArray<unknown> => {
+  const nodes: Array<unknown> = []
+  let node: unknown = error
+  while (node !== undefined && node !== null && nodes.length < 8 && !nodes.includes(node)) {
+    nodes.push(node)
+    node =
+      Predicate.hasProperty(node, "reason") && Predicate.isObject(node.reason)
+        ? node.reason
+        : Predicate.hasProperty(node, "cause")
+          ? node.cause
+          : undefined
+  }
+  return nodes
+}
+
+const tagOf = (node: unknown): string | undefined =>
+  Predicate.hasProperty(node, "_tag") && Predicate.isString(node._tag) ? node._tag : undefined
+
+/** DESIGN §9.1 kinds, by the innermost evidence: a credential failure inside an RPC error is `credentials`. */
+const kindOf = (error: unknown): SyncErrorKind => {
+  const tags = chain(error).map(tagOf)
+  if (tags.includes("CredentialsUnavailable")) return "credentials"
+  if (tags.includes("Unauthorized")) return "unauthorized"
+  if (tags.includes("ServerUnavailable")) return "unavailable"
+  if (tags.includes("RpcClientError")) return "network"
+  return "server"
+}
+
+/**
+ * Each link's name and the first line of its message, outermost first, so an outer `RpcClientError`
+ * (whose own message is just `HttpError: `) never hides the inner text. Only `message` strings are
+ * read: an object is never serialized (an HTTP error's `request` carries the request's headers).
+ */
 const describe = (error: unknown): string =>
-  error instanceof Error ? `${error.name}: ${error.message}` : typeof error === "string" ? error : JSON.stringify(error)
+  chain(error)
+    .flatMap((node) => {
+      if (Predicate.isString(node)) return [node]
+      if (!Predicate.isObject(node)) return [String(node)]
+      const label = tagOf(node) ?? (node instanceof Error ? node.name : undefined)
+      const raw = Predicate.hasProperty(node, "message") && Predicate.isString(node.message) ? node.message : ""
+      const line = (raw.split("\n")[0] ?? "").trim()
+      const text = line.endsWith(":") ? line.slice(0, -1).trim() : line
+      if (text === "" || text === label) return label === undefined ? [] : [label]
+      return [label === undefined || text.startsWith(label) ? text : `${label}: ${text}`]
+    })
+    // An outer message that only names the next link ("RpcClientError: HttpError") already says it.
+    .filter((part, i, parts) => i === 0 || !(parts[i - 1] ?? "").endsWith(`: ${part}`))
+    .join(" <- ")
 
 /**
  * Classifies a whole failure `Cause` (DESIGN §6: defect > transient > rejection), never just its
@@ -65,7 +146,11 @@ const classify = <E>(cause: Cause.Cause<E>, isFatal: ((error: E) => boolean) | u
     const fatalFailure = isFatal === undefined ? undefined : failures.find(isFatal)
     const halts = isFatal !== undefined && (Cause.hasDies(cause) || fatalFailure !== undefined)
     const first = fatalFailure ?? failures[0]
-    return { halts, message: Cause.hasDies(cause) || first === undefined ? Cause.pretty(cause) : describe(first) }
+    const error: SyncError =
+      Cause.hasDies(cause) || first === undefined
+        ? { kind: "server", message: Cause.pretty(cause) }
+        : { kind: kindOf(first), message: describe(first) }
+    return { halts, error }
   })
 
 export const make = <TE>(options: {
@@ -103,23 +188,23 @@ export const make = <TE>(options: {
 
     /** One push+pull cycle; returns whether it hit a transient failure. */
     const cycle = Effect.gen(function* () {
-      let transient = Option.none<string>()
+      let transient = Option.none<SyncError>()
       // A cycle whose push did not run (halted) or did not finish cleanly is not a completed sync.
       let pushedCleanly = false
       if ((yield* SubscriptionRef.get(status)).push._tag === "Active") {
         yield* setPhase("pushing")
         const pushed = yield* Effect.exit(engine.push)
         if (Exit.isFailure(pushed)) {
-          const { halts, message } = yield* classify(pushed.cause, options.isFatalPush)
+          const { halts, error } = yield* classify(pushed.cause, options.isFatalPush)
           if (halts) {
-            yield* Effect.logError(`echo-sync: push halted by an integrity error: ${message}`)
-            const halted: PushState = { _tag: "Halted", message }
+            yield* Effect.logError(`echo-sync: push halted by an integrity error: ${error.message}`)
+            const halted: PushState = { _tag: "Halted", message: error.message }
             yield* SubscriptionRef.update(status, (s) => ({ ...s, push: halted }))
           } else {
-            transient = Option.some(message)
+            transient = Option.some(error)
           }
         } else if (pushed.value.stopped) {
-          transient = Option.some("server stopped the push batch at a transient failure")
+          transient = Option.some({ kind: "server", message: "server stopped the push batch at a transient failure" })
         } else {
           pushedCleanly = true
         }
@@ -128,8 +213,8 @@ export const make = <TE>(options: {
       // Every pull failure, a defect included, is transient (§6): nothing was installed.
       const pulled = yield* Effect.exit(engine.pull)
       if (Exit.isFailure(pulled)) {
-        const { message } = yield* classify(pulled.cause, undefined)
-        if (Option.isNone(transient)) transient = Option.some(message)
+        const { error } = yield* classify(pulled.cause, undefined)
+        if (Option.isNone(transient)) transient = Option.some(error)
       }
       // `engine.pull` succeeds only once a `PullDone` set is installed.
       const syncedAt = pushedCleanly && Exit.isSuccess(pulled) ? yield* Clock.currentTimeMillis : undefined
