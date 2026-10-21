@@ -547,6 +547,14 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
   to the `room` RPC's error union; `track` is unchanged), and `Forbidden` is the only error that
   ends a presence stream. `Forbidden` is wire-additive and lands with the presence client, before
   any app consumes presence.
+  Track semantics (coordinator ruling, ws/presence-client review): `track` completes once the
+  leader has recorded `state` as this tab's desired state for the room, in one synchronous step
+  that never waits on the network; interrupting the caller after that step does not retract the
+  state. Delivery to the server is owned by the open `presence` stream: serialized per room,
+  latest-wins (an undelivered older state may be skipped), never holding a lock across network
+  I/O, and re-sent after every (re)join or handover. A `track` call never blocks snapshot
+  delivery or reconnect, and a `track` whose stream has closed is dropped. The tab API therefore
+  guarantees only that the latest desired state is eventually visible while the stream is open.
 - **Typed notice decoding** (ruling from the HeyBabe trial): a retained notice carries the
   envelope's `args` and a `DomainError.error` as `Schema.Json`, so a mutation's static types stop
   at the notice. The stored notice shape, `Notice = Rejected { envelope, error } |
