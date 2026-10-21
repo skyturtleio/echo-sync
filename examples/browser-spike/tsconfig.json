@@ -4,5 +4,5 @@
     "types": []
   },
   "include": ["*.ts", "../../src/client", "../../src/core"],
-  "exclude": ["../../src/**/*.test.ts"]
+  "exclude": ["../../src/**/*.test.ts", "../../src/client/testing"]
 }

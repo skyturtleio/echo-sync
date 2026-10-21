@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises"
+// oxlint-disable-next-line import/no-unassigned-import -- side-effect: Node fetch shim for wa-sqlite
+import "./testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { expect, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
@@ -6,18 +7,6 @@ import * as Layer from "effect/Layer"
 import * as SqlClient from "effect/sql/SqlClient"
 import { TestClock } from "effect/testing"
 import * as Outbox from "./Outbox.ts"
-
-// wa-sqlite loads its .wasm with fetch(file:...), which Node's fetch does not implement.
-const nodeFetch = globalThis.fetch
-globalThis.fetch = Object.assign(
-  async (input: URL | RequestInfo, init?: RequestInit) => {
-    const url = input instanceof URL ? input : new URL(typeof input === "string" ? input : input.url)
-    return url.protocol === "file:"
-      ? new Response(await readFile(url), { headers: { "content-type": "application/wasm" } })
-      : nodeFetch(input, init)
-  },
-  { preconnect: nodeFetch.preconnect }
-)
 
 const Db = Layer.effectDiscard(Outbox.migrate).pipe(Layer.provideMerge(SqliteClient.layerMemory({})))
 const append = (mutationId: string) => Outbox.append({ clientId: "c", mutationId, name: "t", args: { mutationId } })

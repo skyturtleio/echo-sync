@@ -17,6 +17,7 @@
  */
 import * as Clock from "effect/Clock"
 import * as Effect from "effect/Effect"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
@@ -75,7 +76,9 @@ export const migrate: Effect.Effect<void, SqlError, SqlClient.SqlClient> = Effec
         name TEXT NOT NULL,
         args TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        released_at INTEGER
+        released_at INTEGER,
+        -- First-touch pre-images of the last optimistic run (JSON); owned by the reconcile storage.
+        undo TEXT NOT NULL DEFAULT '[]'
       )`
     })
   )
@@ -123,6 +126,44 @@ export const append = (input: AppendInput): Effect.Effect<OutboxEntry, SqlError,
         return entry
       })
     )
+  })
+
+/**
+ * The seq the next append will get: one past AUTOINCREMENT's high-water mark in `sqlite_sequence`, not
+ * `MAX(seq)`, so a seq whose row was pruned is never handed out again. Call inside the appending
+ * transaction; a rollback rolls `sqlite_sequence` back with it, so the number is not lost.
+ */
+export const nextSeq: Effect.Effect<number, SqlError, SqlClient.SqlClient> = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient
+  const rows = yield* sql<{ readonly seq: number }>`SELECT seq FROM sqlite_sequence WHERE name = 'echo_outbox'`
+  return (rows[0]?.seq ?? 0) + 1
+})
+
+/**
+ * Insert an entry at a seq allocated by `nextSeq` in the same transaction (the reconcile engine's path;
+ * it checks `lookup` first, so `mutationId` is new).
+ */
+export const insert = (input: {
+  readonly seq: number
+  readonly clientId: string
+  readonly mutationId: string
+  readonly name: string
+  readonly args: unknown
+  readonly createdAt: number
+  readonly undo: string
+}): Effect.Effect<void, SqlError, SqlClient.SqlClient> =>
+  Effect.flatMap(SqlClient.SqlClient, (sql) =>
+    Effect.asVoid(sql`INSERT INTO echo_outbox (seq, client_id, mutation_id, name, args, created_at, undo)
+      VALUES (${input.seq}, ${input.clientId}, ${input.mutationId}, ${input.name}, ${JSON.stringify(input.args)},
+        ${input.createdAt}, ${input.undo})`)
+  )
+
+/** The entry for `mutationId`, pending or released (until pruned). */
+export const lookup = (mutationId: string): Effect.Effect<Option.Option<OutboxEntry>, SqlError, SqlClient.SqlClient> =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const [entry] = yield* toEntries(yield* sql`SELECT * FROM echo_outbox WHERE mutation_id = ${mutationId}`)
+    return Option.fromNullishOr(entry)
   })
 
 /** Every not-yet-released entry in local (`seq`) order. */
