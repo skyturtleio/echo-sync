@@ -300,6 +300,10 @@ docker run -d --name echo-pg -p 5432:5432 -e POSTGRES_PASSWORD=echo postgres:17
 bun run test:pg          # ECHO_PG_URL defaults to postgres://postgres:echo@localhost:5432/postgres
 ```
 
+The server requires PostgreSQL 15+ (DESIGN §11: the startup verifier reads
+`pg_index.indnullsnotdistinct`). The engine schema alone needs only PG14 (`CREATE OR REPLACE
+TRIGGER`).
+
 Each test creates a fresh database and drops it afterwards. Without `ECHO_PG_URL` the suites are
 skipped, so `bun run check` works with no database.
 

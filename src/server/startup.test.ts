@@ -5,8 +5,8 @@ import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
 import { RpcClient, RpcSerialization } from "effect/rpc"
 import { SqlClient } from "effect/sql/SqlClient"
-import { AccessScope, Ids, Mutation, Protocol } from "echo-sync"
-import { grant, pgAvailable, registry, TestDatabase } from "./postgres/test-support.ts"
+import { AccessScope, Ids, Mutation, Protocol, Registry, SyncTable } from "echo-sync"
+import { grant, Items, Notes, pgAvailable, registry, RowId, TestDatabase } from "./postgres/test-support.ts"
 import * as Startup from "./startup.ts"
 
 const options: Startup.StartupOptions = {
@@ -72,6 +72,42 @@ describe.skipIf(!pgAvailable)("server startup (§11)", () => {
       const served = yield* pullOnce
       if (!Exit.isSuccess(served)) return assert.fail(`restored server did not serve: ${String(served.cause)}`)
       assert.strictEqual(served.value._tag, "PullDone")
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live(
+    "a registry table the app migrations never created fails startup as a Drift naming it, not a bare SqlError",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* Effect.context<SqlClient | PgClient.PgClient>()
+        const Missing = SyncTable.make("missing_table", { id: RowId, accessScopeId: AccessScope.AccessScopeId })
+        const layer = Startup.layer({ ...options, registry: Registry.make([Items, Notes, Missing]) }).pipe(
+          Layer.provide(Layer.succeedContext(db))
+        )
+        const built = yield* Effect.exit(Effect.scoped(Layer.build(layer.pipe(Layer.provide(HttpRouter.layer)))))
+        if (Exit.isSuccess(built)) return assert.fail("the server started without one of its tables")
+        const [reason] = built.cause.reasons
+        const error = reason !== undefined && reason._tag === "Fail" ? reason.error : undefined
+        if (error === undefined || !("_tag" in error) || error._tag !== "Drift") {
+          return assert.fail(`expected Drift, got ${String(built.cause)}`)
+        }
+        assert.deepStrictEqual(
+          error.mismatches.filter((m) => m.table === "missing_table").map((m) => m.problem),
+          ["not attached (no echo_sync capture trigger); run attach at startup", "table does not exist"]
+        )
+      }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("prepare run concurrently by several instances succeeds for all of them", () =>
+    Effect.gen(function* () {
+      const results = yield* Effect.all(
+        Array.from({ length: 4 }, () => Effect.exit(Startup.prepare(options))),
+        { concurrency: "unbounded" }
+      )
+      assert.deepStrictEqual(
+        results.map((r) => r._tag),
+        ["Success", "Success", "Success", "Success"]
+      )
     }).pipe(Effect.provide(TestDatabase))
   )
 })
