@@ -26,6 +26,7 @@ const rowCount = Effect.flatMap(SqlClient.SqlClient, (sql) => sql<{ n: number }>
 it.effect("an enqueue retried after its original was released returns the original seq and is not pending", () =>
   Effect.gen(function* () {
     const first = yield* append("m")
+    expect(first.seq).toBe(1)
     yield* Outbox.markReleased([first.seq])
     const retried = yield* append("m")
     expect(retried.seq).toBe(first.seq)
