@@ -164,8 +164,14 @@ export const handlers = (options: SyncServerOptions) =>
             Effect.gen(function* () {
               const principalId = yield* options.principalFor(headers)
               yield* registerClient(principalId, clientId)
+              // listen returns only after Postgres confirms LISTEN, so every commit after this
+              // point notifies. The initial poke makes the client pull now, covering every commit
+              // before it: subscribe-then-poke leaves no reconnect gap (DESIGN §6).
               const notifications = yield* pg.listen(pokeChannel)
-              return Stream.fromQueue(notifications).pipe(Stream.map((): typeof Protocol.Poke.Type => ({})))
+              return Stream.concat(
+                Stream.succeed<typeof Protocol.Poke.Type>({}),
+                Stream.fromQueue(notifications).pipe(Stream.map((): typeof Protocol.Poke.Type => ({})))
+              )
             }).pipe(Effect.provideService(SqlClient, sql))
           ).pipe(
             // A lost LISTEN connection ends the stream typed; the client reconnects on any end (§6).

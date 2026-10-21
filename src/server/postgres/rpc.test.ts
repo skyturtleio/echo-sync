@@ -1,6 +1,19 @@
 import { assert, describe, it } from "@effect/vitest"
 import type * as PgClient from "@effect/sql-pg/PgClient"
-import { Array as Arr, Cause, Context, Effect, Exit, Fiber, Layer, Option, Schedule, Schema, Stream } from "effect"
+import {
+  Array as Arr,
+  Cause,
+  Context,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Queue,
+  Schedule,
+  Schema,
+  Stream
+} from "effect"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
 import { RpcClient, RpcSerialization } from "effect/rpc"
@@ -193,6 +206,23 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (§6, §8)", () => {
         client.pull({ clientId: Ids.ClientId.make("d"), cursor: null, continuation: Option.none() })
       )
       assert.isTrue(Exit.hasDies(exit), failureTag(exit))
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
+  it.live("a pokes subscriber gets a poke as soon as LISTEN is in place, so a reconnect has no catch-up gap", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      const client = yield* connect
+      const received = yield* Queue.unbounded<unknown>()
+      yield* Effect.forkChild(
+        Stream.runForEach(client.pokes({ clientId: Ids.ClientId.make("d") }), (poke) => Queue.offer(received, poke))
+      )
+      // No write has happened: the first poke is the server's subscribe-then-poke, not a notification.
+      const first = yield* Effect.timeoutOption(Queue.take(received), "3 seconds")
+      assert.isTrue(Option.isSome(first), "no initial poke after subscribing")
+      yield* sql`INSERT INTO items (id, access_scope_id) VALUES ('a', 's1')`
+      const second = yield* Effect.timeoutOption(Queue.take(received), "3 seconds")
+      assert.isTrue(Option.isSome(second), "no poke after a committed captured write")
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
