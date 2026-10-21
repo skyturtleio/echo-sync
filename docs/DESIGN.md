@@ -271,6 +271,16 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   every replicated row (all `SyncTable`s, system tables included; not the outbox, not the
   staging table), installs the set, and replays pending mutations on top. For a first sync the
   clear is a no-op. `RowStore` gains a `clearAll` primitive for this; it is the only caller.
+- **Unknown table in a pull response is skipped, not a failure.** The manifest is never
+  exchanged on the wire: the server checks its registry against the database, the client
+  rebuilds its replica when its *own* registry changes (§9). So during a deploy that adds a
+  synced table, a running client with the old registry legitimately receives `upsert`/`tombstone`
+  changes for a table it does not know. It cannot store or query them, and nothing is lost: its
+  next app version has a new manifest, which rebuilds the replica from a `null` cursor and
+  fetches those rows. The engine resolves `Change.table` through `Registry.get` and drops
+  unknown names with a log line, inside the same install transaction. A defect here would kill
+  sync for every stale client until the app updated. (Rows of a *known* table at a newer server
+  schema are the separate additive-evolution question, open item 7.)
 - Realtime: a poke stream (RPC stream) says "something may have changed"; it is a hint, never
   data. Pull is the only truth.
 
@@ -438,3 +448,5 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
    - `Rejected{ClientExpired}` still carries a ledger `position` (§6 says every outcome does): the server records, next to the floor, the position of the highest expired ledger row and returns that. The client reports it as an `OutcomeUnknown` notice.
    - **Expiry depends on §9's outbox rule (1).** The §8 push-position backstop (rule 2) does not survive expiry: a duplicate enqueued after its original was released gets a fresh `seq` above the floor, and once the original's ledger row is gone the server cannot recognise it and executes it again (shown by the reconcile simulation). Only a released-row memory in the outbox rules such a duplicate out. Any expiry policy must therefore expire a client's ledger rows only after the released-row retention window (§9, default 24 h) has passed since those rows were acked, and never rows newer than the client's last presented cursor. When to raise the floor beyond that is the remaining open question.
 6. Local full-text search: the pinned wa-sqlite build lacks FTS5 (§10); decide custom build vs. non-FTS search when the search primitive is scheduled.
+7. Additive schema evolution across a deploy: a running client with an older registry receives rows of a *known* table at the newer server schema (added column, widened union). §8 settles unknown tables (skipped). For known tables the wire codec must either tolerate extra fields and decode missing-on-client fields as absent, or the protocol needs a manifest/version gate that forces a replica rebuild. Decide before the first schema migration ships; foundation to report what `SyncTable.wire` does with excess properties today.
+8. Query `limit` is applied after the scope filter in `Store.make` (v1), so `take(n)` is not pushed down to `RowStore.range` and a query over a large table with many unreadable rows scans past them. Fix by pushing the scope predicate into the range plan when queries are built.
