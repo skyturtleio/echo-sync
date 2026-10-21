@@ -699,7 +699,10 @@ export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): R
           Effect.forEach(GRANTS, ([id, row]) => rows.write(ScopeGrants.ScopeGrants, id, Option.some(row)))
         )
         const grants = Effect.map(transaction(rows.scan(ScopeGrants.ScopeGrants)), canonical)
-        const seeded = yield* grants
+        // The fixture's grants in scan order (id, code point), derived from GRANTS, not from a read.
+        const seeded = canonical(GRANTS.map(([, row]) => row).toSorted(byId))
+        const initial = yield* grants
+        if (initial !== seeded) return yield* fail(`seeded scope_grants:\n got ${initial}\nwant ${seeded}`)
         const fresh = AccessScope.AccessScopeId.make("created")
         const u2 = AccessScope.PrincipalId.make("u2")
 
@@ -726,11 +729,7 @@ export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): R
         const created = instance(u1)
         yield* transaction(created.store.createScope(fresh))
         const [newId, newRow] = grant(fresh, u1, "owner")
-        const want = canonical(
-          [...GRANTS.map(([, row]) => row), newRow].toSorted((a, b) =>
-            Store.compareText(String(a["id"]), String(b["id"]))
-          )
-        )
+        const want = canonical([...GRANTS.map(([, row]) => row), newRow].toSorted(byId))
         const got = yield* grants
         if (got !== want) return yield* fail(`after creating ${fresh}:\n got ${got}\nwant ${want}`)
         const images = canonical(yield* created.touched)

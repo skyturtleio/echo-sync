@@ -515,10 +515,8 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
           role: "owner",
           grantedAt: options.now
         })
-        const existing = yield* rows.read(ScopeGrants, id)
-        // A claimed id has no grants; a grant row here means the claim was wrong (not fresh).
-        if (Option.isSome(existing)) return yield* forbidden
-        yield* write(ScopeGrants, id, existing, Option.some(encoded))
+        // A claimed id is fresh, so it has no grant rows: the pre-image is "absent".
+        yield* write(ScopeGrants, id, Option.none(), Option.some(encoded))
       }),
 
     query: <T extends AnySyncTable>(table: T): TableQuery<T, InvalidRow | StoreUnavailable> => ({
