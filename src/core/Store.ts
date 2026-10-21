@@ -63,6 +63,9 @@ export interface Bound {
  * - and, on key column `eq.length`, within `lower`/`upper` (a bound never matches `null`),
  * - ordered by the full index key (`index.key`, which ends with `id`) in `order`;
  *   `asc` ⇒ NULLS FIRST, `desc` ⇒ NULLS LAST on every column.
+ * `eq` and bound values are wire values; a SQL RowStore binds each through its key column's
+ * dialect codec (`column.sqlite` / `column.postgres`), e.g. a timestamp bound is epoch ms on
+ * the wire and a `Date` for Postgres.
  */
 export interface IndexRangePlan {
   readonly index: Index

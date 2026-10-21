@@ -33,6 +33,12 @@
       {
         "additionalTestBlockFunctions": ["it.effect", "it.live", "it.scoped", "it.scopedLive", "it.layer"]
       }
+    ],
+    "vitest/expect-expect": [
+      "error",
+      {
+        "assertFunctionNames": ["expect", "expect*"]
+      }
     ]
   },
   "overrides": [
