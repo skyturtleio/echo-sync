@@ -437,9 +437,9 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
 
 ### 9.1 Tab-side API (the contract every UI adapter builds on)
 
-`src/client` owns one typed tab-side surface; `src/foldkit` and any other adapter are thin
-translations of it and add no sync semantics of their own. Rulings (coordinator, from
-`docs/foldkit-adapter.md`):
+`src/client` owns one typed tab-side surface. The library is UI-framework agnostic: any
+adapter (FoldKit, React, or other) lives in the consuming app, is a thin translation of this
+surface, and adds no sync semantics of its own. Rulings (coordinator):
 
 - **`mutate(mutation, args)`** is the only write API. It encodes `args` with the mutation's
   schema, **generates `mutationId` itself** (one id per logical call, fixed before the first
@@ -540,7 +540,7 @@ const todosByProject = Query.make("todos.byProject", {
   connection. `PRAGMA query_only` around raw statements is kept as defense in depth but is
   **not** a security boundary: the caller's text can itself contain `PRAGMA query_only = OFF` or
   several statements, so the only protection against untrusted raw SQL is not exposing the RPC.
-  The vertical-slice harness sets the flag; apps and the FoldKit adapter never do, and the
+  The vertical-slice harness sets the flag; apps and their UI adapters never do, and an
   adapter exposes neither RPC.
 - `take(n)` pushdown through the scope filter landed (open item 8, resolved) inside `Store.make`,
   behind the same `EchoStore` interface; `Query.make` is unaffected.

@@ -9,7 +9,9 @@ report; do not silently diverge.
   TypeScript source (`exports` → `src/**/*.ts`). No build step, no npm publish.
 - `src/core` (shared: SyncTable, AccessScope, Mutation, Store interface, RPC contracts),
   `src/server` (Postgres + RPC handlers), `src/client` (browser leader worker, replica, outbox,
-  queries), `src/foldkit` (thin adapter). Browser code must never import `src/server`.
+  queries). The library is UI-framework agnostic: no adapter for any UI library lives here;
+  apps build on the `src/client` tab-side API (DESIGN §9.1). Browser code must never import
+  `src/server`.
 - Runtime: Bun. Tooling: TypeScript strict (`exactOptionalPropertyTypes`,
   `noUncheckedIndexedAccess`), `oxlint`, `oxfmt`, `vitest` + `@effect/vitest`.
 - Runtime dependencies are Effect packages only, exact-pinned to one version.
