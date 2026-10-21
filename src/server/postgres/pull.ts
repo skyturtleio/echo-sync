@@ -236,6 +236,8 @@ export const pull = Effect.fnUntraced(function* (registry: Registry.SyncRegistry
             changes,
             acks,
             nextCursor: Ids.Position.make(nextPosition),
+            // Number() is exact only up to Number.MAX_SAFE_INTEGER; that matches SeqFloor being an
+            // Int (DESIGN §16.5), and no v1 job raises the floor at all.
             expiredThrough: Ids.SeqFloor.make(Number(state.expired_through))
           }
         : {
