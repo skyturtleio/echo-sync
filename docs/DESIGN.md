@@ -243,6 +243,9 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   so no later pull will ever ack it), and the client releases it on receipt of the push
   response, with the outcome as its notice. This is how a mutation that was duplicated into the
   outbox after its original was released (§9) terminates instead of staying pending forever.
+  For this to work, the client's push watermark (`pushedThrough`, the highest `seq` it has sent)
+  advances **only on push responses**, never on pull install: raising it to a released `seq` on
+  install would skip a still-pending lower `seq` (such a duplicate) and leave it unsent forever.
 - Initial sync = pull from `null` cursor. The log may be GC'd, so it cannot be log-driven:
   the server keyset-paginates current rows of all readable scopes by `(table, id)` with
   per-page snapshots, records the max position `head` at the first page, then continues with
@@ -417,5 +420,6 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
 5. Ledger retention, separate from log GC. **Confirmed hole** (reconcile simulation: with ledger GC and no handling, 34/40 seeds double-apply or never release). Mechanism, in the protocol from v1 so it needs no later wire change; the v1 server runs no expiry job (its floor stays 0 and `collectGarbage` never touches the ledger, `clients`, or `client_scopes`):
    - Server keeps a per-client **floor** = highest `seq` (§6) whose ledger row was expired. Push answers any `seq ≤ floor` with the terminal outcome `Rejected{ClientExpired}` instead of executing it. Because clients push in `seq` order and the ledger records every processed mutation, every `seq ≤ floor` was processed; a never-pushed mutation always has `seq >` floor and is accepted normally.
    - `PullDone` carries `expiredThrough` (the floor). Inside the install transaction, a pending mutation with `seq ≤ expiredThrough` and no ack leaves the replay set with a notice whose meaning is "processed, outcome unknown, effect (if any) is in the installed replica" — not "rejected". Needed in addition to the push rule: a client that pushed and lost the ack would otherwise hold the intent forever, since a resnapshot acks only surviving ledger rows.
-   - Expiry policy (when to raise the floor) is the remaining open question; it must never expire rows newer than the client's last presented cursor.
+   - `Rejected{ClientExpired}` still carries a ledger `position` (§6 says every outcome does): the server records, next to the floor, the position of the highest expired ledger row and returns that. The client reports it as an `OutcomeUnknown` notice.
+   - **Expiry depends on §9's outbox rule (1).** The §8 push-position backstop (rule 2) does not survive expiry: a duplicate enqueued after its original was released gets a fresh `seq` above the floor, and once the original's ledger row is gone the server cannot recognise it and executes it again (shown by the reconcile simulation). Only a released-row memory in the outbox rules such a duplicate out. Any expiry policy must therefore expire a client's ledger rows only after the released-row retention window (§9, default 24 h) has passed since those rows were acked, and never rows newer than the client's last presented cursor. When to raise the floor beyond that is the remaining open question.
 6. Local full-text search: the pinned wa-sqlite build lacks FTS5 (§10); decide custom build vs. non-FTS search when the search primitive is scheduled.
