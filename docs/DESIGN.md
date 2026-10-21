@@ -141,7 +141,9 @@ defaults or optional keys; `NullOr` is the only way to say "absent"), so §11's 
 is true for every table; a field schema must have no service requirements (`R = never`), since
 row codecs run at storage and wire edges with no context; and a transformed field (e.g. a
 branded or refined timestamp) must round-trip through every codec, nullable or not. The
-manifest hashes the **storage shape only** (columns, column kinds, nullability, indexes).
+manifest hashes the **storage shape only**: `dataHash` covers columns, column kinds and
+nullability; the index set and unique sets hash separately as `indexHash`, which never triggers
+a rebuild (§11).
 Refinements and brands are validation, not storage: changing one does not change the manifest
 and does not rebuild the replica, because a rebuild would refetch the same rows; tightening a
 refinement against existing data is a §11 backfill (expand → backfill → enforce), never a hash
@@ -471,6 +473,41 @@ const todosByProject = Query.make("todos.byProject", {
   safe plus a commented TODO for manual steps. NOT NULL evolution: expand → compatible writers →
   chunked idempotent backfill (outside Migrator's transaction) → validate → enforce.
 - Adding an index must not force a replica re-download.
+- **Generator and verifier contract (rulings):**
+  - *Previous committed manifest* is a checked-in snapshot file next to the app's migrations
+    (default `migrations/manifest.json`): canonical JSON of the registry's `TableManifest`s. The
+    generator reads it, emits `NNN_name.ts`, and rewrites the snapshot in the same commit, so
+    "committed" means committed and review sees the manifest diff. It is never read from a
+    database. `TableManifest` carries the unique sets (`unique`, already part of `indexHash`), so
+    the snapshot needs nothing beyond the manifests.
+  - App migrations run in their **own history table** (default `echo_sync.app_migrations`),
+    numbered from `001`, via `PgMigrator.make({})({ loader: fromRecord(...), table })` after the
+    engine's `migrate` (which keeps `echo_sync.migrations` for `001_engine`). Never share the
+    engine's table.
+  - Intent: `{ defaults?: { "table.column": sqlExpr }, renames?: { tables?, columns? },
+    acknowledgeDrops?: [...] }`. A new NOT NULL column with a default emits
+    `ADD COLUMN … NOT NULL DEFAULT <expr>` **followed by `ALTER COLUMN … DROP DEFAULT`** in the
+    same module: the default backfills existing rows once; new rows always carry every declared
+    column explicitly (§5 forbids encoded-side defaults), and the live catalog must not keep a
+    default the manifest does not know. Without a default: nullable `ADD COLUMN` plus the §11
+    TODO sequence. Rename and drop intents only make the commented TODO more specific; they
+    never emit DDL.
+  - "Drops" that are never inferred means **columns and tables** (data). Index add, drop and
+    change (`DROP INDEX` + `CREATE INDEX` under the same `table__index` name, plain, inside the
+    Migrator transaction) are inferred; `indexHash` changes rebuild nothing. `NOT NULL → nullable`
+    emits `DROP NOT NULL` (loss-free) with a generated comment that `dataHash` changes (replica
+    rebuild) and that a client still at the old manifest fails to decode a `null`, so apps ship
+    clients before writing nulls. Unique sets added or removed are TODO only (adding can fail on
+    data; removing needs the auto-generated constraint name).
+  - Verifier policy: extra undeclared live columns and extra indexes are allowed; a declared
+    column missing, of the wrong type (text without `COLLATE "C"` included) or nullability,
+    a declared index or unique set missing or with different key columns / order / `NULLS`
+    placement, a primary key not on `id`, a missing `echo_sync` capture trigger, or a registry
+    table that is not attached, is drift. Scope: registry tables including `scope_grants`; the
+    engine's own tables are not checked. Compare the structured catalog (`pg_index.indkey`,
+    `indoption`, `indcollation`, `pg_attribute`), never a string match against generated DDL.
+    The result is one typed `Drift` error listing every mismatch; the server runs it after
+    `migrate` and before serving.
 - **Additive column evolution (observed on pinned Effect 4.0.5 `Schema.Struct`):** wire and
   storage row codecs **drop excess keys on decode** and **fail on a missing key**. Never set
   `onExcessProperty: "error"` on row codecs. Consequences, which are the v1 rule: (1) a new
