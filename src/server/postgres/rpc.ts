@@ -1,5 +1,5 @@
 import * as PgClient from "@effect/sql-pg/PgClient"
-import { Cause, DateTime, Deferred, Effect, Layer, Option, PubSub, Queue, Ref, Schedule, Schema, Stream } from "effect"
+import { Cause, DateTime, Deferred, Duration, Effect, Layer, Option, PubSub, Queue, Ref, Schema, Stream } from "effect"
 import type { Headers } from "effect/http/Headers"
 import type * as HttpRouter from "effect/http/HttpRouter"
 import { RpcSerialization, RpcServer } from "effect/rpc"
@@ -114,36 +114,44 @@ interface ListenSession {
   readonly lost: Deferred.Deferred<never, SqlError>
 }
 
-/** Backoff for re-establishing the shared `LISTEN`: exponential from 50 ms, at most 5 s apart. */
-const listenRetry = Schedule.min([Schedule.exponential("50 millis"), Schedule.spaced("5 seconds")])
+/**
+ * Delay before the `attempt`-th consecutive `LISTEN` retry (0-based): exponential from 50 ms,
+ * capped at 5 s. The count resets once a `LISTEN` is confirmed, so a loss after a healthy period
+ * starts again at 50 ms.
+ */
+const listenBackoff = (attempt: number) => Duration.millis(Math.min(50 * 2 ** attempt, 5_000))
 
 /**
  * The process's single `LISTEN` on `pokeChannel` (DESIGN §6). `PgClient.listen` reserves a pool
  * connection for its scope, so one per `pokes` stream would exhaust the pool at `poolSize`
  * connected clients and block every push and pull. Lives in the caller's (the handlers layer's)
  * scope and returns once the first attempt has settled, so a server normally serves with its
- * `LISTEN` already in place. A lost `LISTEN` fails its session (ending every subscribed stream)
- * and is re-established with `listenRetry`.
+ * `LISTEN` already in place.
+ *
+ * Each attempt (reserve, `LISTEN`, pump notifications) is one scoped session, and every session
+ * ends in failure: a `LISTEN` that fails after its reservation, or a confirmed one whose
+ * connection is lost (which also ends every subscribed stream). The scope closes before the
+ * backoff, so a failed attempt never keeps its pool connection, and every retry, including one
+ * after an established connection was lost, waits `listenBackoff`.
  *
  * The returned stream is one `pokes` subscription: it subscribes to the current session first and
  * emits the initial poke only then, so a commit after that poke notifies it and a commit before
  * it is covered by the pull the poke triggers (subscribe-then-poke). Without a confirmed `LISTEN`
  * it fails `ServerUnavailable` and the client reconnects with backoff.
  */
-const sharedPokes = (pg: PgClient.PgClient) =>
+export const sharedPokes = (pg: PgClient.PgClient) =>
   Effect.gen(function* () {
     const current = yield* Ref.make(Option.none<ListenSession>())
     const ready = yield* Deferred.make<void>()
+    const attempts = yield* Ref.make(0)
     const session = Effect.scoped(
       Effect.gen(function* () {
-        const queue = yield* pg.listen(pokeChannel).pipe(
-          Effect.tapError(() => Deferred.succeed(ready, undefined)),
-          Effect.retry(listenRetry)
-        )
+        const queue = yield* pg.listen(pokeChannel)
         const live: ListenSession = {
           pubsub: yield* PubSub.sliding<void>(1),
           lost: yield* Deferred.make<never, SqlError>()
         }
+        yield* Ref.set(attempts, 0)
         yield* Ref.set(current, Option.some(live))
         yield* Deferred.succeed(ready, undefined)
         const error = yield* Effect.flip(
@@ -151,9 +159,14 @@ const sharedPokes = (pg: PgClient.PgClient) =>
         )
         yield* Ref.set(current, Option.none())
         yield* Deferred.fail(live.lost, error)
+        return yield* Effect.fail(error)
       })
     )
-    yield* Effect.forkScoped(Effect.forever(session))
+    const backoff = Effect.gen(function* () {
+      yield* Deferred.succeed(ready, undefined)
+      yield* Effect.sleep(listenBackoff(yield* Ref.getAndUpdate(attempts, (n) => n + 1)))
+    })
+    yield* Effect.forkScoped(Effect.forever(Effect.catch(session, () => backoff)))
     yield* Deferred.await(ready)
     return Stream.unwrap(
       Effect.gen(function* () {

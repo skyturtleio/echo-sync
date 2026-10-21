@@ -66,7 +66,9 @@ is never read from the payload. `ClientForbidden` becomes `Unauthorized`.
   then emits its initial poke. If no `LISTEN` is confirmed, a new stream fails `ServerUnavailable`.
   A lost `LISTEN` connection ends every open stream with `ServerUnavailable` (tested by
   terminating the listener's backend), and the listener re-establishes it with backoff
-  (exponential from 50 ms, capped at 5 s, not configurable). Clients reconnect on any end.
+  (exponential from 50 ms, capped at 5 s, reset once a `LISTEN` is confirmed, not configurable).
+  Each attempt runs in its own scope, so an attempt that fails after reserving its connection
+  releases it before the backoff. Clients reconnect on any end.
 
 ## Engine state
 

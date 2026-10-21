@@ -21,7 +21,8 @@ import { RpcClient, RpcSerialization } from "effect/rpc"
 import { SqlClient } from "effect/sql/SqlClient"
 import { SqlError, UnknownError } from "effect/sql/SqlError"
 import { AccessScope, Ids, Mutation, Protocol } from "echo-sync"
-import { layerHttp } from "./rpc.ts"
+import * as TestClock from "effect/testing/TestClock"
+import { layerHttp, sharedPokes } from "./rpc.ts"
 import { grant, Items, pgAvailable, registry, RowId, TestDatabase } from "./test-support.ts"
 
 const addItem = Mutation.make("items.add", {
@@ -379,6 +380,127 @@ describe.skipIf(!pgAvailable)("one LISTEN per server process (§6)", () => {
         yield* nextPoke(reconnected)
         assert.strictEqual(yield* listeners, 1)
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
+    60_000
+  )
+})
+
+/** A channel name over 63 bytes: `PgClient.listen` reserves its pool connection, then rejects it. */
+const tooLong = "x".repeat(64)
+
+/**
+ * The test database's own pool of 3, whose `listen` the test can steer: while `failing()` the
+ * attempt fails after reserving its connection (a post-reservation failure on the real driver).
+ */
+const steeredPool = (failing: () => boolean) =>
+  Effect.gen(function* () {
+    const url = (yield* PgClient.PgClient).config.url
+    if (url === undefined) return yield* Effect.die("test database has no url")
+    const small = yield* Layer.build(PgClient.layer({ url, maxConnections: 3 }))
+    const pg = Context.get(small, PgClient.PgClient)
+    const calls = { attempts: 0 }
+    const steered: PgClient.PgClient = new Proxy(pg, {
+      get: (target, key, receiver) =>
+        key === "listen"
+          ? (channel: string) => {
+              calls.attempts++
+              return target.listen(failing() ? tooLong : channel)
+            }
+          : Reflect.get(target, key, receiver)
+    })
+    return { context: Context.add(small, PgClient.PgClient, steered), pg: steered, calls }
+  })
+
+/** Real time, independent of the TestClock. */
+const realSleep = (ms: number) => Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+const eventually = <E, R>(check: Effect.Effect<boolean, E, R>, what: string) =>
+  Effect.gen(function* () {
+    for (let i = 0; i < 250; i++) {
+      if (yield* check) return
+      yield* realSleep(20)
+    }
+    return yield* Effect.die(`timed out waiting for ${what}`)
+  })
+const killListener = Effect.gen(function* () {
+  const sql = yield* SqlClient
+  yield* sql`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+    WHERE datname = current_database() AND query ILIKE 'listen%'`
+})
+
+describe.skipIf(!pgAvailable)("re-establishing the shared LISTEN (§6)", () => {
+  it.live(
+    "LISTEN attempts that fail after reserving a connection release it: recovery succeeds after more failures than the pool has connections",
+    () =>
+      Effect.gen(function* () {
+        yield* writer
+        let failures = 0
+        const { context, calls } = yield* steeredPool(() => failures++ < 4)
+        const client = yield* connectTo(context)
+        // A reconnecting client: open streams until one gets its initial poke.
+        const received = yield* Effect.gen(function* () {
+          const failed = yield* Queue.unbounded<string>()
+          const pokes = yield* openPokes(client, failed)
+          const first = yield* Effect.raceFirst(Effect.as(Queue.take(pokes), "poke"), Queue.take(failed))
+          return first === "poke" ? pokes : yield* Effect.fail(first)
+        }).pipe(Effect.retry(Schedule.spaced("50 millis").pipe(Schedule.upTo({ times: 200 }))))
+        assert.strictEqual(calls.attempts, 5)
+        const pushed = yield* client.push(push([["m1", "hello"]])).pipe(Effect.timeout("10 seconds"))
+        assert.strictEqual(pushed.results[0]?.outcome._tag, "Applied")
+        yield* nextPoke(received)
+        assert.strictEqual(yield* listeners, 1)
+      }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
+    60_000
+  )
+
+  it.effect(
+    "every LISTEN retry waits its backoff, after an established connection is lost as after a failed attempt, and the backoff resets once LISTEN is confirmed",
+    () =>
+      Effect.gen(function* () {
+        let failing = false
+        const { pg, calls } = yield* steeredPool(() => failing)
+        yield* sharedPokes(pg)
+        const attemptsAre = (n: number) =>
+          eventually(
+            Effect.sync(() => calls.attempts === n),
+            `attempt ${n}`
+          )
+        const stillAt = (n: number) =>
+          Effect.andThen(
+            realSleep(300),
+            Effect.sync(() => assert.strictEqual(calls.attempts, n))
+          )
+        const listening = eventually(
+          Effect.map(listeners, (n) => n === 1),
+          "one LISTEN"
+        )
+        yield* listening
+        assert.strictEqual(calls.attempts, 1)
+
+        // An established LISTEN lost: no reconnect until the first backoff (50 ms) has passed.
+        yield* killListener
+        yield* stillAt(1)
+        yield* TestClock.adjust("49 millis")
+        yield* stillAt(1)
+        yield* TestClock.adjust("1 millis")
+        yield* attemptsAre(2)
+        yield* listening
+
+        // Lost again, then failed attempts: 50 ms (reset), then 100 ms, then 200 ms.
+        failing = true
+        yield* killListener
+        yield* stillAt(2)
+        yield* TestClock.adjust("50 millis")
+        yield* attemptsAre(3)
+        yield* TestClock.adjust("99 millis")
+        yield* stillAt(3)
+        yield* TestClock.adjust("1 millis")
+        yield* attemptsAre(4)
+        failing = false
+        yield* TestClock.adjust("199 millis")
+        yield* stillAt(4)
+        yield* TestClock.adjust("1 millis")
+        yield* attemptsAre(5)
+        yield* listening
+      }).pipe(Effect.provide(TestDatabase)),
     60_000
   )
 })
