@@ -75,7 +75,7 @@ describe.skipIf(!pgAvailable)("log GC (§7)", () => {
       yield* grant("p", "s1")
       const replica = new Replica("p", "c1")
       yield* replica.sync()
-      yield* runMutation({ principalId: "p", clientId: "c1", mutationId: 1 }, insert("a"))
+      yield* runMutation({ principalId: "p", clientId: "c1", mutationId: "m1", seq: 1n }, insert("a"))
       yield* replica.sync()
       const snapshot = Effect.all([
         sql`SELECT client_id, mutation_id, position, outcome FROM echo_sync.mutations ORDER BY position`,
@@ -87,6 +87,21 @@ describe.skipIf(!pgAvailable)("log GC (§7)", () => {
       const gc = yield* gcAt(twoHours)
       assert.isAbove(gc.deleted, 0)
       assert.deepStrictEqual(yield* snapshot, before)
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("a page set interrupted mid row walk whose position GC passed must resnapshot instead of resuming", () =>
+    Effect.gen(function* () {
+      yield* grant("p", "s1")
+      for (const id of ["a", "b", "c"]) yield* insert(id)
+      const replica = new Replica("p", "d")
+      const page = yield* replica.pullOnce(1)
+      assert.strictEqual(page._tag, "PullPage")
+      // Writes after the walk's head, then GC past them: the log the walk would continue with is gone.
+      for (const id of ["d", "e"]) yield* insert(id)
+      yield* gcAt(twoHours)
+      const failure = yield* Effect.flip(replica.pullOnce(1))
+      assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "gcHorizon")
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -105,6 +120,27 @@ describe.skipIf(!pgAvailable)("log GC (§7)", () => {
     }).pipe(Effect.provide(TestDatabase))
   )
 })
+
+/** A well-formed, decodable continuation for client `d` of principal `p`. */
+const forge = (cursor: bigint | null, position: string) =>
+  Option.some(
+    JSON.stringify({
+      clientId: "d",
+      principalId: "p",
+      cursor: cursor === null ? null : String(cursor),
+      position,
+      scopes: [],
+      walking: []
+    })
+  )
+
+const expectStale = (cursor: bigint | null, position: string) =>
+  Effect.gen(function* () {
+    const failure = yield* Effect.flip(
+      pull({ principalId: "p", clientId: "d", cursor, continuation: forge(cursor, position), limit: 10 })
+    )
+    assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "staleContinuation")
+  })
 
 describe.skipIf(!pgAvailable)("pull continuation (§8)", () => {
   it.live("a continuation replayed by another client, principal, or cursor, or garbled, is refused", () =>
@@ -132,6 +168,59 @@ describe.skipIf(!pgAvailable)("pull continuation (§8)", () => {
         )
         assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "staleContinuation")
       }
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("a well-formed forged continuation cannot record a held set no snapshot produced", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      const heldSets = sql`SELECT position, scope_ids FROM echo_sync.client_scopes ORDER BY position`
+
+      yield* grant("p", "A")
+      yield* sql`INSERT INTO items (id, access_scope_id) VALUES ('a1', 'A')`
+      yield* sql`INSERT INTO echo_sync.access_scopes (id) VALUES ('B')`
+      yield* sql`INSERT INTO items (id, access_scope_id) VALUES ('b1', 'B')`
+      const replica = new Replica("p", "d")
+      yield* replica.sync()
+      const cursor = replica.cursor
+      if (cursor === null) return assert.fail("expected a cursor")
+      const before = yield* heldSets
+
+      // The reviewer's reproduction: a valid-JSON continuation at a future position, while the
+      // client holds A, and again after A is revoked and B granted.
+      yield* expectStale(null, "1000")
+      yield* expectStale(cursor, "1000")
+      yield* sql`DELETE FROM echo_sync.scope_grants WHERE access_scope_id = 'A'`
+      yield* grant("p", "B")
+      yield* expectStale(cursor, "1000")
+      // Negative, and behind the originating cursor, are refused too.
+      yield* expectStale(null, "-1")
+      yield* expectStale(cursor, String(cursor - 1n))
+      assert.deepStrictEqual(yield* heldSets, before)
+
+      // The honest client then purges A and walks B; a later revoke of B still purges B.
+      yield* replica.sync()
+      assert.isTrue(replica.rows.has("items/b1") && !replica.rows.has("items/a1"))
+      yield* sql`DELETE FROM echo_sync.scope_grants WHERE access_scope_id = 'B'`
+      const received = replica.received.length
+      yield* replica.sync()
+      assert.deepStrictEqual(
+        replica.received.slice(received).filter((c) => c._tag === "ScopePurged"),
+        [{ _tag: "ScopePurged", scopeId: "B" }]
+      )
+      assert.deepStrictEqual(replica.view(), yield* serverView("p"))
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("a resumed page set whose originating cursor the server never completed is refused", () =>
+    Effect.gen(function* () {
+      yield* grant("p", "s1")
+      for (const id of ["a", "b"]) yield* insert(id)
+      const continuation = Option.some(
+        JSON.stringify({ clientId: "d", principalId: "p", cursor: "1", position: "1", scopes: ["s1"], walking: [] })
+      )
+      const failure = yield* Effect.flip(pull({ principalId: "p", clientId: "d", cursor: 1n, continuation, limit: 10 }))
+      assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "unknownCursor")
     }).pipe(Effect.provide(TestDatabase))
   )
 

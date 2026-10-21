@@ -48,7 +48,7 @@ export type Change =
   | { readonly _tag: "ScopePurged"; readonly scopeId: string }
 
 export interface Ack {
-  readonly mutationId: number
+  readonly mutationId: string
   readonly outcome: MutationOutcome
 }
 
@@ -66,6 +66,8 @@ export type PullResponse =
       readonly changes: ReadonlyArray<Change>
       readonly acks: ReadonlyArray<Ack>
       readonly nextCursor: bigint
+      /** The client's ledger-expiry floor (§16.5), as of this page's snapshot. */
+      readonly expiredThrough: bigint
     }
 
 /** The client must discard staged pages and pull from a `null` cursor. */
@@ -138,32 +140,45 @@ export const pull = Effect.fnUntraced(function* (request: PullRequest) {
     Effect.gen(function* () {
       yield* sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`
 
-      const stateRows = yield* sql<{ gc_horizon: bigint; head: bigint }>`
+      const stateRows = yield* sql<{ gc_horizon: bigint; head: bigint; expired_through: bigint }>`
         SELECT gc_horizon,
                GREATEST(gc_horizon,
                         (SELECT max(position) FROM echo_sync.log),
-                        (SELECT max(position) FROM echo_sync.mutations)) AS head
+                        (SELECT max(position) FROM echo_sync.mutations)) AS head,
+               (SELECT expired_through FROM echo_sync.clients WHERE client_id = ${request.clientId}) AS expired_through
         FROM echo_sync.engine_state`
       const state = stateRows[0]
       if (state === undefined) return yield* Effect.die("echo_sync.engine_state is empty; run migrate")
+      // Resumed progress must lie in [originating cursor, head of this snapshot]. A position the
+      // server never reached would let PullDone record a nextCursor no snapshot produced.
+      if (
+        resumed !== undefined &&
+        (resumed.position < 0n ||
+          resumed.position > state.head ||
+          (request.cursor !== null && resumed.position < request.cursor))
+      ) {
+        return yield* stale
+      }
       const base = resumed?.position ?? request.cursor
       if (base !== null && base < state.gc_horizon) {
         return yield* new ResnapshotRequired({ reason: "gcHorizon" })
       }
 
-      // What the client holds at the start of this page.
+      // The originating cursor must be one the server completed a set at, resumed or not.
       let held: ReadonlyArray<string> = []
-      let walking: Array<{ scopeId: string; after: typeof RowKey.Type | null }> = []
-      if (resumed !== undefined) {
-        held = resumed.scopes
-        walking = [...resumed.walking]
-      } else if (request.cursor !== null) {
+      if (request.cursor !== null) {
         const recorded = yield* sql<{ scope_ids: ReadonlyArray<string> }>`
           SELECT scope_ids FROM echo_sync.client_scopes
           WHERE client_id = ${request.clientId} AND position = ${request.cursor}`
         const row = recorded[0]
         if (row === undefined) return yield* new ResnapshotRequired({ reason: "unknownCursor" })
         held = row.scope_ids
+      }
+      // What the client holds at the start of this page.
+      let walking: Array<{ scopeId: string; after: typeof RowKey.Type | null }> = []
+      if (resumed !== undefined) {
+        held = resumed.scopes
+        walking = [...resumed.walking]
       }
 
       const readable = new Set(
@@ -220,7 +235,8 @@ export const pull = Effect.fnUntraced(function* (request: PullRequest) {
         logDone = fetched.length <= budget
         const entries = logDone ? fetched : fetched.slice(0, budget)
         const last = entries.at(-1)
-        nextPosition = !logDone && last !== undefined ? last.position : bigMax(state.head, position)
+        // position ≤ head is enforced above, so a completed set ends exactly at this snapshot's head.
+        nextPosition = !logDone && last !== undefined ? last.position : state.head
 
         const payloads = yield* fetchPayloads(tables, entries)
         for (const entry of entries) {
@@ -243,17 +259,17 @@ export const pull = Effect.fnUntraced(function* (request: PullRequest) {
       // Acks: ledger rows in (cursor, nextCursor] across the set, each page covering the log
       // range it advanced. An initial sync covers every committed mutation of this client.
       const ackFloor = resumed?.position ?? request.cursor ?? -1n
-      const ackRows = yield* sql<{ mutation_id: bigint; outcome: unknown }>`
+      const ackRows = yield* sql<{ mutation_id: string; outcome: unknown }>`
         SELECT mutation_id, outcome FROM echo_sync.mutations
         WHERE client_id = ${request.clientId} AND position > ${ackFloor} AND position <= ${nextPosition}
         ORDER BY position`
       const acks: Array<Ack> = []
       for (const row of ackRows) {
-        acks.push({ mutationId: Number(row.mutation_id), outcome: yield* Effect.orDie(decodeOutcome(row.outcome)) })
+        acks.push({ mutationId: row.mutation_id, outcome: yield* Effect.orDie(decodeOutcome(row.outcome)) })
       }
 
       const result: PullResponse = logDone
-        ? { _tag: "PullDone", changes, acks, nextCursor: nextPosition }
+        ? { _tag: "PullDone", changes, acks, nextCursor: nextPosition, expiredThrough: state.expired_through }
         : {
             _tag: "PullPage",
             changes,
@@ -267,7 +283,9 @@ export const pull = Effect.fnUntraced(function* (request: PullRequest) {
               walking
             })
           }
-      return { result, scopes }
+      // At PullDone the delivered set is the readable set of this snapshot (every readable scope
+      // was kept or walked, every other purged). Record that directly, not what the request claimed.
+      return { result, held: Arr.sort(readable, compare) }
     })
   )
 
@@ -282,7 +300,7 @@ export const pull = Effect.fnUntraced(function* (request: PullRequest) {
   if (response.result._tag === "PullDone") {
     yield* sql`
       INSERT INTO echo_sync.client_scopes (client_id, position, scope_ids)
-      VALUES (${request.clientId}, ${response.result.nextCursor}, ${Arr.sort(response.scopes, compare)}::text[])
+      VALUES (${request.clientId}, ${response.result.nextCursor}, ${response.held}::text[])
       ON CONFLICT DO NOTHING`
   }
   return response.result
@@ -290,7 +308,6 @@ export const pull = Effect.fnUntraced(function* (request: PullRequest) {
 
 /** Code-point order, matching `COLLATE "C"` (DESIGN.md §10). Table names are ASCII identifiers. */
 const compare: Order.Order<string> = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
-const bigMax = (a: bigint, b: bigint) => (a > b ? a : b)
 const payloadKey = (table: string, rowId: string) => `${table}\u0000${rowId}`
 
 const fetchPayloads = Effect.fnUntraced(function* (
