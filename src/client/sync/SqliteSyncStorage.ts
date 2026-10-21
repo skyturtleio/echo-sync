@@ -13,7 +13,7 @@
 import { Effect, Option, Schema } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
-import { AccessScope, type Errors, type Registry, SyncTable } from "../../core/index.ts"
+import { AccessScope, type Errors, type Registry, SyncTable } from "echo-sync"
 import * as SqliteRowStore from "../SqliteRowStore.ts"
 import * as Outbox from "../Outbox.ts"
 import type * as Engine from "./Engine.ts"
@@ -98,15 +98,17 @@ const q = (name: string) => `"${name.replaceAll('"', '""')}"`
  * Brings the leader's database in line with `registry` (DESIGN §9, §11) in ONE SQLite transaction:
  * the outbox, the engine's tables, the replica tables, and the bookkeeping that describes them.
  *
- * The registry's manifest hashes live in `echo_meta` under `replica_tables`, `replica_data_hash` and
- * `replica_index_hash`; this function is their only writer.
+ * The registry's manifest hashes live in `echo_meta` under `replica_tables`, `replica_data_hash`,
+ * `replica_index_hash` and `replica_table_ddl` (a hash of the tables' SQLite DDL); this function is
+ * their only writer.
  * - First run: create every replica table and index.
- * - `dataHash` changed: drop the previous replica tables, recreate them empty, and in the same
- *   transaction reset what described the old replica: `cursor` to `null`, `resnapshot` off, staged
+ * - `dataHash` or the table DDL changed (core hashes a `unique` constraint as index shape, but it
+ *   lives in CREATE TABLE, which SQLite cannot alter): drop the previous replica tables, recreate
+ *   them empty, and in the same transaction reset what described the old replica: `cursor` to `null`, `resnapshot` off, staged
  *   pages deleted, pending undo images emptied (they pre-image rows that no longer exist). The outbox,
  *   `pushedThrough` and notices are kept. A crash at any point therefore leaves either the old tables
  *   with the old cursor or the new tables with a `null` cursor, never a mix. Returns `rebuilt: true`.
- * - Only `indexHash` changed: drop and recreate the declared indexes; rows and cursor stay.
+ * - Otherwise, if `indexHash` changed: drop and recreate the declared indexes; rows and cursor stay.
  */
 export const migrate = (
   registry: Registry.SyncRegistry
@@ -120,7 +122,7 @@ export const migrate = (
         yield* sql`CREATE TABLE IF NOT EXISTS echo_notices (id INTEGER PRIMARY KEY AUTOINCREMENT, notice TEXT NOT NULL) STRICT`
         const meta = new Map(
           (yield* sql<{ readonly key: string; readonly value: string }>`
-            SELECT key, value FROM echo_meta WHERE key IN ('replica_tables', 'replica_data_hash', 'replica_index_hash')`).map(
+            SELECT key, value FROM echo_meta WHERE key IN ('replica_tables', 'replica_data_hash', 'replica_index_hash', 'replica_table_ddl')`).map(
             (r) => [r.key, r.value]
           )
         )
@@ -132,7 +134,12 @@ export const migrate = (
           (ddl) => sql.unsafe(ddl)
         )
         const previous = meta.get("replica_tables")
-        const rebuilt = previous !== undefined && meta.get("replica_data_hash") !== registry.dataHash
+        // Table DDL also carries constraints the manifest hashes as index shape (`unique`); SQLite
+        // cannot alter a table's constraints, so any change to the CREATE TABLE text rebuilds too.
+        const tableDdl = SyncTable.hash(registry.tables.map((t) => t.sqlite.createTable).join(";\n"))
+        const rebuilt =
+          previous !== undefined &&
+          (meta.get("replica_data_hash") !== registry.dataHash || meta.get("replica_table_ddl") !== tableDdl)
 
         if (previous === undefined || rebuilt) {
           for (const name of previous === undefined ? [] : yield* decodeTables(previous)) {
@@ -157,6 +164,7 @@ export const migrate = (
         }
         yield* put("replica_tables", yield* encodeTables(registry.tables.map((t) => t.name)))
         yield* put("replica_data_hash", registry.dataHash)
+        yield* put("replica_table_ddl", tableDdl)
         yield* put("replica_index_hash", registry.indexHash)
         return { rebuilt }
       })

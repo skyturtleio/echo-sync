@@ -1,7 +1,7 @@
 import { expect, it } from "@effect/vitest"
 import { Effect, Schema } from "effect"
 import { TestClock } from "effect/testing"
-import { Ids, Protocol } from "../../core/index.ts"
+import { Ids, Protocol } from "echo-sync"
 import type * as Engine from "./Engine.ts"
 import * as SyncLoop from "./SyncLoop.ts"
 import * as Transport from "./Transport.ts"

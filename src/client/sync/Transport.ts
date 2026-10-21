@@ -23,7 +23,7 @@
 import { Cause, Effect, Layer, Predicate, Schema, type Scope } from "effect"
 import { FetchHttpClient } from "effect/http"
 import { RpcClient, type RpcClientError, RpcSerialization } from "effect/rpc"
-import { Protocol } from "../../core/index.ts"
+import { Protocol } from "echo-sync"
 import type * as Engine from "./Engine.ts"
 import * as Wire from "./Wire.ts"
 

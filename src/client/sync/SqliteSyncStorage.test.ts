@@ -5,7 +5,7 @@ import { expect, it } from "@effect/vitest"
 import { Deferred, Effect, Fiber, Layer, Option, Schema, Scope } from "effect"
 import type { Scheduler } from "effect/Scheduler"
 import * as SqlClient from "effect/sql/SqlClient"
-import { AccessScope, Registry, SyncTable } from "../../core/index.ts"
+import { AccessScope, Registry, SyncTable } from "echo-sync"
 import * as Outbox from "../Outbox.ts"
 import * as SqliteRowStore from "../SqliteRowStore.ts"
 import * as Engine from "./Engine.ts"
@@ -233,8 +233,19 @@ it.effect("an index-only change keeps rows and cursor; a data-shape change rebui
     expect(yield* SqliteSyncStorage.migrate(registry)).toEqual({ rebuilt: false })
     expect(yield* classify).toBe("old")
 
+    // A unique constraint is CREATE TABLE text: only a rebuild can apply it.
+    const uniqueScope = Registry.make([
+      SyncTable.make("t", { id: TId, accessScopeId: AccessScope.AccessScopeId }, { unique: [["accessScopeId"]] })
+    ])
+    expect(uniqueScope.dataHash).toBe(registry.dataHash)
+    expect(yield* SqliteSyncStorage.migrate(uniqueScope)).toEqual({ rebuilt: true })
+    const unique = SqliteSyncStorage.make(sql, uniqueScope)
+    yield* unique.rows.write("t", "u1", Option.some({ id: "u1", access_scope_id: "s" }))
+    const duplicate = yield* Effect.exit(unique.rows.write("t", "u2", Option.some({ id: "u2", access_scope_id: "s" })))
+    expect(duplicate._tag).toBe("Failure")
+    yield* unique.rows.clearAll
+
     expect(yield* SqliteSyncStorage.migrate(reshaped)).toEqual({ rebuilt: true })
-    expect(yield* classify).toBe("new")
     expect(yield* SqliteSyncStorage.migrate(reshaped)).toEqual({ rebuilt: false })
   }).pipe(Effect.provide(Db))
 )

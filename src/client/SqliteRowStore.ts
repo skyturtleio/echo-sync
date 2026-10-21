@@ -14,7 +14,7 @@
 import { Effect, Option, Schema } from "effect"
 import type * as SqlClient from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
-import { Errors, type Registry, type Store, type SyncTable } from "../core/index.ts"
+import { Errors, type Registry, type Store, type SyncTable } from "echo-sync"
 
 type Table = SyncTable.AnySyncTable
 type Value = SyncTable.SqliteValue

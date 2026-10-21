@@ -2,7 +2,7 @@ import { expect, it } from "@effect/vitest"
 import { Effect, Exit, Layer, Option, Schema, Stream } from "effect"
 import { FetchHttpClient, HttpRouter } from "effect/http"
 import { Rpc, RpcClient, RpcGroup, RpcSerialization, RpcServer } from "effect/rpc"
-import { Ids, Mutation, Protocol } from "../../core/index.ts"
+import { Ids, Mutation, Protocol } from "echo-sync"
 import * as Transport from "./Transport.ts"
 import * as Wire from "./Wire.ts"
 
