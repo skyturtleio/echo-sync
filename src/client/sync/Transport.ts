@@ -38,6 +38,7 @@ export type TransportError =
   | RpcClientError.RpcClientError
   | Protocol.Unauthorized
   | Protocol.MalformedEnvelope
+  | Protocol.ServerUnavailable
   | PushIntegrityError
   | PullProtocolError
 
