@@ -165,8 +165,9 @@ ab tab close "$A" >/dev/null
 ab tab close "$B" >/dev/null
 
 # ── reactive query re-emits after a cross-tab write ─────────────────────────────────────────────────
-# (The pair_a/pair_b agreement is a sanity check only: removing the read transaction does not make it fail,
-# because the single-connection semaphore already serializes the reader's statements. See docs.)
+# (The pair_a/pair_b agreement is a sanity check only: "no write interleaves between the statements of one
+# emission" holds by construction (withTransaction leases the single connection), and removing the
+# transaction does not make this check fail. See docs/browser-substrate.md.)
 APP="reactive-$RUN"
 A=$(open_tab "$BASE/?app=$APP")
 ev <<<'await echo.exec("CREATE TABLE pair_a (id INTEGER PRIMARY KEY)")

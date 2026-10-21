@@ -143,11 +143,12 @@ Each scenario uses a fresh `appId`, so runs are independent. Invariants checked:
    final value.
 7. Fallback: without SharedWorker the second tab fails closed; after the owner closes, it takes over.
 
-Known gap: "one emission = one read transaction" holds by construction (`subscribe` wraps the statement
-batch in `withTransaction`, which holds the connection's semaphore across all statements). The harness
-also checks two tables kept equal by a trigger, but that check does **not** fail when the transaction is
-removed: the single-connection semaphore already serializes the reader's statements back to back, so a
-write cannot be forced between them from outside. It is a sanity check, not a proof.
+Emission consistency: the invariant is "no write interleaves between the statements of one emission".
+It holds by construction: `subscribe` runs the statement batch in `withTransaction`, which leases the
+leader's single SQLite connection (its semaphore) for the whole batch, so no other request's statement
+can run in between. This is not proven by a browser test. The harness also checks two tables kept equal
+by a trigger, but that check still passes with the transaction removed (the reader's statements
+already run back to back), so it is a sanity check only.
 
 `window.echo` in the harness page (`status`, `ready`, `info`, `exec`, `enqueue`, `enqueueRetrying`,
 `subscribe`) is the scripting surface; failures come back as values (`{ ok: false, error }`) so scripts
