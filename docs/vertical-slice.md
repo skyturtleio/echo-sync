@@ -166,14 +166,15 @@ Postgres ledger has exactly one row for each exactly-once mutation they enqueue 
 | `skip-offline` | A never goes offline, so its edit is pushed at once | S6 (ledger row while "offline", no network error) |
 | `drop-outbox` | the queued entry is deleted from A's outbox before the reload | S6 (entry gone after the reload, edit never reaches Postgres or B) |
 | `stay-offline` | A never comes back online | S6 |
-| `b-offline-after-push` | B drops offline again once its own pushes are acknowledged, so it never pulls A's | S7a, S7b |
+| `b-offline-after-push` | B drops offline again once its own pushes are acknowledged, so it never pulls A's | S7a, S7b, S7c (B never sees the marker) |
 | `a-first` | A reconnects before B | S7a (ledger order), S7b (B's title stands) |
 | `no-reject` | the server's blocked-title check is switched off (`/admin/rejections?enabled=0`); A's input is unchanged | S7c |
 | `transient-rejected` | B's replica shows A's rejected title for one emission and then B's again, so B's final state is correct | S7c (history scan) |
 | `a-stays-offline` | A never comes back online | S8a, S8b |
 | `skip-b-delete` | B does not delete the row A edits | S8b only (the row survives) |
 
-Each control was run on its own section; every check not listed for a control still passed.
+Each control was run on its own section (`transient-rejected` and `no-reject` also in the full run); every
+check not listed for a control still passed.
 
 ### What the slice does not prove
 
