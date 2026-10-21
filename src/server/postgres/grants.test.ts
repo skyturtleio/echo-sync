@@ -102,7 +102,9 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (§4)", () => {
           const rows = yield* RowStore.make(new Map(tables.map((t) => [t.table.name, t.schema])))
           const { store } = Store.make(rows, {
             actor: AccessScope.PrincipalId.make("p"),
-            roleFor: () => Effect.succeed(Option.some<AccessScope.Role>("owner"))
+            roleFor: () => Effect.succeed(Option.some<AccessScope.Role>("owner")),
+            claimScope: () => Effect.succeed(false),
+            now: yield* DateTime.now
           })
           yield* store.insert(ScopeGrants.ScopeGrants, {
             id: ScopeGrants.grantId(scope, principal),

@@ -80,6 +80,8 @@ export const make = (options: { readonly pageSize: number }) => {
   const continuations = new Map<string, Continuation>()
   const history = new Map<Position, MemoryStore.Tables>([[0n, new Map()]])
   const executions = new Map<string, number>()
+  /** `access_scopes`: every scope ever created or granted in; kept when its grants go (§4). */
+  const accessScopes = new Set<string>()
 
   const ledgerOf = (clientId: string) => {
     const existing = ledger.get(clientId)
@@ -117,6 +119,10 @@ export const make = (options: { readonly pageSize: number }) => {
           for (const write of writes) {
             images.push({ table: write.table, id: write.id, before: yield* store.read(write.table, write.id) })
             yield* store.write(write.table, write.id, write.row)
+            // A grant needs its scope's access_scopes row (the Postgres FK).
+            if (write.table === ScopeGrants.ScopeGrants && Option.isSome(write.row)) {
+              accessScopes.add(scopeOf(write.row.value))
+            }
           }
           yield* logWrites(images)
           commit(head)
@@ -128,14 +134,24 @@ export const make = (options: { readonly pageSize: number }) => {
     store.transaction(
       Effect.gen(function* () {
         const principal = principals.get(envelope.clientId) ?? AccessScope.PrincipalId.make("nobody")
+        // The authoritative claim (DESIGN §4): fresh iff no access_scopes row; it is added only
+        // if the mutation applies, like the Postgres insert that rolls back with the savepoint.
+        const claimed = new Set<string>()
+        const claimScope = (scopeId: AccessScope.AccessScopeId) =>
+          Effect.sync(() => {
+            if (accessScopes.has(scopeId) || claimed.has(scopeId)) return false
+            claimed.add(scopeId)
+            return true
+          })
         // The in-memory store has no transient failures.
-        const run = yield* Effect.orDie(Engine.runHandler(store, mutations, principal, envelope, now))
+        const run = yield* Effect.orDie(Engine.runHandler(store, mutations, principal, envelope, now, claimScope))
         let outcome: MutationOutcome
         if (Option.isSome(run.rejection)) {
           yield* Engine.restore(store, run.undo)
           outcome = { _tag: "Rejected", error: run.rejection.value }
         } else {
           yield* logWrites(run.undo)
+          for (const scope of claimed) accessScopes.add(scope)
           outcome = { _tag: "Applied" }
         }
         head += 1n

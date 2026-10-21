@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Cause, Deferred, Effect, Exit, Option, Ref, Schedule, Schema } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Option, Ref, Schedule, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { SqlError, UnknownError } from "effect/sql/SqlError"
 import { AccessScope, Ids, Mutation, Registry, Store, SyncTable } from "echo-sync"
@@ -24,7 +24,9 @@ const makeBarrier = (n: number) =>
 
 const asOwner = {
   actor: AccessScope.PrincipalId.make("owner"),
-  roleFor: () => Effect.succeed(Option.some<AccessScope.Role>("owner"))
+  roleFor: () => Effect.succeed(Option.some<AccessScope.Role>("owner")),
+  claimScope: () => Effect.succeed(false),
+  now: DateTime.makeUnsafe(0)
 }
 const attachedRowStore = (registry: Registry.SyncRegistry) =>
   Effect.flatMap(resolveTables(registry), (tables) =>

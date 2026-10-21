@@ -55,7 +55,9 @@ const makeStore = () => {
   }
   return Store.make(rows, {
     actor: PrincipalId.make("*"),
-    roleFor: () => Effect.succeed(Option.some("writer" as const))
+    roleFor: () => Effect.succeed(Option.some("writer" as const)),
+    claimScope: () => Effect.succeed(false),
+    now: DateTime.makeUnsafe(0)
   }).store
 }
 

@@ -21,9 +21,10 @@
  */
 import { Array as Arr, Cause, DateTime, Deferred, Effect, Exit, Fiber, Option, Schema, Scheduler } from "effect"
 import type { Scope } from "effect"
-import type * as Engine from "../../client/sync/Engine.ts"
+import * as Engine from "../../client/sync/Engine.ts"
 import { AccessScope, Ids, Protocol, ScopeGrants, Store, SyncTable } from "../index.ts"
-import type { Errors, Mutation } from "../index.ts"
+import { Errors } from "../index.ts"
+import type { Mutation } from "../index.ts"
 
 // ---------------------------------------------------------------------------------------------
 // Subjects and checks
@@ -33,6 +34,8 @@ import type { Errors, Mutation } from "../index.ts"
 export interface RowStoreSubject<S extends Store.RowStore = Store.RowStore> {
   readonly rows: S
   readonly transaction: <A, E, R>(self: Effect.Effect<A, E, R>) => Effect.Effect<A, E | Errors.StoreUnavailable, R>
+  /** The substrate's scope claim (DESIGN §4); default: a replica's (`Engine.claimFromGrants`). */
+  readonly claimScope?: Store.StoreOptions["claimScope"] | undefined
 }
 
 export interface SyncStorageSubject {
@@ -539,7 +542,12 @@ export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): R
             Effect.forEach(data, (row) => rows.write(Items, String(row["id"]), Option.some(row)))
           ])
         )
-        const { store } = Store.make(rows, { actor: u1, roleFor: () => Effect.succeedSome("reader" as const) })
+        const { store } = Store.make(rows, {
+          actor: u1,
+          roleFor: () => Effect.succeedSome("reader" as const),
+          claimScope: () => Effect.succeed(false),
+          now: DateTime.makeUnsafe(0)
+        })
         const query = store.query(Items).withIndex("by_score")
         const all = yield* transaction(query.collect)
         if (canonical(all.map((r) => r.id)) !== canonical(data.map((r) => r["id"]))) {
@@ -667,6 +675,75 @@ export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): R
       }
       return cases
     })
+  ),
+  check(
+    "createScope writes exactly the actor's owner grant on a fresh id; an existing id is ScopeForbidden{owner} with nothing written; the actor * is refused before any claim (DESIGN §4)",
+    use(make, (subject) =>
+      Effect.gen(function* () {
+        const { rows, transaction } = subject
+        const fail = violation("createScope")
+        const substrateClaim = subject.claimScope ?? Engine.claimFromGrants(rows)
+        const claims: Array<string> = []
+        const instance = (actor: AccessScope.PrincipalId) =>
+          Store.make(rows, {
+            actor,
+            roleFor: () => Effect.succeedNone,
+            claimScope: (scopeId) =>
+              Effect.andThen(
+                Effect.sync(() => claims.push(scopeId)),
+                substrateClaim(scopeId)
+              ),
+            now: DateTime.makeUnsafe(0)
+          })
+        yield* transaction(
+          Effect.forEach(GRANTS, ([id, row]) => rows.write(ScopeGrants.ScopeGrants, id, Option.some(row)))
+        )
+        const grants = Effect.map(transaction(rows.scan(ScopeGrants.ScopeGrants)), canonical)
+        const seeded = yield* grants
+        const fresh = AccessScope.AccessScopeId.make("created")
+        const u2 = AccessScope.PrincipalId.make("u2")
+
+        // Refused, nothing written: an existing scope (u2's grant), and any scope for the actor *.
+        const refused = [
+          { actor: u1, scope: theirs, claimed: [theirs] },
+          { actor: AccessScope.Everyone, scope: fresh, claimed: [] }
+        ]
+        for (const { actor, scope, claimed } of refused) {
+          claims.length = 0
+          const { store, touched } = instance(actor)
+          const exit = yield* Effect.exit(transaction(store.createScope(scope)))
+          const want = canonical(new Errors.ScopeForbidden({ scopeId: scope, required: "owner", held: null }))
+          const got = Exit.isFailure(exit) ? canonical(Cause.squash(exit.cause)) : "success"
+          if (got !== want) return yield* fail(`${actor} creating ${scope}: got ${got}, want ${want}`)
+          if ((yield* touched).length !== 0) return yield* fail(`${actor} creating ${scope} wrote rows`)
+          if (canonical(claims) !== canonical(claimed)) {
+            return yield* fail(`${actor} creating ${scope} claimed ${canonical(claims)}, want ${canonical(claimed)}`)
+          }
+          if ((yield* grants) !== seeded) return yield* fail(`${actor} creating ${scope} changed scope_grants`)
+        }
+
+        // A fresh id: exactly one new grant, the actor's, as owner, through the write path.
+        const created = instance(u1)
+        yield* transaction(created.store.createScope(fresh))
+        const [newId, newRow] = grant(fresh, u1, "owner")
+        const want = canonical(
+          [...GRANTS.map(([, row]) => row), newRow].toSorted((a, b) =>
+            Store.compareText(String(a["id"]), String(b["id"]))
+          )
+        )
+        const got = yield* grants
+        if (got !== want) return yield* fail(`after creating ${fresh}:\n got ${got}\nwant ${want}`)
+        const images = canonical(yield* created.touched)
+        const wantImages = canonical([{ table: ScopeGrants.ScopeGrants, id: newId, before: Option.none() }])
+        if (images !== wantImages) return yield* fail(`undo images ${images}, want ${wantImages}`)
+
+        // Now taken: another principal cannot create it again.
+        const again = yield* Effect.exit(transaction(instance(u2).store.createScope(fresh)))
+        if (Exit.isSuccess(again)) return yield* fail(`u2 re-created ${fresh}`)
+        if ((yield* grants) !== want) return yield* fail(`u2's refused re-create changed scope_grants`)
+        return refused.length + 2
+      })
+    )
   )
 ]
 
@@ -964,7 +1041,9 @@ export const syncStorage = <R>(make: Effect.Effect<SyncStorageSubject, unknown, 
           Effect.gen(function* () {
             const { store, touched } = Store.make(storage.rows, {
               actor: AccessScope.Everyone,
-              roleFor: () => Effect.succeedSome("owner" as const)
+              roleFor: () => Effect.succeedSome("owner" as const),
+              claimScope: () => Effect.succeed(false),
+              now: DateTime.makeUnsafe(0)
             })
             yield* store.patch(Items, ItemId.make("i1"), { label: "b" })
             yield* store.patch(Items, ItemId.make("i1"), { rank: 99 })

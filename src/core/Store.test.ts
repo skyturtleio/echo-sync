@@ -170,7 +170,9 @@ const ids = (rows: ReadonlyArray<{ readonly id: string }>) => rows.map((r) => r.
 
 const roles = (granted: Partial<Record<string, Role>>): Store.StoreOptions => ({
   actor: PrincipalId.make("u1"),
-  roleFor: (scopeId) => Effect.succeed(Option.fromNullishOr(granted[scopeId]))
+  roleFor: (scopeId) => Effect.succeed(Option.fromNullishOr(granted[scopeId])),
+  claimScope: () => Effect.succeed(false),
+  now: DateTime.makeUnsafe(0)
 })
 
 describe("typed Store over a RowStore", () => {

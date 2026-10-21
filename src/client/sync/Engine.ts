@@ -141,6 +141,15 @@ export const roleFromGrants =
       return Option.fromNullishOr(AccessScope.strongest(roles))
     })
 
+/**
+ * The replica's optimistic scope claim (DESIGN §4): fresh iff `rows` holds no `scope_grants` row
+ * for the scope. The server's claim is authoritative; a rejection undoes the optimistic grant.
+ */
+export const claimFromGrants =
+  (rows: Store.RowStore) =>
+  (scopeId: AccessScope.AccessScopeId): Effect.Effect<boolean, StoreUnavailable> =>
+    Effect.map(rows.scan(ScopeGrants.ScopeGrants), (grants) => !grants.some((g) => g["access_scope_id"] === scopeId))
+
 export interface RunResult {
   /** First-touch pre-images of every row the handler wrote, in write order. */
   readonly undo: ReadonlyArray<Store.UndoImage>
@@ -150,6 +159,7 @@ export interface RunResult {
 /**
  * Runs `envelope`'s handler against `rows` as `actor` with `ctx.now = now` and `ctx.random`
  * seeded from the mutation identity, so every rebase reproduces the same optimistic result.
+ * `claimScope` defaults to the replica's optimistic claim; the reference server passes its own.
  * Writes go straight to `rows` (the caller owns the transaction); on rejection the partial
  * writes remain and the caller restores them from `undo`. Transient failures propagate.
  */
@@ -158,13 +168,15 @@ export const runHandler = (
   mutations: Mutation.MutationRegistry,
   actor: AccessScope.PrincipalId,
   envelope: Mutation.MutationEnvelope,
-  now: number
+  now: number,
+  claimScope: Store.StoreOptions["claimScope"] = claimFromGrants(rows)
 ): Effect.Effect<RunResult, StoreUnavailable> =>
   Effect.gen(function* () {
-    const instance = Store.make(rows, { actor, roleFor: roleFromGrants(rows, actor) })
+    const at = DateTime.makeUnsafe(now)
+    const instance = Store.make(rows, { actor, roleFor: roleFromGrants(rows, actor), claimScope, now: at })
     const ctx: Mutation.MutationContext = {
       actor,
-      now: DateTime.makeUnsafe(now),
+      now: at,
       random: Mutation.seededRandom(envelope.clientId, envelope.mutationId),
       store: instance.store
     }

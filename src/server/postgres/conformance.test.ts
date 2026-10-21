@@ -4,6 +4,7 @@ import { SqlClient } from "effect/sql/SqlClient"
 import { isSqlError, SqlError, UnknownError } from "effect/sql/SqlError"
 import { Errors } from "echo-sync"
 import * as Conformance from "../../core/testing/Conformance.ts"
+import { claimScope } from "./rpc.ts"
 import * as RowStore from "./rowStore.ts"
 import { attach } from "./schema.ts"
 import { pgAvailable, TestDatabase } from "./test-support.ts"
@@ -32,6 +33,7 @@ const subject = Effect.gen(function* () {
   )
   const made: Conformance.RowStoreSubject = {
     rows,
+    claimScope: claimScope(sql),
     transaction: <A, E, R>(self: Effect.Effect<A, E, R>) =>
       sql.withTransaction(self).pipe(
         // Whole cause (Cause.map touches Fail reasons only): a rollback-cleanup defect next to the

@@ -1,4 +1,4 @@
-import { Effect, Option, Schema } from "effect"
+import { type DateTime, Effect, Option, Schema } from "effect"
 import {
   type AccessScopeId,
   AccessScopeId as AccessScopeIdSchema,
@@ -289,6 +289,21 @@ export interface EchoStore {
   ) => Effect.Effect<void, RowNotFound | ScopeForbidden | StoreUnavailable>
   readonly query: <T extends AnySyncTable>(table: T) => TableQuery<T, InvalidRow | StoreUnavailable>
   readonly scan: <T extends AnySyncTable>(table: T) => Effect.Effect<ReadonlyArray<RowOf<T>>, StoreUnavailable>
+  /**
+   * Creates the scope `scopeId` with the actor as its first owner (DESIGN §4): claims the id
+   * (`StoreOptions.claimScope`) and, only if the claim succeeds, writes
+   * `{ id: grantId(scopeId, actor), role: "owner" }` through the normal write path (undo image,
+   * log), skipping the owner check that every other `scope_grants` write needs. The grant is
+   * always for `StoreOptions.actor`; a handler cannot name another principal.
+   *
+   * An id that is not fresh (it exists, including a scope whose grants were all revoked) fails
+   * with the existing `ScopeForbidden { required: "owner" }`, not a new rejection: "already
+   * exists" reads as "you are not its owner", and the wire does not change. The actor `*` is
+   * refused the same way, before any claim (it would make everyone the owner).
+   *
+   * Mutation store only: not part of a query's read-only store.
+   */
+  readonly createScope: (scopeId: AccessScopeId) => Effect.Effect<void, ScopeForbidden | InvalidRow | StoreUnavailable>
 }
 
 /** The read half of `EchoStore`: what a registered query's handler gets (DESIGN §10.1). */
@@ -309,6 +324,14 @@ export interface StoreOptions {
    * among the actor's and `*`'s `scope_grants` rows, the rows queries filter by.
    */
   readonly roleFor: (scopeId: AccessScopeId) => Effect.Effect<Option.Option<Role>, StoreUnavailable>
+  /**
+   * Claims `scopeId` for `createScope`: true iff the id was fresh and is now taken by this
+   * transaction. The server's claim is authoritative and atomic (an `access_scopes` insert in the
+   * mutation's transaction); a replica's is optimistic (no `scope_grants` row for the scope).
+   */
+  readonly claimScope: (scopeId: AccessScopeId) => Effect.Effect<boolean, StoreUnavailable>
+  /** The mutation's `ctx.now` (DESIGN §6): `createScope`'s `grantedAt`, so a rebase replays it exactly. */
+  readonly now: DateTime.Utc
 }
 
 export interface StoreInstance {
@@ -463,6 +486,28 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
         const current = yield* decode(table, found.value)
         yield* authorize(current.accessScopeId, requiredRole(table))
         yield* write(table, id, found, Option.none())
+      }),
+
+    createScope: (scopeId) =>
+      Effect.gen(function* () {
+        const forbidden = Effect.gen(function* () {
+          const held = yield* options.roleFor(scopeId)
+          return yield* new ScopeForbidden({ scopeId, required: "owner", held: Option.getOrNull(held) })
+        })
+        if (options.actor === Everyone) return yield* forbidden
+        if (!(yield* options.claimScope(scopeId))) return yield* forbidden
+        const id = grantId(scopeId, options.actor)
+        const encoded = yield* encode(ScopeGrants, {
+          id,
+          accessScopeId: scopeId,
+          principalId: options.actor,
+          role: "owner",
+          grantedAt: options.now
+        })
+        const existing = yield* rows.read(ScopeGrants, id)
+        // A claimed id has no grants; a grant row here means the claim was wrong (not fresh).
+        if (Option.isSome(existing)) return yield* forbidden
+        yield* write(ScopeGrants, id, existing, Option.some(encoded))
       }),
 
     query: <T extends AnySyncTable>(table: T): TableQuery<T, InvalidRow | StoreUnavailable> => ({

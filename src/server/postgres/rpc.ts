@@ -81,7 +81,7 @@ const decodeRole = Schema.decodeUnknownOption(AccessScope.Role)
  * The actor's effective role on a scope: the strongest of its own grant and the `*` grant. Read
  * inside the mutation's transaction (the client joins the fiber's transaction), so the authorization check and the write see one snapshot.
  */
-const roleFor = (sql: SqlClient, actor: string) => (scopeId: AccessScope.AccessScopeId) =>
+export const roleFor = (sql: SqlClient, actor: string) => (scopeId: AccessScope.AccessScopeId) =>
   Effect.gen(function* () {
     const rows = yield* sql<{ role: unknown }>`
       SELECT role FROM echo_sync.scope_grants
@@ -90,6 +90,21 @@ const roleFor = (sql: SqlClient, actor: string) => (scopeId: AccessScope.AccessS
     )
     return Option.fromUndefinedOr(AccessScope.strongest(rows.flatMap((r) => Option.toArray(decodeRole(r.role)))))
   })
+
+/**
+ * The authoritative scope claim (DESIGN §4): inserts the `access_scopes` row inside the mutation's
+ * transaction and savepoint, so it commits or rolls back with the grant. The mutation runs at
+ * SERIALIZABLE (ledger.ts): a concurrent creator blocks on the first one's uncommitted row and,
+ * once that commits, fails with 40001; the ledger retries it, and the retry finds the row (no
+ * row returned, so `ScopeForbidden`). A scope whose grants were all revoked keeps its row, so it
+ * is never fresh again.
+ */
+export const claimScope = (sql: SqlClient) => (scopeId: AccessScope.AccessScopeId) =>
+  sql<{ id: string }>`
+    INSERT INTO echo_sync.access_scopes (id) VALUES (${scopeId}) ON CONFLICT DO NOTHING RETURNING id`.pipe(
+    Effect.map((rows) => rows.length === 1),
+    Effect.mapError(RowStore.unavailable)
+  )
 
 /**
  * Handlers for `Protocol.SyncRpcs` over Postgres (DESIGN §6, §8).
@@ -114,10 +129,16 @@ export const handlers = (options: SyncServerOptions) =>
               mutationId: m.mutationId,
               seq: BigInt(m.seq),
               body: Effect.gen(function* () {
-                const { store } = Store.make(rowStore, { actor, roleFor: roleFor(sql, actor) })
+                const now = yield* DateTime.now
+                const { store } = Store.make(rowStore, {
+                  actor,
+                  roleFor: roleFor(sql, actor),
+                  claimScope: claimScope(sql),
+                  now
+                })
                 yield* Mutation.run(options.mutations, m, {
                   actor,
-                  now: yield* DateTime.now,
+                  now,
                   random: Mutation.seededRandom(request.clientId, m.mutationId),
                   store
                 })
