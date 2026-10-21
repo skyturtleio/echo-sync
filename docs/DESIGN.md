@@ -550,14 +550,21 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
   to the `room` RPC's error union; `track` is unchanged), and `Forbidden` is the only error that
   ends a presence stream. `Forbidden` is wire-additive and lands with the presence client, before
   any app consumes presence.
-  Track semantics (coordinator ruling, ws/presence-client review): `track` completes once the
-  leader has recorded `state` as this tab's desired state for the room, in one synchronous step
-  that never waits on the network; interrupting the caller after that step does not retract the
-  state. Delivery to the server is owned by the open `presence` stream: serialized per room,
-  latest-wins (an undelivered older state may be skipped), never holding a lock across network
-  I/O, and re-sent after every (re)join or handover. A `track` call never blocks snapshot
-  delivery or reconnect, and a `track` whose stream has closed is dropped. The tab API therefore
-  guarantees only that the latest desired state is eventually visible while the stream is open.
+  Track semantics (coordinator ruling, ws/presence-client review, amended after re-review):
+  `track` completes once **this tab** has recorded `state` as its desired state for the room, in
+  one synchronous step that never waits on the leader or the network; interrupting the caller
+  after that step does not retract the state. Delivery is then two hops of the same shape, each
+  owned by the open `presence` stream and each a supervised *sender*: the tab's room cell
+  delivers the latest desired state to the leader, and the leader delivers it to the server.
+  A sender is serialized per room, latest-wins (an undelivered older state may be skipped), never
+  holds a lock across I/O, and has a finite deadline per attempt (`idleTimeout`). A sender that
+  fails, dies, or exceeds its deadline is restarted with the ordinary backoff and retries the
+  latest state; `LeaderLost` restarts the tab's sender against the new leader. Sender health is
+  independent of the stream: a stranded send must never wait for an unrelated stream failure or
+  rejoin to be retried, and a sender failure never ends the stream. Every (re)join and handover
+  re-sends the latest state. A `track` call never blocks snapshot delivery or reconnect, and a
+  `track` whose stream has closed is dropped. The tab API therefore guarantees only that the
+  latest desired state is eventually visible while the stream is open.
 - **Typed notice decoding** (ruling from the HeyBabe trial): a retained notice carries the
   envelope's `args` and a `DomainError.error` as `Schema.Json`, so a mutation's static types stop
   at the notice. The stored notice shape, `Notice = Rejected { envelope, error } |
