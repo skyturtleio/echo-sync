@@ -58,9 +58,15 @@ is never read from the payload. `ClientForbidden` becomes `Unauthorized`.
   injected SqlError, a backend killed before ROLLBACK of a failed pull, and Fail(SqlError) plus a
   programmer defect (must stay a defect).
 - pokes: `LISTEN echo_sync`. `next_position()` runs `pg_notify('echo_sync', '')`, which Postgres
-  delivers at commit and coalesces per transaction. The stream carries no data. A lost LISTEN
-  connection ends it with `ServerUnavailable` (tested by terminating the listener's backend); the
-  client reconnects on any end.
+  delivers at commit and coalesces per transaction. The stream carries no data.
+  **One `LISTEN` per server process** (DESIGN §6): `PgClient.listen` pins a pool connection for
+  its scope, so a `LISTEN` per stream would exhaust the pool at `maxConnections` open streams and
+  block every push and pull. The handlers layer owns the single `LISTEN` (`sharedPokes` in rpc.ts)
+  and fans notifications out through a sliding `PubSub` of capacity 1. A stream subscribes first,
+  then emits its initial poke. If no `LISTEN` is confirmed, a new stream fails `ServerUnavailable`.
+  A lost `LISTEN` connection ends every open stream with `ServerUnavailable` (tested by
+  terminating the listener's backend), and the listener re-establishes it with backoff
+  (exponential from 50 ms, capped at 5 s, not configurable). Clients reconnect on any end.
 
 ## Engine state
 

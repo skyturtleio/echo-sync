@@ -267,6 +267,122 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (§6, §8)", () => {
   )
 })
 
+/** The number of backends in this database sitting in `LISTEN`. */
+const listeners = Effect.gen(function* () {
+  const sql = yield* SqlClient
+  const [row] = yield* sql<{ n: number }>`
+    SELECT count(*)::int AS n FROM pg_stat_activity
+    WHERE datname = current_database() AND query ILIKE 'listen%'`
+  return row?.n ?? 0
+})
+
+/** Opens a pokes stream whose pokes land in a queue; the stream's exit lands in `ended`. */
+const openPokes = (client: Effect.Success<typeof connect>, ended: Queue.Queue<string>) =>
+  Effect.gen(function* () {
+    const received = yield* Queue.unbounded<unknown>()
+    yield* Effect.forkChild(
+      Effect.exit(
+        Stream.runForEach(client.pokes({ clientId: Ids.ClientId.make("d") }), (poke) => Queue.offer(received, poke))
+      ).pipe(Effect.flatMap((exit) => Queue.offer(ended, failureTag(exit))))
+    )
+    return received
+  })
+
+const nextPoke = (received: Queue.Queue<unknown>) =>
+  Effect.flatMap(Effect.timeoutOption(Queue.take(received), "5 seconds"), (poke) =>
+    Option.isSome(poke) ? Effect.void : Effect.fail("no poke within 5 s")
+  )
+
+describe.skipIf(!pgAvailable)("one LISTEN per server process (§6)", () => {
+  it.live(
+    "more open pokes streams than pool connections do not block push or pull, and the server holds one LISTEN",
+    () =>
+      Effect.gen(function* () {
+        yield* writer
+        const pg = yield* PgClient.PgClient
+        const url = pg.config.url
+        if (url === undefined) return assert.fail("test database has no url")
+        // A pool of 3; per-stream LISTEN would pin all 3 with the 6 streams below.
+        const small = yield* Layer.build(PgClient.layer({ url, maxConnections: 3 }))
+        const client = yield* connectTo(small)
+        const ended = yield* Queue.unbounded<string>()
+        const streams = yield* Effect.forEach(Arr.range(1, 6), () => openPokes(client, ended))
+        for (const received of streams) yield* nextPoke(received) // every initial poke
+
+        const pushed = yield* client.push(push([["m1", "hello"]])).pipe(Effect.timeout("10 seconds"))
+        assert.strictEqual(pushed.results[0]?.outcome._tag, "Applied")
+        const pulled = yield* client
+          .pull({ clientId: Ids.ClientId.make("d"), cursor: null, continuation: Option.none() })
+          .pipe(Effect.timeout("10 seconds"))
+        assert.strictEqual(pulled._tag, "PullDone")
+        // The push's commit notifies every open stream through the one LISTEN.
+        for (const received of streams) yield* nextPoke(received)
+        assert.strictEqual(yield* listeners, 1)
+      }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
+    60_000
+  )
+
+  it.live(
+    "subscribe-then-poke: a commit before the stream opened is covered by the initial poke's pull, a commit after it notifies",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient
+        yield* grant("p", "s1")
+        const client = yield* connect
+        yield* sql`INSERT INTO items (id, access_scope_id) VALUES ('before', 's1')`
+        const received = yield* openPokes(client, yield* Queue.unbounded<string>())
+        yield* nextPoke(received)
+        const pulled = yield* client.pull({
+          clientId: Ids.ClientId.make("d"),
+          cursor: null,
+          continuation: Option.none()
+        })
+        if (pulled._tag !== "PullDone") return assert.fail("expected PullDone")
+        assert.isTrue(
+          pulled.changes.some((c) => c._tag === "upsert" && c.table === "items" && c.row["id"] === "before")
+        )
+        yield* sql`INSERT INTO items (id, access_scope_id) VALUES ('after', 's1')`
+        yield* nextPoke(received)
+      }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
+    60_000
+  )
+
+  it.live(
+    "a lost shared LISTEN ends every open pokes stream with ServerUnavailable; after it is re-established a new stream gets its initial poke and notifications",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient
+        const client = yield* connect
+        const ended = yield* Queue.unbounded<string>()
+        const streams = yield* Effect.forEach(Arr.range(1, 3), () => openPokes(client, ended))
+        for (const received of streams) yield* nextPoke(received)
+        assert.strictEqual(yield* listeners, 1)
+
+        yield* sql`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+          WHERE datname = current_database() AND query ILIKE 'listen%'`
+        const endings = yield* Effect.forEach(Arr.range(1, 3), () =>
+          Effect.timeoutOption(Queue.take(ended), "5 seconds")
+        )
+        assert.deepStrictEqual(
+          endings.map((e) => Option.getOrElse(e, () => "still open")),
+          ["ServerUnavailable", "ServerUnavailable", "ServerUnavailable"]
+        )
+
+        // A client reconnecting with backoff: open streams until one gets its initial poke.
+        const reconnected = yield* Effect.gen(function* () {
+          const failed = yield* Queue.unbounded<string>()
+          const received = yield* openPokes(client, failed)
+          const first = yield* Effect.raceFirst(Effect.as(Queue.take(received), "poke"), Queue.take(failed))
+          return first === "poke" ? received : yield* Effect.fail(first)
+        }).pipe(Effect.retry(Schedule.spaced("50 millis").pipe(Schedule.upTo({ times: 100 }))))
+        yield* sql`INSERT INTO items (id, access_scope_id) VALUES ('a', 's1')`
+        yield* nextPoke(reconnected)
+        assert.strictEqual(yield* listeners, 1)
+      }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
+    60_000
+  )
+})
+
 /** The tag of the exit's sole typed failure, or a description of why there is none. */
 const failureTag = (exit: Exit.Exit<unknown, { readonly _tag: string }>) => {
   if (Exit.isSuccess(exit)) return "success"

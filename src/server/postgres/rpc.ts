@@ -1,5 +1,5 @@
 import * as PgClient from "@effect/sql-pg/PgClient"
-import { Cause, DateTime, Effect, Layer, Option, Schema, Stream } from "effect"
+import { Cause, DateTime, Deferred, Effect, Layer, Option, PubSub, Queue, Ref, Schedule, Schema, Stream } from "effect"
 import type { Headers } from "effect/http/Headers"
 import type * as HttpRouter from "effect/http/HttpRouter"
 import { RpcSerialization, RpcServer } from "effect/rpc"
@@ -106,6 +106,71 @@ export const claimScope = (sql: SqlClient) => (scopeId: AccessScope.AccessScopeI
     Effect.mapError(RowStore.unavailable)
   )
 
+/** One confirmed `LISTEN` on the shared connection. */
+interface ListenSession {
+  /** Every notification on the channel, fanned out; pokes carry no payload, so it slides. */
+  readonly pubsub: PubSub.PubSub<void>
+  /** Fails with the connection's error once this `LISTEN` is lost. */
+  readonly lost: Deferred.Deferred<never, SqlError>
+}
+
+/** Backoff for re-establishing the shared `LISTEN`: exponential from 50 ms, at most 5 s apart. */
+const listenRetry = Schedule.min([Schedule.exponential("50 millis"), Schedule.spaced("5 seconds")])
+
+/**
+ * The process's single `LISTEN` on `pokeChannel` (DESIGN §6). `PgClient.listen` reserves a pool
+ * connection for its scope, so one per `pokes` stream would exhaust the pool at `poolSize`
+ * connected clients and block every push and pull. Lives in the caller's (the handlers layer's)
+ * scope and returns once the first attempt has settled, so a server normally serves with its
+ * `LISTEN` already in place. A lost `LISTEN` fails its session (ending every subscribed stream)
+ * and is re-established with `listenRetry`.
+ *
+ * The returned stream is one `pokes` subscription: it subscribes to the current session first and
+ * emits the initial poke only then, so a commit after that poke notifies it and a commit before
+ * it is covered by the pull the poke triggers (subscribe-then-poke). Without a confirmed `LISTEN`
+ * it fails `ServerUnavailable` and the client reconnects with backoff.
+ */
+const sharedPokes = (pg: PgClient.PgClient) =>
+  Effect.gen(function* () {
+    const current = yield* Ref.make(Option.none<ListenSession>())
+    const ready = yield* Deferred.make<void>()
+    const session = Effect.scoped(
+      Effect.gen(function* () {
+        const queue = yield* pg.listen(pokeChannel).pipe(
+          Effect.tapError(() => Deferred.succeed(ready, undefined)),
+          Effect.retry(listenRetry)
+        )
+        const live: ListenSession = {
+          pubsub: yield* PubSub.sliding<void>(1),
+          lost: yield* Deferred.make<never, SqlError>()
+        }
+        yield* Ref.set(current, Option.some(live))
+        yield* Deferred.succeed(ready, undefined)
+        const error = yield* Effect.flip(
+          Effect.forever(Effect.andThen(Queue.take(queue), PubSub.publish(live.pubsub, undefined)))
+        )
+        yield* Ref.set(current, Option.none())
+        yield* Deferred.fail(live.lost, error)
+      })
+    )
+    yield* Effect.forkScoped(Effect.forever(session))
+    yield* Deferred.await(ready)
+    return Stream.unwrap(
+      Effect.gen(function* () {
+        const live = yield* Ref.get(current)
+        if (Option.isNone(live)) {
+          return yield* new Protocol.ServerUnavailable({ message: "LISTEN is not established" })
+        }
+        const subscription = yield* PubSub.subscribe(live.value.pubsub)
+        if (yield* Deferred.isDone(live.value.lost)) yield* Deferred.await(live.value.lost)
+        return Stream.concat(Stream.succeed(undefined), Stream.fromSubscription(subscription)).pipe(
+          Stream.map((): typeof Protocol.Poke.Type => ({})),
+          Stream.interruptWhen(Deferred.await(live.value.lost))
+        )
+      })
+    )
+  })
+
 /**
  * Handlers for `Protocol.SyncRpcs` over Postgres (DESIGN §6, §8).
  *
@@ -118,7 +183,7 @@ export const handlers = (options: SyncServerOptions) =>
   Protocol.SyncRpcs.toLayer(
     Effect.gen(function* () {
       const sql = yield* SqlClient
-      const pg = yield* PgClient.PgClient
+      const pokes = yield* sharedPokes(yield* PgClient.PgClient)
       return Protocol.SyncRpcs.of({
         push: (request, { headers }) =>
           Effect.gen(function* () {
@@ -185,14 +250,7 @@ export const handlers = (options: SyncServerOptions) =>
             Effect.gen(function* () {
               const principalId = yield* options.principalFor(headers)
               yield* registerClient(principalId, clientId)
-              // listen returns only after Postgres confirms LISTEN, so every commit after this
-              // point notifies. The initial poke makes the client pull now, covering every commit
-              // before it: subscribe-then-poke leaves no reconnect gap (DESIGN §6).
-              const notifications = yield* pg.listen(pokeChannel)
-              return Stream.concat(
-                Stream.succeed<typeof Protocol.Poke.Type>({}),
-                Stream.fromQueue(notifications).pipe(Stream.map((): typeof Protocol.Poke.Type => ({})))
-              )
+              return pokes
             }).pipe(Effect.provideService(SqlClient, sql))
           ).pipe(
             // A lost LISTEN connection ends the stream typed; the client reconnects on any end (§6).
