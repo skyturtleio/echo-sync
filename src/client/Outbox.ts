@@ -171,7 +171,11 @@ export const nextSeq: Effect.Effect<number, SqlError, SqlClient.SqlClient> = Eff
     SELECT 'echo_outbox', 0 WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'echo_outbox')`
   yield* sql`UPDATE sqlite_sequence SET seq = seq + 1 WHERE name = 'echo_outbox'`
   const rows = yield* sql<{ readonly seq: number }>`SELECT seq FROM sqlite_sequence WHERE name = 'echo_outbox'`
-  return rows[0]?.seq ?? 1
+  const seq = rows[0]?.seq
+  // The row was seeded and bumped just above, inside this transaction: its absence is a defect.
+  if (seq === undefined)
+    return yield* Effect.die(new Error("echo_outbox: sqlite_sequence row missing after allocation"))
+  return seq
 })
 
 /**

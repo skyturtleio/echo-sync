@@ -43,7 +43,9 @@ describe("SqliteSyncStorage conforms to SyncStorage", () => {
     Conformance.syncStorage(
       Effect.map(freshDatabase, (sql) => ({
         storage: SqliteSyncStorage.make(sql, registry),
-        // A reload: a new storage (new permit, nothing cached) over the same database.
+        // Storage reconstruction (new permit, nothing cached) over the same live connection. This is not a
+        // connection or OPFS reload: memory-VFS checks do not prove persistence across processes or crashes
+        // (the Chromium scenarios cover reload and hard kill).
         reopen: Effect.sync(() => SqliteSyncStorage.make(sql, registry)),
         // The retention window has passed for every released row.
         pruneReleased: Outbox.pruneReleased(-1).pipe(Effect.provideService(SqlClient.SqlClient, sql))
