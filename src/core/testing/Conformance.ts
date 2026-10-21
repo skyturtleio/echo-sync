@@ -19,7 +19,7 @@
  * Every expectation is a constant derived from the fixture the check wrote, never an observation
  * of a subject (DESIGN §14): a subject whose writes are no-ops fails every check.
  */
-import { Array as Arr, DateTime, Deferred, Effect, Fiber, Option, Schema, Scheduler } from "effect"
+import { Array as Arr, Cause, DateTime, Deferred, Effect, Exit, Fiber, Option, Schema, Scheduler } from "effect"
 import type { Scope } from "effect"
 import type * as Engine from "../../client/sync/Engine.ts"
 import { AccessScope, Ids, Protocol, ScopeGrants, Store, SyncTable } from "../index.ts"
@@ -522,6 +522,69 @@ export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): R
       }
       return cases
     })
+  ),
+  check(
+    "take(n) defects identically for NaN, -1, 1.5 and 2^53 (never clamped or unlimited); take(0) is []; collect is unlimited (DESIGN §10)",
+    use(make, ({ rows, transaction }) =>
+      Effect.gen(function* () {
+        const fail = violation("take(n) limits")
+        // 120 readable rows: more than any default page or limit a store might impose.
+        const data = Array.from({ length: 120 }, (_, i) =>
+          item(`t${String(i).padStart(3, "0")}`, { accessScopeId: mine, score: i })
+        )
+        yield* transaction(
+          Effect.all([
+            Effect.forEach(GRANTS, ([id, row]) => rows.write(ScopeGrants.ScopeGrants, id, Option.some(row))),
+            Effect.forEach(data, (row) => rows.write(Items, String(row["id"]), Option.some(row)))
+          ])
+        )
+        const { store } = Store.make(rows, { actor: u1, roleFor: () => Effect.succeedSome("reader" as const) })
+        const query = store.query(Items).withIndex("by_score")
+        const all = yield* transaction(query.collect)
+        if (canonical(all.map((r) => r.id)) !== canonical(data.map((r) => r["id"]))) {
+          return yield* fail(`collect returned ${all.length} rows, want all 120 in score order`)
+        }
+        const none = yield* transaction(query.take(0))
+        if (none.length !== 0) return yield* fail(`take(0) returned ${none.length} rows`)
+        let cases = 2
+        for (const n of [Number.NaN, -1, 1.5, 2 ** 53, Number.POSITIVE_INFINITY]) {
+          const want = `take(n) requires a non-negative safe integer, got ${n}`
+          const viaStore = yield* Effect.exit(transaction(Effect.map(query.take(n), (found) => found.length)))
+          const viaRange = yield* Effect.exit(
+            transaction(
+              Effect.map(
+                rows.range(Items, {
+                  index: Items.indexes.by_score,
+                  eq: [],
+                  lower: Option.none(),
+                  upper: Option.none(),
+                  order: "asc",
+                  readableBy: Option.none(),
+                  limit: Option.some(n)
+                }),
+                (found) => found.length
+              )
+            )
+          )
+          for (const [label, exit] of [
+            ["take", viaStore],
+            ["range", viaRange]
+          ] as const) {
+            const defects = Exit.isSuccess(exit)
+              ? []
+              : exit.cause.reasons.flatMap((r) => (Cause.isDieReason(r) ? [r.defect] : []))
+            const ok = defects.some((d) => d instanceof RangeError && d.message === want)
+            if (!ok) {
+              return yield* fail(
+                `${label} with limit ${n}: want a defect "${want}", got ${Exit.isSuccess(exit) ? `success (${exit.value} rows)` : String(exit.cause)}`
+              )
+            }
+            cases++
+          }
+        }
+        return cases
+      })
+    )
   ),
   check(
     "read returns the last written wire row exactly; a delete makes it absent",

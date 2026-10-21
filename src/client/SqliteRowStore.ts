@@ -14,7 +14,7 @@
 import { Effect, Option, Schema } from "effect"
 import type * as SqlClient from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
-import { Errors, ScopeGrants, type Registry, type Store, type SyncTable } from "echo-sync"
+import { Errors, ScopeGrants, type Registry, Store, type SyncTable } from "echo-sync"
 
 type Table = SyncTable.AnySyncTable
 type Value = SyncTable.SqliteValue
@@ -31,12 +31,6 @@ export const unavailable = <A, R>(
 
 const decodeRows = (table: Table, rows: ReadonlyArray<unknown>) =>
   Effect.forEach(rows, (row) => Effect.orDie(Schema.decodeUnknownEffect(table.sqlite.row)(row)))
-
-/** A plan limit as SQL text; anything but a non-negative safe integer is a caller bug. */
-const limitOf = (n: number) => {
-  if (!Number.isSafeInteger(n) || n < 0) throw new RangeError(`range: limit ${n} is not a non-negative integer`)
-  return String(n)
-}
 
 const bind = (column: SyncTable.Column, value: Schema.Json): Effect.Effect<Value> =>
   Effect.orDie(Schema.encodeEffect(column.sqlite)(value))
@@ -70,6 +64,8 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
 
     range: (table, plan) =>
       Effect.gen(function* () {
+        // Validated first: the limit is then a safe integer, written into the SQL text.
+        yield* Store.checkLimit(plan.limit)
         const where: Array<string> = []
         const params: Array<Value> = []
         for (const [i, value] of plan.eq.entries()) {
@@ -108,7 +104,7 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
           where.length === 0 ? "" : ` WHERE ${where.join(" AND ")}`,
           params,
           plan.index.key.map((c) => `t.${q(c.name)} ${dir}`).join(", "),
-          Option.match(plan.limit, { onNone: () => "", onSome: (n) => ` LIMIT ${limitOf(n)}` })
+          Option.match(plan.limit, { onNone: () => "", onSome: (n) => ` LIMIT ${n}` })
         )
       }),
 

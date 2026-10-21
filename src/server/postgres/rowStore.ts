@@ -2,7 +2,7 @@ import * as PgTypes from "@effect/sql-pg/PgTypes"
 import { Effect, Option, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
-import { Errors, ScopeGrants, type Store, type SyncTable } from "echo-sync"
+import { Errors, ScopeGrants, Store, type SyncTable } from "echo-sync"
 
 /**
  * The transient store failure for a SQL error. The reason tag leads the message so the ledger
@@ -119,20 +119,21 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
         let limit = ""
         if (Option.isSome(plan.limit)) {
           const n = plan.limit.value
-          if (!Number.isSafeInteger(n) || n < 0) return Effect.die(`range: limit ${n} is not a non-negative integer`)
           params.push(n)
           limit = ` LIMIT $${params.length}`
         }
         const dir = plan.order === "asc" ? "ASC NULLS FIRST" : "DESC NULLS LAST"
         const order = plan.index.key.map((c) => `t.${q(c.name)} ${dir}`).join(", ")
-        return Effect.flatMap(
-          query(
-            table,
-            (rel) =>
-              `SELECT ${selectList(table, "t")} FROM ${rel} AS t${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY ${order}${limit}`,
-            params
-          ),
-          (rows) => decodeAll(table, rows)
+        return Effect.andThen(Store.checkLimit(plan.limit), () =>
+          Effect.flatMap(
+            query(
+              table,
+              (rel) =>
+                `SELECT ${selectList(table, "t")} FROM ${rel} AS t${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY ${order}${limit}`,
+              params
+            ),
+            (rows) => decodeAll(table, rows)
+          )
         )
       },
       scan: (table) =>

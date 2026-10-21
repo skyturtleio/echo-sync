@@ -51,8 +51,11 @@ export const make = (initial: Tables = new Map()): MemoryStore => {
         else tables.get(table.name)?.delete(id)
       }),
     range: (table, plan) =>
-      Effect.sync(() =>
-        Store.planResult(plan, rowsOf(table.name), tables.get(ScopeGrants.ScopeGrants.name)?.values() ?? [])
+      Effect.andThen(
+        Store.checkLimit(plan.limit),
+        Effect.sync(() =>
+          Store.planResult(plan, rowsOf(table.name), tables.get(ScopeGrants.ScopeGrants.name)?.values() ?? [])
+        )
       ),
     scan: (table) => Effect.sync(() => rowsOf(table.name).toSorted(byId)),
     purgeScope: (scopeId) =>

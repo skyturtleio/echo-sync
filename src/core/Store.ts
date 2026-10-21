@@ -120,6 +120,15 @@ export const planOrder = (plan: IndexRangePlan): ((a: EncodedRow, b: EncodedRow)
   return plan.order === "asc" ? asc : (a, b) => asc(b, a)
 }
 
+/**
+ * A plan limit (`take(n)`) must be a non-negative safe integer (DESIGN §10). Anything else is a
+ * programmer error: a defect with this one message in every store, never clamped or unlimited.
+ */
+export const checkLimit = (limit: Option.Option<number>): Effect.Effect<void> =>
+  Option.isSome(limit) && !(Number.isSafeInteger(limit.value) && limit.value >= 0)
+    ? Effect.die(new RangeError(`take(n) requires a non-negative safe integer, got ${limit.value}`))
+    : Effect.void
+
 const grantPair = (scope: unknown, principal: unknown) => JSON.stringify([scope, principal])
 
 /**
@@ -448,7 +457,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
         const built = (range ?? ((q) => q))(
           new IndexRangeBuilder({ eq: [], lower: Option.none(), upper: Option.none() })
         ).state
-        const run = (order: "asc" | "desc", limit: number) =>
+        const run = (order: "asc" | "desc", limit: Option.Option<number>) =>
           Effect.gen(function* () {
             if (index === undefined) {
               return yield* new InvalidRow({ table: table.name, message: `unknown index ${name}` })
@@ -474,15 +483,15 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
               upper: yield* bound(built.upper),
               order,
               readableBy: Option.some([options.actor, Everyone]),
-              limit: Number.isFinite(limit) ? Option.some(Math.max(0, Math.floor(limit))) : Option.none()
+              limit
             }
             return yield* Effect.forEach(yield* rows.range(table, plan), (row) => decode(table, row))
           })
         const ordered = (order: "asc" | "desc"): OrderedQuery<RowOf<T>, InvalidRow | StoreUnavailable> => ({
           order: (next) => ordered(next),
-          take: (n) => run(order, n),
-          first: run(order, 1).pipe(Effect.map((rs) => Option.fromNullishOr(rs[0]))),
-          collect: run(order, Number.POSITIVE_INFINITY)
+          take: (n) => run(order, Option.some(n)),
+          first: run(order, Option.some(1)).pipe(Effect.map((rs) => Option.fromNullishOr(rs[0]))),
+          collect: run(order, Option.none())
         })
         return ordered("asc")
       }
