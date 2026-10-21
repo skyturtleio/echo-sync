@@ -1,4 +1,4 @@
-import { Effect, Option, Schedule, Schema } from "effect"
+import { Cause, Effect, Option, Schedule, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
 
@@ -41,6 +41,22 @@ export class MutationTransient extends Schema.TaggedError<MutationTransient>()("
   message: Schema.String
 }) {}
 
+/**
+ * The envelope itself is invalid (`seq < 1`, DESIGN §6): a request-level rejection. Nothing is
+ * executed or recorded. Without this, `seq ≤ 0` would fall under the default expiry floor 0 and
+ * be answered `clientExpired` although it was never processed.
+ */
+export class MalformedEnvelope extends Schema.TaggedError<MalformedEnvelope>()("MalformedEnvelope", {
+  clientId: Schema.String,
+  mutationId: Schema.String,
+  message: Schema.String
+}) {}
+
+const checkEnvelope = (clientId: string, mutationId: string, seq: bigint) =>
+  seq < 1n
+    ? Effect.fail(new MalformedEnvelope({ clientId, mutationId, message: `seq must be ≥ 1, got ${seq}` }))
+    : Effect.void
+
 /** The client id is registered to a different principal. */
 export class ClientForbidden extends Schema.TaggedError<ClientForbidden>()("ClientForbidden", {
   clientId: Schema.String
@@ -72,8 +88,47 @@ const transient = (envelope: Envelope, error: SqlError) =>
     message: `${error.reason._tag}: ${error.message}`
   })
 
-const isConflict = (error: SqlError | ClientForbidden) =>
+const isConflict = (error: SqlError | ClientForbidden | MutationRejected) =>
   error._tag === "SqlError" && (error.reason._tag === "SerializationError" || error.reason._tag === "DeadlockError")
+
+/** The body failed with only `MutationRejected`: a permanent, recordable outcome. */
+const asRejection = (cause: Cause.Cause<MutationRejected | SqlError>): MutationOutcome | undefined => {
+  const [first] = cause.reasons
+  const onlyRejections = cause.reasons.every((r) => Cause.isFailReason(r) && r.error instanceof MutationRejected)
+  return onlyRejections && first !== undefined && Cause.isFailReason(first) && first.error instanceof MutationRejected
+    ? { _tag: "Rejected", reason: first.error.reason, message: first.error.message }
+    : undefined
+}
+
+/**
+ * Classifies the whole failure cause of a mutation attempt. Only a cause made entirely of SQL
+ * failures (typed, or the pinned SqlClient's cleanup defects carrying a SqlError) and
+ * `ClientForbidden` becomes a typed error. Anything else (a programmer defect, an interruption,
+ * a stray typed error) is re-raised with every typed failure turned into a defect, so the whole
+ * cause is preserved and no `catchTag` downstream can mistake it for a retryable transient.
+ */
+const classify = (
+  envelope: Envelope,
+  cause: Cause.Cause<SqlError | ClientForbidden | MutationRejected>
+): Effect.Effect<never, MutationTransient | ClientForbidden> => {
+  const expected = cause.reasons.every(
+    (r) =>
+      (Cause.isFailReason(r) && (isSqlError(r.error) || r.error instanceof ClientForbidden)) ||
+      (Cause.isDieReason(r) && isSqlError(r.defect))
+  )
+  if (expected) {
+    for (const r of cause.reasons) {
+      if (Cause.isFailReason(r) && r.error instanceof ClientForbidden) return Effect.fail(r.error)
+    }
+    const sqlError = cause.reasons
+      .map((r) => (Cause.isFailReason(r) ? r.error : Cause.isDieReason(r) ? r.defect : undefined))
+      .find(isSqlError)
+    if (sqlError !== undefined) return Effect.fail(transient(envelope, sqlError))
+  }
+  return Effect.failCause(
+    Cause.fromReasons(cause.reasons.map((r) => (Cause.isFailReason(r) ? Cause.makeDieReason(r.error) : r)))
+  )
+}
 
 /**
  * Binds a client id to its principal on first sight and refuses it to any other principal, so
@@ -109,9 +164,10 @@ export const runMutation = <R>(
   envelope: Envelope,
   body: Effect.Effect<void, MutationRejected | SqlError, R>,
   options?: LedgerOptions
-): Effect.Effect<Processed, MutationTransient | ClientForbidden, R | SqlClient> =>
+): Effect.Effect<Processed, MutationTransient | ClientForbidden | MalformedEnvelope, R | SqlClient> =>
   Effect.gen(function* () {
     const sql = yield* SqlClient
+    yield* checkEnvelope(envelope.clientId, envelope.mutationId, envelope.seq)
     if (Option.isSome(yield* Effect.serviceOption(sql.transactionService))) {
       return yield* Effect.die("runMutation must own its transaction; do not call it inside withTransaction")
     }
@@ -137,9 +193,12 @@ export const runMutation = <R>(
 
         const outcome: MutationOutcome = yield* sql.withTransaction(body).pipe(
           Effect.as<MutationOutcome>({ _tag: "Applied" }),
-          Effect.catchTag("MutationRejected", (e) =>
-            Effect.succeed<MutationOutcome>({ _tag: "Rejected", reason: e.reason, message: e.message })
-          )
+          // A rejection combined with anything else (e.g. a defect in a finalizer) is not a
+          // rejection: it must not be ledgered as one.
+          Effect.catchCause((cause) => {
+            const rejection = asRejection(cause)
+            return rejection === undefined ? Effect.failCause(cause) : Effect.succeed(rejection)
+          })
         )
         const inserted = yield* sql<{ position: bigint }>`
           INSERT INTO echo_sync.mutations (client_id, mutation_id, seq, position, outcome)
@@ -155,12 +214,7 @@ export const runMutation = <R>(
 
     return yield* execute.pipe(
       Effect.retry({ schedule: options?.conflictRetry ?? defaultConflictRetry, while: isConflict }),
-      Effect.catchTag("SqlError", (error) => Effect.fail(transient(envelope, error))),
-      // The pinned SqlClient turns savepoint/rollback cleanup failures (a dead connection) into
-      // defects carrying the SqlError; they are as transient as the failure that caused them.
-      Effect.catchDefect((defect) =>
-        isSqlError(defect) ? Effect.fail(transient(envelope, defect)) : Effect.die(defect)
-      )
+      Effect.catchCause((cause) => classify(envelope, cause))
     )
   })
 
@@ -187,8 +241,10 @@ export const runBatch = <R>(
   clientId: string,
   items: ReadonlyArray<BatchItem<R>>,
   options?: LedgerOptions
-): Effect.Effect<BatchResult, ClientForbidden, R | SqlClient> =>
+): Effect.Effect<BatchResult, ClientForbidden | MalformedEnvelope, R | SqlClient> =>
   Effect.gen(function* () {
+    // Request-level: one malformed envelope rejects the push before anything executes.
+    for (const item of items) yield* checkEnvelope(clientId, item.mutationId, item.seq)
     const processed: Array<Processed & { mutationId: string }> = []
     for (const item of items) {
       const result = yield* runMutation(

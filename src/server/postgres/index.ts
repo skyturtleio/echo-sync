@@ -5,6 +5,7 @@ export {
   ClientForbidden,
   type Envelope,
   type LedgerOptions,
+  MalformedEnvelope,
   MutationOutcome,
   MutationRejected,
   MutationTransient,

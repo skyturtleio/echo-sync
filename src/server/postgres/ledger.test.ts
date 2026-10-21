@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Exit, Schedule } from "effect"
+import { Cause, Effect, Exit, Schedule } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
+import { SqlError, UnknownError } from "effect/sql/SqlError"
 import { MutationRejected, runBatch, runMutation } from "./ledger.ts"
 import { pgAvailable, Replica, TestDatabase } from "./test-support.ts"
 
@@ -32,6 +33,15 @@ const serializationFailure = Effect.gen(function* () {
   const sql = yield* SqlClient
   yield* sql`DO $$ BEGIN RAISE EXCEPTION 'conflict' USING ERRCODE = '40001'; END $$`
 })
+
+const sqlDefect = new SqlError({ reason: new UnknownError({ cause: null, message: "connection lost" }) })
+const programmerBug = new Error("programmer bug")
+
+/** The attempt died with the programmer bug still in its cause, and no typed (retryable) failure. */
+const diedWithBug = (exit: Exit.Exit<unknown, unknown>) =>
+  Exit.isFailure(exit) &&
+  exit.cause.reasons.some((r) => Cause.isDieReason(r) && r.defect === programmerBug) &&
+  !exit.cause.reasons.some(Cause.isFailReason)
 
 const env = (mutationId: string, seq: bigint) => ({ principalId: "p", clientId: "c1", mutationId, seq })
 const reject = (message: string) => Effect.fail(new MutationRejected({ reason: "domain", message }))
@@ -209,6 +219,56 @@ describe.skipIf(!pgAvailable)("mutation ledger (§6)", () => {
         runMutation({ principalId: "mallory", clientId: "c1", mutationId: "m", seq: 1n }, Effect.void)
       )
       assert.strictEqual(result._tag, "ClientForbidden")
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("a programmer defect combined with a SQL failure is never reported as a retryable transient", () =>
+    Effect.gen(function* () {
+      const bodies = [
+        // SQL cleanup defect first, programmer bug in a finalizer, and the reverse order.
+        Effect.die(sqlDefect).pipe(Effect.ensuring(Effect.die(programmerBug))),
+        Effect.die(programmerBug).pipe(Effect.ensuring(Effect.die(sqlDefect))),
+        Effect.andThen(appendEffect("x"), Effect.fail(sqlDefect)).pipe(Effect.ensuring(Effect.die(programmerBug)))
+      ]
+      for (const [i, body] of bodies.entries()) {
+        const exit = yield* Effect.exit(runMutation(env(`m${i}`, BigInt(i + 1)), body))
+        assert.isTrue(diedWithBug(exit), `ordering ${i}`)
+      }
+      assert.deepStrictEqual(yield* ledgerIds, [])
+      assert.strictEqual(yield* counterBody, "")
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("a rejection combined with a defect is not ledgered as an ordinary rejection", () =>
+    Effect.gen(function* () {
+      const body = Effect.andThen(appendEffect("x"), reject("no")).pipe(Effect.ensuring(Effect.die(programmerBug)))
+      const exit = yield* Effect.exit(runMutation(env("m", 1n), body))
+      assert.isTrue(diedWithBug(exit))
+      assert.deepStrictEqual(yield* ledgerIds, [])
+      assert.strictEqual(yield* counterBody, "")
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("seq < 1 is a malformed envelope: not executed, not recorded, not answered as clientExpired", () =>
+    Effect.gen(function* () {
+      for (const seq of [0n, -1n]) {
+        const failure = yield* Effect.flip(runMutation(env(`bad${seq}`, seq), appendEffect("x")))
+        assert.strictEqual(failure._tag, "MalformedEnvelope")
+      }
+      // One malformed item rejects the whole push before anything runs.
+      const batch = yield* Effect.flip(
+        runBatch("p", "c1", [
+          { mutationId: "a", seq: 1n, body: appendEffect("a") },
+          { mutationId: "z", seq: 0n, body: appendEffect("z") }
+        ])
+      )
+      assert.strictEqual(batch._tag, "MalformedEnvelope")
+      assert.deepStrictEqual(yield* ledgerIds, [])
+      assert.strictEqual(yield* counterBody, "")
+      // seq 1 is above the default floor 0 and is accepted.
+      const ok = yield* runMutation(env("a", 1n), appendEffect("a"))
+      assert.strictEqual(ok.outcome._tag, "Applied")
+      assert.strictEqual(yield* counterBody, "a")
     }).pipe(Effect.provide(TestDatabase))
   )
 })
