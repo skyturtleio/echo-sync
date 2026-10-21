@@ -7,7 +7,8 @@
 # Needs the slice server and the harness running. Scenario 5 stops and restarts the server with
 # $ECHO_SERVER_STOP / $ECHO_SERVER_START (default: the `echo-server` orb service).
 # Prints one PASS/FAIL line per invariant and a summary; exits non-zero if any failed. Every check awaits
-# the condition it asserts (echo.until); the only fixed wait is the server's downtime in scenario 5.
+# the condition it asserts (echo.until); the only fixed wait is the server's downtime in scenario 5. Scenarios
+# 3 and 6 hold the server's push handler at a named gate (app.ts) until they open it through /admin/open.
 ECHO_SYNC=real
 SESSION_PREFIX=slice
 ECHO_EVIDENCE=${ECHO_EVIDENCE:-1}
@@ -54,21 +55,26 @@ check "two clients: A's todos.add lands in B's live query via poke/pull, no refr
 # ── (3) a server-side domain rejection: typed notice in A, no effect anywhere ─────────────────────────
 ab tab "$A" >/dev/null
 a=$(ev <<<"$PRE
-const e = await add('reject-$RUN', 'server-rejects-$RUN')
+const e = await add('reject-$RUN', 'server-rejects-$RUN [gate:reject-$RUN]')
+// The server's handler is parked at the gate, so the rejection cannot have arrived yet: the row must be
+// in A's replica now (optimistic apply), with no notice.
+const parked = await echo.until(async () => (await (await fetch('/admin/stats?todo=reject-$RUN')).json()).started >= 1, 15000)
 const optimistic = (await todos()).includes('reject-$RUN')
+const noticeWhileGated = (await echo.notices()).value.some((n) => n.notice.envelope.mutationId === 'reject-$RUN')
+await fetch('/admin/open?gate=reject-$RUN')
 const notice = await echo.until(async () => (await echo.notices()).value.find((n) => n.notice.envelope.mutationId === 'reject-$RUN'), 20000)
 const after = await todos()
 // A later mutation: once B shows it, B has pulled past the rejection's ledger position.
 await add('marker-$RUN', 'after the rejection')
-return { e: e.ok, optimistic, notice: notice?.notice, after }")
+return { e: e.ok, parked: parked === true, optimistic, noticeWhileGated, notice: notice?.notice, after }")
 ab tab "$B" >/dev/null
 b=$(ev <<<"$PRE
 const ok = await echo.until(() => seen('marker-$RUN'), 20000)
 return { ok: ok === true, everSawRejected: seen('reject-$RUN'), now: await todos() }")
 ledger=$(admin "ledger?mutationId=reject-$RUN")
 server=$(admin "todos?scope=$SCOPE")
-check "real mutator rejection: A gets the typed Rejected{DomainError} notice and its optimistic row is undone; B and the server never see it" "$(jq -nc --argjson a "$a" --argjson b "$b" --argjson l "$ledger" --argjson s "$server" '
-  { pass: ($a.e and $a.notice._tag == "Rejected" and $a.notice.error._tag == "DomainError"
+check "real mutator rejection: A applies the row optimistically while the server holds the push, then gets the typed Rejected{DomainError} notice and the row is undone; B and the server never see it" "$(jq -nc --argjson a "$a" --argjson b "$b" --argjson l "$ledger" --argjson s "$server" '
+  { pass: ($a.e and $a.parked and $a.optimistic and ($a.noticeWhileGated | not) and $a.notice._tag == "Rejected" and $a.notice.error._tag == "DomainError"
           and $a.notice.error.error.reason == "blocked-title" and ($a.after | index("reject-'"$RUN"'")) == null
           and $b.ok and ($b.everSawRejected | not) and ($b.now | index("reject-'"$RUN"'")) == null
           and ($s | map(.id) | index("reject-'"$RUN"'")) == null
@@ -97,9 +103,11 @@ return { rows: ok ?? (await todos()) }")
 ab tab "$B" >/dev/null
 b=$(ev <<<"$PRE
 $BACK
-return { rows: ok ?? (await todos()), live: sub.emissions.at(-1).results[0].map((r) => r.id) }")
+const want = JSON.stringify(ok ?? [])
+const live = await echo.until(() => JSON.stringify(sub.emissions.at(-1).results[0].map((r) => r.id)) === want, 20000)
+return { rows: ok ?? (await todos()), live: sub.emissions.at(-1).results[0].map((r) => r.id), liveCaughtUp: live === true }")
 check "re-grant: the scope is walked again and both replicas hold exactly the server's rows" "$(jq -nc --argjson a "$a" --argjson b "$b" --argjson s "$(admin "todos?scope=$SCOPE")" '
-  ($s | map(.id)) as $want | { pass: ($a.rows == $want and $b.rows == $want and $b.live == $want), want: $want, a: $a, b: $b }')"
+  ($s | map(.id)) as $want | { pass: ($a.rows == $want and $b.rows == $want and $b.liveCaughtUp and $b.live == $want), want: $want, a: $a, b: $b }')"
 
 # ── (5) server restart mid-session: nothing enqueued while it was down is lost or doubled ─────────────
 server_stop
@@ -143,22 +151,31 @@ ev <<<"$SERVED" >/dev/null
 ab tab "$C1" >/dev/null
 c1=$(ev <<<"$PRE
 const s = await echo.status()
-const e = await add('inflight-$RUN', 'slow: the server stalls this push 2 s')
+const e = await add('inflight-$RUN', 'in flight [gate:inflight-$RUN]')
+// Parked at the gate inside the server's push transaction: this push is in flight until the gate opens.
 const started = await echo.until(async () => (await (await fetch('/admin/stats?todo=inflight-$RUN')).json()).started >= 1, 15000)
-return { leaderTab: s.isLeaderTab, leaderId: s.leaderId, e: e.ok, started: started === true, clientId: await clientId() }")
+const id = await clientId()
+const pushes = (await (await fetch('/admin/stats?clientId=' + id)).json()).rpcs.push ?? 0
+return { leaderTab: s.isLeaderTab, leaderId: s.leaderId, e: e.ok, started: started === true, clientId: id, pushes }")
 ab tab close "$C1" >/dev/null
 ab tab "$C2" >/dev/null
 c2=$(ev <<<"$PRE
 const old = $(jq '.leaderId' <<<"$c1")
-await echo.until(async () => { const s = await echo.status(); return s.isLeaderTab && s.leaderId !== old })
+const succeeded = await echo.until(async () => { const s = await echo.status(); return s.isLeaderTab && s.leaderId !== old })
+// The gate is still closed: the entry is unreleased, so the new leader must push it again itself.
+const id = await clientId()
+const repushed = await echo.until(async () => ((await (await fetch('/admin/stats?clientId=' + id)).json()).rpcs.push ?? 0) > $(jq '.pushes' <<<"$c1"), 30000)
+const pendingWhileGated = (await echo.exportPending()).value.map((x) => x.envelope.mutationId)
+await fetch('/admin/open?gate=inflight-$RUN')
 const ok = await released('inflight-$RUN')
-return { released: ok === true, clientId: await clientId(), notices: (await echo.notices()).value.length }")
+return { succeeded: succeeded === true, repushed: repushed === true, pendingWhileGated, released: ok === true, clientId: id, notices: (await echo.notices()).value.length }")
 ledger=$(admin "ledger?mutationId=inflight-$RUN")
 started=$(admin "stats?todo=inflight-$RUN" | jq .started)
-check "leader closed mid-push: the new leader pushes the entry, the ledger has exactly one row, and it is released" "$(jq -nc --argjson c1 "$c1" --argjson c2 "$c2" --argjson l "$ledger" --argjson n "$started" '
-  { pass: ($c1.leaderTab and $c1.e and $c1.started and $c2.released and $c2.notices == 0 and $c2.clientId == $c1.clientId
+check "leader closed while its push is held on the server: the new leader sends its own push of the entry, the ledger has exactly one row, and it is released" "$(jq -nc --argjson c1 "$c1" --argjson c2 "$c2" --argjson l "$ledger" --argjson n "$started" '
+  { pass: ($c1.leaderTab and $c1.e and $c1.started and $c1.pushes >= 1 and $c2.succeeded and $c2.repushed
+          and $c2.pendingWhileGated == ["inflight-'"$RUN"'"] and $c2.released and $c2.notices == 0 and $c2.clientId == $c1.clientId
           and ($l | length) == 1 and $l[0].client_id == $c1.clientId and $l[0].outcome._tag == "Applied"),
-    serverHandlerStarts: $n, ledger: $l }')"
+    pushesBeforeClose: $c1.pushes, serverHandlerStarts: $n, ledger: $l }')"
 ab tab close "$C2" >/dev/null
 
 ab close >/dev/null

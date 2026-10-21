@@ -4,12 +4,10 @@
  *
  * - `t` writes nothing. The substrate scenarios use it to exercise the outbox, ownership and handover.
  * - `todos.add` inserts a todo into a scope. The server's copy adds a server-authoritative domain check
- *   the client cannot evaluate (titles starting with "server-rejects"), so a rejection reaches the client
- *   only through the ledger, as a typed notice. The server's copy also stalls titles starting with "slow"
- *   for 2 s inside the push transaction, so a scenario can close the leader while that push is in flight;
- *   `serverHooks.started` counts how often each mutation's server handler began.
+ *   the client cannot evaluate (titles containing "server-rejects"), so a rejection reaches the client
+ *   only through the ledger, as a typed notice, and honours scenario gates (`serverHooks`).
  */
-import { Effect, Schema } from "effect"
+import { Deferred, Effect, Schema } from "effect"
 import { AccessScope, Mutation, Registry, SyncTable } from "../../src/core/index.ts"
 
 const TodoId = Schema.String.check(Schema.isNonEmpty()).pipe(Schema.brand("harness/TodoId"))
@@ -27,7 +25,25 @@ const Blocked = Schema.Struct({ reason: Schema.Literal("blocked-title"), title: 
 
 const t = Mutation.make("t", { args: Schema.Json, handler: () => Effect.void })
 
-export const serverHooks = { started: new Map<string, number>() }
+/**
+ * Server-side scenario hooks. A todo whose title contains `[gate:NAME]` parks its server handler, inside the
+ * push transaction and before any write, until `/admin/open?gate=NAME`: a scenario can hold a push in flight
+ * (or a rejection unanswered) for exactly as long as it asserts. `started` counts handler starts per todo id.
+ */
+const gates = new Map<string, Deferred.Deferred<void>>()
+const gate = (name: string): Deferred.Deferred<void> => {
+  const existing = gates.get(name)
+  if (existing !== undefined) return existing
+  const fresh = Deferred.makeUnsafe<void>()
+  gates.set(name, fresh)
+  return fresh
+}
+export const serverHooks = {
+  started: new Map<string, number>(),
+  /** Opens a gate (now or before anyone waits on it); returns whether it was closed. */
+  open: (name: string): boolean => Deferred.doneUnsafe(gate(name), Effect.void)
+}
+const gateIn = (title: string) => /\[gate:([^\]]+)\]/.exec(title)?.[1]
 
 const addTodo = (side: "client" | "server") =>
   Mutation.make("todos.add", {
@@ -37,8 +53,9 @@ const addTodo = (side: "client" | "server") =>
       Effect.gen(function* () {
         if (side === "server") {
           serverHooks.started.set(args.id, (serverHooks.started.get(args.id) ?? 0) + 1)
-          if (args.title.startsWith("slow")) yield* Effect.sleep("2 seconds")
-          if (args.title.startsWith("server-rejects")) {
+          const name = gateIn(args.title)
+          if (name !== undefined) yield* Deferred.await(gate(name))
+          if (args.title.includes("server-rejects")) {
             return yield* Effect.fail({ reason: "blocked-title" as const, title: args.title })
           }
         }

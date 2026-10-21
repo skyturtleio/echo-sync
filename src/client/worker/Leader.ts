@@ -160,7 +160,9 @@ export interface LeaderOptions {
   readonly syncUrl?: string
   /**
    * Request headers for the sync server, given the principal this replica acts as (its tab's
-   * `principal`): the credentials the server's `principalFor` authenticates (DESIGN §4).
+   * `principal`): the credentials the server's `principalFor` authenticates (DESIGN §4). Called once, when
+   * this worker becomes leader; every request of that leader carries the same headers. Credentials that
+   * expire are refreshed only by a new leader (e.g. a reload), not per request.
    */
   readonly syncHeaders?: (principal: AccessScope.PrincipalId) => Readonly<Record<string, string>>
 }

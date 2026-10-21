@@ -120,6 +120,8 @@ const adminRoute = (url: URL): Effect.Effect<Response, unknown, SqlClient> =>
             [q("scope")]
           )
         )
+      case "/admin/open":
+        return json({ wasClosed: serverHooks.open(q("gate")) })
       case "/admin/stats":
         return json({
           rpcs: rpcCounts.get(q("clientId")) ?? {},
