@@ -128,12 +128,17 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
           Effect.gen(function* () {
             const { changes, replaced } = yield* enter(joined)
             const subscription = yield* PubSub.subscribe(changes)
-            // Subscribed before announcing: this tick is the join snapshot, for this stream and the others.
+            // Subscribed before announcing: the other streams see the join, and this stream consumes
+            // the tick itself, so its first element is the join snapshot, emitted before the merge
+            // (and with it the heartbeat timer) starts. A change after this take ticks again.
             yield* PubSub.publish(changes, undefined)
-            return Stream.mapEffect(Stream.fromSubscription(subscription), () => snapshot(joined.room)).pipe(
-              Stream.merge(Stream.fromEffectRepeat(Effect.as(Effect.sleep(options.heartbeatInterval), heartbeat))),
-              Stream.interruptWhen(Deferred.await(replaced))
-            )
+            yield* PubSub.take(subscription)
+            return Stream.concat(
+              Stream.fromEffect(snapshot(joined.room)),
+              Stream.mapEffect(Stream.fromSubscription(subscription), () => snapshot(joined.room)).pipe(
+                Stream.merge(Stream.fromEffectRepeat(Effect.as(Effect.sleep(options.heartbeatInterval), heartbeat)))
+              )
+            ).pipe(Stream.interruptWhen(Deferred.await(replaced)))
           })
         ),
 
@@ -163,5 +168,3 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
       snapshot
     }
   })
-
-export type Presence = Effect.Success<typeof make>

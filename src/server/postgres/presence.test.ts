@@ -205,6 +205,24 @@ describe("presence state (§12)", () => {
       })
   )
 
+  it.effect("the first element of every room stream is the join snapshot, even when a heartbeat is already due", () =>
+    Effect.gen(function* () {
+      // Interval 0: a heartbeat is due at once, so only sequencing (not timing) puts the snapshot first.
+      const presence = yield* Presence.make({ heartbeatInterval: 0 })
+      // Budgets 1 and 2 livelock a forked fiber in the pinned runtime (effect 4.0.5).
+      for (const ops of [3, 5, 10, 2048]) {
+        const first = yield* Stream.runCollect(Stream.take(presence.join(entry(`first-${ops}`)), 3)).pipe(
+          Effect.provideService(Scheduler.MaxOpsBeforeYield, ops)
+        )
+        assert.strictEqual(
+          first[0]?._tag,
+          "snapshot",
+          `MaxOpsBeforeYield ${ops}: ${first.map((e) => e._tag).join(",")}`
+        )
+      }
+    })
+  )
+
   it.effect(
     "a change pending when a heartbeat arrives, or arriving while a heartbeat is pending, is still delivered as a snapshot: a heartbeat never displaces a change",
     () =>

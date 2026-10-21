@@ -96,7 +96,8 @@ is never read from the payload. `ClientForbidden` becomes `Unauthorized`.
   Room streams carry the §6 heartbeat (DESIGN §16 item 13): the element is `snapshot |
   heartbeat`, the first one the join snapshot, and every stream emits a `heartbeat` every
   `heartbeatInterval` (the same `SyncServerOptions` field as pokes, default 15 s) from its own
-  timer merged beside its change subscription. A heartbeat therefore never slides out a pending
+  timer merged beside its change subscription, started only after the join snapshot has been
+  emitted (so that snapshot is always the first element). A heartbeat therefore never slides out a pending
   change tick, is never a snapshot, and reads or changes no room state. `track` needs no grant lookup: it only
   changes an entry the same principal holds. Not handled in v1: a grant revoked while a `room`
   stream is open leaves the entry until the stream ends (DESIGN §16 item 13).
