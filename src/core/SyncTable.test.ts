@@ -179,6 +179,11 @@ describe("SyncTable declaration-time rejection", () => {
       () => SyncTable.make("t", { ...base, x: Schema.NullOr(encodedDefault) }),
       /field "x".*encoded-side defaults/
     )
+    // Reviewer's repro: the same default behind Schema.suspend.
+    expectRejected(
+      () => SyncTable.make("t", { ...base, x: Schema.suspend(() => Schema.NullOr(encodedDefault)) }),
+      /field "x".*encoded-side defaults/
+    )
     const json = SyncTable.make("t", { ...base, j: Schema.Struct({ a: Schema.optionalKey(Schema.String) }) })
     expect(json.columns.find((c) => c.field === "j")?.kind).toBe("json")
     // @ts-expect-error optional keys are not supported

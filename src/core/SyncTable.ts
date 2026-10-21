@@ -249,11 +249,17 @@ interface Classified {
 
 /**
  * Optionality at the field level: the node itself or, through field-level unions (`NullOr`
- * etc.), any member. Does not descend into Objects/Arrays, so optional properties inside a JSON
+ * etc.) and `suspend` (cycle-safe), any member. Does not descend into Objects/Arrays, so optional properties inside a JSON
  * column remain allowed.
  */
-const optionalAtField = (ast: SchemaAST.AST): boolean =>
-  SchemaAST.isOptional(ast) || (ast._tag === "Union" && ast.types.some(optionalAtField))
+const optionalAtField = (ast: SchemaAST.AST, seen: ReadonlySet<SchemaAST.AST> = new Set()): boolean => {
+  if (SchemaAST.isOptional(ast)) return true
+  if (seen.has(ast)) return false
+  const next = new Set(seen).add(ast)
+  if (ast._tag === "Union") return ast.types.some((t) => optionalAtField(t, next))
+  if (ast._tag === "Suspend") return optionalAtField(ast.thunk(), next)
+  return false
+}
 
 /**
  * Classifies a field by its *encoded* side (what is stored), so a transformed field (branded,
