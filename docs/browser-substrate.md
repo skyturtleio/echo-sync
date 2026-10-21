@@ -250,6 +250,9 @@ Invariants checked:
 5. Crash after commit: the leader dies after committing an enqueue but before responding, while two tabs
    enqueue that same `mutationId` simultaneously; both retries return the committed seq, there is one row,
    and the next new intent gets seq + 1.
+5b. Worker-only crash: a tab outlives its own leader worker (the same fault, on that tab's own enqueue).
+   Its continuous `status` stream flips `isLeaderTab` to false when that worker's epoch lock is released,
+   and follows the new leader elected in another tab. Ownership is tied to the epoch, not the tab.
 6. OPFS startup failure: the first tab's candidate holds the leader lock while its open is blocked, a
    second tab queues, the open fails; the second tab becomes leader and serves both.
 7. Saved means durable: an enqueued entry is visible after reload; after hard-killing the only tab
@@ -269,5 +272,5 @@ by a trigger, but that check still passes with the transaction removed (the read
 already run back to back), so it is a sanity check only.
 
 `window.echo` in the harness page (`status`, `ready`, `info`, `exec`, `enqueue`, `enqueueRetrying`,
-`subscribe`, `until`, `barrier`, `release`, `forgeLeaderAnnouncement`) is the scripting surface; failures come back as values (`{ ok: false, error }`) so scripts
+`subscribe`, `until`, `barrier`, `release`, `forgeLeaderAnnouncement`, `watchStatus`/`statusLog`) is the scripting surface; failures come back as values (`{ ok: false, error }`) so scripts
 can assert on `_tag` / `reason`.

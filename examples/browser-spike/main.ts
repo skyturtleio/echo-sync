@@ -73,7 +73,15 @@ const currentStatus = Stream.runHead(client.status).pipe(
   Effect.flatMap((head) => (Option.isSome(head) ? Effect.succeed(head.value) : Effect.die(new Error("no status"))))
 )
 
+/** Every `status` emission since `watchStatus()`, in order (the stream is continuous, not polled). */
+const statusLog: Array<LeaderClientModule.Status> = []
+
 const echo = {
+  statusLog,
+  watchStatus: () => {
+    Effect.runFork(Stream.runForEach(client.status, (s) => Effect.sync(() => void statusLog.push(s))))
+    return true
+  },
   status: () => Effect.runPromise(currentStatus),
   /** Status once a leader is connected, or the current status after `timeoutMs`. */
   ready: async (timeoutMs = 10_000) => {

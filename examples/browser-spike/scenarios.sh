@@ -131,6 +131,28 @@ check "crash after commit: both tabs' retries return the committed seq, one row,
     attempts: ($r | map(.attempts)), seqs: ($r | map(.value.seq)), rows: $a.rows, next: $a.next }' <<<"$results")"
 for t in "$L" "$F" "$G"; do ab tab close "$t" >/dev/null; done
 
+# ── worker-only crash: the tab outlives its leader worker and must stop claiming leadership ──────────
+# Tab L's worker ends itself after committing L's own enqueue (`crashAfterCommit`); tab L stays open, F's
+# worker is elected, and L reaches F's leader through the router. L's continuous status stream must flip
+# `isLeaderTab` to false and follow the new leader.
+APP="workercrash-$RUN"
+L=$(open_tab "$BASE/?app=$APP&crashAfterCommit")
+l=$(ev <<<"$SERVED")
+F=$(open_tab "$BASE/?app=$APP")
+ev <<<"$SERVED" >/dev/null
+ab tab "$L" >/dev/null
+ev <<<"echo.watchStatus(); await echo.enqueue({ mutationId: 'crash-after-commit-worker-only', name: 't', args: {} }); return true" >/dev/null
+moved=$(ev <<<"return await echo.until(() => { const s = echo.statusLog.at(-1); return s && s.leaderId !== undefined && s.leaderId !== '$(jq -r .leaderId <<<"$l")' ? s : undefined }, 15000) ?? null")
+log=$(ev <<<"return echo.statusLog")
+ab tab "$F" >/dev/null
+f=$(ev <<<"return await echo.status()")
+check "worker-only crash: the surviving tab's status stream flips isLeaderTab to false and follows the new leader" "$(jq -c --argjson l "$l" --argjson m "$moved" --argjson log "$log" --argjson f "$f" '
+  { pass: ($l.isLeaderTab and ($log | any(.isLeaderTab)) and $m != null and ($m.isLeaderTab | not)
+          and $m.leaderId == $f.leaderId and $f.isLeaderTab),
+    before: $l.isLeaderTab, after: $m, newLeaderTab: $f.isLeaderTab,
+    log: ($log | map({ isLeaderTab, leader: (.leaderId // "-")[0:8] })) }' <<<"{}")"
+for t in "$L" "$F"; do ab tab close "$t" >/dev/null; done
+
 # ── a candidate that cannot open OPFS releases its locks; the next tab becomes leader ────────────────
 APP="failopen-$RUN"
 LOCK="echo:$APP:default:leader"

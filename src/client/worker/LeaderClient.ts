@@ -254,7 +254,12 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     }
     // Async work started for a connection only acts while that exact connection object is `active`.
     let active: Active | undefined
-    let isLeaderTab = false
+    /**
+     * The epoch (leaderId) this tab's own worker was elected with, while that epoch lasts. Ownership ends
+     * with the epoch, not with the tab: a worker can die while its tab survives and connects to another
+     * tab's replacement leader.
+     */
+    let localEpoch: string | undefined
     const publish = (connection: Connection | undefined) => {
       if (Deferred.isDoneUnsafe(current)) current = Deferred.makeUnsafe()
       if (connection !== undefined) Deferred.doneUnsafe(current, Effect.succeed(connection))
@@ -295,10 +300,12 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
         )
       )
 
-    const status = yield* SubscriptionRef.make<Status>({ mode, tabId, isLeaderTab, leaderId: undefined })
-    // Called from DOM callbacks after every change to `active` or `isLeaderTab`; `set` never suspends here.
+    const status = yield* SubscriptionRef.make<Status>({ mode, tabId, isLeaderTab: false, leaderId: undefined })
+    // Called from DOM callbacks after every change to `active` or `localEpoch`; `set` never suspends here.
     const publishStatus = () =>
-      Effect.runSync(SubscriptionRef.set(status, { mode, tabId, isLeaderTab, leaderId: active?.leaderId }))
+      Effect.runSync(
+        SubscriptionRef.set(status, { mode, tabId, isLeaderTab: localEpoch !== undefined, leaderId: active?.leaderId })
+      )
 
     const enqueue = (envelope: OutboxEnvelope) => withLeader((client) => client.enqueue({ envelope }))
     const service = LeaderClient.of({
@@ -409,8 +416,22 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
           return
         }
         case "Elected": {
-          isLeaderTab = true
+          const epoch = message.leaderId
+          localEpoch = epoch
           publishStatus()
+          // The epoch lock is held by this worker until it dies, also when the tab outlives it.
+          fork(
+            Platform.awaitLockReleased(Platform.leaderEpochLockName(identity, epoch)).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  if (localEpoch !== epoch) return
+                  localEpoch = undefined
+                  publishStatus()
+                })
+              ),
+              Effect.catchCause((cause) => Effect.logError("echo: watching this tab's leader epoch failed", cause))
+            )
+          )
           const channel = new MessageChannel()
           if (router !== undefined) {
             const routerPort: ToLeader = { _tag: "RouterPort", port: channel.port1 }
