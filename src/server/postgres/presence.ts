@@ -1,4 +1,4 @@
-import { Deferred, type Duration, Effect, PubSub, Ref, type Scope, Stream } from "effect"
+import { Deferred, type Duration, Effect, PubSub, Ref, type Scope, Semaphore, Stream } from "effect"
 import { type AccessScope, Protocol } from "echo-sync"
 
 /** An entry, the room it is in, and the revision of its state (DESIGN §12 revision fencing). */
@@ -76,6 +76,14 @@ const byKey = (a: Protocol.PresenceEntry, b: Protocol.PresenceEntry) =>
 export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
   Effect.gen(function* () {
     const rooms = yield* Ref.make<ReadonlyMap<AccessScope.AccessScopeId, Room>>(new Map())
+    /**
+     * Installation gate: `reevaluate` holds it from reading the members through removing them, and
+     * `enter` holds it only for the install itself (waiting for it is interruptible). So no entry is
+     * installed between a check's capture and its removal: every entry of a revoked principal is
+     * either captured, and removed in that one step, or installed after the removal, where its own
+     * `admit` reads the grant after the check's. Never held across `admit` or any stream I/O.
+     */
+    const gate = yield* Semaphore.make(1)
 
     const snapshot = (room: AccessScope.AccessScopeId) => Effect.map(Ref.get(rooms), (all) => snapshotOf(all, room))
 
@@ -100,7 +108,7 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
     > => {
       const key = keyOf(joined.principalId, joined.clientId, joined.tabId)
       const entry = entryOf(joined)
-      return Effect.acquireRelease(
+      const install = Effect.acquireRelease(
         Effect.gen(function* () {
           const fresh = yield* PubSub.sliding<void>(1)
           const ended = yield* Deferred.make<void, Protocol.Forbidden>()
@@ -136,6 +144,8 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
           }).pipe(Effect.flatMap((left) => (left ? PubSub.publish(changes, undefined) : Effect.void)))
         }
       )
+      // Only the install waits for the gate; the release (a removal) never conflicts with a check.
+      return gate.withPermit(install)
     }
 
     return {
@@ -143,12 +153,14 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
        * The entry is present exactly while the returned stream runs: added before its first
        * snapshot, removed when it ends for any reason (completion, failure, interruption,
        * revocation). The first snapshot already contains it; every later change produces another,
-       * and a stream only ever emits a snapshot that contains its own entry. A superseded join
-       * (revision lower than the stored entry's) ends at once without an element and changes nothing.
+       * and a snapshot read after the entry's removal is never emitted to its stream. A superseded
+       * join (revision lower than the stored entry's) ends at once without an element and changes
+       * nothing.
        *
        * `admit` runs once the entry is installed, before anyone is told of it: `false` ends the
-       * stream `Forbidden` and removes the entry. It closes the race with `reevaluate`: a revocation
-       * that `reevaluate` ran too early to see this entry for is one `admit` observes.
+       * stream `Forbidden` and removes the entry. It closes the race with `reevaluate`: an entry
+       * installed after a check (the gate) reads the grant after that check did. A revocation or
+       * replacement while `admit` is pending ends the stream without waiting for it.
        */
       join: <E>(
         joined: Joined,
@@ -159,24 +171,32 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
             const entered = yield* enter(joined)
             if (entered === undefined) return Stream.empty
             const { changes, ended } = entered
-            const subscription = yield* PubSub.subscribe(changes)
-            if (!(yield* admit)) return yield* new Protocol.Forbidden({ room: joined.room })
             const key = keyOf(joined.principalId, joined.clientId, joined.tabId)
-            // Only while this stream's own entry is in the room. Once it is replaced or revoked
-            // (`ended` completes right after the removal) the stream ends with nothing more.
-            const own = Effect.map(Ref.get(rooms), (all) =>
-              all.get(joined.room)?.members.get(key)?.ended === ended ? [snapshotOf(all, joined.room)] : []
-            )
-            // Subscribed before announcing: the other streams see the join, and this stream consumes
-            // the tick itself, so its first element is the join snapshot, emitted before the merge
-            // (and with it the heartbeat timer) starts. A change after this take ticks again.
-            yield* PubSub.publish(changes, undefined)
-            yield* PubSub.take(subscription)
-            return Stream.concat(
-              Stream.flattenIterable(Stream.fromEffect(own)),
-              Stream.flattenIterable(Stream.mapEffect(Stream.fromSubscription(subscription), () => own)).pipe(
-                Stream.merge(Stream.fromEffectRepeat(Effect.as(Effect.sleep(options.heartbeatInterval), heartbeat)))
-              )
+            // Everything after the install runs inside `ended`'s boundary, `admit` included: a
+            // revocation or replacement while `admit` is pending ends the stream at once (with
+            // `Forbidden`, or empty), and a later outcome of `admit` can no longer surface.
+            return Stream.unwrap(
+              Effect.gen(function* () {
+                const subscription = yield* PubSub.subscribe(changes)
+                if (!(yield* admit)) return yield* new Protocol.Forbidden({ room: joined.room })
+                // Only while this stream's own entry is in the room: a snapshot read after its
+                // removal is never emitted to it (one already read before may still be delivered).
+                const own = Effect.map(Ref.get(rooms), (all) =>
+                  all.get(joined.room)?.members.get(key)?.ended === ended ? [snapshotOf(all, joined.room)] : []
+                )
+                // Subscribed before announcing: the other streams see the join, and this stream
+                // consumes the tick itself, so its first element is the join snapshot, emitted
+                // before the merge (and with it the heartbeat timer) starts. A change after this
+                // take ticks again.
+                yield* PubSub.publish(changes, undefined)
+                yield* PubSub.take(subscription)
+                return Stream.concat(
+                  Stream.flattenIterable(Stream.fromEffect(own)),
+                  Stream.flattenIterable(Stream.mapEffect(Stream.fromSubscription(subscription), () => own)).pipe(
+                    Stream.merge(Stream.fromEffectRepeat(Effect.as(Effect.sleep(options.heartbeatInterval), heartbeat)))
+                  )
+                )
+              })
             ).pipe(Stream.interruptWhen(Deferred.await(ended)))
           })
         ),
@@ -185,57 +205,62 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
        * Revocation (DESIGN §16 item 13): asks `holds` which `(room, principal)` pairs with an open
        * stream still hold the room's scope, then, for each pair that does not, removes every entry
        * of that principal in that room in one step, ends each of those streams `Forbidden`, and
-       * announces the removal once. Only entries already present when `holds` was asked are removed:
-       * one that joined meanwhile is checked by its own `admit`.
+       * announces the removal once. The installation gate is held throughout, so no entry is
+       * installed between the capture and the removal: a principal's entries all go in one step, and
+       * an entry installed after the check (say, after a re-grant the check's read predates) is
+       * judged by its own `admit`, never by this check. Only captured entries are removed.
        */
       reevaluate: <E>(
         holds: (
           pairs: ReadonlyArray<{ readonly room: AccessScope.AccessScopeId; readonly principalId: string }>
         ) => Effect.Effect<(room: AccessScope.AccessScopeId, principalId: string) => boolean, E>
       ) =>
-        Effect.gen(function* () {
-          const seen = yield* Ref.get(rooms)
-          const pairs = [...seen].flatMap(([room, { members }]) =>
-            [...new Set([...members.values()].map((m) => m.entry.principalId))].map((principalId) => ({
-              room,
-              principalId
-            }))
-          )
-          if (pairs.length === 0) return
-          const held = yield* holds(pairs)
-          for (const { room, principalId } of pairs) {
-            if (held(room, principalId)) continue
-            const asked = new Set(
-              [...(seen.get(room)?.members.values() ?? [])]
-                .filter((m) => m.entry.principalId === principalId)
-                .map((m) => m.ended)
+        gate.withPermit(
+          Effect.gen(function* () {
+            const seen = yield* Ref.get(rooms)
+            const pairs = [...seen].flatMap(([room, { members }]) =>
+              [...new Set([...members.values()].map((m) => m.entry.principalId))].map((principalId) => ({
+                room,
+                principalId
+              }))
             )
-            yield* Effect.uninterruptible(
-              Effect.gen(function* () {
-                const removed = yield* Ref.modify(rooms, (all) => {
-                  const current = all.get(room)
-                  if (current === undefined) return [undefined, all] as const
-                  const members = new Map(current.members)
-                  const gone: Array<Member> = []
-                  for (const [key, member] of current.members) {
-                    if (asked.has(member.ended)) {
-                      members.delete(key)
-                      gone.push(member)
+            if (pairs.length === 0) return
+            const held = yield* holds(pairs)
+            for (const { room, principalId } of pairs) {
+              if (held(room, principalId)) continue
+              const asked = new Set(
+                [...(seen.get(room)?.members.values() ?? [])]
+                  .filter((m) => m.entry.principalId === principalId)
+                  .map((m) => m.ended)
+              )
+              yield* Effect.uninterruptible(
+                Effect.gen(function* () {
+                  const removed = yield* Ref.modify(rooms, (all) => {
+                    const current = all.get(room)
+                    if (current === undefined) return [undefined, all] as const
+                    const members = new Map(current.members)
+                    const gone: Array<Member> = []
+                    for (const [key, member] of current.members) {
+                      if (asked.has(member.ended)) {
+                        members.delete(key)
+                        gone.push(member)
+                      }
                     }
-                  }
-                  if (gone.length === 0) return [undefined, all] as const
-                  const next = new Map(all)
-                  if (members.size === 0) next.delete(room)
-                  else next.set(room, { members, changes: current.changes })
-                  return [{ gone, changes: current.changes }, next] as const
+                    if (gone.length === 0) return [undefined, all] as const
+                    const next = new Map(all)
+                    if (members.size === 0) next.delete(room)
+                    else next.set(room, { members, changes: current.changes })
+                    return [{ gone, changes: current.changes }, next] as const
+                  })
+                  if (removed === undefined) return
+                  for (const member of removed.gone)
+                    yield* Deferred.fail(member.ended, new Protocol.Forbidden({ room }))
+                  yield* PubSub.publish(removed.changes, undefined)
                 })
-                if (removed === undefined) return
-                for (const member of removed.gone) yield* Deferred.fail(member.ended, new Protocol.Forbidden({ room }))
-                yield* PubSub.publish(removed.changes, undefined)
-              })
-            )
-          }
-        }),
+              )
+            }
+          })
+        ),
 
       /**
        * Replaces the state of an existing entry; `false` (and no change) when there is none, or when its

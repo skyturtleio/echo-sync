@@ -481,6 +481,113 @@ describe("presence state (§12)", () => {
         assert.deepStrictEqual(yield* room, [])
       })
   )
+  it.effect(
+    "a principal's entry admitted while a revocation check is in flight cannot survive it: all its entries leave in the check's one step or the newcomer is refused",
+    () =>
+      Effect.gen(function* () {
+        const presence = yield* Presence.make({ heartbeatInterval: "1 hour" })
+        const room = Effect.map(presence.snapshot(s1), show)
+        const granted = { p: true }
+        const admit = Effect.sync(() => granted.p)
+        const a = yield* Effect.forkChild(Effect.exit(Stream.runDrain(presence.join(entry("a"), admit))))
+        yield* settle
+        // The check captures A and waits before its grant read.
+        const asking = yield* Deferred.make<void>()
+        const answer = yield* Deferred.make<void>()
+        const check = yield* Effect.forkChild(
+          presence.reevaluate(() =>
+            Deferred.succeed(asking, undefined).pipe(
+              Effect.andThen(Deferred.await(answer)),
+              Effect.andThen(Effect.sync(() => granted.p)),
+              Effect.map((held) => (_: unknown, principalId: string) => principalId !== "p" || held)
+            )
+          )
+        )
+        yield* Deferred.await(asking)
+        // B joins while the check waits; an admit run now would still see the grant.
+        const bSeen: Array<ReadonlyArray<string>> = []
+        const b = yield* Effect.forkChild(
+          Effect.exit(
+            Stream.runForEach(presence.join(entry("b"), admit), (element) =>
+              Effect.sync(() => void bSeen.push(show(element)))
+            )
+          )
+        )
+        yield* settle
+        // The revoke commits; the check reads it.
+        granted.p = false
+        yield* Deferred.succeed(answer, undefined)
+        yield* Fiber.join(check)
+        assert.deepStrictEqual(yield* room, [], "after the one check, no entry of p is left")
+        yield* settle
+        assert.deepStrictEqual(forbidden(yield* Fiber.join(a)), expected)
+        assert.deepStrictEqual(forbidden(yield* Fiber.join(b)), expected)
+        assert.deepStrictEqual(bSeen, [], "the newcomer received nothing")
+      })
+  )
+
+  it.effect("a check whose denial predates a re-grant does not end a newcomer admitted after the re-grant", () =>
+    Effect.gen(function* () {
+      const presence = yield* Presence.make({ heartbeatInterval: "1 hour" })
+      const room = Effect.map(presence.snapshot(s1), show)
+      const granted = { p: true }
+      const admit = Effect.sync(() => granted.p)
+      const a = yield* Effect.forkChild(Effect.exit(Stream.runDrain(presence.join(entry("a"), admit))))
+      yield* settle
+      // The revoke commits; the check captures A, reads the denial, and waits before removing.
+      granted.p = false
+      const asked = yield* Deferred.make<void>()
+      const answer = yield* Deferred.make<void>()
+      const check = yield* Effect.forkChild(
+        presence.reevaluate(() =>
+          Effect.sync(() => granted.p).pipe(
+            Effect.tap(() => Deferred.succeed(asked, undefined)),
+            Effect.tap(() => Deferred.await(answer)),
+            Effect.map((held) => (_: unknown, principalId: string) => principalId !== "p" || held)
+          )
+        )
+      )
+      yield* Deferred.await(asked)
+      // Re-granted; B joins meanwhile, and its admit sees the new grant.
+      granted.p = true
+      const b = yield* Effect.forkChild(Effect.exit(Stream.runDrain(presence.join(entry("b"), admit))))
+      yield* settle
+      yield* Deferred.succeed(answer, undefined)
+      yield* Fiber.join(check)
+      yield* settle
+      assert.deepStrictEqual(forbidden(yield* Fiber.join(a)), expected, "the stale denial still ends A")
+      assert.isUndefined(b.pollUnsafe(), "B, admitted after the re-grant, is open")
+      assert.deepStrictEqual(yield* room, ["p/c1/b=null"])
+    })
+  )
+
+  it.effect(
+    "a revocation while the join's admit is still pending ends the stream Forbidden at once, and the admit's later failure never surfaces",
+    () =>
+      Effect.gen(function* () {
+        const presence = yield* Presence.make({ heartbeatInterval: "1 hour" })
+        const room = Effect.map(presence.snapshot(s1), show)
+        const gate = yield* Deferred.make<void>()
+        const pending = yield* Effect.forkChild(
+          Effect.exit(
+            Stream.runDrain(
+              presence.join(entry("pending"), Effect.andThen(Deferred.await(gate), Effect.fail("late admit failure")))
+            )
+          )
+        )
+        yield* settle
+        assert.deepStrictEqual(yield* room, ["p/c1/pending=null"], "installed, admit pending")
+        yield* presence.reevaluate(() => Effect.succeed(() => false))
+        yield* settle
+        assert.deepStrictEqual(yield* room, [])
+        // The admit gate is still closed.
+        assert.isDefined(pending.pollUnsafe(), "the stream ended without the admit completing")
+        assert.deepStrictEqual(forbidden(yield* Fiber.join(pending)), expected)
+        yield* Deferred.succeed(gate, undefined)
+        yield* settle
+        assert.deepStrictEqual(forbidden(yield* Fiber.join(pending)), expected)
+      })
+  )
 })
 
 describe.skipIf(!pgAvailable)("presence over the sync mount (§12)", () => {

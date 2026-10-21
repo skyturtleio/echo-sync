@@ -114,15 +114,19 @@ an expired token is honoured on a live one. The client evaluates `syncHeaders` p
   entry of that principal in that room in one `Ref` update, fails each of their streams
   `Forbidden { room }` (the per-member `Deferred` now carries that failure; a replacement still
   succeeds it), and announces once, so the remaining members get one snapshot without them.
-  Only entries present when the query was asked are removed, so a rejoin after a re-grant is
-  not ended by a stale check. A stream never emits a snapshot that lacks its own entry, so a
-  revoked principal receives nothing after its removal. The check runs on every commit rather
+  A check holds an installation gate from reading the members until the removal, and `enter`
+  takes it only around the install (interruptibly, never across `admit` or stream I/O), so no
+  entry is installed mid-check: a principal's entries all leave in the same step, and an entry
+  installed after the check (a rejoin after a re-grant the check's read predates) is judged by its
+  own `admit`, not by that check. A snapshot read after an entry's removal is never emitted to its
+  stream; one already read before it may still be delivered. The check runs on every commit rather
   than only on `scope_grants` entries: the pokes carry no data, and one indexed query per
   committed transaction (coalesced while one runs, skipped while no room is open) costs less
   than reading the log tail to filter. Join race: `room` checks the grant before installing the
   entry and again after (`join`'s `admit`, before announcing). A revoke committed before the
   second check's snapshot fails the join; one committed after it notifies a check that starts
-  after the entry is installed. A lost `LISTEN` or failed check restarts the watch after 1 s,
+  after the entry is installed. `admit` runs inside the stream's end boundary, so a revocation
+  while it is still pending ends the stream `Forbidden` at once. A lost `LISTEN` or failed check restarts the watch after 1 s,
   and its first poke re-checks everything. A re-grant does nothing automatically; across a
   server restart presence state is gone anyway and a rejoin re-checks the grant.
 
