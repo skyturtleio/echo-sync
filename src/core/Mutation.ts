@@ -80,6 +80,18 @@ export const MutationEnvelope = Schema.Struct({
 })
 export type MutationEnvelope = typeof MutationEnvelope.Type
 
+/**
+ * A mutation that left the outbox without being applied as intended, retained for inspection
+ * (DESIGN §9): `Rejected`, processed and rejected with a typed error; `OutcomeUnknown`, processed
+ * with an unknown outcome (its ledger row expired before the ack was pulled, §16.5), its effect,
+ * if any, in the installed replica. Stored by the client and sent over the tab RPC.
+ */
+export const Notice = Schema.Union([
+  Schema.TaggedStruct("Rejected", { envelope: MutationEnvelope, error: MutationRejection }),
+  Schema.TaggedStruct("OutcomeUnknown", { envelope: MutationEnvelope })
+])
+export type Notice = typeof Notice.Type
+
 // ---------------------------------------------------------------------------------------------
 // Definition and registry
 // ---------------------------------------------------------------------------------------------
@@ -226,48 +238,48 @@ export interface TypedDomainError<Name extends string, E> {
   readonly error: E
 }
 
-/** A notice's envelope args and outcome, typed by its mutation. Other rejections pass through. */
-export interface DecodedNotice<Name extends string, A, E> {
-  readonly args: A
-  readonly outcome:
-    | typeof Applied.Type
-    | {
-        readonly _tag: "Rejected"
-        readonly error: Exclude<MutationRejection, DomainError> | TypedDomainError<Name, E>
-      }
-}
+/** An envelope whose `args` are decoded by its mutation. */
+export type TypedEnvelope<A> = Omit<MutationEnvelope, "args"> & { readonly args: A }
+
+/** A `Notice` typed by its mutation: typed args; a `DomainError` payload typed; other rejections as is. */
+export type DecodedNotice<Name extends string, A, E> =
+  | {
+      readonly _tag: "Rejected"
+      readonly envelope: TypedEnvelope<A>
+      readonly error: Exclude<MutationRejection, DomainError> | TypedDomainError<Name, E>
+    }
+  | { readonly _tag: "OutcomeUnknown"; readonly envelope: TypedEnvelope<A> }
 
 /**
- * Decodes a retained notice against `mutation`: `args` with its `args` schema and, for a
- * `Rejected` outcome whose error is a `DomainError`, the payload with its `error` schema. Any
- * other rejection is returned as is. A notice of a different mutation, or one these schemas
- * cannot decode (a different args version, a corrupted payload), is `NoticeMismatch`, never a
- * defect. Pure: the schemas are service-free, so it runs on the tab and on the server.
+ * Decodes a retained notice against `mutation`: its envelope's `args` with the `args` schema and,
+ * for a `Rejected` whose error is a `DomainError` of this mutation, the payload with its `error`
+ * schema. Other rejections are returned as is; `OutcomeUnknown` gets typed args only. A notice of
+ * a different mutation, a `DomainError` naming another mutation, or anything these schemas cannot
+ * decode (a different args version, a corrupted payload) is `NoticeMismatch`, never a defect.
+ * Pure: the schemas are service-free, so it runs on the tab and on the server.
  */
 export const decodeNotice = <Name extends string, A extends PureSchema, E extends PureSchema>(
   mutation: Mutation<Name, A, E>,
-  notice: {
-    readonly envelope: { readonly name: string; readonly args: Schema.Json }
-    readonly outcome: MutationOutcome
-  }
+  notice: Notice
 ): Effect.Effect<DecodedNotice<Name, A["Type"], E["Type"]>, NoticeMismatch> =>
   Effect.gen(function* () {
-    const { envelope, outcome } = notice
-    const mismatch = (message: string) => new NoticeMismatch({ mutation: mutation.name, name: envelope.name, message })
-    if (envelope.name !== mutation.name) {
-      return yield* mismatch(`a notice of "${envelope.name}" cannot be decoded as "${mutation.name}"`)
+    const mismatch = (message: string) =>
+      new NoticeMismatch({ mutation: mutation.name, name: notice.envelope.name, message })
+    if (notice.envelope.name !== mutation.name) {
+      return yield* mismatch(`a notice of "${notice.envelope.name}" cannot be decoded as "${mutation.name}"`)
     }
-    const args: A["Type"] = yield* Schema.decodeUnknownEffect(Schema.toCodecJson(mutation.args))(envelope.args).pipe(
-      Effect.mapError((e) => mismatch(`args: ${e.message}`))
-    )
-    if (outcome._tag === "Applied") return { args, outcome }
-    const domain = outcome.error
-    if (domain._tag !== "DomainError") return { args, outcome: { _tag: "Rejected", error: domain } }
+    const args: A["Type"] = yield* Schema.decodeUnknownEffect(Schema.toCodecJson(mutation.args))(
+      notice.envelope.args
+    ).pipe(Effect.mapError((e) => mismatch(`args: ${e.message}`)))
+    const envelope: TypedEnvelope<A["Type"]> = { ...notice.envelope, args }
+    if (notice._tag === "OutcomeUnknown") return { _tag: "OutcomeUnknown", envelope }
+    const domain = notice.error
+    if (domain._tag !== "DomainError") return { _tag: "Rejected", envelope, error: domain }
     if (domain.mutation !== mutation.name) {
       return yield* mismatch(`a domain error of "${domain.mutation}" cannot be decoded as "${mutation.name}"`)
     }
     const error: E["Type"] = yield* Schema.decodeUnknownEffect(Schema.toCodecJson(mutation.error))(domain.error).pipe(
       Effect.mapError((e) => mismatch(`error: ${e.message}`))
     )
-    return { args, outcome: { _tag: "Rejected", error: { _tag: "DomainError", mutation: mutation.name, error } } }
+    return { _tag: "Rejected", envelope, error: { _tag: "DomainError", mutation: mutation.name, error } }
   })

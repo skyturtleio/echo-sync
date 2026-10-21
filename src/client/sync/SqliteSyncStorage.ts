@@ -31,11 +31,8 @@ const StoredUndo = Schema.fromJsonString(
     })
   )
 )
-/** A stored notice (DESIGN §9): the engine's `Notice` as a Schema, so it can also cross the tab RPC. */
-export const Notice = Schema.Union([
-  Schema.TaggedStruct("Rejected", { envelope: Mutation.MutationEnvelope, error: Mutation.MutationRejection }),
-  Schema.TaggedStruct("OutcomeUnknown", { envelope: Mutation.MutationEnvelope })
-])
+/** A stored notice (DESIGN §9): core's `Mutation.Notice`, so it can also cross the tab RPC. */
+export const Notice = Mutation.Notice
 const StoredNotice = Schema.fromJsonString(Notice)
 const StoredMeta = Schema.fromJsonString(
   Schema.Struct({ cursor: Ids.Cursor, pushedThrough: Schema.Int, resnapshot: Schema.Boolean })

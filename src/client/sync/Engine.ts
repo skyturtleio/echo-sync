@@ -46,18 +46,7 @@ export const initialMeta: SyncMeta = { cursor: null, pushedThrough: 0, resnapsho
 const pullFrom = (meta: SyncMeta): Ids.Cursor => (meta.resnapshot ? null : meta.cursor)
 
 /** A mutation that left the outbox without being applied as intended, retained for inspection (§9). */
-export type Notice =
-  /** The server processed it and rejected it with a typed error. */
-  | {
-      readonly _tag: "Rejected"
-      readonly envelope: Mutation.MutationEnvelope
-      readonly error: Mutation.MutationRejection
-    }
-  /**
-   * Processed, outcome unknown: its ledger row expired before the ack was pulled (§16.5). Its
-   * effect, if any, is in the installed replica.
-   */
-  | { readonly _tag: "OutcomeUnknown"; readonly envelope: Mutation.MutationEnvelope }
+export type Notice = Mutation.Notice
 
 type StoreUnavailable = Errors.StoreUnavailable
 
