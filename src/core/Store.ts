@@ -315,6 +315,12 @@ export interface StoreInstance {
    * before its write is issued, so it is complete even if the handler fails midway.
    */
   readonly touched: Effect.Effect<ReadonlyArray<UndoImage>>
+  /**
+   * Names of every table this instance has read so far (DESIGN §10.1): the tables of `get`, `query`
+   * and `scan`, plus `scope_grants` whenever a role was looked up to authorize or filter a row.
+   * A registered query's live subscription is reactive on exactly this set of its latest run.
+   */
+  readonly reads: Effect.Effect<ReadonlySet<string>>
 }
 
 /**
@@ -365,9 +371,13 @@ const toKeyValue = (table: AnySyncTable, field: string, value: unknown) =>
 export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
   const images: Array<UndoImage> = []
   const seen = new Set<string>()
+  const reads = new Set<string>()
+  const read = (table: AnySyncTable) => Effect.sync(() => void reads.add(table.name))
+  // Roles come from `scope_grants` rows, so every role lookup is a read of that table.
+  const roleFor = (scopeId: AccessScopeId) => Effect.andThen(read(ScopeGrants), options.roleFor(scopeId))
 
   const authorize = Effect.fnUntraced(function* (scopeId: AccessScopeId, required: Role) {
-    const held = yield* options.roleFor(scopeId)
+    const held = yield* roleFor(scopeId)
     if (Option.isNone(held) || !satisfies(held.value, required)) {
       return yield* new ScopeForbidden({ scopeId, required, held: Option.getOrNull(held) })
     }
@@ -391,7 +401,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
     Effect.gen(function* () {
       const cached = scopes.get(scopeId)
       if (cached !== undefined) return cached
-      const held = yield* options.roleFor(scopeId)
+      const held = yield* roleFor(scopeId)
       const ok = Option.isSome(held) && satisfies(held.value, "reader")
       scopes.set(scopeId, ok)
       return ok
@@ -411,6 +421,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
   const store: EchoStore = {
     get: (table, id) =>
       Effect.gen(function* () {
+        yield* read(table)
         const found = yield* rows.read(table, id)
         if (Option.isNone(found)) return yield* new RowNotFound({ table: table.name, id })
         const row = yield* decode(table, found.value)
@@ -459,6 +470,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
         ).state
         const run = (order: "asc" | "desc", limit: Option.Option<number>) =>
           Effect.gen(function* () {
+            yield* read(table)
             if (index === undefined) {
               return yield* new InvalidRow({ table: table.name, message: `unknown index ${name}` })
             }
@@ -497,8 +509,12 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
       }
     }),
 
-    scan: (table) => Effect.flatMap(rows.scan(table), (encoded) => visible(table, encoded))
+    scan: (table) =>
+      read(table).pipe(
+        Effect.andThen(rows.scan(table)),
+        Effect.flatMap((encoded) => visible(table, encoded))
+      )
   }
 
-  return { store, touched: Effect.sync(() => [...images]) }
+  return { store, touched: Effect.sync(() => [...images]), reads: Effect.sync(() => new Set(reads)) }
 }
