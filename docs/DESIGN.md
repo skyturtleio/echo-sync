@@ -400,7 +400,18 @@ const todosByProject = Query.make("todos.byProject", {
   rows); (3) a newer client against an older server is a decode failure the §9 rebuild cannot
   repair, so **deploy order is server first, then clients**; the startup verifier (above) makes
   the server refuse to serve a mismatched database, never a stale client. A manifest/version
-  gate on the wire is the later fix for (3).
+  gate on the wire is the later fix for (3). Key presence is the server's obligation: a row on
+  the wire carries **every declared column, `null` included** (a missing key fails decode on
+  every client). That holds only if every declared column exists in the live table, which the
+  startup verifier enforces.
+- **Pull payloads are built from the declared columns through core's codec, never from the
+  live relation.** `to_jsonb(t)` / `row_to_json` are forbidden for synced rows: they emit
+  `timestamptz` as an ISO string where the wire is epoch ms (§10), and they ship any column the
+  app added to the table but did not declare in the `SyncTable` to every scope reader (a
+  disclosure leak; the client dropping it on decode is too late). The server selects the
+  declared columns only and decodes through `table.postgres.row`, whose decoded side is the
+  wire row, so there is one definition of the encoding. `attach` therefore takes the
+  `SyncTable`, not a bare name.
 
 ## 12. Transport
 
