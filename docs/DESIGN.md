@@ -513,10 +513,20 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
   `"unauthorized"` (the server rejected the credential), `"unavailable"` (`ServerUnavailable`),
   `"network"` (the request failed before a server response: transport, HTTP, decode of a
   response that never arrived), `"server"` (any other server-produced transient failure, the
-  stopped-batch case included). `message` is a human-readable description that walks the
-  cause chain (an outer `RpcClientError` must not hide the inner cause's text) and never
-  contains header values, request bodies, or tokens. Cleared (`null`) by the next clean
-  cycle, as before. Consumer-visible shape change; lands before any app ships on `syncStatus`.
+  stopped-batch case included). Amendment after the fd77a29 review: preserving arbitrary
+  inner text and an absolute no-secrets guarantee cannot both hold, and the guarantee wins.
+  `message` is a **library-controlled constant** chosen by walking the cause chain to the
+  innermost *recognized* stage or tag (so an outer `RpcClientError` never hides a wrapped
+  `CredentialsUnavailable`); it never copies a raw error message, error name, unrecognized
+  tag, string cause, URL, or `Cause.pretty` output into public status, because any of those
+  can carry a token, an echoed header, or a request body. The same rule applies to every
+  string in `syncStatus`, the `Halted` reason included. Diagnostic detail belongs in the
+  leader's log (`Effect.log*` with the cause), never in `syncStatus`. Kind clarifications:
+  `"network"` means no usable RPC result, which includes a body-read, empty, or incomplete
+  response after an HTTP response arrived; `"server"` is the closed union's fallback for any
+  other transient failure, a local `StoreUnavailable` included (an app treats it as "retrying",
+  nothing finer). Cleared (`null`) by the next clean cycle, as before. Consumer-visible shape
+  change; lands before any app ships on `syncStatus`.
 - **`requestSync`**: `Effect<void, SyncDisabled | LeaderUnavailable>` on the tab client. It
   wakes the sync loop (coalesced with the existing wake queue) and completes once the wake is
   accepted. It never implies network success, never clears `Halted`, and retries `LeaderLost`
