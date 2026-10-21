@@ -289,11 +289,23 @@ const atomicity = <S, R>(options: TransactionCase<S, R>) =>
 // Code-point order differs from UTF-16 order between U+FFFF and astral characters.
 const TEXT = ["", "a", "aa", "a\u{1F600}", "B", "b", "Z", "\u00E9", "\uFFFF", "\u{1F600}", "\u{10FFFF}"]
 
+// Beyond int4 on both sides up to the safe-integer limits: int8 storage must round-trip and order
+// these as numbers (DESIGN §10), not only small values.
+const WIDE_INTS = [
+  -Number.MAX_SAFE_INTEGER,
+  -(2 ** 31 + 1),
+  -(2 ** 31),
+  2 ** 31 - 1,
+  2 ** 31,
+  2 ** 31 + 1,
+  Number.MAX_SAFE_INTEGER
+]
+
 const randomItem = (rng: ReturnType<typeof prng>, id: string) =>
   item(id, {
     accessScopeId: rng.chance(0.5) ? s1 : s2,
     label: rng.chance(0.2) ? null : rng.pick(TEXT),
-    rank: rng.chance(0.2) ? null : rng.int(7) - 3,
+    rank: rng.chance(0.2) ? null : rng.chance(0.5) ? rng.int(7) - 3 : rng.pick(WIDE_INTS),
     score: rng.pick([-1.5, -1, 0, 0.25, 1, 2.5, 1e300]),
     flag: rng.chance(0.5),
     at: rng.chance(0.2) ? null : new Date(rng.pick([-86_400_000, -1, 0, 1, 1_700_000_000_000])),
@@ -406,7 +418,7 @@ export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): R
           at: new Date(-1),
           data: { tags: ["", "\u00E9"], n: 0.5 }
         })
-        const second = item("a", { label: "", accessScopeId: s2 })
+        const second = item("a", { label: "", accessScopeId: s2, rank: Number.MAX_SAFE_INTEGER })
         yield* transaction(rows.write(Items, "a", Option.some(first)))
         const one = canonical(yield* transaction(rows.read(Items, "a")))
         if (one !== canonical(Option.some(first))) return yield* fail(`after insert: ${one}`)
