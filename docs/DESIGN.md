@@ -227,7 +227,10 @@ infrastructure failure (connection, pool, `40001` after retries) must surface as
 *failure*, never leak as a defect, or clients halt until reload. On `push` that failure is the
 short result list (the batch stops at the first unprocessed entry). `pull` and `pokes` carry a
 typed transient member, `Protocol.ServerUnavailable`, for the same purpose: the server maps
-`SqlError`/`StoreUnavailable` to it, so a defect from the server always means a bug. The client
+`SqlError`/`StoreUnavailable` to it **over the whole cause**, `Fail` or `Die` alike (the pinned
+`SqlClient` rollback dies on a lost connection, so `Die(SqlError)` is a real production shape);
+a cause that also carries any non-SQL defect stays a defect (§6 precedence, defect > transient).
+So a defect from the server always means a bug. The client
 treats a pull defect as transient anyway (below) as a safety net, not as the contract. The
 `pokes` stream ending for any reason (failure, defect, clean end) is reconnected by the client
 with backoff; it is a hint stream and nothing is lost. Transient push failures
@@ -360,6 +363,12 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   speaks the same port protocol (so the stock `SqliteClient.layer({ worker })` drives it) with a
   per-identity pool directory `echo-sync/<appId>/<profile>`. The protocol is internal to that
   package: re-verify `OpfsSqlite.ts` on every `@effect/sql-sqlite-wasm` bump.
+- Storage transactions on that connection are admitted through a permit taken interruptibly
+  before the connection lease, so a transaction queued behind a long install can be cancelled
+  while it waits. The permit guarantees **serialized, cancellable admission and nothing more**:
+  no fairness, so a fiber that releases and immediately re-acquires may barge ahead of a waiter.
+  Ordering between one tab's mutations comes from the caller sequencing them (each `mutate`
+  completes before the next is issued), never from the lease.
 - Leadership via Web Locks (`echo:<appId>:<profile>:leader`, plus per-incarnation and per-tab
   locks for death detection; never timeouts). Liveness invariant: a candidate that cannot serve (driver failed to open, OPFS unavailable) must release the leader and epoch locks so the next candidate is elected; every lock wait is cancellable. Tabs reach the leader through a `SharedWorker`
   router that holds the leader's control port and relinks a fresh `MessageChannel` per tab;
