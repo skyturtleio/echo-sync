@@ -79,7 +79,7 @@ Engine tables (Postgres schema `echo_sync`):
 | table | purpose |
 |---|---|
 | `access_scopes(id, created_at)` | scope identity (opaque id, app-generated) |
-| `scope_grants` | a **system `SyncTable`** (`id`, `accessScopeId` = the granted scope, `principalId`, `role`, `grantedAt`); `role ∈ {reader, writer, owner}`; principal `*` = everyone (global catalogs). Replicates like any row so clients can run optimistic role checks. v1 disclosure policy: anyone who can read a scope sees who else is granted on it. Writes require `owner` on that scope; the only exception is scope creation (engine primitive: insert `access_scopes` row + first `owner` grant for the actor, allowed for any principal on a fresh id). `(accessScopeId, principalId)` is unique — derive `id` from it so duplicates are structurally impossible. |
+| `scope_grants` | a **system `SyncTable`** (`id`, `accessScopeId` = the granted scope, `principalId`, `role`, `grantedAt`); `role ∈ {reader, writer, owner}`; principal `*` = everyone (global catalogs). Replicates like any row so clients can run optimistic role checks. v1 disclosure policy: anyone who can read a scope sees who else is granted on it. Writes require `owner` on that scope; the only exception is scope creation (engine primitive: insert `access_scopes` row + first `owner` grant for the actor, allowed for any principal on a fresh id). `(accessScopeId, principalId)` is unique — derive `id` from it so duplicates are structurally impossible. `id = grantId(accessScopeId, principalId)` is a server-enforced invariant: `echo_sync.scope_grants` carries a CHECK that recomputes it, so a grant written around the store (raw SQL) can never make an id lookup and a column lookup disagree. `grantId` uses the JS string length (UTF-16 code units) as its prefix; the CHECK must compute the same value for every id it accepts, so ids whose JS length and `char_length` differ (characters outside the BMP) are rejected rather than mis-derived. |
 | `clients(client_id, principal_id, cursor, last_seen_at, created_at)` | one row per client device/profile |
 | `mutations(client_id, mutation_id, position, outcome, received_at)` | ledger: exactly-once + ack delivery |
 | `client_scopes(client_id, position, scope_ids)` | the set of scopes a client **holds** as of each completed pull (written at `PullDone` under `nextCursor`, `ON CONFLICT DO NOTHING`; rows below the cursor a client presents are pruned on that pull). The wire cursor is a bare `Position`, and the held set cannot be rebuilt from the log (identity only, GC'd, revoke+re-grant cancels out), so it is recorded as an explicit fact. A presented cursor with no record ⇒ `ResnapshotRequired(unknownCursor)`, never trusted. |
@@ -464,6 +464,10 @@ const todosByProject = Query.make("todos.byProject", {
 
 - `db.get(T, id)`, `db.query(T).withIndex(name, q => q.eq(...).gt(...)).order(...).take(n)/first()`,
   `db.scan(T)` for small tables. Joins/aggregates happen in ordinary typed code.
+- `take(n)` requires a non-negative safe integer (`Number.isSafeInteger(n) && n >= 0`); anything
+  else (`NaN`, `±Infinity`, negatives, fractions, `2**53`) is a programmer error and is a defect in
+  every store, never silently clamped, truncated, or treated as unlimited. `take(0)` is `[]`.
+  `collect()` is unlimited by construction (plan `limit = None`), not a sentinel passed through `take`.
 - Index ordering is pinned so Postgres, SQLite, and the in-memory reference agree exactly:
   order by the index fields, then `id`. `NULL` is the smallest value (`NULLS FIRST` ascending,
   `NULLS LAST` descending, written explicitly in Postgres index DDL and `ORDER BY` so the index
