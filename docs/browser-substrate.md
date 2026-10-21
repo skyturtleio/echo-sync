@@ -61,12 +61,19 @@ reproduced with `?app=.`).
 - Every lock wait is interruptible: `holdLock` aborts its queued Web Locks request on interruption, and a
   grant that races with the abort is released immediately, so a cancelled waiter never ends up holding
   the lock. Web Locks rejections surface as a typed `LockError` instead of being swallowed.
+- Known limitation (review, nonblocking): lock-cancellation safety relies on Effect's default
+  scheduler, which resumes a granted `request` and enters `holdUntilScopeCloses`' uninterruptible
+  region synchronously. A custom scheduler that yields between the grant's `resume` and that region
+  (or before `awaitLockReleased` releases its shared grant) could, on interruption, leave a granted lock
+  held until the agent dies. Making it scheduler-independent means keeping the grant's resolver for the
+  interruption cleanup and returning immediately from the shared-watcher callback; deferred.
 - Identity segments that are all dots (`.`, `..`) are rejected in the tab before anything is spawned.
 
 ## Stale announcements
 
-The router accepts a `Leader` announcement only if that leader's epoch lock is held when the
-announcement is processed, and processes announcements one at a time. A dead leader's announcement that
+The router accepts a `Leader` announcement only if that leader's epoch lock is held **in exclusive
+mode** when the announcement is processed (`isLockHeld`; shared holders are `awaitLockReleased`
+watchers, which briefly hold a dead leader's epoch right after it dies, and must not count), and processes announcements one at a time. A dead leader's announcement that
 arrives after its successor's (the relaying tab can be slow) is dropped instead of replacing the live
 route. On the tab side every connection is an object; its handshake and epoch watcher only act while it
 is still the active connection, and a displaced connection completes its `lost` signal (typed

@@ -32,6 +32,22 @@ it.live("an interrupted lock wait leaves the queue and never acquires the lock a
   })
 )
 
+it.live("a name held only in shared mode does not count as held (a dead leader's watchers)", () =>
+  Effect.gen(function* () {
+    const name = `test:${crypto.randomUUID()}`
+    let drop: (() => void) | undefined
+    const shared = navigator.locks.request(name, { mode: "shared" }, () => new Promise<void>((r) => (drop = r)))
+    yield* waitUntil(Effect.sync(() => drop !== undefined))
+    expect(yield* Platform.isLockHeld(name)).toBe(false)
+    drop?.()
+    yield* Effect.promise(() => shared)
+    const scope = yield* Scope.make()
+    yield* Platform.holdLock(name).pipe(Scope.provide(scope))
+    expect(yield* Platform.isLockHeld(name)).toBe(true)
+    yield* Scope.close(scope, Exit.void)
+  })
+)
+
 it.live("a Web Locks rejection surfaces as LockError instead of hanging", () =>
   Effect.gen(function* () {
     // Lock names starting with "-" are reserved; the API rejects the request.

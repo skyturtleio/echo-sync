@@ -118,12 +118,17 @@ export const tryHoldLock = (name: string): Effect.Effect<boolean, LockError, Sco
 export const awaitLockReleased = (name: string): Effect.Effect<void, LockError> =>
   Effect.flatMap(request(name, { mode: "shared" }), (release) => Effect.sync(() => release?.()))
 
-/** Whether some agent currently holds `name` exclusively. */
+/**
+ * Whether some agent currently holds `name` exclusively. Shared holders do not count: right after an
+ * exclusive holder dies, `awaitLockReleased` watchers briefly hold the name in shared mode.
+ */
 export const isLockHeld = (name: string): Effect.Effect<boolean, LockError> =>
   Effect.tryPromise({
     try: () => navigator.locks.query(),
     catch: (cause) => lockError(name, cause)
-  }).pipe(Effect.map((snapshot) => (snapshot.held ?? []).some((lock) => lock.name === name)))
+  }).pipe(
+    Effect.map((snapshot) => (snapshot.held ?? []).some((lock) => lock.name === name && lock.mode === "exclusive"))
+  )
 
 /**
  * Whether this agent can host the leader: Web Locks plus OPFS synchronous access handles (worker-only

@@ -108,7 +108,12 @@ return { pass: items.ok && items.value[0].n === 3 && ob.ok && ob.value[0]?.mutat
 # A dead leader's announcement replayed to the router after its successor took over (a delayed relay).
 # The router must ignore it: for 2 s, every surviving tab must keep its route to the new leader.
 NEW_LEADER=$(jq -r '.[0].leaderId' <<<"$statuses")
-ev <<<"echo.forgeLeaderAnnouncement('$OLD_LEADER'); return true" >/dev/null
+# Also hold the dead epoch in shared mode, as a slow awaitLockReleased watcher would right after the death:
+# a shared holder must not count as the leader being alive.
+ab tab "$FOLLOWER" >/dev/null
+ev <<<"const epoch = 'echo:$APP:default:leader:$OLD_LEADER'
+await new Promise((granted) => { window.sharedEpoch = navigator.locks.request(epoch, { mode: 'shared' }, () => { granted(); return new Promise((r) => (window.dropSharedEpoch = r)) }) })
+echo.forgeLeaderAnnouncement('$OLD_LEADER'); return true" >/dev/null
 stable="[]"
 for t in "${TABS[@]}"; do
   [ "$t" = "$LEADER_TAB" ] && continue
@@ -123,7 +128,9 @@ while (Date.now() < end && bad === null) {
 return { bad, samples }")
   stable=$(jq -c --argjson r "$r" '. + [$r]' <<<"$stable")
 done
-check "router ignores a stale announcement from a dead leader (every tab keeps the live route for 2 s)" "$(jq -c '{ pass: all(.[]; .bad == null and .samples > 5), tabs: . }' <<<"$stable")"
+ab tab "$FOLLOWER" >/dev/null
+ev <<<'window.dropSharedEpoch(); await window.sharedEpoch; return true' >/dev/null
+check "router ignores a stale announcement from a dead leader, even while its epoch is held shared (every tab keeps the live route for 2 s)" "$(jq -c '{ pass: all(.[]; .bad == null and .samples > 5), tabs: . }' <<<"$stable")"
 for t in "${TABS[@]}"; do [ "$t" != "$LEADER_TAB" ] && ab tab close "$t" >/dev/null; done
 
 # ── commit before lost response, with simultaneous same-id retries from two tabs ─────────────────────
