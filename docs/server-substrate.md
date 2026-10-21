@@ -14,7 +14,7 @@ unordered idempotency key, `seq` the client's outbox sequence.
 | `ledger.ts` | `runMutation`, `runBatch`, client↔principal binding |
 | `pull.ts` | `pull(registry, request)` (one page per call), the continuation |
 | `rowStore.ts` | core's `RowStore` on Postgres; declared-column projection and row codec |
-| `rpc.ts` | `handlers` / `layerHttp`: `Protocol.SyncRpcs` over HTTP POST + NDJSON |
+| `rpc.ts` | `handlers` / `presenceHandlers` / `layerHttp`: the RPC groups over HTTP POST + NDJSON, composed from transport-neutral steps: `principalFor` (authorize), `executeBatch` (push for an actor), `pull` (pull.ts), `serverFailures` (pull/pokes failure mapping) |
 | `gc.ts` | `collectGarbage(retention)`, `expireLedger({ retention })` |
 
 For how a consumer app wires the server (registry, mutations, app migrations, `Startup.layer`,

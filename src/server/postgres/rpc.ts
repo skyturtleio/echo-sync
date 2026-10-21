@@ -11,6 +11,7 @@ import {
   PubSub,
   Queue,
   Ref,
+  Result,
   Schema,
   Stream
 } from "effect"
@@ -20,7 +21,7 @@ import { RpcSerialization, RpcServer } from "effect/rpc"
 import { SqlClient } from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
 import { AccessScope, Ids, Mutation, Protocol, type Registry, Store } from "echo-sync"
-import { type ClientForbidden, type LedgerOptions, registerClient, runBatch } from "./ledger.ts"
+import { ClientForbidden, type LedgerOptions, registerClient, runBatch } from "./ledger.ts"
 import * as Presence from "./presence.ts"
 import { pull } from "./pull.ts"
 import * as RowStore from "./rowStore.ts"
@@ -94,6 +95,26 @@ const toServerFailure = <E>(
   return verdict._tag === "unavailable"
     ? Effect.fail(serverUnavailable(verdict.error))
     : Effect.failCause<Exclude<E, SqlError>>(verdict.cause)
+}
+
+/**
+ * The pull/pokes failure mapping (DESIGN §6), for any transport: infrastructure (`SqlError`) ⇒
+ * `ServerUnavailable`; a client id bound to another principal (`ClientForbidden`) ⇒
+ * `Unauthorized`; any other defect stays a defect (a server bug); other typed failures pass.
+ */
+export const serverFailures = <A, E, R>(
+  self: Effect.Effect<A, E | ClientForbidden | SqlError, R>
+): Effect.Effect<A, Exclude<E, SqlError> | Protocol.ServerUnavailable | Protocol.Unauthorized, R> => {
+  type Rest = Exclude<E, SqlError> | Protocol.ServerUnavailable
+  const classified: Effect.Effect<A, Rest | ClientForbidden, R> = Effect.catchCause(self, toServerFailure)
+  // `catchFilter` has `catchTag`'s semantics (first failure; otherwise the whole cause passes),
+  // with a filter that names the remainder so the mapping stays generic.
+  return Effect.catchFilter<A, Rest | ClientForbidden, R, ClientForbidden, never, Protocol.Unauthorized, never, Rest>(
+    classified,
+    (e: Rest | ClientForbidden): Result.Result<ClientForbidden, Rest> =>
+      e instanceof ClientForbidden ? Result.succeed(e) : Result.fail(e),
+    (e: ClientForbidden) => Effect.fail(forbidden(e))
+  )
 }
 
 const decodeRole = Schema.decodeUnknownOption(AccessScope.Role)
@@ -256,6 +277,63 @@ export const layerNotifications = (options: Pick<SyncServerOptions, "heartbeatIn
   )
 
 /**
+ * Push for an authenticated `actor`, for any transport (DESIGN §6): resolves the registry's
+ * tables, runs each mutation through the ledger (`runBatch`) with a `Store` scoped to the actor,
+ * and returns the processed prefix as a `PushResponse`. Never fails with infrastructure: a SQL
+ * failure before the first mutation (catalog read) is an empty result list, and `runBatch` turns
+ * one inside the batch into a short list, so a defect always means a server bug (the client halts
+ * push on any defect). A client id bound to another principal fails `Unauthorized`.
+ */
+export const executeBatch = (
+  options: Pick<SyncServerOptions, "registry" | "mutations" | "ledger">,
+  actor: AccessScope.PrincipalId,
+  request: Protocol.PushRequest
+): Effect.Effect<Protocol.PushResponse, Protocol.Unauthorized | Protocol.MalformedEnvelope, SqlClient> =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient
+    const tables = yield* resolveTables(options.registry)
+    const rowStore = yield* RowStore.make(new Map(tables.map((t) => [t.table.name, t.schema])))
+    const items = request.mutations.map((m) => ({
+      mutationId: m.mutationId,
+      seq: BigInt(m.seq),
+      body: Effect.gen(function* () {
+        const now = yield* DateTime.now
+        const { store } = Store.make(rowStore, {
+          actor,
+          roleFor: roleFor(sql, actor),
+          claimScope: claimScope(sql),
+          now
+        })
+        yield* Mutation.run(options.mutations, m, {
+          actor,
+          now,
+          random: Mutation.seededRandom(request.clientId, m.mutationId),
+          store
+        })
+      })
+    }))
+    const batch = yield* runBatch(actor, request.clientId, items, options.ledger)
+    const response: Protocol.PushResponse = {
+      results: batch.processed.map((p) => ({
+        mutationId: Ids.MutationId.make(p.mutationId),
+        position: Ids.Position.make(p.position),
+        outcome: p.outcome
+      }))
+    }
+    return response
+  }).pipe(
+    // Infrastructure before the first mutation (catalog read): nothing processed, a
+    // transient stop. runBatch already turns infrastructure failures inside it into one.
+    Effect.catchCause((cause) => {
+      const verdict = classifyCause(cause)
+      return verdict._tag === "unavailable"
+        ? Effect.succeed<Protocol.PushResponse>({ results: [] })
+        : Effect.failCause(verdict.cause)
+    }),
+    Effect.catchTag("ClientForbidden", (e) => Effect.fail(forbidden(e)))
+  )
+
+/**
  * Handlers for `Protocol.SyncRpcs` over Postgres (DESIGN §6, §8).
  *
  * Pull and pokes report infrastructure failures as `ServerUnavailable`.
@@ -270,48 +348,7 @@ export const handlers = (options: SyncServerOptions) =>
       const pokes = yield* Notifications
       return Protocol.SyncRpcs.of({
         push: (request, { headers }) =>
-          Effect.gen(function* () {
-            const actor = yield* options.principalFor(headers)
-            const tables = yield* resolveTables(options.registry)
-            const rowStore = yield* RowStore.make(new Map(tables.map((t) => [t.table.name, t.schema])))
-            const items = request.mutations.map((m) => ({
-              mutationId: m.mutationId,
-              seq: BigInt(m.seq),
-              body: Effect.gen(function* () {
-                const now = yield* DateTime.now
-                const { store } = Store.make(rowStore, {
-                  actor,
-                  roleFor: roleFor(sql, actor),
-                  claimScope: claimScope(sql),
-                  now
-                })
-                yield* Mutation.run(options.mutations, m, {
-                  actor,
-                  now,
-                  random: Mutation.seededRandom(request.clientId, m.mutationId),
-                  store
-                })
-              })
-            }))
-            const batch = yield* runBatch(actor, request.clientId, items, options.ledger)
-            const response: Protocol.PushResponse = {
-              results: batch.processed.map((p) => ({
-                mutationId: Ids.MutationId.make(p.mutationId),
-                position: Ids.Position.make(p.position),
-                outcome: p.outcome
-              }))
-            }
-            return response
-          }).pipe(
-            // Infrastructure before the first mutation (catalog read): nothing processed, a
-            // transient stop. runBatch already turns infrastructure failures inside it into one.
-            Effect.catchCause((cause) => {
-              const verdict = classifyCause(cause)
-              return verdict._tag === "unavailable"
-                ? Effect.succeed<Protocol.PushResponse>({ results: [] })
-                : Effect.failCause(verdict.cause)
-            }),
-            Effect.catchTag("ClientForbidden", (e) => Effect.fail(forbidden(e))),
+          Effect.flatMap(options.principalFor(headers), (actor) => executeBatch(options, actor, request)).pipe(
             Effect.provideService(SqlClient, sql)
           ),
         pull: (request, { headers }) =>
@@ -324,11 +361,7 @@ export const handlers = (options: SyncServerOptions) =>
               continuation: request.continuation,
               limit: options.pageLimit ?? 500
             })
-          }).pipe(
-            Effect.catchCause(toServerFailure),
-            Effect.catchTag("ClientForbidden", (e) => Effect.fail(forbidden(e))),
-            Effect.provideService(SqlClient, sql)
-          ),
+          }).pipe(serverFailures, Effect.provideService(SqlClient, sql)),
         pokes: ({ clientId }, { headers }) =>
           Stream.unwrap(
             Effect.gen(function* () {
@@ -338,8 +371,7 @@ export const handlers = (options: SyncServerOptions) =>
             }).pipe(Effect.provideService(SqlClient, sql))
           ).pipe(
             // A lost LISTEN connection ends the stream typed; the client reconnects on any end (§6).
-            Stream.catchCause((cause) => Stream.fromEffect(toServerFailure(cause))),
-            Stream.catchTag("ClientForbidden", (e) => Stream.fail(forbidden(e)))
+            Stream.catchCause((cause) => Stream.fromEffect(serverFailures(Effect.failCause(cause))))
           )
       })
     })
