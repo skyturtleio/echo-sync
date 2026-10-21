@@ -218,7 +218,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (§6, §8)", () => {
     Effect.gen(function* () {
       const sql = yield* SqlClient
       const client = yield* connect
-      const received = yield* Queue.unbounded<unknown>()
+      const received = yield* Queue.unbounded<typeof Protocol.PokesElement.Type>()
       yield* Effect.forkChild(
         Stream.runForEach(client.pokes({ clientId: Ids.ClientId.make("d") }), (poke) => Queue.offer(received, poke))
       )
@@ -283,7 +283,7 @@ const listeners = Effect.gen(function* () {
 /** Opens a pokes stream whose pokes land in a queue; the stream's exit lands in `ended`. */
 const openPokes = (client: Effect.Success<typeof connect>, ended: Queue.Queue<string>) =>
   Effect.gen(function* () {
-    const received = yield* Queue.unbounded<unknown>()
+    const received = yield* Queue.unbounded<typeof Protocol.PokesElement.Type>()
     yield* Effect.forkChild(
       Effect.exit(
         Stream.runForEach(client.pokes({ clientId: Ids.ClientId.make("d") }), (poke) => Queue.offer(received, poke))
@@ -292,9 +292,14 @@ const openPokes = (client: Effect.Success<typeof connect>, ended: Queue.Queue<st
     return received
   })
 
-const nextPoke = (received: Queue.Queue<unknown>) =>
-  Effect.flatMap(Effect.timeoutOption(Queue.take(received), "5 seconds"), (poke) =>
-    Option.isSome(poke) ? Effect.void : Effect.fail("no poke within 5 s")
+/** The next `poke` within 5 s in total; heartbeats in between are skipped, they announce nothing. */
+const nextPoke = (received: Queue.Queue<typeof Protocol.PokesElement.Type>) =>
+  Effect.flatMap(
+    Effect.timeoutOption(
+      Effect.repeat(Queue.take(received), { until: (element) => element._tag === "poke" }),
+      "5 seconds"
+    ),
+    (poke) => (Option.isSome(poke) ? Effect.void : Effect.fail("no poke within 5 s"))
   )
 
 describe.skipIf(!pgAvailable)("one LISTEN per server process (§6)", () => {
