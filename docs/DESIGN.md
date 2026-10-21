@@ -394,7 +394,16 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   `"opfs"`, which is also its OPFS directory, and takes exclusive access handles on every file in
   it, so two identities (`appId`/`profile`) on one origin block each other (reproduced). Ours
   speaks the same port protocol (so the stock `SqliteClient.layer({ worker })` drives it) with a
-  per-identity pool directory `echo-sync/<appId>/<profile>`. The protocol is internal to that
+  per-identity pool directory `echo-sync/<appId>/<profile>`. **Path capacity ruling (HeyBabe
+  trial):** `wa-sqlite`'s `VFS.Base` declares `mxPathname = 64`, while `AccessHandlePoolVFS`
+  itself stores paths up to its 512-byte file header. A UUID-length profile makes
+  `echo-sync/<appId>/<profile>.db` plus SQLite's `-journal` suffix exceed 64 and `sqlite3_open_v2`
+  fails with an opaque `LeaderFailed`. The host must raise the registered VFS's `mxPathname` to
+  the pool header's capacity (derive the bound from the pinned sources, leaving room for the
+  journal suffix), keep the existing `dbName` layout so existing pools stay readable, and
+  `validateIdentity` must reject an identity whose database path would not fit with a message
+  that names the limit. Any UUID-length `profile` with a reasonable `appId` must be accepted.
+  The protocol is internal to that
   package: re-verify `OpfsSqlite.ts` on every `@effect/sql-sqlite-wasm` bump.
 - Storage transactions on that connection are admitted through a permit taken interruptibly
   before the connection lease, so a transaction queued behind a long install can be cancelled
