@@ -121,6 +121,10 @@ needed to keep the invariant.
 | Chrome Android | yes | historically **no** | yes | `single-tab` | Documentation; the runtime check decides |
 | Firefox desktop | 96+ | yes | 111+ | `shared-worker` | Documentation; not run here |
 | Safari macOS / iOS | 15.4+ | 16+ (re-added) | 15.2+ (`createSyncAccessHandle`), full sync API later | `shared-worker` expected | Documentation; not run here |
+| Language runtime (ES2023: `Array.prototype.toSorted`, used by core) | — | — | — | — | Chrome/Edge 110+, Firefox 115+, Safari 16+ |
+
+**Effective minimum browser** is the maximum over all rows: **Chrome/Edge 110, Firefox 115, Safari 16**.
+The binding row is the ES2023 language runtime (core's tsconfig target, `toSorted`), not any storage API.
 
 Caveats, all from documentation and untested here:
 

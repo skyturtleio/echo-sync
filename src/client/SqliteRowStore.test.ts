@@ -7,6 +7,7 @@ import * as SqlClient from "effect/sql/SqlClient"
 import { AccessScope, Registry, Store, SyncTable } from "../core/index.ts"
 import * as Outbox from "./Outbox.ts"
 import * as SqliteRowStore from "./SqliteRowStore.ts"
+import * as SqliteSyncStorage from "./sync/SqliteSyncStorage.ts"
 
 const ItemId = Schema.String.pipe(Schema.brand("ItemId"))
 const itemFields = {
@@ -18,11 +19,10 @@ const itemFields = {
   at: Schema.Date,
   doc: Schema.Struct({ tags: Schema.Array(Schema.String) })
 }
-const noteFields = { id: ItemId, accessScopeId: AccessScope.AccessScopeId, body: Schema.String }
 const Items = SyncTable.make("items", itemFields, {
   indexes: { by_label: ["label", "rank"], by_flag_at: ["flag", "at"] }
 })
-const Notes = SyncTable.make("notes", noteFields)
+const Notes = SyncTable.make("notes", { id: ItemId, accessScopeId: AccessScope.AccessScopeId, body: Schema.String })
 const registry = Registry.make([Items, Notes])
 
 // Text where UTF-16 code-unit order and code-point order disagree (U+FFFF vs U+1F600), plus case and NULL.
@@ -74,11 +74,10 @@ const randomPlan = (r: ReturnType<typeof rng>): Store.IndexRangePlan => {
   return { index, eq, lower: bound(), upper: bound(), order: r.next() < 0.5 ? "asc" : "desc" }
 }
 
-const Db = Layer.effectDiscard(Effect.andThen(Outbox.migrate, SqliteRowStore.migrate(registry))).pipe(
+const Db = Layer.effectDiscard(SqliteSyncStorage.migrate(registry)).pipe(
   Layer.provideMerge(SqliteClient.layerMemory({}))
 )
-const storeFor = (reg: Registry.SyncRegistry) =>
-  Effect.map(SqlClient.SqlClient, (sql) => ({ sql, store: SqliteRowStore.make(sql, reg) }))
+const storeFor = Effect.map(SqlClient.SqlClient, (sql) => ({ sql, store: SqliteRowStore.make(sql, registry) }))
 const ids = (rows: ReadonlyArray<SyncTable.EncodedRow>) => rows.map((row) => row["id"])
 const note = (id: string, scope: string, body: string): SyncTable.EncodedRow => ({ id, access_scope_id: scope, body })
 const appendIntent = Outbox.append({ clientId: "c", mutationId: "m", name: "t", args: {} })
@@ -86,7 +85,7 @@ const pendingIds = Effect.map(Outbox.pending, (entries) => entries.map((e) => e.
 
 it.effect("range returns exactly core's reference rows in core's reference order (seeded random plans)", () =>
   Effect.gen(function* () {
-    const { sql, store } = yield* storeFor(registry)
+    const { sql, store } = yield* storeFor
     for (const seed of [1, 2, 3]) {
       const r = rng(seed)
       const rows = randomRows(r, 80)
@@ -110,7 +109,7 @@ it.effect("range returns exactly core's reference rows in core's reference order
 
 it.effect("write/read round-trips every column kind; None deletes; scan orders ids by code point", () =>
   Effect.gen(function* () {
-    const { store } = yield* storeFor(registry)
+    const { store } = yield* storeFor
     const rows = randomRows(rng(9), 5)
     const odd = Schema.encodeSync(Items.wire)({
       id: ItemId.make("😀"),
@@ -134,7 +133,7 @@ it.effect("write/read round-trips every column kind; None deletes; scan orders i
 
 it.effect("clearAll and purgeScope touch only replicated rows; the outbox and meta survive", () =>
   Effect.gen(function* () {
-    const { sql, store } = yield* storeFor(registry)
+    const { sql, store } = yield* storeFor
     for (const row of randomRows(rng(4), 20)) yield* store.write(Items, String(row["id"]), Option.some(row))
     yield* store.write(Notes, "n1", Option.some(note("n1", "s1", "x")))
     yield* store.write(Notes, "n2", Option.some(note("n2", "s2", "y")))
@@ -145,44 +144,11 @@ it.effect("clearAll and purgeScope touch only replicated rows; the outbox and me
     expect(scopes.length).toBeGreaterThan(0)
     expect(new Set(scopes)).toEqual(new Set(["s2"]))
 
+    const metaRows = sql`SELECT key, value FROM echo_meta ORDER BY key`
+    const metaBefore = yield* metaRows
     yield* store.clearAll
     for (const table of registry.tables) expect(yield* store.scan(table)).toEqual([])
     expect(yield* pendingIds).toEqual(["m"])
-    const meta = yield* sql<{ n: number }>`SELECT count(*) AS n FROM echo_meta`
-    expect(meta[0]?.n).toBe(3)
-  }).pipe(Effect.provide(Db))
-)
-
-it.effect("an index-only change keeps rows; a data-shape change rebuilds the replica and keeps the outbox", () =>
-  Effect.gen(function* () {
-    const { store } = yield* storeFor(registry)
-    yield* store.write(Notes, "n1", Option.some(note("n1", "s1", "x")))
-    yield* appendIntent
-    expect(yield* SqliteRowStore.migrate(registry)).toEqual({ rebuilt: false })
-
-    const reindexedNotes = SyncTable.make("notes", noteFields, { indexes: { by_body: ["body"] } })
-    const reindexed = Registry.make([SyncTable.make("items", itemFields), reindexedNotes])
-    expect(reindexed.dataHash).toBe(registry.dataHash)
-    expect(reindexed.indexHash).not.toBe(registry.indexHash)
-    expect(yield* SqliteRowStore.migrate(reindexed)).toEqual({ rebuilt: false })
-    const afterReindex = (yield* storeFor(reindexed)).store
-    expect(ids(yield* afterReindex.scan(reindexedNotes))).toEqual(["n1"])
-    const byBody = yield* afterReindex.range(reindexedNotes, {
-      index: reindexedNotes.indexes.by_body,
-      eq: ["x"],
-      lower: Option.none(),
-      upper: Option.none(),
-      order: "asc"
-    })
-    expect(ids(byBody)).toEqual(["n1"])
-
-    const reshapedNotes = SyncTable.make("notes", { ...noteFields, title: Schema.String })
-    const reshaped = Registry.make([Items, reshapedNotes])
-    expect(yield* SqliteRowStore.migrate(reshaped)).toEqual({ rebuilt: true })
-    const afterReshape = (yield* storeFor(reshaped)).store
-    expect(yield* afterReshape.scan(reshapedNotes)).toEqual([])
-    yield* afterReshape.write(reshapedNotes, "n2", Option.some({ ...note("n2", "s1", "y"), title: "t" }))
-    expect(ids(yield* afterReshape.scan(reshapedNotes))).toEqual(["n2"])
-    expect(yield* pendingIds).toEqual(["m"])
+    expect(yield* metaRows).toEqual(metaBefore)
   }).pipe(Effect.provide(Db))
 )

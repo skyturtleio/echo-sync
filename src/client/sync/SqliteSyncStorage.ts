@@ -13,6 +13,8 @@
 import { Effect, Option, Schema } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
+import { AccessScope, type Errors, type Registry, SyncTable } from "../../core/index.ts"
+import * as SqliteRowStore from "../SqliteRowStore.ts"
 import * as Outbox from "../Outbox.ts"
 import type * as Engine from "./Engine.ts"
 import type { MutationEnvelope, PullPage, RowWriter, UndoImage } from "./Wire.ts"
@@ -87,16 +89,79 @@ const encodeMeta = encode(StoredMeta)
 
 const initialMeta: Engine.SyncMeta = { cursor: null, pushedThrough: 0, resnapshot: false }
 
-/** Idempotent DDL for the engine's tables beside `echo_outbox` (run after `Outbox.migrate`). */
-export const migrate: Effect.Effect<void, SqlError, SqlClient.SqlClient> = Effect.gen(function* () {
-  const sql = yield* SqlClient.SqlClient
-  yield* sql.withTransaction(
-    Effect.gen(function* () {
-      yield* sql`CREATE TABLE IF NOT EXISTS echo_staged (ord INTEGER PRIMARY KEY AUTOINCREMENT, page TEXT NOT NULL) STRICT`
-      yield* sql`CREATE TABLE IF NOT EXISTS echo_notices (id INTEGER PRIMARY KEY AUTOINCREMENT, notice TEXT NOT NULL) STRICT`
-    })
-  )
-})
+const StoredTables = Schema.fromJsonString(Schema.Array(Schema.String))
+const decodeTables = decode(StoredTables)
+const encodeTables = encode(StoredTables)
+const q = (name: string) => `"${name.replaceAll('"', '""')}"`
+
+/**
+ * Brings the leader's database in line with `registry` (DESIGN §9, §11) in ONE SQLite transaction:
+ * the outbox, the engine's tables, the replica tables, and the bookkeeping that describes them.
+ *
+ * The registry's manifest hashes live in `echo_meta` under `replica_tables`, `replica_data_hash` and
+ * `replica_index_hash`; this function is their only writer.
+ * - First run: create every replica table and index.
+ * - `dataHash` changed: drop the previous replica tables, recreate them empty, and in the same
+ *   transaction reset what described the old replica: `cursor` to `null`, `resnapshot` off, staged
+ *   pages deleted, pending undo images emptied (they pre-image rows that no longer exist). The outbox,
+ *   `pushedThrough` and notices are kept. A crash at any point therefore leaves either the old tables
+ *   with the old cursor or the new tables with a `null` cursor, never a mix. Returns `rebuilt: true`.
+ * - Only `indexHash` changed: drop and recreate the declared indexes; rows and cursor stay.
+ */
+export const migrate = (
+  registry: Registry.SyncRegistry
+): Effect.Effect<{ readonly rebuilt: boolean }, SqlError, SqlClient.SqlClient> =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* Outbox.migrate
+        yield* sql`CREATE TABLE IF NOT EXISTS echo_staged (ord INTEGER PRIMARY KEY AUTOINCREMENT, page TEXT NOT NULL) STRICT`
+        yield* sql`CREATE TABLE IF NOT EXISTS echo_notices (id INTEGER PRIMARY KEY AUTOINCREMENT, notice TEXT NOT NULL) STRICT`
+        const meta = new Map(
+          (yield* sql<{ readonly key: string; readonly value: string }>`
+            SELECT key, value FROM echo_meta WHERE key IN ('replica_tables', 'replica_data_hash', 'replica_index_hash')`).map(
+            (r) => [r.key, r.value]
+          )
+        )
+        const put = (key: string, value: string) =>
+          sql`INSERT INTO echo_meta (key, value) VALUES (${key}, ${value})
+            ON CONFLICT (key) DO UPDATE SET value = excluded.value`
+        const createIndexes = Effect.forEach(
+          registry.tables.flatMap((t) => t.sqlite.createIndexes),
+          (ddl) => sql.unsafe(ddl)
+        )
+        const previous = meta.get("replica_tables")
+        const rebuilt = previous !== undefined && meta.get("replica_data_hash") !== registry.dataHash
+
+        if (previous === undefined || rebuilt) {
+          for (const name of previous === undefined ? [] : yield* decodeTables(previous)) {
+            yield* sql.unsafe(`DROP TABLE IF EXISTS ${q(name)}`)
+          }
+          for (const table of registry.tables) yield* sql.unsafe(table.sqlite.createTable)
+          yield* createIndexes
+          // Nothing may describe rows that are not in the new tables.
+          const stored = yield* sql<{ readonly value: string }>`SELECT value FROM echo_meta WHERE key = 'sync_meta'`
+          const current = stored[0] === undefined ? initialMeta : yield* decodeMeta(stored[0].value)
+          yield* put("sync_meta", yield* encodeMeta({ ...current, cursor: null, resnapshot: false }))
+          yield* sql`DELETE FROM echo_staged`
+          yield* sql`UPDATE echo_outbox SET undo = '[]' WHERE released_at IS NULL`
+        } else if (meta.get("replica_index_hash") !== registry.indexHash) {
+          const names = registry.tables.map((t) => t.name)
+          const indexes = yield* sql.unsafe<{ readonly name: string }>(
+            `SELECT name FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL AND tbl_name IN (${names.map(() => "?").join(", ")})`,
+            names
+          )
+          for (const { name } of indexes) yield* sql.unsafe(`DROP INDEX ${q(name)}`)
+          yield* createIndexes
+        }
+        yield* put("replica_tables", yield* encodeTables(registry.tables.map((t) => t.name)))
+        yield* put("replica_data_hash", registry.dataHash)
+        yield* put("replica_index_hash", registry.indexHash)
+        return { rebuilt }
+      })
+    )
+  })
 
 const toEnvelope = (entry: Outbox.OutboxEntry): MutationEnvelope => ({
   clientId: entry.clientId,
@@ -106,11 +171,34 @@ const toEnvelope = (entry: Outbox.OutboxEntry): MutationEnvelope => ({
   args: entry.args
 })
 
+const toCoreRow = Schema.decodeUnknownEffect(SyncTable.EncodedRow)
+
 /**
- * `rows` is the replica's row store (the SQLite `ReplicaRowStore` once core's ports are on main); it
- * must run its statements on the same `SqlClient`, so they join this storage's transactions.
+ * `rows` is the SQLite `ReplicaRowStore` for `registry`, on the same connection, so its statements join
+ * this storage's transactions. Until the engine takes core's ports (reconcile's type swap), the engine's
+ * name-keyed `RowWriter` is adapted here: a name the registry does not know is a defect, because the
+ * engine skips unknown tables before writing (DESIGN §8) and handlers only write registered tables.
  */
-export const make = (sql: SqlClient.SqlClient, rows: RowWriter<SqlError>): Engine.SyncStorage<SqlError> => {
+export const make = (
+  sql: SqlClient.SqlClient,
+  registry: Registry.SyncRegistry
+): Engine.SyncStorage<SqlError | Errors.StoreUnavailable> => {
+  const store = SqliteRowStore.make(sql, registry)
+  const tableNamed = (name: string) =>
+    Option.match(registry.get(name), {
+      onNone: () => Effect.die(new Error(`echo-sync: write to unregistered table ${name}`)),
+      onSome: Effect.succeed
+    })
+  const rows: RowWriter<Errors.StoreUnavailable> = {
+    write: (name, id, row) =>
+      Effect.gen(function* () {
+        const table = yield* tableNamed(name)
+        const value = Option.isNone(row) ? Option.none() : Option.some(yield* Effect.orDie(toCoreRow(row.value)))
+        yield* store.write(table, id, value)
+      }),
+    purgeScope: (scopeId) => store.purgeScope(AccessScope.AccessScopeId.make(scopeId)),
+    clearAll: store.clearAll
+  }
   const provide = <A, E>(effect: Effect.Effect<A, E, SqlClient.SqlClient>) =>
     Effect.provideService(effect, SqlClient.SqlClient, sql)
 

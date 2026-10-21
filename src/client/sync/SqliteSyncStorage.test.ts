@@ -2,38 +2,26 @@
 import "../testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { expect, it } from "@effect/vitest"
-import { Deferred, Effect, Fiber, Layer, Option } from "effect"
+import { Deferred, Effect, Fiber, Layer, Option, Schema, Scope } from "effect"
+import type { Scheduler } from "effect/Scheduler"
 import * as SqlClient from "effect/sql/SqlClient"
+import { AccessScope, Registry, SyncTable } from "../../core/index.ts"
 import * as Outbox from "../Outbox.ts"
 import * as SqliteSyncStorage from "./SqliteSyncStorage.ts"
-import type { RowWriter } from "./Wire.ts"
 
-// Stand-in for the SQLite ReplicaRowStore: one table, statements on the same connection.
-const Db = Layer.effectDiscard(
-  Effect.gen(function* () {
-    const sql = yield* SqlClient.SqlClient
-    yield* Outbox.migrate
-    yield* SqliteSyncStorage.migrate
-    yield* sql`CREATE TABLE replica (id TEXT PRIMARY KEY, row TEXT NOT NULL)`
-  })
-).pipe(Layer.provideMerge(SqliteClient.layerMemory({})))
+const TId = Schema.String.pipe(Schema.brand("TId"))
+const T = SyncTable.make("t", { id: TId, accessScopeId: AccessScope.AccessScopeId })
+const registry = Registry.make([T])
+const Db = Layer.effectDiscard(SqliteSyncStorage.migrate(registry)).pipe(
+  Layer.provideMerge(SqliteClient.layerMemory({}))
+)
 
 const makeStorage = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient
-  const rows: RowWriter<never> & { readonly ids: Effect.Effect<ReadonlyArray<string>> } = {
-    write: (_table, id, row) =>
-      Effect.orDie(
-        Option.isSome(row)
-          ? sql`INSERT OR REPLACE INTO replica (id, row) VALUES (${id}, ${JSON.stringify(row.value)})`
-          : sql`DELETE FROM replica WHERE id = ${id}`
-      ).pipe(Effect.asVoid),
-    purgeScope: () => Effect.void,
-    clearAll: Effect.orDie(Effect.asVoid(sql`DELETE FROM replica`)),
-    ids: Effect.orDie(sql<{ id: string }>`SELECT id FROM replica ORDER BY id`).pipe(
-      Effect.map((r) => r.map((x) => x.id))
-    )
+  const rows = {
+    ids: Effect.orDie(sql<{ id: string }>`SELECT id FROM t ORDER BY id`).pipe(Effect.map((r) => r.map((x) => x.id)))
   }
-  return { storage: SqliteSyncStorage.make(sql, rows), rows }
+  return { storage: SqliteSyncStorage.make(sql, registry), rows }
 })
 
 const entry = (seq: number, mutationId: string) => ({
@@ -148,3 +136,147 @@ it.live("an interrupted transaction rolls back rows, outbox, seq and meta togeth
     expect(yield* storage.transaction(storage.nextSeq)).toBe(1)
   }).pipe(Effect.provide(Db))
 )
+
+// --- migrate (DESIGN §9, §11): the replica schema and the bookkeeping that describes it move together.
+
+const reindexed = Registry.make([
+  SyncTable.make(
+    "t",
+    { id: TId, accessScopeId: AccessScope.AccessScopeId },
+    { indexes: { by_scope: ["accessScopeId"] } }
+  )
+])
+const reshaped = Registry.make([
+  SyncTable.make("t", { id: TId, accessScopeId: AccessScope.AccessScopeId, n: Schema.NullOr(Schema.Int) }),
+  SyncTable.make("u", { id: TId, accessScopeId: AccessScope.AccessScopeId })
+])
+
+const page = {
+  _tag: "PullPage" as const,
+  changes: [{ _tag: "upsert" as const, table: "t", row: { id: "b", access_scope_id: "s" } }],
+  acks: [],
+  continuation: "k"
+}
+
+/** An installed replica mid-sync: rows, a cursor, a staged page, a pending entry with undo, a released one. */
+const seedOldReplica = Effect.gen(function* () {
+  const { storage } = yield* makeStorage
+  yield* storage.transaction(
+    Effect.gen(function* () {
+      yield* storage.rows.write("t", "a", Option.some({ id: "a", access_scope_id: "s" }))
+      yield* storage.appendPending(entry(yield* storage.nextSeq, "p"))
+      yield* storage.appendPending(entry(yield* storage.nextSeq, "r"))
+      yield* storage.release([2])
+      yield* storage.stage(page)
+      yield* storage.setMeta({ cursor: 7n, pushedThrough: 2, resnapshot: true })
+    })
+  )
+})
+
+/** Which replica the database describes: "old", "new", or "mixed" (the failure). */
+const classify = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient
+  const { storage } = yield* makeStorage
+  const hash = yield* sql<{ value: string }>`SELECT value FROM echo_meta WHERE key = 'replica_data_hash'`
+  const columns = yield* sql<{ name: string }>`SELECT name FROM pragma_table_info('t')`
+  const hasU = (yield* sql`SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'u'`).length === 1
+  const rowIds = (yield* sql<{ id: string }>`SELECT id FROM t`).map((r) => r.id)
+  const meta = yield* storage.meta
+  const staged = (yield* storage.staged).length
+  const pending = yield* storage.pending
+  const undo = pending.flatMap((e) => e.undo).length
+  // Kept in every outcome: the outbox (pending and released) and pushedThrough.
+  const kept =
+    pending.map((e) => e.envelope.seq).join() === "1" &&
+    Option.isSome(yield* storage.lookup("r")) &&
+    meta.pushedThrough === 2
+  const old = [
+    hash[0]?.value === registry.dataHash,
+    columns.length === 2,
+    !hasU,
+    rowIds.join() === "a",
+    meta.cursor === 7n,
+    meta.resnapshot,
+    staged === 1,
+    undo === 1
+  ]
+  const fresh = [
+    hash[0]?.value === reshaped.dataHash,
+    columns.length === 3,
+    hasU,
+    rowIds.length === 0,
+    meta.cursor === null,
+    !meta.resnapshot,
+    staged === 0,
+    undo === 0
+  ]
+  if (kept && old.every(Boolean)) return "old"
+  if (kept && fresh.every(Boolean)) return "new"
+  return `mixed ${JSON.stringify({ kept, old, fresh })}`
+})
+
+it.effect("an index-only change keeps rows and cursor; a data-shape change rebuilds and resets them together", () =>
+  Effect.gen(function* () {
+    yield* seedOldReplica
+    expect(yield* SqliteSyncStorage.migrate(registry)).toEqual({ rebuilt: false })
+    expect(yield* classify).toBe("old")
+
+    expect(reindexed.dataHash).toBe(registry.dataHash)
+    expect(yield* SqliteSyncStorage.migrate(reindexed)).toEqual({ rebuilt: false })
+    const sql = yield* SqlClient.SqlClient
+    const indexes = yield* sql<{
+      name: string
+    }>`SELECT name FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL AND tbl_name = 't'`
+    expect(indexes.length).toBe(1)
+    expect(yield* SqliteSyncStorage.migrate(registry)).toEqual({ rebuilt: false })
+    expect(yield* classify).toBe("old")
+
+    expect(yield* SqliteSyncStorage.migrate(reshaped)).toEqual({ rebuilt: true })
+    expect(yield* classify).toBe("new")
+    expect(yield* SqliteSyncStorage.migrate(reshaped)).toEqual({ rebuilt: false })
+  }).pipe(Effect.provide(Db))
+)
+
+it("a data-shape migration interrupted at any scheduler boundary leaves the old replica or the new one, never a mix", async () => {
+  const outcomes = new Map<string, Array<number>>()
+  for (let boundary = 1; ; boundary++) {
+    const scope = await Effect.runPromise(Scope.make())
+    const context = await Effect.runPromise(Layer.buildWithScope(Db, scope))
+    const run = Effect.runPromiseExitWith(context)
+    await run(seedOldReplica)
+
+    const controller = new AbortController()
+    let ticks = 0
+    let yielded = false
+    const tasks: Array<() => void> = []
+    const scheduler: Scheduler = {
+      executionMode: "async",
+      shouldYield: () => !yielded && ++ticks === boundary && (yielded = true),
+      makeDispatcher: () => ({
+        scheduleTask: (task) => {
+          tasks.push(task)
+        },
+        flush: () => {
+          while (tasks.length > 0) tasks.shift()?.()
+        }
+      })
+    }
+    const state = { settled: false }
+    const migrating = run(SqliteSyncStorage.migrate(reshaped), { scheduler, signal: controller.signal }).finally(
+      () => (state.settled = true)
+    )
+    if (yielded) controller.abort()
+    while (!state.settled) {
+      while (tasks.length > 0) tasks.shift()?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    await migrating
+    const outcome = await run(classify)
+    const label = outcome._tag === "Success" ? outcome.value : `classify failed ${String(outcome.cause)}`
+    outcomes.set(label, [...(outcomes.get(label) ?? []), boundary])
+    await Effect.runPromise(Scope.close(scope, outcome))
+    if (!yielded) break // the migration ran to completion before reaching this boundary: the sweep is done
+  }
+  expect([...outcomes.keys()].toSorted()).toEqual(["new", "old"])
+  expect((outcomes.get("old") ?? []).length).toBeGreaterThan(10) // the sweep spans the transaction
+})
