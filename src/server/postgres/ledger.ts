@@ -163,8 +163,7 @@ const classify = (
 
 /**
  * Binds a client id to its principal on first sight and refuses it to any other principal, so
- * one principal can never read another's acks or replay another's mutation ids. Inside a
- * transaction the upsert also row-locks the client until commit.
+ * one principal can never read another's acks or replay another's mutation ids.
  */
 export const registerClient = Effect.fnUntraced(function* (principalId: string, clientId: string) {
   const sql = yield* SqlClient
@@ -172,6 +171,29 @@ export const registerClient = Effect.fnUntraced(function* (principalId: string, 
     INSERT INTO echo_sync.clients (client_id, principal_id) VALUES (${clientId}, ${principalId})
     ON CONFLICT (client_id) DO UPDATE SET last_seen_at = now()
     RETURNING principal_id, expired_through, expired_position`
+  const row = rows[0]
+  if (row === undefined || row.principal_id !== principalId) {
+    return yield* new ClientForbidden({ clientId })
+  }
+  return row
+})
+
+/**
+ * `registerClient` for the SERIALIZABLE ledger transaction: binds on first sight, then row-locks
+ * the client until commit without modifying it. Concurrent submissions of one client serialize
+ * on the lock, and because the row is only locked, a waiter is not failed with 40001 when the
+ * holder commits; a duplicate then fails once on the ledger's unique key (40001 under
+ * SERIALIZABLE) and its retry replays the recorded outcome. Updating the row here (as
+ * `last_seen_at` does) would make every replay fail the remaining waiters again.
+ */
+const lockClient = Effect.fnUntraced(function* (principalId: string, clientId: string) {
+  const sql = yield* SqlClient
+  yield* sql`
+    INSERT INTO echo_sync.clients (client_id, principal_id) VALUES (${clientId}, ${principalId})
+    ON CONFLICT (client_id) DO NOTHING`
+  const rows = yield* sql<{ principal_id: string; expired_through: bigint; expired_position: bigint }>`
+    SELECT principal_id, expired_through, expired_position FROM echo_sync.clients
+    WHERE client_id = ${clientId} FOR UPDATE`
   const row = rows[0]
   if (row === undefined || row.principal_id !== principalId) {
     return yield* new ClientForbidden({ clientId })
@@ -210,7 +232,7 @@ export const runMutation = <R>(
         // concurrent mutations would both commit on one stale read (lost update). A conflict is
         // 40001, which retries the whole attempt (§6).
         yield* sql`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`
-        const client = yield* registerClient(envelope.principalId, envelope.clientId)
+        const client = yield* lockClient(envelope.principalId, envelope.clientId)
         if (envelope.seq <= client.expired_through) {
           const expired: Processed = {
             outcome: {
