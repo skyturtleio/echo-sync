@@ -421,6 +421,34 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
 - `navigator.storage.persist()`, pending-writes warning on clear/sign-out, export of pending
   mutations.
 
+### 9.1 Tab-side API (the contract every UI adapter builds on)
+
+`src/client` owns one typed tab-side surface; `src/foldkit` and any other adapter are thin
+translations of it and add no sync semantics of their own. Rulings (coordinator, from
+`docs/foldkit-adapter.md`):
+
+- **`mutate(mutation, args)`** is the only write API. It encodes `args` with the mutation's
+  schema, **generates `mutationId` itself** (one id per logical call, fixed before the first
+  `enqueue` attempt, so a retry after `LeaderLost` reuses it and lands on the §9 idempotency
+  rule), retries `LeaderUnavailable{LeaderLost}` and nothing else, and completes only after the
+  leader's commit. Apps never mint `mutationId`; an explicit id is accepted only for replay and
+  tests. The caller still sequences its own mutations (await each before issuing the next).
+- **`subscribe(query, args)`** takes a registered query (§10.1), not SQL, and is a `Stream` that
+  survives handover: on `LeaderLost` it re-subscribes to the new leader and **keeps the last
+  emission** until the first fresh one arrives (no flash-to-empty). Every emission is decoded
+  with the query's `success` Schema on the tab. Any other error ends the stream.
+- **Notices** are a `Stream` of the retained list (current value, then every change; reactive
+  on `echo_notices`), plus **`dismissNotices(ids)`**. "Retained for inspection, not silently
+  erased" (§9) means exactly: the engine never removes a notice on its own, there is no cap,
+  and only an explicit dismissal deletes one. A notice carries the full envelope, so an
+  undismissed `Rejected`/`OutcomeUnknown` is also the user's recovery record for that intent.
+- **`status`** is a `Stream` (mode, `isLeaderTab`, `leaderId`), current value then changes;
+  `syncStatus` stays as is. `mode: "unsupported"` and `SecondaryTabWithoutRouter` are states the
+  adapter must render, not errors it may swallow.
+- **Credentials**: `syncHeaders` is evaluated once per leader (§6: `Unauthorized` is retried,
+  so a renewed credential needs a new leader today). Refresh without a leader restart is §16
+  item 10.
+
 ## 10. Queries (client read API)
 
 Convex-style typed data API, not a SQL builder:
@@ -461,6 +489,35 @@ const todosByProject = Query.make("todos.byProject", {
   (requires our own `OpfsWorker` equivalent or a package override, since `OpfsWorker`
   hard-imports `@effect/wa-sqlite/dist/wa-sqlite.mjs`), or search without FTS (e.g. `LIKE` over
   indexed columns / trigram-ish helper columns). Tracked as open item 6.
+
+### 10.1 Query registry and execution (coordinator rulings)
+
+- **`Query.make` lives in `src/core` and mirrors `Mutation.make`**: `name`, `args` Schema,
+  mandatory `success` Schema, and `handler: (db: EchoStore, args) => Effect<Success, ReadError>`.
+  `Query.makeRegistry(queries)` is given to the leader next to the mutation registry. The
+  `EchoStore` is the one that already exists (`src/core/Store.ts`, `Store.make` over the
+  client's `SqliteRowStore`, with the same `roleFor` the engine uses for optimistic
+  execution), so queries and mutation handlers read through one typed API and one ordering
+  definition. No new query engine.
+- **Tabs send `(name, encoded args)`**, never SQL. The leader decodes `args` with the query's
+  schema (a decode failure is the tab's bug: a typed error, not `SqlFailure`), runs the handler
+  in one read transaction, and sends the **encoded** result; the tab decodes with `success`.
+- **Dependencies are recorded, not declared.** The store records every table a run touches
+  (`get`, `query`, `scan`); the live subscription is reactive on exactly the tables read by the
+  **latest** run, re-derived after each run. This is correct because handlers are deterministic
+  functions of their args and their reads (same purity rule as mutation handlers, §5): a table a
+  run did not read cannot change that run's result, and a run that newly reads a table widens
+  the set before the next change can be missed. Result + dependency set come from one read
+  transaction, so an emission is never a mixed snapshot.
+- **Raw SQL.** The declared-tables `LiveQuery` subscription stays as §10's read escape hatch,
+  wrapped on the tab with an explicit result Schema; the leader runs it with the connection in
+  `PRAGMA query_only` for that admitted transaction, so a raw statement that writes fails
+  instead of committing (admission is serialized, so toggling the pragma is safe). Raw
+  **`exec`** (writes outside the outbox, which break the §9 replica invariant) is a harness
+  tool: it exists only when the leader is started with `allowRawExec: true`; otherwise the RPC
+  fails with a typed error. The vertical-slice harness sets the flag; apps never do.
+- `take(n)` pushdown through the scope filter is still open item 8; `Query.make` must not wait
+  for it (the fix is inside `Store.make`, behind the same `EchoStore` interface).
 
 ## 11. Schema evolution
 
@@ -509,7 +566,12 @@ const todosByProject = Query.make("todos.byProject", {
     is drift. **More than one relation carrying the capture trigger for one sync table name is
     drift by itself**, however clean each relation is: the name is the unqualified sync identity
     (§3) and `attach` refuses that state, so the verifier reports it rather than checking each
-    relation and passing. A declared index or unique set is compared against a **valid, ready, live**
+    relation and passing. Likewise, **the relation the unqualified name resolves to through
+    `search_path` must be the captured one**: when `to_regclass(name)` resolves to a relation that
+    carries no capture trigger while another schema's same-name relation does, the verifier
+    reports it (app SQL through `search_path` would write rows sync never sees, and `attach`
+    would have refused with `TableNameConflict`); the fix is the app's `search_path` or an
+    explicit `schema` on attach, never a silent pass. A declared index or unique set is compared against a **valid, ready, live**
     index (`indisvalid`, `indisready`, `indislive`) whose **key** columns (`indnkeyatts`, not
     `INCLUDE` payload) match in order, collation and `NULLS` placement; a unique set's expected
     shape is the one `SyncTable`'s DDL generates (`NULLS DISTINCT`, default placement), which
@@ -637,3 +699,4 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
 7. Additive schema evolution across a deploy — **resolved in §11** (codecs drop excess keys, fail on missing; new columns nullable/defaulted; deploy server first). Remaining: a wire manifest/version gate so a newer client against an older server degrades cleanly instead of failing row decode; needed before clients can ship ahead of the server.
 8. Query `limit` is applied after the scope filter in `Store.make` (v1), so `take(n)` is not pushed down to `RowStore.range` and a query over a large table with many unreadable rows scans past them. Fix by pushing the scope predicate into the range plan when queries are built.
 9. Pokes liveness. An idle client's only wake source is the `pokes` stream (§6: no resync timer, client pulls on every poke), and the HTTP RPC transport has no heartbeat, so an intermediary that holds a dead response open (observed with Vite's dev proxy, `docs/vertical-slice.md`) leaves the client deaf until a local enqueue. **User decision**, since it touches `Protocol`: (a) server heartbeat element on `pokes` distinguishable from a poke, plus a client idle timeout that reconnects; (b) a capped `pokes` connection lifetime with reconnect, no heartbeat; (c) accept for v1 and document. Until ruled, the vertical slice breaks the proxied response in the harness only.
+10. Credential refresh. `LeaderOptions.syncHeaders(principal)` is evaluated once per leader, so a renewed token takes effect only after a leader restart, while `Unauthorized` is retried (§6) and never fatal — a client with an expired token retries forever until the tab is reloaded. Lean: make `syncHeaders` an Effect evaluated per outgoing request (push, pull, pokes reconnect), with the app owning the refresh. Not scheduled; raise before any app relies on short-lived tokens.
