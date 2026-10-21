@@ -139,8 +139,9 @@ const grant = (
 }
 const GRANTS = [
   grant(mine, u1, "reader"),
-  // Written around the store with a non-derived id: readability follows the grant's columns, not its id.
-  grant(open, AccessScope.Everyone, "writer", ScopeGrants.ScopeGrantId.make("not-derived")),
+  // A derived id: the server CHECK (DESIGN §4) rejects any other, so malformed-id rejection is tested
+  // in src/server/postgres/grants.test.ts, not here.
+  grant(open, AccessScope.Everyone, "writer"),
   grant(theirs, AccessScope.PrincipalId.make("u2"), "owner")
 ]
 const encodeItem = Schema.encodeSync(Items.wire)

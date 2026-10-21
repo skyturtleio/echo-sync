@@ -100,7 +100,10 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (§4)", () => {
         const body = Effect.gen(function* () {
           const tables = yield* resolveTables(registry)
           const rows = yield* RowStore.make(new Map(tables.map((t) => [t.table.name, t.schema])))
-          const { store } = Store.make(rows, { roleFor: () => Effect.succeed(Option.some<AccessScope.Role>("owner")) })
+          const { store } = Store.make(rows, {
+            actor: AccessScope.PrincipalId.make("p"),
+            roleFor: () => Effect.succeed(Option.some<AccessScope.Role>("owner"))
+          })
           yield* store.insert(ScopeGrants.ScopeGrants, {
             id: ScopeGrants.grantId(scope, principal),
             accessScopeId: scope,
