@@ -1,0 +1,34 @@
+{
+  "name": "echo-sync",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/core/index.ts",
+    "./server": "./src/server/index.ts",
+    "./client": "./src/client/index.ts",
+    "./foldkit": "./src/foldkit/index.ts"
+  },
+  "scripts": {
+    "check": "tsc --noEmit && oxlint --deny-warnings && oxfmt --check && vitest run",
+    "test": "vitest run",
+    "lint": "oxlint --deny-warnings",
+    "fmt": "oxfmt"
+  },
+  "devDependencies": {
+    "@effect/vitest": "4.0.5",
+    "@effect/wa-sqlite": "0.1.2",
+    "@types/bun": "1.4.3",
+    "oxfmt": "0.74.0",
+    "oxlint": "1.89.0",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  },
+  "peerDependencies": {
+    "@effect/platform-browser": "4.0.5",
+    "@effect/platform-bun": "4.0.5",
+    "@effect/sql-pg": "4.0.5",
+    "@effect/sql-sqlite-wasm": "4.0.5",
+    "effect": "4.0.5"
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc", "import", "vitest"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn"
+  },
+  "rules": {
+    "typescript/no-explicit-any": "error",
+    "typescript/no-non-null-assertion": "error",
+    "typescript/consistent-type-assertions": [
+      "error",
+      {
+        "assertionStyle": "never"
+      }
+    ],
+    "typescript/consistent-type-imports": "error",
+    "import/no-cycle": "error",
+    "no-restricted-imports": [
+      "error",
+      {
+        "paths": [
+          {
+            "name": "effect/schema",
+            "message": "Use the stable `effect/Schema` module; `effect/schema` is a different, unstable barrel."
+          }
+        ]
+      }
+    ],
+    "no-underscore-dangle": "off"
+  },
+  "overrides": [
+    {
+      "files": ["src/core/**", "src/client/**", "src/foldkit/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "effect/schema",
+                "message": "Use the stable `effect/Schema` module."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["**/server", "**/server/**", "echo-sync/server"],
+                "message": "Browser/shared code must never import src/server."
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "ignorePatterns": ["node_modules"]
+}
