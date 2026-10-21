@@ -196,13 +196,17 @@ tab's state in a room it has joined; for a room it has not joined it does nothin
     stream cannot strand a state. Snapshots never wait for a send, and the join's end (idle timeout,
     reconnect, handover, close) interrupts one in flight.
 - **Revision fencing (DESIGN §12, §9.1, 001eaaf).** Timeouts and fetch aborts do not stop a request the
-  server has already received, so latest-wins is enforced by the receiver. The tab assigns every state a
-  revision: 0 for the opening state, plus one for each accepted `track`. Every join and track carries the
-  `(state, revision)` pair; a rejoin or handover join carries the tab's current pair. The leader never
-  makes up a revision. It keeps the highest one it has accepted and never sends a lower one after it. The
-  server stores the revision each entry was installed with and ignores a `track` whose revision is not
-  greater; a join installs its pair unconditionally. A late `track` from a cancelled attempt, or from the
-  old leader after a handover, therefore cannot overwrite a newer state.
+  server has already received, so latest-wins is enforced by the receiver (amended in 6c7027f). The tab
+  client keeps one revision counter per room for its whole life, outside any stream, so closing and
+  reopening a room never resets it. Every event the server may see out of order takes the next value: an
+  open, an accepted `track`, a handover (`LeaderLost`) rejoin. Every join and track carries a
+  `(state, revision)` pair read in one synchronous step. Leader-initiated rejoins (idle timeout,
+  `Unauthorized`, a failed join) re-send the leader's latest pair unchanged; the leader never makes up a
+  revision, keeps the highest one it has accepted and never sends a lower one after it. The server stores
+  the revision each entry was installed with: a `track` must be greater; a join at or above it installs
+  and replaces, and a join below it is a superseded attempt that installs nothing, leaves the entry and
+  its stream alone, and ends with no element. A late `track` or `room` request from a cancelled attempt,
+  an old leader or a closed-and-reopened stream therefore cannot displace a newer state.
 - **Registration.** Each layer registers a subscription with `acquireRelease`, as one synchronous
   check-and-insert step. Its release removes only itself, so a stream cancelled at any point leaves nothing
   behind, and two simultaneous opens of one room in a tab produce exactly one upstream open; the other
@@ -217,10 +221,13 @@ Evidence:
   (room stream heartbeating, so no rejoin) and a send that dies are both retried with the latest state; a
   subscription cancelled at any point (swept under a small `MaxOpsBeforeYield`) sends no later track;
   `Unauthorized` rejoins and only `Forbidden` ends the subscription; a lower revision after a higher one
-  is never sent or rejoined with.
+  is never sent or rejoined with; a join racing a `track` carries a genuine pair.
 - `presence.test.ts` (server): a track delayed before it applies cannot overwrite a newer one; after a
-  handover rejoin with `(s2, 2)`, a late `track(s1, 1)` is ignored.
-- `Leader.test.ts`: the tab re-joins with the latest state across handover; closing the stream drops the
+  handover rejoin with `(s2, 2)`, a late `track(s1, 1)` is ignored; after close and reopen, a late
+  old-lifetime track is ignored; a late lower-revision join leaves the current entry and stream untouched
+  and ends empty.
+- `Leader.test.ts`: the tab re-joins with the latest state and a fresh revision across handover; a
+  reopened room's join is above every earlier revision; a tab open racing a `track` carries a genuine pair; closing the stream drops the
   room; simultaneous opens give one upstream open; cancellation at any point frees the room; a hung tab
   send and a tab send lost with `LeaderLost` are retried with the latest state on the same join.
 - `scenarios.sh` (real server): an entry is listed only while its stream is open, and after the leader tab

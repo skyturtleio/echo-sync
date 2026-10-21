@@ -139,7 +139,8 @@ export const make = <E, F extends E>(options: {
         let delay = base
         while (true) {
           sub.restart = Deferred.makeUnsafe<void>()
-          const joinedRevision = sub.revision
+          // One synchronous read: the join carries a genuine (state, revision) pair, the sender's baseline.
+          const { state: joinedState, revision: joinedRevision } = sub
           const joined = Deferred.makeUnsafe<void>()
           let delivered = false
           const ended = yield* Effect.exit(
@@ -151,7 +152,7 @@ export const make = <E, F extends E>(options: {
                   Effect.andThen(Deferred.await(joined), deliver(sub, room, tabId, joinedRevision))
                 )
                 // Preparation (credentials) runs before the idle clock starts; a failure there is retried.
-                const connection = yield* upstream.room({ room, tabId, state: sub.state, revision: joinedRevision })
+                const connection = yield* upstream.room({ room, tabId, state: joinedState, revision: joinedRevision })
                 yield* connection.pipe(
                   Stream.timeout(idleTimeout),
                   Stream.interruptWhen(Deferred.await(sub.restart)),

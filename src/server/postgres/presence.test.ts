@@ -318,6 +318,58 @@ describe("presence state (§12)", () => {
     })
   )
 
+  it.effect(
+    "close then reopen: a late old-lifetime track@5 is ignored by the reopened entry@6, whose next state applies",
+    () =>
+      Effect.gen(function* () {
+        const presence = yield* Presence.make({ heartbeatInterval: "1 hour" })
+        const state = Effect.map(presence.snapshot(s1), (r) => r.entries[0]?.state)
+        const old = yield* Effect.forkChild(
+          Stream.runDrain(presence.join({ ...entry("t"), state: "old", revision: 4 }))
+        )
+        yield* settle
+        const gate = yield* Deferred.make<void>()
+        const late = yield* Effect.forkChild(
+          Effect.andThen(Deferred.await(gate), presence.track({ ...entry("t"), state: "old", revision: 5 }))
+        )
+        yield* Fiber.interrupt(old)
+        yield* Effect.forkChild(Stream.runDrain(presence.join({ ...entry("t"), state: "new", revision: 6 })))
+        yield* settle
+        yield* Deferred.succeed(gate, undefined)
+        assert.isFalse(yield* Fiber.join(late))
+        assert.strictEqual(yield* state, "new")
+        assert.isTrue(yield* presence.track({ ...entry("t"), state: "desired", revision: 7 }))
+        assert.strictEqual(yield* state, "desired")
+      })
+  )
+
+  it.effect(
+    "a late join@2 against the current entry@3 is superseded: the entry and its stream are untouched, the late stream ends empty",
+    () =>
+      Effect.gen(function* () {
+        const presence = yield* Presence.make({ heartbeatInterval: "1 hour" })
+        const state = Effect.map(presence.snapshot(s1), (r) => r.entries[0]?.state)
+        const current = yield* Effect.forkChild(
+          Stream.runDrain(presence.join({ ...entry("t"), state: "current", revision: 3 }))
+        )
+        yield* settle
+        const late = yield* Stream.runCollect(presence.join({ ...entry("t"), state: "old", revision: 2 }))
+        yield* settle
+        assert.deepStrictEqual(late, [])
+        assert.isUndefined(current.pollUnsafe(), "the current stream is still open")
+        assert.strictEqual(yield* state, "current")
+        // The late join installed nothing: a track@3 is still not newer, a track@4 is.
+        assert.isFalse(yield* presence.track({ ...entry("t"), state: "x", revision: 3 }))
+        assert.isTrue(yield* presence.track({ ...entry("t"), state: "y", revision: 4 }))
+        assert.strictEqual(yield* state, "y")
+        // An equal revision is a same-attempt retry: it installs and replaces, as before.
+        yield* Effect.forkChild(Stream.runDrain(presence.join({ ...entry("t"), state: "z", revision: 4 })))
+        yield* settle
+        assert.isDefined(current.pollUnsafe(), "an equal-revision join replaced the current stream")
+        assert.strictEqual(yield* state, "z")
+      })
+  )
+
   it.effect("a track interrupted at any point either changed nothing or was announced to every observer", () =>
     Effect.gen(function* () {
       const presence = yield* Presence.make({ heartbeatInterval: "1 hour" })

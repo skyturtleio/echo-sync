@@ -165,7 +165,8 @@ export const RoomSnapshot = Schema.TaggedStruct("snapshot", {
 export type RoomSnapshot = typeof RoomSnapshot.Type
 
 /**
- * One `room` stream element: a `RoomSnapshot` (the first element of every stream) or a
+ * One `room` stream element: a `RoomSnapshot` (the first element of every stream that installed its
+ * entry; a superseded join, with a revision lower than the stored entry's, ends with no element) or a
  * `Heartbeat` (DESIGN §16 item 13, the §6 Liveness shape), which is never a snapshot and
  * changes no room state.
  */
@@ -179,9 +180,10 @@ export const PresencePayload = Schema.Struct({
   tabId: TabId,
   state: Schema.Json,
   /**
-   * Tab-assigned, strictly increasing per `(room, tab)` for the life of its `presence` stream (DESIGN §9.1,
-   * §12 revision fencing): `track` is a no-op unless it is greater than the entry's, so a late request can
-   * never overwrite a newer state. A join installs its `(state, revision)` unconditionally.
+   * Tab-assigned, never decreasing per `(room, tab)` for the life of the tab client (DESIGN §9.1, §12
+   * revision fencing): `track` is a no-op unless it is greater than the entry's; a join installs its
+   * `(state, revision)` when it is at least the entry's and is a superseded attempt otherwise. A late
+   * request therefore never displaces a newer state.
    */
   revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 })

@@ -206,6 +206,40 @@ it.effect("a subscription cancelled at any point leaves nothing registered: a la
   })
 )
 
+it.effect("a join carries a genuine (state, revision) pair even when a track races its start", () =>
+  Effect.gen(function* () {
+    // States are named after their revision, so a torn read shows up as a mismatched pair.
+    for (let ops = 3; ops < 35; ops++) {
+      for (let turns = 0; turns < 20; turns++) {
+        const server = yield* fakeServer
+        const pairs: Array<string> = []
+        const presence = Presence.make({
+          upstream: {
+            room: (p) =>
+              Effect.andThen(
+                Effect.sync(() => void pairs.push(`${p.state}@${p.revision}`)),
+                server.upstream.room(p)
+              ),
+            track: server.upstream.track
+          },
+          isFatal: Transport.isFatalPresence
+        })
+        const fiber = yield* Effect.forkChild(
+          Stream.runDrain(presence.join({ room, tabId, state: "s0", revision: 0 })).pipe(
+            Effect.provideService(References.MaxOpsBeforeYield, ops)
+          )
+        )
+        yield* Effect.repeat(Effect.yieldNow, { times: turns })
+        yield* presence.track({ room, tabId, state: "s1", revision: 1 })
+        yield* settle
+        const torn = pairs.filter((pair) => pair !== "s0@0" && pair !== "s1@1")
+        expect({ ops, turns, torn }).toEqual({ ops, turns, torn: [] })
+        yield* Fiber.interrupt(fiber)
+      }
+    }
+  })
+)
+
 /** Heartbeats on `connection` every 5 ms of test time, for `ms`; the room stream stays healthy throughout. */
 const heartbeatFor = (connection: Queue.Queue<Protocol.RoomElement, Transport.PresenceError>, ms: number) =>
   Effect.gen(function* () {

@@ -863,8 +863,9 @@ it.live(
       // The rejoin was read before s2 (whose track was lost with the leader): it carries the latest state at
       // that point, never the opening s0, and the catch-up after its first snapshot brings the new leader to s2.
       expect(joins).toEqual(["s0", "s1"])
-      // Revisions are the tab's: the rejoin re-sends its pair, and s2 (lost with the old leader) keeps 2.
-      expect(pairs).toEqual(['join "s0"@0', 'track "s1"@1', 'join "s1"@1', 'track "s2"@2'])
+      // Revisions are the tab's (DESIGN §9.1, 6c7027f): the handover rejoin takes a fresh one (2), above
+      // anything the old leader was ever given, so a late old-leader track is fenced; s2 then takes 3.
+      expect(pairs).toEqual(['join "s0"@0', 'track "s1"@1', 'join "s1"@2', 'track "s2"@3'])
       expect(held[2]).toBe("s2")
       expect(yield* Deferred.isDone(ended)).toBe(false)
       // track on a room this tab has not joined is a no-op.
@@ -999,6 +1000,61 @@ it.live(
         }
       }
     })
+)
+
+it.live("a tab's presence open carries a genuine (state, revision) pair even when a track races its start", () =>
+  Effect.gen(function* () {
+    const room = AccessScope.AccessScopeId.make("room-1")
+    const { client } = yield* leaderRpc({ allowRawExec: false })
+    // States are named after their revision, so a torn read shows up as a mismatched pair.
+    for (let ops = 3; ops < 35; ops++) {
+      for (let turns = 0; turns < 20; turns++) {
+        const { calls } = presenceCalls(client)
+        const pairs: Array<string> = []
+        const api = tabApi({
+          ...calls,
+          presence: (r, state, revision) =>
+            Stream.suspend(() => {
+              pairs.push(`${String(state)}@${revision}`)
+              return calls.presence(r, state, revision)
+            })
+        })
+        const fiber = yield* Effect.forkChild(preempted(Stream.runDrain(api.presence(room, "s0")), ops))
+        yield* Effect.repeat(Effect.yieldNow, { times: turns })
+        yield* api.track(room, "s1")
+        yield* Effect.repeat(Effect.yieldNow, { times: 50 })
+        const torn = pairs.filter((p) => p !== "s0@0" && p !== "s1@1")
+        expect({ ops, turns, torn }).toEqual({ ops, turns, torn: [] })
+        yield* Fiber.interrupt(fiber)
+      }
+    }
+  })
+)
+
+it.live("closing and reopening a room never reuses a revision: the reopened join is above every earlier one", () =>
+  Effect.gen(function* () {
+    const room = AccessScope.AccessScopeId.make("room-1")
+    const { client } = yield* leaderRpc({ allowRawExec: false })
+    const { calls } = presenceCalls(client)
+    const opened: Array<number> = []
+    const api = tabApi({
+      ...calls,
+      presence: (r, state, revision) =>
+        Stream.suspend(() => {
+          opened.push(revision)
+          return calls.presence(r, state, revision)
+        })
+    })
+    // First lifetime: open (0), two tracks (1, 2) that may still be in flight when the stream closes.
+    const first = yield* Effect.forkChild(Stream.runDrain(api.presence(room, "a")))
+    yield* Effect.repeat(Effect.yieldNow, { times: 50 })
+    yield* api.track(room, "b")
+    yield* api.track(room, "c")
+    yield* Fiber.interrupt(first)
+    // A late old-lifetime track@2 must not outrank the reopened entry, so the reopen takes 3.
+    expect(Option.isSome(yield* Stream.runHead(api.presence(room, "d")))).toBe(true)
+    expect(opened).toEqual([0, 3])
+  })
 )
 
 // Short deadlines for the tab's sender, so these run in live time.

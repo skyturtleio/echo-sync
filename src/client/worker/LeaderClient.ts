@@ -270,11 +270,22 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
    */
   interface Cell {
     state: Schema.Json
-    /** Tab-assigned (DESIGN §9.1): 0 for the opening state, +1 per accepted `track`; every join and send carries it. */
+    /** The revision `state` was given (`nextRevision`); every join and send carries the pair. */
     revision: number
     wake: Deferred.Deferred<void>
   }
   const joined = new Map<string, Cell>()
+  /**
+   * One revision counter per room for the life of this tab client (DESIGN §9.1, 6c7027f), outside any
+   * stream's cell: closing and reopening a room never resets it. Every event the server may see out of
+   * order takes the next value: an open, an accepted `track`, a handover rejoin.
+   */
+  const revisions = new Map<string, number>()
+  const nextRevision = (room: AccessScope.AccessScopeId) => {
+    const next = (revisions.get(room) ?? -1) + 1
+    revisions.set(room, next)
+    return next
+  }
   /**
    * Each attempt has a deadline; one that fails (`LeaderLost` included: the retry goes to whichever leader
    * is current), dies or times out is retried with backoff and the latest state. It never ends the stream,
@@ -308,7 +319,7 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
         const cell = yield* Effect.acquireRelease(
           Effect.sync((): Cell | undefined => {
             if (joined.has(room)) return undefined
-            const fresh: Cell = { state, revision: 0, wake: Deferred.makeUnsafe<void>() }
+            const fresh: Cell = { state, revision: nextRevision(room), wake: Deferred.makeUnsafe<void>() }
             joined.set(room, fresh)
             return fresh
           }),
@@ -318,14 +329,19 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
             })
         )
         if (cell === undefined) return Stream.fail<PresenceError>(new PresenceAlreadyOpen({ room }))
+        let rejoin = false
         const open = Stream.unwrap(
           Effect.gen(function* () {
-            const read = cell.revision
+            // A handover rejoin takes a fresh revision, above anything the old leader may still deliver.
+            if (rejoin) cell.revision = nextRevision(room)
+            rejoin = true
+            // One synchronous read: the join carries a genuine (state, revision) pair, the sender's baseline.
+            const { state: joinedState, revision: read } = cell
             const first = Deferred.makeUnsafe<void>()
             // Scoped to this join: its end (a lost leader, a closed stream) interrupts a send in flight.
             yield* Effect.forkScoped(Effect.andThen(Deferred.await(first), deliver(room, cell, read)))
             return calls
-              .presence(room, cell.state, read)
+              .presence(room, joinedState, read)
               .pipe(Stream.tap(() => Effect.sync(() => Deferred.doneUnsafe(first, Effect.void))))
           })
         )
@@ -338,7 +354,7 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
       const cell = joined.get(room)
       if (cell === undefined) return
       cell.state = state
-      cell.revision++
+      cell.revision = nextRevision(room)
       Deferred.doneUnsafe(cell.wake, Effect.void)
     })
   return {

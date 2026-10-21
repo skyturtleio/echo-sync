@@ -80,11 +80,15 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
      * open stream keeps its room, and with it the room's `PubSub`, alive. Otherwise the replacing
      * stream could leave as the room's last member, the room would be recreated on a new `PubSub`,
      * and the replaced stream would observe the abandoned one forever.
+     *
+     * A join whose revision is lower than the stored entry's is a superseded attempt (DESIGN §12
+     * revision fencing): nothing is installed, the entry and its stream are untouched, and the result
+     * is `undefined`.
      */
     const enter = (
       joined: Joined
     ): Effect.Effect<
-      { readonly changes: PubSub.PubSub<void>; readonly replaced: Deferred.Deferred<void> },
+      { readonly changes: PubSub.PubSub<void>; readonly replaced: Deferred.Deferred<void> } | undefined,
       never,
       Scope.Scope
     > => {
@@ -94,19 +98,25 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
         Effect.gen(function* () {
           const fresh = yield* PubSub.sliding<void>(1)
           const replaced = yield* Deferred.make<void>()
-          const [changes, previous] = yield* Ref.modify(rooms, (all) => {
+          const installed = yield* Ref.modify(rooms, (all) => {
             const room = all.get(joined.room) ?? { members: new Map(), changes: fresh }
+            const stored = room.members.get(key)
+            if (stored !== undefined && joined.revision < stored.revision) return [undefined, all] as const
             const members = new Map(room.members).set(key, { entry, revision: joined.revision, replaced })
             return [
               [room.changes, room.members.get(key)] as const,
               new Map(all).set(joined.room, { members, changes: room.changes })
             ] as const
           })
+          if (installed === undefined) return undefined
+          const [changes, previous] = installed
           if (previous !== undefined) yield* Deferred.succeed(previous.replaced, undefined)
           return { changes, replaced }
         }),
-        ({ changes, replaced }) =>
-          Ref.modify(rooms, (all) => {
+        (entered) => {
+          if (entered === undefined) return Effect.void
+          const { changes, replaced } = entered
+          return Ref.modify(rooms, (all) => {
             const room = all.get(joined.room)
             // A later stream with the same key took the entry over: it is not this stream's to drop.
             if (room?.members.get(key)?.replaced !== replaced) return [false, all] as const
@@ -117,6 +127,7 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
             else next.set(joined.room, { members, changes: room.changes })
             return [true, next] as const
           }).pipe(Effect.flatMap((left) => (left ? PubSub.publish(changes, undefined) : Effect.void)))
+        }
       )
     }
 
@@ -124,12 +135,15 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
       /**
        * The entry is present exactly while the returned stream runs: added before its first
        * snapshot, removed when it ends for any reason (completion, failure, interruption). The
-       * first snapshot already contains it; every later change produces another.
+       * first snapshot already contains it; every later change produces another. A superseded join
+       * (revision lower than the stored entry's) ends at once without an element and changes nothing.
        */
       join: (joined: Joined): Stream.Stream<Protocol.RoomElement> =>
         Stream.unwrap(
           Effect.gen(function* () {
-            const { changes, replaced } = yield* enter(joined)
+            const entered = yield* enter(joined)
+            if (entered === undefined) return Stream.empty
+            const { changes, replaced } = entered
             const subscription = yield* PubSub.subscribe(changes)
             // Subscribed before announcing: the other streams see the join, and this stream consumes
             // the tick itself, so its first element is the join snapshot, emitted before the merge
