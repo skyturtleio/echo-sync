@@ -15,8 +15,9 @@
  * - Only an error `isFatal` classifies (the server's `Forbidden`: no grant in the room's scope) ends the
  *   subscription; an `Unauthorized` credential failure is rejoined like any other.
  *
- * One subscription per `(room, tabId)`: registering it is one synchronous step, and a newer one replaces
- * (and ends) an older one; its release only removes itself, never a successor. A rejoin with the same
+ * One subscription per `(room, tabId)`: registering it is one synchronous step, and a join at or above the
+ * registered revision replaces (and ends) the older one; a lower one is superseded and ends empty without
+ * touching it. A release only removes itself, never a successor. A rejoin with the same
  * key ends the older server stream (DESIGN §12); the older one is always ours and already abandoned
  * here, so that is expected. Presence never touches the replica or the outbox.
  */
@@ -116,9 +117,13 @@ export const make = <E, F extends E>(options: {
     Stream.callback<Protocol.RoomSnapshot, F>((out) =>
       Effect.gen(function* () {
         const k = key(room, tabId)
-        // Registration is one synchronous step, released on every exit, and only ever removes itself.
+        // Registration is one synchronous step, released on every exit, and only ever removes itself. A join
+        // below the registered subscription's revision is a superseded attempt (DESIGN §12, 6c7027f): it
+        // registers nothing, leaves the incumbent alone and ends empty, with no upstream join or sender.
         const sub = yield* Effect.acquireRelease(
-          Effect.sync(() => {
+          Effect.sync((): Subscription | undefined => {
+            const previous = subscriptions.get(k)
+            if (previous !== undefined && revision < previous.revision) return undefined
             const fresh: Subscription = {
               state,
               revision,
@@ -126,16 +131,16 @@ export const make = <E, F extends E>(options: {
               restart: Deferred.makeUnsafe<void>(),
               replaced: Deferred.makeUnsafe<void>()
             }
-            const previous = subscriptions.get(k)
             subscriptions.set(k, fresh)
             if (previous !== undefined) Deferred.doneUnsafe(previous.replaced, Effect.void)
             return fresh
           }),
           (registered) =>
             Effect.sync(() => {
-              if (subscriptions.get(k) === registered) subscriptions.delete(k)
+              if (registered !== undefined && subscriptions.get(k) === registered) subscriptions.delete(k)
             })
         )
+        if (sub === undefined) return yield* Queue.end(out)
         let delay = base
         while (true) {
           sub.restart = Deferred.makeUnsafe<void>()

@@ -205,7 +205,8 @@ tab's state in a room it has joined; for a room it has not joined it does nothin
   revision, keeps the highest one it has accepted and never sends a lower one after it. The server stores
   the revision each entry was installed with: a `track` must be greater; a join at or above it installs
   and replaces, and a join below it is a superseded attempt that installs nothing, leaves the entry and
-  its stream alone, and ends with no element. A late `track` or `room` request from a cancelled attempt,
+  its stream alone, and ends with no element. The leader applies the same rule to its own subscriptions: a
+  join below the registered revision registers nothing, opens no upstream join or sender, and ends empty. A late `track` or `room` request from a cancelled attempt,
   an old leader or a closed-and-reopened stream therefore cannot displace a newer state.
 - **Registration.** Each layer registers a subscription with `acquireRelease`, as one synchronous
   check-and-insert step. Its release removes only itself, so a stream cancelled at any point leaves nothing
@@ -221,7 +222,8 @@ Evidence:
   (room stream heartbeating, so no rejoin) and a send that dies are both retried with the latest state; a
   subscription cancelled at any point (swept under a small `MaxOpsBeforeYield`) sends no later track;
   `Unauthorized` rejoins and only `Forbidden` ends the subscription; a lower revision after a higher one
-  is never sent or rejoined with; a join racing a `track` carries a genuine pair.
+  is never sent or rejoined with; a join racing a `track` carries a genuine pair; a late lower-revision
+  join is superseded and the incumbent keeps streaming and tracking.
 - `presence.test.ts` (server): a track delayed before it applies cannot overwrite a newer one; after a
   handover rejoin with `(s2, 2)`, a late `track(s1, 1)` is ignored; after close and reopen, a late
   old-lifetime track is ignored; a late lower-revision join leaves the current entry and stream untouched

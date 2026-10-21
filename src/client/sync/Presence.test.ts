@@ -301,6 +301,40 @@ it.effect("a send that dies is retried with the latest state; the stream and its
   })
 )
 
+it.effect(
+  "a late lower-revision join to the leader is superseded: it ends empty with no upstream join, and the incumbent keeps streaming and tracking",
+  () =>
+    Effect.gen(function* () {
+      const server = yield* fakeServer
+      const presence = Presence.make({ upstream: server.upstream, isFatal: Transport.isFatalPresence })
+      const seen: Array<Protocol.RoomSnapshot> = []
+      const incumbent = yield* Effect.forkChild(
+        Stream.runForEach(presence.join({ room, tabId, state: "s2", revision: 2 }), (s) =>
+          Effect.sync(() => void seen.push(s))
+        )
+      )
+      const first = yield* server.nextConnection
+      yield* Queue.offer(first, snapshot("s2"))
+      yield* settle
+      // The incumbent advances past the late join's revision through a track.
+      yield* presence.track({ room, tabId, state: "s3", revision: 3 })
+      yield* settle
+      // A join@2 from an abandoned attempt arrives late.
+      const late = yield* Effect.forkChild(
+        Stream.runCollect(presence.join({ room, tabId, state: "stale", revision: 2 }))
+      )
+      yield* settle
+      expect(server.joins).toEqual(["s2"])
+      expect(incumbent.pollUnsafe()).toBeUndefined()
+      expect(yield* Fiber.join(late)).toEqual([])
+      yield* Queue.offer(first, snapshot("s3"))
+      yield* presence.track({ room, tabId, state: "s4", revision: 4 })
+      yield* settle
+      expect(seen.length).toBe(2)
+      expect(server.tracks).toEqual(["s3", "s4"])
+    })
+)
+
 it.effect("a slow credential step does not count against idleTimeout: the clock starts when the join is sent", () =>
   Effect.gen(function* () {
     let prepared = 0
