@@ -126,7 +126,9 @@ an expired token is honoured on a live one. The client evaluates `syncHeaders` p
   entry and again after (`join`'s `admit`, before announcing). A revoke committed before the
   second check's snapshot fails the join; one committed after it notifies a check that starts
   after the entry is installed. `admit` runs inside the stream's end boundary, so a revocation
-  while it is still pending ends the stream `Forbidden` at once. A lost `LISTEN` or failed check restarts the watch after 1 s,
+  while it is still pending ends the stream `Forbidden` at once, and an end signal already
+  completed when `admit` starts or returns takes precedence over its outcome (`Forbidden` for a
+  revocation, empty for a replacement). A lost `LISTEN` or failed check restarts the watch after 1 s,
   and its first poke re-checks everything. A re-grant does nothing automatically; across a
   server restart presence state is gone anyway and a rejoin re-checks the grant.
 

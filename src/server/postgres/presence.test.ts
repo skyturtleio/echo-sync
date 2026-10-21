@@ -588,6 +588,44 @@ describe("presence state (§12)", () => {
         assert.deepStrictEqual(forbidden(yield* Fiber.join(pending)), expected)
       })
   )
+  it.effect(
+    "a revocation that completed while admit ran wins over admit's later outcome: the join ends Forbidden, not with admit's failure or a pass",
+    () =>
+      Effect.gen(function* () {
+        const presence = yield* Presence.make({ heartbeatInterval: "1 hour" })
+        const room = Effect.map(presence.snapshot(s1), show)
+        const revokeAll = presence.reevaluate(() => Effect.succeed(() => false))
+        // No yield between the revoke and admit's outcome: only precedence, not timing, decides.
+        const failing = yield* Effect.exit(
+          Stream.runDrain(presence.join(entry("fails"), Effect.andThen(revokeAll, Effect.fail("late admit failure"))))
+        )
+        assert.deepStrictEqual(forbidden(failing), expected)
+        const passing = yield* Effect.exit(
+          Stream.runCollect(presence.join(entry("passes"), Effect.andThen(revokeAll, Effect.succeed(true))))
+        )
+        assert.deepStrictEqual(forbidden(passing), expected)
+        assert.deepStrictEqual(yield* room, [])
+        // Replaced (a same-key rejoin) while admit ran, then admit fails: the old stream ends empty
+        // and the newcomer keeps the entry. The rejoin is detached and uninterruptible so the
+        // replacement is complete before admit's failure, whatever the old stream does meanwhile.
+        const joined = yield* Deferred.make<void>()
+        const rejoin = Effect.uninterruptible(
+          Effect.andThen(
+            Effect.forkDetach(
+              Stream.runForEach(presence.join({ ...entry("k"), revision: 1 }), () =>
+                Deferred.succeed(joined, undefined)
+              )
+            ),
+            Deferred.await(joined)
+          )
+        )
+        const replaced = yield* Effect.exit(
+          Stream.runCollect(presence.join(entry("k"), Effect.andThen(rejoin, Effect.fail("late admit failure"))))
+        )
+        assert.isTrue(Exit.isSuccess(replaced) && replaced.value.length === 0, "replaced: ends empty")
+        assert.deepStrictEqual(yield* room, ["p/c1/k=null"])
+      })
+  )
 })
 
 describe.skipIf(!pgAvailable)("presence over the sync mount (§12)", () => {

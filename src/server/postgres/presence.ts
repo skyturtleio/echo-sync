@@ -178,7 +178,15 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
             return Stream.unwrap(
               Effect.gen(function* () {
                 const subscription = yield* PubSub.subscribe(changes)
-                if (!(yield* admit)) return yield* new Protocol.Forbidden({ room: joined.room })
+                // `interruptWhen` only races a signal; one that already completed must win over
+                // whatever `admit` does next: revoked ⇒ `Forbidden`, replaced ⇒ empty.
+                const endedAlready = Effect.flatMap(Deferred.isDone(ended), (done) =>
+                  done ? Effect.as(Deferred.await(ended), true) : Effect.succeed(false)
+                )
+                if (yield* endedAlready) return Stream.empty
+                const admitted = yield* Effect.exit(admit)
+                if (yield* endedAlready) return Stream.empty
+                if (!(yield* admitted)) return yield* new Protocol.Forbidden({ room: joined.room })
                 // Only while this stream's own entry is in the room: a snapshot read after its
                 // removal is never emitted to it (one already read before may still be delivered).
                 const own = Effect.map(Ref.get(rooms), (all) =>
