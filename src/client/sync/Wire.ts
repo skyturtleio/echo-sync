@@ -1,0 +1,105 @@
+/**
+ * TEMPORARY: local mirror of the wire shapes agreed with ws/foundation (DESIGN v0.2 §6, §8).
+ * Replace every export here with the `src/core` Protocol/Mutation/Store types once
+ * `ws/foundation` is pushed; nothing outside `src/client/sync` and `src/core/testing` may
+ * depend on this file.
+ */
+import { Schema } from "effect"
+import type { Effect, Option } from "effect"
+
+/** Commit-ordered log/ledger position. bigint in memory (DESIGN §8). */
+export type Position = bigint
+export type Cursor = Position | null
+
+/** A row in wire form: snake_case keys, JSON-safe values; always has `id` and `access_scope_id`. */
+export interface EncodedRow {
+  readonly id: string
+  readonly access_scope_id: string
+  readonly [column: string]: unknown
+}
+
+export interface MutationEnvelope {
+  readonly clientId: string
+  readonly mutationId: number
+  readonly name: string
+  readonly args: unknown
+}
+
+/** Typed, encodable rejection (decode / unknown mutation / forbidden / domain error). */
+export interface MutationRejection {
+  readonly _tag: string
+  readonly [field: string]: unknown
+}
+
+export type MutationOutcome =
+  | { readonly _tag: "Applied" }
+  | { readonly _tag: "Rejected"; readonly error: MutationRejection }
+
+export type Change =
+  | { readonly _tag: "Upsert"; readonly table: string; readonly row: EncodedRow }
+  | { readonly _tag: "Tombstone"; readonly table: string; readonly id: string }
+  | { readonly _tag: "ScopePurged"; readonly scopeId: string }
+
+export interface Ack {
+  readonly mutationId: number
+  readonly position: Position
+  readonly outcome: MutationOutcome
+}
+
+/** Opaque server-issued token for resuming a page set; echoed back exactly. */
+export type PullContinuation = string
+
+export interface PullRequest {
+  readonly clientId: string
+  /** The cursor the page set started from (unchanged until `PullDone` is installed). */
+  readonly cursor: Cursor
+  readonly continuation: Option.Option<PullContinuation>
+}
+
+/** A page with `more: true`: consistent only together with the rest of its set (§8). */
+export interface PullPage {
+  readonly _tag: "PullPage"
+  readonly changes: ReadonlyArray<Change>
+  readonly acks: ReadonlyArray<Ack>
+  readonly continuation: PullContinuation
+}
+
+/** The final page of a set (`more: false`); its `nextCursor` is the only cursor persisted. */
+export interface PullDone {
+  readonly _tag: "PullDone"
+  readonly changes: ReadonlyArray<Change>
+  readonly acks: ReadonlyArray<Ack>
+  readonly nextCursor: Position
+}
+
+export type PullResponse = PullPage | PullDone
+
+/** The cursor is past log retention or the continuation is stale: restart from `null`. */
+export class ResnapshotRequired extends Schema.TaggedError<ResnapshotRequired>()("ResnapshotRequired", {}) {}
+
+export interface PushRequest {
+  readonly clientId: string
+  readonly mutations: ReadonlyArray<{ readonly mutationId: number; readonly name: string; readonly args: unknown }>
+}
+
+export interface PushResponse {
+  /** Outcomes for the processed prefix of the request, in request order. */
+  readonly results: ReadonlyArray<{ readonly mutationId: number; readonly outcome: MutationOutcome }>
+  /** Present when the server stopped at a transient failure; the rest was not processed. */
+  readonly stopped: Option.Option<{ readonly reason: string }>
+}
+
+/** Raw replica writes used by reconciliation (no role checks; inside the caller's transaction). */
+export interface RowWriter<E> {
+  readonly write: (table: string, id: string, row: Option.Option<EncodedRow>) => Effect.Effect<void, E>
+  readonly purgeScope: (scopeId: string) => Effect.Effect<void, E>
+  /** Deletes every replica row; used when installing a snapshot (page set from `null`). */
+  readonly clear: Effect.Effect<void, E>
+}
+
+/** First-touch pre-image of a row written by one handler run (reported by core's Store). */
+export interface UndoImage {
+  readonly table: string
+  readonly id: string
+  readonly before: Option.Option<EncodedRow>
+}
