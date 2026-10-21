@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import type * as PgClient from "@effect/sql-pg/PgClient"
-import { Effect, Exit, Fiber, Layer, Option, Queue, Stream } from "effect"
+import { Effect, Exit, Fiber, Layer, Option, Queue, Scheduler, Stream } from "effect"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
 import { RpcClient, RpcSerialization } from "effect/rpc"
@@ -56,6 +56,8 @@ const payload = (clientId: string, tabId: string, state: Protocol.PresenceEntry[
   tabId: Protocol.TabId.make(tabId),
   state
 })
+
+const settle = Effect.repeat(Effect.yieldNow, { times: 50 })
 
 const entry = (tabId: string) => ({ principalId: AccessScope.PrincipalId.make("p"), ...payload("c1", tabId) })
 
@@ -128,6 +130,79 @@ describe("presence state (§12)", () => {
         assert.deepStrictEqual(yield* room, [])
       })
   )
+
+  it.effect(
+    "a same-key rejoin ends the replaced stream, so it is never left observing an abandoned room after the room is recreated",
+    () =>
+      Effect.gen(function* () {
+        const presence = yield* Presence.make
+        const room = Effect.map(presence.snapshot(s1), show)
+        const watch = (tabId: string) =>
+          Effect.gen(function* () {
+            const seen: Array<ReadonlyArray<string>> = []
+            const ready = yield* Queue.unbounded<void>()
+            const fiber = yield* Effect.forkChild(
+              Stream.runForEach(presence.join(entry(tabId)), (snapshot) =>
+                Effect.andThen(
+                  Effect.sync(() => void seen.push(show(snapshot))),
+                  Queue.offer(ready, undefined)
+                )
+              )
+            )
+            yield* Queue.take(ready)
+            return { seen, fiber }
+          })
+        const a = yield* watch("k") // A holds key K
+        const b = yield* watch("k") // B rejoins K: replaces A's entry
+        yield* settle
+        assert.isDefined(a.fiber.pollUnsafe(), "the replaced stream has ended")
+        assert.isTrue(Exit.isSuccess(yield* Fiber.await(a.fiber)))
+        // B leaves as the last member: the room is gone. C joins: a new room.
+        yield* Fiber.interrupt(b.fiber)
+        assert.deepStrictEqual(yield* room, [])
+        const c = yield* watch("c")
+        assert.deepStrictEqual(yield* room, ["p/c1/c=null"])
+        assert.deepStrictEqual(c.seen, [["p/c1/c=null"]])
+        // A's last view was its own replacement, never a stale room it keeps observing.
+        assert.deepStrictEqual(a.seen.at(-1), ["p/c1/k=null"])
+      })
+  )
+
+  it.effect("a track interrupted at any point either changed nothing or was announced to every observer", () =>
+    Effect.gen(function* () {
+      const presence = yield* Presence.make
+      const latest: { state: unknown } = { state: undefined }
+      const ready = yield* Queue.unbounded<void>()
+      yield* Effect.forkChild(
+        Stream.runForEach(presence.join(entry("watch")), (snapshot) =>
+          Effect.andThen(
+            Effect.sync(() => void (latest.state = snapshot.entries[0]?.state)),
+            Queue.offer(ready, undefined)
+          )
+        )
+      )
+      yield* Queue.take(ready)
+      // Sweep where the tracking fiber is interrupted: it yields every `ops` operations (1 livelocks
+      // the pinned runtime) and is interrupted after `yields` turns of this fiber.
+      let n = 0
+      for (let ops = 2; ops < 12; ops++) {
+        for (let yields = 0; yields < 30; yields++) {
+          n++
+          const tracking = yield* Effect.forkChild(
+            presence
+              .track({ ...entry("watch"), state: n })
+              .pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, ops))
+          )
+          yield* Effect.repeat(Effect.yieldNow, { times: yields })
+          yield* Fiber.interrupt(tracking)
+          yield* settle
+          const installed = (yield* presence.snapshot(s1)).entries[0]?.state
+          // Whatever the room now holds, the observer has been told.
+          assert.deepStrictEqual(latest.state, installed, `ops ${ops}, yields ${yields}`)
+        }
+      }
+    })
+  )
 })
 
 describe.skipIf(!pgAvailable)("presence over the sync mount (§12)", () => {
@@ -193,7 +268,8 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (§12)", () => {
         // Tab 2 reconnects before its old stream has ended: the old stream's end must not drop it.
         const tab2again = yield* open(client, payload("c1", "t2", "two, again"))
         yield* until(tab2again.snapshots, ["p/c0/watch=null", 'p/c1/t1="one, moved"', 'p/c1/t2="two, again"'])
-        yield* Fiber.interrupt(tab2.fiber)
+        // The rejoin ended the old stream: an entry has exactly one observing stream (§12).
+        assert.isTrue(Exit.isSuccess(yield* Fiber.join(tab2.fiber)))
         yield* Fiber.interrupt(tab1.fiber)
         yield* until(observer.snapshots, ["p/c0/watch=null", 'p/c1/t2="two, again"'])
         yield* client.track(payload("c1", "t2", "still here"))

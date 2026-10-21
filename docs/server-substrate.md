@@ -88,8 +88,11 @@ is never read from the payload. `ClientForbidden` becomes `Unauthorized`.
   (entries ordered by principal, client, tab), so snapshots coalesce under load and never miss
   the latest state. As DESIGN §12 states: the payload carries `clientId` (the entry key needs it);
   the key also includes the principal, so naming another principal's client id cannot replace
-  or end its entry; a rejoin with the same key replaces the entry, and the older stream's end
-  does not remove the newer one (a per-join token). `track` needs no grant lookup: it only
+  or end its entry; a rejoin with the same key replaces the entry and ends the older stream
+  (a per-member `Deferred` the stream interrupts on, completed after the new member is
+  installed), so every open stream holds an entry and keeps its room's `PubSub` current; the
+  older stream's release does not remove the newer member (the same `Deferred` is its identity).
+  `track`'s state update and its announcement are one uninterruptible step. `track` needs no grant lookup: it only
   changes an entry the same principal holds. Not handled in v1: a grant revoked while a `room`
   stream is open leaves the entry until the stream ends, and presence streams carry no
   heartbeat (DESIGN §16 item 13).
