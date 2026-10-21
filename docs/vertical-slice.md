@@ -61,6 +61,7 @@ all three, renewal without a leader restart, and one evaluation per request.
 | `ledger?mutationId=` | every `echo_sync.mutations` row for that id, across clients |
 | `todos?scope=` | the server's `todos` rows in a scope |
 | `open?gate=` | opens a scenario gate (see the app) |
+| `rejections?enabled=0\|1` | turns the server's `server-rejects` title check off or on (the `no-reject` control) |
 | `stats?clientId=&todo=` | RPC requests this process received per tag for a client; how often the server's `todos.add` handler started for a todo id |
 
 The Vite harness proxies `/sync` and `/admin` to the server (`ECHO_SLICE_SERVER`, default
@@ -150,7 +151,7 @@ One PASS/FAIL line each. slice.sh also prints what each passing check observed.
 | S6 | offline edit, reload, reconnect: A goes offline, runs `todos.update` on a row both clients hold and reloads while still offline; the queued entry and the optimistic row survive and nothing reaches the ledger; once A is online again Postgres, A's live query and B's existing live query (no refresh) hold the edited row, and the ledger has exactly one `Applied` row, for A | slice.sh | real |
 | S7a | both offline, same row, different fields: B reconnects (and is acknowledged) before A; the server row has B's title and A's note, B's ledger position is lower, and both replicas and live queries hold exactly that row with nothing pending | slice.sh | real |
 | S7b | both offline, same field: B then A; the server applied B's mutator then A's, so A's title stands, and B's replica and live query keep no trace of B's optimistic title | slice.sh | real |
-| S7c | both offline, A's edit is one the real server mutator rejects: A gets `Rejected{DomainError{blocked-title}}`, its optimistic title is undone to B's, and B's title is in Postgres and both replicas | slice.sh | real |
+| S7c | both offline, A's edit is one the real server mutator rejects: A gets `Rejected{DomainError{blocked-title}}`, its optimistic title is undone to B's, and B's title is in Postgres and both replicas. A then commits a marker; once B's live query shows it, B has pulled past the rejection, and no emission in B's whole history ever showed A's rejected title | slice.sh | real |
 | S8a | A deletes a row offline while B edits it online: B's edit lands (B's live query shows it), A's delete then removes it; Postgres, A and B end without the row, A has no notice | slice.sh | real |
 | S8b | A edits a row offline that B deletes online: A's update is `Rejected{RowNotFound}` and its optimistic edit does not resurrect the row in A, B or Postgres | slice.sh | real |
 
@@ -167,7 +168,8 @@ Postgres ledger has exactly one row for each exactly-once mutation they enqueue 
 | `stay-offline` | A never comes back online | S6 |
 | `b-offline-after-push` | B drops offline again once its own pushes are acknowledged, so it never pulls A's | S7a, S7b |
 | `a-first` | A reconnects before B | S7a (ledger order), S7b (B's title stands) |
-| `no-reject` | A's third edit uses an ordinary title | S7c |
+| `no-reject` | the server's blocked-title check is switched off (`/admin/rejections?enabled=0`); A's input is unchanged | S7c |
+| `transient-rejected` | B's replica shows A's rejected title for one emission and then B's again, so B's final state is correct | S7c (history scan) |
 | `a-stays-offline` | A never comes back online | S8a, S8b |
 | `skip-b-delete` | B does not delete the row A edits | S8b only (the row survives) |
 

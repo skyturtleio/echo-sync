@@ -50,6 +50,8 @@ const gate = (name: string): Deferred.Deferred<void> => {
 }
 export const serverHooks = {
   started: new Map<string, number>(),
+  /** The server-only "server-rejects" title check; `/admin/rejections?enabled=0` turns it off (a slice control). */
+  rejecting: true,
   /** Opens a gate (now or before anyone waits on it); returns whether it was closed. */
   open: (name: string): boolean => Deferred.doneUnsafe(gate(name), Effect.void)
 }
@@ -65,7 +67,7 @@ const addTodo = (side: "client" | "server") =>
           serverHooks.started.set(args.id, (serverHooks.started.get(args.id) ?? 0) + 1)
           const name = gateIn(args.title)
           if (name !== undefined) yield* Deferred.await(gate(name))
-          if (args.title.includes("server-rejects")) {
+          if (serverHooks.rejecting && args.title.includes("server-rejects")) {
             return yield* Effect.fail({ reason: "blocked-title" as const, title: args.title })
           }
         }
@@ -94,7 +96,7 @@ const updateTodo = (side: "client" | "server") =>
       Effect.gen(function* () {
         if (side === "server") {
           yield* serverStart(args.id, args.title)
-          if (args.title?.includes("server-rejects") === true) {
+          if (serverHooks.rejecting && args.title?.includes("server-rejects") === true) {
             return yield* Effect.fail({ reason: "blocked-title" as const, title: args.title })
           }
         }

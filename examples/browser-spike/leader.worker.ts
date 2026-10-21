@@ -40,15 +40,16 @@ if (flags.has("net")) {
   // Harness network gate (slice.sh): while this replica's identity is "offline", every request to the sync
   // server fails as an unreachable server does (fetch rejects with a TypeError) and responses already
   // streaming (the pokes stream) are aborted. Only the sync URL: the worker's own assets (the SQLite wasm)
-  // still load, as they would from cache when a real device is offline. The tab sets the initial state in the worker URL and flips it on the
-  // "echo-test:net:<identity>" channel, so a leader started by a reload starts in the same state.
-  const live = new Set<AbortController>()
+  // still load, as they would from cache when a real device is offline. The tab sets the initial state in
+  // the worker URL and flips it on the "echo-test:net:<identity>" channel, so a leader started by a reload
+  // starts in the same state. Requests made while online share one abort signal per online period.
   let offline = flags.has("offline")
+  let period = new AbortController()
   new BroadcastChannel(`echo-test:net:${flags.get("net") ?? ""}`).addEventListener("message", (event) => {
     offline = event.data === "offline"
     if (!offline) return
-    for (const controller of live) controller.abort(new TypeError("harness: network offline"))
-    live.clear()
+    period.abort(new TypeError("harness: network offline"))
+    period = new AbortController()
   })
   const fetch = globalThis.fetch.bind(globalThis)
   Object.defineProperty(globalThis, "fetch", {
@@ -56,10 +57,8 @@ if (flags.has("net")) {
       const url = input instanceof Request ? input.url : String(input)
       if (syncUrl === null || !url.startsWith(syncUrl)) return fetch(input, init)
       if (offline) return Promise.reject(new TypeError("Failed to fetch (harness: network offline)"))
-      const controller = new AbortController()
-      init?.signal?.addEventListener("abort", () => controller.abort(init.signal?.reason))
-      live.add(controller)
-      return fetch(input, { ...init, signal: controller.signal })
+      const signal = init?.signal ? AbortSignal.any([init.signal, period.signal]) : period.signal
+      return fetch(input, { ...init, signal })
     }
   })
 }

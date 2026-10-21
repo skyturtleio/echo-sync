@@ -117,6 +117,9 @@ const adminRoute = (url: URL): Effect.Effect<Response, unknown, SqlClient> =>
             [q("scope")]
           )
         )
+      case "/admin/rejections":
+        serverHooks.rejecting = q("enabled") !== "0"
+        return json({ rejecting: serverHooks.rejecting })
       case "/admin/open":
         return json({ wasClosed: serverHooks.open(q("gate")) })
       case "/admin/stats":
