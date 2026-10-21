@@ -606,12 +606,14 @@ describe("presence state (§12)", () => {
         assert.deepStrictEqual(forbidden(passing), expected)
         assert.deepStrictEqual(yield* room, [])
         // Replaced (a same-key rejoin) while admit ran, then admit fails: the old stream ends empty
-        // and the newcomer keeps the entry. The rejoin is detached and uninterruptible so the
-        // replacement is complete before admit's failure, whatever the old stream does meanwhile.
+        // and the newcomer keeps the entry. The rejoin is forked into the test's own scope (not the
+        // old admission's, which the replacement closes) and is uninterruptible until joined, so the
+        // replacement is complete before admit's failure; the test scope interrupts it at the end.
+        const outer = yield* Effect.scope
         const joined = yield* Deferred.make<void>()
         const rejoin = Effect.uninterruptible(
           Effect.andThen(
-            Effect.forkDetach(
+            Effect.forkIn(outer)(
               Stream.runForEach(presence.join({ ...entry("k"), revision: 1 }), () =>
                 Deferred.succeed(joined, undefined)
               )
@@ -624,7 +626,7 @@ describe("presence state (§12)", () => {
         )
         assert.isTrue(Exit.isSuccess(replaced) && replaced.value.length === 0, "replaced: ends empty")
         assert.deepStrictEqual(yield* room, ["p/c1/k=null"])
-      })
+      }).pipe(Effect.scoped)
   )
 })
 
