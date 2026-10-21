@@ -42,24 +42,43 @@ const decodeAll = (table: SyncTable.AnySyncTable, rows: ReadonlyArray<unknown>) 
   Effect.forEach(rows, (row) => decodeRow(table, row))
 
 export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store.RowStore, never, SqlClient> => {
-  const relation = (table: SyncTable.AnySyncTable) => `${q(schemaOf.get(table.name) ?? "public")}.${q(table.name)}`
+  // A table without a mapping is not attached (or not in the registry): writing it would commit
+  // rows no client ever hears about, so it is a defect, never a guess at a schema.
+  const relation = (table: SyncTable.AnySyncTable) => {
+    const schema = schemaOf.get(table.name)
+    return schema === undefined ? undefined : `${q(schema)}.${q(table.name)}`
+  }
   return Effect.gen(function* () {
     const sql = yield* SqlClient
-    const query = (statement: string, params: ReadonlyArray<unknown>) =>
+    const run = (statement: string, params: ReadonlyArray<unknown>) =>
       sql.unsafe<Record<string, unknown>>(statement, params).pipe(Effect.mapError(unavailable))
+    /** `statement` receives the table's quoted relation; an unattached table dies before any SQL. */
+    const query = (
+      table: SyncTable.AnySyncTable,
+      statement: (relation: string) => string,
+      params: ReadonlyArray<unknown>
+    ) => {
+      const rel = relation(table)
+      return rel === undefined
+        ? Effect.die(`RowStore: table ${table.name} is not an attached registry table`)
+        : run(statement(rel), params)
+    }
 
     const rowStore: Store.RowStore = {
       read: (table, id) =>
-        Effect.flatMap(query(`SELECT ${selectList(table)} FROM ${relation(table)} WHERE "id" = $1`, [id]), (rows) =>
-          rows[0] === undefined ? Effect.succeed(Option.none()) : Effect.map(decodeRow(table, rows[0]), Option.some)
+        Effect.flatMap(
+          query(table, (rel) => `SELECT ${selectList(table)} FROM ${rel} WHERE "id" = $1`, [id]),
+          (rows) =>
+            rows[0] === undefined ? Effect.succeed(Option.none()) : Effect.map(decodeRow(table, rows[0]), Option.some)
         ),
       write: (table, id, row) => {
-        if (Option.isNone(row)) return Effect.asVoid(query(`DELETE FROM ${relation(table)} WHERE "id" = $1`, [id]))
+        if (Option.isNone(row)) return Effect.asVoid(query(table, (rel) => `DELETE FROM ${rel} WHERE "id" = $1`, [id]))
         const params = table.columns.map((c) => bindColumn(c, row.value[c.name] ?? null))
         const names = table.columns.map((c) => q(c.name))
         return Effect.asVoid(
           query(
-            `INSERT INTO ${relation(table)} (${names.join(", ")}) VALUES (${names.map((_, i) => `$${i + 1}`).join(", ")})
+            table,
+            (rel) => `INSERT INTO ${rel} (${names.join(", ")}) VALUES (${names.map((_, i) => `$${i + 1}`).join(", ")})
              ON CONFLICT ("id") DO UPDATE SET ${names.map((n) => `${n} = EXCLUDED.${n}`).join(", ")}`,
             params
           )
@@ -91,15 +110,18 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
         const order = plan.index.key.map((c) => `${q(c.name)} ${dir}`).join(", ")
         return Effect.flatMap(
           query(
-            `SELECT ${selectList(table)} FROM ${relation(table)}${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY ${order}`,
+            table,
+            (rel) =>
+              `SELECT ${selectList(table)} FROM ${rel}${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY ${order}`,
             params
           ),
           (rows) => decodeAll(table, rows)
         )
       },
       scan: (table) =>
-        Effect.flatMap(query(`SELECT ${selectList(table)} FROM ${relation(table)} ORDER BY "id"`, []), (rows) =>
-          decodeAll(table, rows)
+        Effect.flatMap(
+          query(table, (rel) => `SELECT ${selectList(table)} FROM ${rel} ORDER BY "id"`, []),
+          (rows) => decodeAll(table, rows)
         )
     }
     return rowStore
