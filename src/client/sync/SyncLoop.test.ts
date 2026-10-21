@@ -1,5 +1,5 @@
 import { expect, it } from "@effect/vitest"
-import { Cause, Clock, Effect, Schema, Stream } from "effect"
+import { Cause, Clock, Effect, Queue, Schema, Stream } from "effect"
 import { RpcClientError } from "effect/rpc"
 import { TestClock } from "effect/testing"
 import { Ids, Protocol } from "echo-sync"
@@ -202,10 +202,47 @@ it.effect(
         expect(attempts.length).toBe(before + 1)
       }
       expect(attempts).toEqual([0, 1000, 3000, 7000])
-      expect(wakes.n).toBe(5) // two pokes + one wake per reconnect
+      expect(wakes.n).toBe(2) // only pokes wake: reconnecting itself does not
       expect(fiber.pollUnsafe()).toBeUndefined()
       yield* TestClock.adjust("1 hour")
       yield* settle
       expect(attempts.length).toBe(4) // a live connection is not replaced
     })
+)
+
+it.effect("only stream elements wake: a stream with no initial poke wakes nothing until it delivers one", () =>
+  Effect.gen(function* () {
+    const wakes = { n: 0 }
+    const notifications = yield* Queue.unbounded<object>()
+    const connections = { n: 0 }
+    // Attempt 1 ends at once with no element; attempt 2 is a live stream that has sent nothing yet.
+    const connect = Stream.unwrap(
+      Effect.sync(() => (++connections.n === 1 ? Stream.empty : Stream.fromQueue(notifications)))
+    )
+    yield* Effect.forkChild(SyncLoop.followPokes({ connect, wake: Effect.sync(() => void wakes.n++) }))
+    yield* settle
+    yield* TestClock.adjust("1 second")
+    yield* settle
+    expect([connections.n, wakes.n]).toEqual([2, 0])
+    yield* Queue.offer(notifications, {})
+    yield* settle
+    expect(wakes.n).toBe(1)
+  })
+)
+
+it.effect("the server's initial poke, the first element of each stream, wakes the loop on every (re)connect", () =>
+  Effect.gen(function* () {
+    const wakes = { n: 0 }
+    const connections = { n: 0 }
+    // Like the real server: one poke right after LISTEN; the first connection then ends.
+    const connect = Stream.unwrap(
+      Effect.sync(() => (++connections.n === 1 ? Stream.make({}) : Stream.concat(Stream.make({}), Stream.never)))
+    )
+    yield* Effect.forkChild(SyncLoop.followPokes({ connect, wake: Effect.sync(() => void wakes.n++) }))
+    yield* settle
+    expect([connections.n, wakes.n]).toEqual([1, 1])
+    yield* TestClock.adjust("1 second")
+    yield* settle
+    expect([connections.n, wakes.n]).toEqual([2, 2])
+  })
 )

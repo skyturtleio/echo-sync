@@ -180,7 +180,8 @@ tables and replica schema, one transaction) and builds `Engine.make` over the SQ
 - With `syncUrl`, the leader runs `SyncLoop` (push then pull per cycle, one backoff 1 s → 30 s; any defect
   or `MalformedEnvelope` in a push halts push for this leader's lifetime, pull keeps running, nothing is
   released) and `SyncLoop.followPokes`, which wakes the loop on every poke and reconnects the pokes stream
-  after any end (failure, defect, clean completion) with the same backoff, waking once per reconnect.
+  after any end (failure, defect, clean completion) with the same backoff. Reconnecting does not wake
+  the loop; the server's initial poke (sent right after LISTEN, DESIGN §6 aec6cd4) does.
   A new leader starts a fresh loop, so a halt re-trips on its first push (DESIGN §6).
 - Without `syncUrl` the replica is local-only: enqueue still applies and persists; `syncStatus` fails
   with `SyncDisabled`.

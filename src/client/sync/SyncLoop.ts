@@ -124,8 +124,10 @@ export const make = <TE>(options: {
  * Follows the server's pokes stream (DESIGN §6, §8, 81a07db): every poke wakes the loop, and the
  * stream is reconnected after ANY end (failure, defect or clean completion) following a backoff that
  * starts at `retryDelay`, doubles up to `maxRetryDelay`, and resets once a connection delivered a poke.
- * Each reconnect also wakes the loop, since pokes sent while disconnected were missed. Pokes are only
- * hints (§8), so nothing here is fatal. Runs until interrupted.
+ * Reconnecting does not wake the loop itself: a wake before the server's LISTEN is confirmed could pull
+ * before a change that the new stream then never announces. The server emits one poke on every stream
+ * right after LISTEN (DESIGN §6, aec6cd4), and that first element is what covers anything missed while
+ * disconnected. Pokes are only hints (§8), so nothing here is fatal. Runs until interrupted.
  */
 export const followPokes = <E>(options: {
   readonly connect: Stream.Stream<unknown, E>
@@ -153,6 +155,5 @@ export const followPokes = <E>(options: {
       )
       yield* Effect.sleep(Duration.millis(delay))
       delay = Math.min(delay * 2, cap)
-      yield* options.wake
     }
   })
