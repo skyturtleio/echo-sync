@@ -195,8 +195,10 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
   return {
     // BEGIN/COMMIT failures map like any statement's; the body's own errors pass through unchanged.
     // `withTransaction` waits for the connection lease uninterruptibly; waiting for `permit` first makes
-    // a transaction queued behind a long one (e.g. a pull install) cancellable while it waits, in FIFO
-    // order. The lease still serializes against SQL that bypasses this storage.
+    // a transaction queued behind a long one (e.g. a pull install) cancellable while it waits. Admission
+    // is serialized, not fair (DESIGN §9, aa267ac): a fiber that just released may take the permit again
+    // ahead of a waiter. Order between mutations comes from the caller sequencing them, never from here.
+    // The lease still serializes against SQL that bypasses this storage.
     transaction: (self) =>
       permit
         .withPermit(sql.withTransaction(self))

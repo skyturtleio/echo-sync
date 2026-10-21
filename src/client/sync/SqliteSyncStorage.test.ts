@@ -95,7 +95,7 @@ it.effect("nextSeq starts at 1 and never reuses a seq, even after its released r
   }).pipe(Effect.provide(Db))
 )
 
-it.effect("staged pages, meta and notices round-trip with bigint positions", () =>
+it.effect("staged pages and meta round-trip with bigint positions", () =>
   Effect.gen(function* () {
     const { storage } = yield* makeStorage
     const page = decodePage({
@@ -391,50 +391,60 @@ it.effect("a database created by main's first outbox DDL migrates forward: undo 
   }).pipe(Effect.provide(SqliteClient.layerMemory({})))
 )
 
-it.live("a transaction queued behind a long one can be interrupted while it waits; the rest run in FIFO order", () =>
-  Effect.gen(function* () {
-    const { storage } = yield* makeStorage
-    const ran: Array<string> = []
-    const holding = yield* Deferred.make<void>()
-    const gate = yield* Deferred.make<void>()
-    // The holder plays a long pull install: it owns the connection until `gate` opens.
-    const holder = yield* Effect.forkChild(
-      storage.transaction(
-        Effect.gen(function* () {
-          yield* Deferred.succeed(holding, undefined)
-          yield* Deferred.await(gate)
-          ran.push("holder")
-        })
-      )
-    )
-    yield* Deferred.await(holding)
-    const queued = (name: string) =>
-      Effect.forkChild(
+it.live(
+  "a transaction queued behind a long one can be interrupted while it waits; the rest commit, one at a time",
+  () =>
+    Effect.gen(function* () {
+      const { storage } = yield* makeStorage
+      const ran: Array<string> = []
+      const holding = yield* Deferred.make<void>()
+      const gate = yield* Deferred.make<void>()
+      // The holder plays a long pull install: it owns the connection until `gate` opens.
+      const holder = yield* Effect.forkChild(
         storage.transaction(
           Effect.gen(function* () {
-            ran.push(name)
-            yield* storage.appendPending(entry(yield* storage.nextSeq, name))
+            yield* Deferred.succeed(holding, undefined)
+            yield* Deferred.await(gate)
+            ran.push("holder")
           })
         )
       )
-    const a = yield* queued("a")
-    const x = yield* queued("x")
-    const b = yield* queued("b")
-    for (let i = 0; i < 100; i++) yield* Effect.yieldNow
-    const interrupting = yield* Effect.forkChild(Fiber.interrupt(x))
-    for (let i = 0; i < 100; i++) yield* Effect.yieldNow
-    // The interrupt completes while the holder still owns the connection.
-    const done = interrupting.pollUnsafe() !== undefined
-    yield* Deferred.succeed(gate, undefined)
-    yield* Fiber.join(holder)
-    yield* Fiber.join(a)
-    yield* Fiber.join(b)
-    yield* Fiber.join(interrupting)
-    expect(done).toBe(true)
-    expect(ran).toEqual(["holder", "a", "b"])
-    expect((yield* storage.pending).map((e) => [e.envelope.mutationId, e.envelope.seq])).toEqual([
-      ["a", 1],
-      ["b", 2]
-    ])
-  }).pipe(Effect.provide(Db))
+      yield* Deferred.await(holding)
+      // Serialization: no two transaction bodies are ever inside at once (each yields to invite overlap).
+      const inside = { now: 0, max: 0 }
+      const queued = (name: string) =>
+        Effect.forkChild(
+          storage.transaction(
+            Effect.gen(function* () {
+              inside.now++
+              inside.max = Math.max(inside.max, inside.now)
+              ran.push(name)
+              for (let i = 0; i < 5; i++) yield* Effect.yieldNow
+              yield* storage.appendPending(entry(yield* storage.nextSeq, name))
+              inside.now--
+            })
+          )
+        )
+      const a = yield* queued("a")
+      const x = yield* queued("x")
+      const b = yield* queued("b")
+      for (let i = 0; i < 100; i++) yield* Effect.yieldNow
+      const interrupting = yield* Effect.forkChild(Fiber.interrupt(x))
+      for (let i = 0; i < 100; i++) yield* Effect.yieldNow
+      // The interrupt completes while the holder still owns the connection.
+      const done = interrupting.pollUnsafe() !== undefined
+      yield* Deferred.succeed(gate, undefined)
+      yield* Fiber.join(holder)
+      yield* Fiber.join(a)
+      yield* Fiber.join(b)
+      yield* Fiber.join(interrupting)
+      expect(done).toBe(true)
+      // The interrupted body never ran; the others ran after the holder, in some order (no fairness promised).
+      expect(ran[0]).toBe("holder")
+      expect(ran.toSorted()).toEqual(["a", "b", "holder"])
+      expect(inside.max).toBe(1)
+      const pending = yield* storage.pending
+      expect(pending.map((e) => e.envelope.mutationId).toSorted()).toEqual(["a", "b"])
+      expect(pending.map((e) => e.envelope.seq)).toEqual([1, 2])
+    }).pipe(Effect.provide(Db))
 )
