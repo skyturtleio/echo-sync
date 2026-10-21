@@ -103,18 +103,48 @@ the scope.
 
 ### The continuation
 
-`PullContinuation` is a Schema'd value, encoded with positions as decimal strings:
+On the wire the continuation is core's opaque branded string. On the server it is
+`Schema.fromJsonString(Continuation)` over a private struct, with positions as decimal strings:
 
 ```
 { clientId, principalId, cursor: Position | null, position: Position,
   scopes: string[], walking: [{ scopeId, after: { table, rowId } | null }] }
 ```
 
-The client treats it as opaque and resends it. The server checks `clientId`, `principalId` and
-`cursor` against the request; a mismatch is `staleContinuation`. A `position` below the GC
-horizon is `gcHorizon`. The continuation is not signed, and does not need to be: every payload
+A plain JSON string survives structured clone and SQLite text storage unchanged. The client
+resends it verbatim with the same cursor. Any of these fail with
+`ResnapshotRequired { reason: "staleContinuation" }`: a decode failure, or a `clientId`,
+`principalId` or `cursor` that doesn't match the request. A `position` below the GC horizon
+fails with `gcHorizon`. The continuation is not signed, and does not need to be: every payload
 is filtered by the request principal's grants as of this page, so a forged continuation can
 only make the forger skip or re-receive its own data.
+
+### Page size
+
+`limit` is a server choice (an argument of `pull`, set by the RPC handler), not a wire field.
+It bounds upserts and tombstones per page; purges are not counted.
+
+### One `nextCursor`, one held set
+
+`client_scopes` is written with `ON CONFLICT DO NOTHING`, so two `PullDone`s with the same
+`nextCursor` must carry identical `scope_ids`. They do:
+
+- At `PullDone` no walk is outstanding, so every readable scope has been either kept or walked
+  and every unreadable one purged. The recorded set is exactly the readable set at the last
+  page's snapshot. It does not depend on what the client held before.
+- At `PullDone`, `nextCursor` is that snapshot's `head` (`max` over log, ledger and GC horizon).
+- The readable set is a function of the `scope_grants` rows. Every change to them, including
+  cascades from `access_scopes`, goes through the capture trigger and so allocates a position.
+  Positions are commit-ordered (§7). A snapshot whose head is `H` therefore sees every commit
+  with a position ≤ `H` and none above it.
+- So two snapshots with the same `head` see the same grant state, and the same readable set.
+
+### Cursor `null` replaces the replica
+
+After `ResnapshotRequired`, the log entries for revokes and deletes the client missed may be
+gone. A set that started from cursor `null` is therefore installed with `RowStore.clearAll`
+first (§8). The test replica does the same, and the GC test checks that a row whose tombstone
+was collected disappears after the resnapshot.
 
 ### Acks
 
@@ -135,7 +165,10 @@ never trusted. For the bigints: `@effect/sql-pg` 4.0.5 already decodes `int8` to
 
 `collectGarbage(retention)` deletes log entries whose `committed_at` is older than
 `Clock.now - retention` and raises `gc_horizon` to the highest deleted position, in one
-transaction. The ledger and `client_scopes` are not touched; their retention is §16.5. A cursor
+transaction. It never touches the ledger, `clients`, or `client_scopes` (tested). §16.5: a
+resnapshot acks only the ledger rows that survive. Expiring ledger rows while mutations are
+still pending would therefore re-execute them. Any future expiry must forget the client binding
+and reject later submissions as terminal. A cursor
 or continuation below the horizon gets `ResnapshotRequired { reason: "gcHorizon" }`.
 
 ## Running the Postgres tests
