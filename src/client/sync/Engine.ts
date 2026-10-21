@@ -14,7 +14,7 @@
  * would either expose a torn transaction or replay a pending mutation over a server row that
  * already contains it.
  */
-import { Array as Arr, Clock, DateTime, Effect, Option, Predicate, Schema, Semaphore } from "effect"
+import { Array as Arr, Clock, DateTime, Effect, Option, Schema, Semaphore } from "effect"
 import { AccessScope, Errors, Mutation, Protocol, ScopeGrants, Store } from "../../core/index.ts"
 import type { Ids, Registry } from "../../core/index.ts"
 
@@ -105,6 +105,16 @@ export interface Transport<E> {
     request: Protocol.PullRequest
   ) => Effect.Effect<Protocol.PullResponse, E | Protocol.ResnapshotRequired>
 }
+
+/**
+ * A pull change for a table this client knows does not decode with that table's schema. The
+ * install transaction fails as a whole (no rows, acks, cursor or staging change). Per DESIGN §8
+ * and §6 it is a transient pull failure: the sync loop retries with backoff, never halts.
+ */
+export class MalformedChange extends Schema.TaggedError<MalformedChange>()("MalformedChange", {
+  table: Schema.String,
+  message: Schema.String
+}) {}
 
 /** The handler rejected the mutation against the local replica; nothing was saved. */
 export class LocallyRejected extends Schema.TaggedError<LocallyRejected>()("LocallyRejected", {
@@ -210,9 +220,9 @@ const noticeFor = (envelope: Mutation.MutationEnvelope, outcome: Mutation.Mutati
  * release the entries `settle` says are covered by that base (with their notices), and re-run
  * the rest with fresh undo images.
  */
-const rebase = (
+const rebase = <E>(
   context: Context,
-  install: Effect.Effect<void, StoreUnavailable>,
+  install: Effect.Effect<void, E | StoreUnavailable>,
   settle: (envelope: Mutation.MutationEnvelope) => Option.Option<Option.Option<Notice>>
 ) =>
   Effect.gen(function* () {
@@ -246,9 +256,13 @@ const applyChange = (storage: SyncStorage, registry: Registry.SyncRegistry, chan
       return yield* Effect.logWarning(`echo-sync: skipping ${change._tag} for unknown table ${change.table}`)
     }
     if (change._tag === "tombstone") return yield* storage.rows.write(table.value, change.id, Option.none())
-    const id = change.row["id"]
-    if (!Predicate.isString(id)) return yield* Effect.die(`echo-sync: upsert for ${change.table} without a string id`)
-    yield* storage.rows.write(table.value, id, Option.some(change.row))
+    // Protocol's row is a generic JSON record; only the table's codec knows its fields. Store the
+    // canonical re-encoding (excess columns dropped, values normalized), as every writer does.
+    const malformed = (error: Schema.SchemaError) =>
+      new MalformedChange({ table: change.table, message: error.message })
+    const decoded = yield* Schema.decodeUnknownEffect(table.value.wire)(change.row).pipe(Effect.mapError(malformed))
+    const row = yield* Schema.encodeEffect(table.value.wire)(decoded).pipe(Effect.mapError(malformed))
+    yield* storage.rows.write(table.value, decoded.id, Option.some(row))
   })
 
 /**
@@ -313,7 +327,7 @@ export interface Engine<TE> {
   /** Sends unprocessed outbox entries in seq order until none remain or the server stops. */
   readonly push: Effect.Effect<PushResult, StoreUnavailable | TE>
   /** Pulls until `PullDone`, staging intermediate pages, then installs the set atomically. */
-  readonly pull: Effect.Effect<void, StoreUnavailable | TE | Protocol.ResnapshotRequired>
+  readonly pull: Effect.Effect<void, StoreUnavailable | TE | Protocol.ResnapshotRequired | MalformedChange>
 }
 
 export const make = <TE>(options: {

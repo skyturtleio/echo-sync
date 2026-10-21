@@ -43,6 +43,22 @@ const installedDisk = (): MemorySyncStorage.Disk => ({
 const valueOf = (disk: MemorySyncStorage.Disk, rowId: string) =>
   disk.replica.tables().get(Counters.name)?.get(rowId)?.["value"]
 
+/** An engine over `disk` whose pulls answer from `responses` in order (none left: offline). */
+const scriptedPulls = (disk: MemorySyncStorage.Disk, responses: Array<Protocol.PullResponse>) =>
+  Engine.make({
+    ...engineOptions,
+    storage: MemorySyncStorage.make(disk),
+    transport: {
+      push: () => Effect.die("unused"),
+      pull: () => {
+        const next = responses.shift()
+        return next === undefined
+          ? Effect.fail(new Simulation.TransportFailed({ during: "pull" }))
+          : Effect.succeed(next)
+      }
+    }
+  })
+
 describe("reconciliation simulation", () => {
   it.effect(
     "random schedules keep every client = replay(pending, server@cursor) and lose/duplicate no intent",
@@ -328,6 +344,57 @@ describe("reconciliation simulation", () => {
       assert.strictEqual(disk.outbox.length, 0)
       assert.strictEqual(valueOf(disk, "x"), 5) // 10 would mean the intent was replayed over its own result
       assert.strictEqual(disk.meta.cursor, position(3n))
+    })
+  )
+
+  it.effect("a known-table row that does not decode fails the install whole: no ack, cursor or staging change", () =>
+    Effect.gen(function* () {
+      const disk = installedDisk()
+      const ack = { mutationId: id("u-1"), position: position(2n), outcome: { _tag: "Applied" as const } }
+      const engine = yield* scriptedPulls(disk, [
+        { _tag: "PullPage", changes: [], acks: [ack], continuation: Protocol.PullContinuation.make("k") },
+        {
+          _tag: "PullDone",
+          // Covers the intent's ack, but carries only an id: not a counters row.
+          changes: [
+            { _tag: "upsert", table: Counters.name, row: counterRow("w", 1) },
+            { _tag: "upsert", table: Counters.name, row: { id: "x" } }
+          ],
+          acks: [],
+          nextCursor: position(3n),
+          expiredThrough: Ids.SeqFloor.make(0)
+        }
+      ])
+      yield* engine.mutate(id("u-1"), "increment", { id: "x", by: 5 })
+
+      const error = yield* Effect.flip(engine.pull)
+      assert.strictEqual(error._tag, "MalformedChange")
+      assert.strictEqual(disk.outbox.length, 1) // a released intent would have no covering row
+      assert.strictEqual(disk.meta.cursor, position(1n))
+      assert.strictEqual(disk.staged.length, 1)
+      assert.deepStrictEqual(disk.replica.tables().get(Counters.name)?.get("x"), { ...counter, value: 5 })
+      assert.isUndefined(disk.replica.tables().get(Counters.name)?.get("w")) // nothing from the set installed
+    })
+  )
+
+  it.effect("a pulled row is stored in canonical wire form (excess columns dropped, values normalized)", () =>
+    Effect.gen(function* () {
+      const disk = installedDisk()
+      const engine = yield* scriptedPulls(disk, [
+        {
+          _tag: "PullDone",
+          changes: [
+            { _tag: "upsert", table: Counters.name, row: { ...counterRow("x", 7), updated_at: -0, legacy: "drop me" } }
+          ],
+          acks: [],
+          nextCursor: position(2n),
+          expiredThrough: Ids.SeqFloor.make(0)
+        }
+      ])
+      yield* engine.pull
+      const stored = disk.replica.tables().get(Counters.name)?.get("x")
+      assert.deepStrictEqual(stored, counterRow("x", 7))
+      assert.isTrue(Object.is(stored?.["updated_at"], 0)) // -0 would differ from every other writer's 0
     })
   )
 })
