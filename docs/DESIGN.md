@@ -193,6 +193,17 @@ return the recorded outcome without re-executing. Every push outcome carries the
 `position` it was recorded at, so the client can tell whether its installed replica already
 covers it (§8).
 
+**Outcome classification is over the whole `Cause`, with precedence defect > transient >
+rejection.** A handler can fail with a compound cause (parallel branches, finalizers). Any
+defect anywhere in the cause makes the mutation die with the full cause: never retried, never
+ledgered, never reported transient. Otherwise, any transient failure (`40001`, connection)
+anywhere in the cause means the transaction could not have committed, so nothing it computed
+is trustworthy, including a rejection decided on its snapshot: the mutation is retried
+(bounded) and, if retries are exhausted, stops the batch as transient with nothing ledgered. A
+rejection is ledgered only when it is the sole kind of failure in the cause, i.e. it came from
+a transaction that would have committed had the handler succeeded. The same rule applies to
+`Mutation.run` in core (`StoreUnavailable` outranks `MutationRejection`).
+
 **Request-level push errors are reserved for input an honest client cannot produce.** Push
 fails as a whole, with nothing executed or ledgered, only on `Unauthorized` and
 `MalformedEnvelope` (e.g. `seq < 1`; the `Seq` schema already refuses this at RPC decode, so
