@@ -1,5 +1,5 @@
 import { expect, it } from "@effect/vitest"
-import { Effect, Exit, Layer, Option, Schema, Stream } from "effect"
+import { Cause, Effect, Exit, Layer, Option, Schema, Stream } from "effect"
 import { FetchHttpClient, HttpRouter } from "effect/http"
 import { Rpc, RpcClient, RpcGroup, RpcSerialization, RpcServer } from "effect/rpc"
 import { AccessScope, Ids, Mutation, Protocol, Registry } from "echo-sync"
@@ -480,6 +480,33 @@ it.live(
       expect(statuses.map((s) => s.push._tag)).not.toContain("Halted")
     }).pipe(Effect.scoped),
   15_000
+)
+
+it.effect(
+  "a syncHeaders interruption whose cleanup also dies stays an interruption: it is never turned into a credentials failure, and nothing is sent",
+  () =>
+    Effect.gen(function* () {
+      const fetches = { n: 0 }
+      const fetch = Object.assign(
+        (_input: URL | RequestInfo, _init?: RequestInit) => {
+          fetches.n++
+          return Promise.reject(new TypeError("must not be sent"))
+        },
+        { preconnect: globalThis.fetch.preconnect }
+      )
+      const t = yield* Transport.make.pipe(
+        Effect.provide(
+          Transport.layerProtocolHttp(
+            "http://echo.test/rpc",
+            Effect.interrupt.pipe(Effect.ensuring(Effect.die(new Error("cleanup bug"))))
+          )
+        )
+      )
+      const exit = yield* Effect.exit(t.push(batch(1)).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)))
+      expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBe(true)
+      expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").not.toContain("CredentialsUnavailable")
+      expect(fetches.n).toBe(0)
+    }).pipe(Effect.scoped)
 )
 
 it.live(

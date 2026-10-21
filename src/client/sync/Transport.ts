@@ -81,11 +81,12 @@ const PreparedHeaders = Context.Reference<Headers.Input | undefined>("echo-sync/
   defaultValue: () => undefined
 })
 
-/** Runs `syncHeaders`; a defect becomes `CredentialsUnavailable`, interruption passes through. */
+/**
+ * Runs `syncHeaders`; a defect becomes `CredentialsUnavailable`. Any cause with an interruption,
+ * including interruption plus a defect from a finalizer, passes through unchanged.
+ */
 const acquire = (headers: Effect.Effect<Headers.Input>) =>
-  Effect.catchDefect(headers, (defect) =>
-    Effect.fail(new CredentialsUnavailable({ message: `syncHeaders failed: ${String(defect)}` }))
-  )
+  headers.pipe(defectsAs((message) => new CredentialsUnavailable({ message: `syncHeaders failed: ${message}` })))
 
 /** A `Transport` over an RPC client `Protocol` (see `layerProtocolHttp`). */
 /**
