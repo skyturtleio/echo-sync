@@ -22,6 +22,40 @@ export const runRouter = (self: SharedWorkerScope): void => {
   let leader: { readonly leaderId: string; readonly port: MessagePort } | undefined
   const tabs = new Map<string, MessagePort>()
 
+  let announcements: Promise<void> = Promise.resolve()
+
+  /**
+   * Accept an announcement only from the current holder of its epoch lock. A dead leader's announcement
+   * can arrive after its successor's (the announcing tab relays it); without this check it would replace
+   * the live route and then be cleared, leaving no leader at all.
+   */
+  const accept = (
+    replica: Platform.ReplicaIdentity,
+    announced: { readonly leaderId: string; readonly port: MessagePort }
+  ) =>
+    Effect.gen(function* () {
+      const epoch = Platform.leaderEpochLockName(replica, announced.leaderId)
+      if (!(yield* Platform.isLockHeld(epoch))) {
+        announced.port.close()
+        return
+      }
+      leader?.port.close()
+      leader = announced
+      for (const [tabId, port] of tabs) link(tabId, port)
+      yield* Effect.forkDetach(
+        Platform.awaitLockReleased(epoch).pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              if (leader !== announced) return
+              announced.port.close()
+              leader = undefined
+            })
+          ),
+          Effect.catchCause((cause) => Effect.logError("echo router: watching leader epoch failed", cause))
+        )
+      )
+    })
+
   const link = (tabId: string, tabPort: MessagePort) => {
     if (leader === undefined) return
     const channel = new MessageChannel()
@@ -44,7 +78,8 @@ export const runRouter = (self: SharedWorkerScope): void => {
           const tabId = data.tabId
           Effect.runFork(
             Platform.awaitLockReleased(Platform.tabLockName(identity, tabId)).pipe(
-              Effect.andThen(Effect.sync(() => tabs.get(tabId) === tabPort && tabs.delete(tabId)))
+              Effect.andThen(Effect.sync(() => tabs.get(tabId) === tabPort && tabs.delete(tabId))),
+              Effect.catchCause((cause) => Effect.logError("echo router: watching tab failed", cause))
             )
           )
           link(tabId, tabPort)
@@ -52,21 +87,16 @@ export const runRouter = (self: SharedWorkerScope): void => {
         }
         case "Leader": {
           if (identity === undefined) return
-          leader?.port.close()
-          leader = { leaderId: data.leaderId, port: data.port }
-          const leaderId = data.leaderId
-          Effect.runFork(
-            Platform.awaitLockReleased(Platform.leaderEpochLockName(identity, leaderId)).pipe(
-              Effect.andThen(
-                Effect.sync(() => {
-                  if (leader?.leaderId !== leaderId) return
-                  leader.port.close()
-                  leader = undefined
-                })
+          const replica = identity
+          const announced = { leaderId: data.leaderId, port: data.port }
+          // One announcement at a time, each checked against the live epoch lock when it is processed.
+          announcements = announcements.then(() =>
+            Effect.runPromise(
+              accept(replica, announced).pipe(
+                Effect.catchCause((cause) => Effect.logError("echo router: leader announcement failed", cause))
               )
             )
           )
-          for (const [tabId, port] of tabs) link(tabId, port)
           return
         }
       }

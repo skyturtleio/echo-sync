@@ -108,7 +108,13 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
 
     // `current` is pending while no leader is connected; requests wait on it.
     let current = Deferred.makeUnsafe<Connection>()
-    let active: { readonly leaderId: string; readonly scope: Scope.Closeable } | undefined
+    interface Active {
+      readonly leaderId: string
+      readonly scope: Scope.Closeable
+      readonly lost: Deferred.Deferred<void>
+    }
+    // Async work started for a connection only acts while that exact connection object is `active`.
+    let active: Active | undefined
     let isLeaderTab = false
     const publish = (connection: Connection | undefined) => {
       if (Deferred.isDoneUnsafe(current)) current = Deferred.makeUnsafe()
@@ -159,25 +165,43 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     }
 
     // Held for the tab's lifetime: the leader and the router drop this tab's port when it is released.
-    yield* Platform.holdLock(Platform.tabLockName(identity, tabId))
+    const tabLock = yield* Effect.exit(Platform.holdLock(Platform.tabLockName(identity, tabId)))
+    if (Exit.isFailure(tabLock)) {
+      publish({
+        _tag: "Unavailable",
+        error: new LeaderUnavailable({ reason: "Unsupported", message: `tab lock: ${String(tabLock.cause)}` })
+      })
+      return service
+    }
     void navigator.storage.persist().catch(() => false)
 
+    /**
+     * Fail everything in flight on `connection` with a typed `LeaderLost` first, then tear down its RPC
+     * client: closing the scope first would surface as interruption instead.
+     */
+    const displace = (connection: Active) => {
+      Deferred.doneUnsafe(connection.lost, Effect.void)
+      fork(Effect.andThen(Effect.yieldNow, Scope.close(connection.scope, Exit.void)))
+    }
+
     const connect = (leaderId: string, port: MessagePort) => {
-      if (active !== undefined) fork(Scope.close(active.scope, Exit.void))
-      const connectionScope = Scope.forkUnsafe(scope)
-      active = { leaderId, scope: connectionScope }
-      const lost = Deferred.makeUnsafe<void>()
+      if (active !== undefined) displace(active)
+      const connection: Active = { leaderId, scope: Scope.forkUnsafe(scope), lost: Deferred.makeUnsafe<void>() }
+      active = connection
+      // Requests wait for this connection's handshake rather than using the displaced one.
+      publish(undefined)
       fork(
         Platform.awaitLockReleased(Platform.leaderEpochLockName(identity, leaderId)).pipe(
           Effect.andThen(
             Effect.sync(() => {
-              Deferred.doneUnsafe(lost, Effect.void)
-              if (active?.leaderId !== leaderId) return
-              active = undefined
-              publish(undefined)
+              if (active === connection) {
+                active = undefined
+                publish(undefined)
+              }
+              displace(connection)
             })
           ),
-          Effect.andThen(Scope.close(connectionScope, Exit.void))
+          Effect.catchCause((cause) => Effect.logError("echo: watching leader epoch failed", cause))
         )
       )
       fork(
@@ -188,13 +212,13 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
             RpcClient.layerProtocolWorker({ size: 1, concurrency: Number.MAX_SAFE_INTEGER }).pipe(
               Layer.provide(BrowserWorker.layer(() => port))
             ),
-            connectionScope
+            connection.scope
           )
-          const client = yield* makeRpcClient.pipe(Effect.provide(protocol), Scope.provide(connectionScope))
-          if (active?.leaderId === leaderId) publish({ _tag: "Connected", leaderId, client, lost })
+          const client = yield* makeRpcClient.pipe(Effect.provide(protocol), Scope.provide(connection.scope))
+          if (active === connection) publish({ _tag: "Connected", leaderId, client, lost: connection.lost })
         }).pipe(
           // The handshake never completes if the leader died first.
-          Effect.raceFirst(Deferred.await(lost)),
+          Effect.raceFirst(Deferred.await(connection.lost)),
           Effect.catchCause((cause) => Effect.logError("echo: connecting to leader failed", cause))
         )
       )

@@ -3,8 +3,10 @@
  * and capability detection. Everything here is usable from a window, a dedicated worker, or a
  * SharedWorker.
  */
+/// <reference lib="webworker" />
 import * as Effect from "effect/Effect"
 import * as Schedule from "effect/Schedule"
+import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 
 const noop = () => {}
@@ -14,7 +16,8 @@ export interface ReplicaIdentity {
   readonly profile: string
 }
 
-const segment = /^[A-Za-z0-9._-]+$/
+// No all-dot segments: "." and ".." are path traversal in the OPFS directory walk.
+const segment = /^(?!\.+$)[A-Za-z0-9._-]+$/
 
 /** Rejects ids that would collide or escape the `echo-sync/<appId>/<profile>.db` / `echo:<appId>:*` namespaces. */
 export const validateIdentity = (identity: ReplicaIdentity): string | undefined =>
@@ -42,40 +45,36 @@ export const leaderEpochLockName = ({ appId, profile }: ReplicaIdentity, leaderI
 export const tabLockName = ({ appId, profile }: ReplicaIdentity, tabId: string): string =>
   `echo:${appId}:${profile}:tab:${tabId}`
 
-/**
- * Hold an exclusive Web Lock until the enclosing scope closes. Resolves once the lock is granted.
- * The browser releases it automatically if the holding agent (tab/worker) dies.
- */
-export const holdLock = (name: string): Effect.Effect<void, never, Scope.Scope> =>
-  Effect.acquireRelease(
-    Effect.callback<() => void>((resume) => {
-      const abort = new AbortController()
-      void navigator.locks
-        .request(name, { mode: "exclusive", signal: abort.signal }, () => {
-          let release = noop
-          const held = new Promise<void>((resolve) => {
-            release = resolve
-          })
-          resume(Effect.succeed(release))
-          return held
-        })
-        .catch(() => {})
-      return Effect.sync(() => abort.abort())
-    }),
-    (release) => Effect.sync(release)
-  ).pipe(Effect.asVoid)
+/** The Web Locks API rejected a request for a reason other than our own cancellation. */
+export class LockError extends Schema.TaggedError<LockError>()("LockError", {
+  name: Schema.String,
+  message: Schema.String
+}) {}
+
+const lockError = (name: string, cause: unknown) =>
+  new LockError({ name, message: cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause) })
 
 /**
- * Like `holdLock` but never waits: succeeds with `true` and holds the lock if it was free, `false` otherwise.
+ * Request `name` and resolve with a release function once granted (or `undefined` when `ifAvailable`
+ * and the lock is taken). Interrupting the wait aborts the queued request; a grant that races with the
+ * interruption is released immediately, so a cancelled waiter never ends up holding the lock.
  */
-export const tryHoldLock = (name: string): Effect.Effect<boolean, never, Scope.Scope> =>
-  Effect.acquireRelease(
-    Effect.callback<(() => void) | undefined>((resume) => {
-      void navigator.locks.request(name, { mode: "exclusive", ifAvailable: true }, (lock) => {
+const request = (
+  name: string,
+  options: { readonly mode: LockMode; readonly ifAvailable?: true }
+): Effect.Effect<(() => void) | undefined, LockError> =>
+  Effect.callback<(() => void) | undefined, LockError>((resume, signal) => {
+    // `signal` and `ifAvailable` cannot be combined; an ifAvailable request never queues anyway.
+    const lockOptions: LockOptions = options.ifAvailable
+      ? { mode: options.mode, ifAvailable: true }
+      : { ...options, signal }
+    navigator.locks
+      .request(name, lockOptions, (lock) => {
         if (lock === null) {
           resume(Effect.succeed(undefined))
           return undefined
         }
+        if (signal.aborted) return undefined
         let release = noop
         const held = new Promise<void>((resolve) => {
           release = resolve
@@ -83,25 +82,48 @@ export const tryHoldLock = (name: string): Effect.Effect<boolean, never, Scope.S
         resume(Effect.succeed(release))
         return held
       })
-    }),
-    (release) => Effect.sync(() => release?.())
-  ).pipe(Effect.map((release) => release !== undefined))
+      .catch((cause: unknown) => {
+        if (!signal.aborted) resume(Effect.fail(lockError(name, cause)))
+      })
+  })
+
+/** Releases the granted lock when the enclosing scope closes; the wait itself stays interruptible. */
+const holdUntilScopeCloses = (acquire: Effect.Effect<(() => void) | undefined, LockError>) =>
+  Effect.uninterruptibleMask((restore) =>
+    Effect.flatMap(restore(acquire), (release) =>
+      release === undefined
+        ? Effect.succeed(false)
+        : Effect.as(
+            Effect.addFinalizer(() => Effect.sync(release)),
+            true
+          )
+    )
+  )
+
+/**
+ * Hold an exclusive Web Lock until the enclosing scope closes. Resolves once the lock is granted; the
+ * wait is interruptible. The browser releases the lock automatically if the holding agent dies.
+ */
+export const holdLock = (name: string): Effect.Effect<void, LockError, Scope.Scope> =>
+  Effect.asVoid(holdUntilScopeCloses(request(name, { mode: "exclusive" })))
+
+/** Like `holdLock` but never waits: `true` and the lock is held if it was free, `false` otherwise. */
+export const tryHoldLock = (name: string): Effect.Effect<boolean, LockError, Scope.Scope> =>
+  holdUntilScopeCloses(request(name, { mode: "exclusive", ifAvailable: true }))
 
 /**
  * Completes when the exclusive holder of `name` releases it (or immediately if nobody holds it).
- * Uses a shared-mode request so any number of watchers are released together.
+ * A shared-mode request, released at once, so any number of watchers are woken together.
  */
-export const awaitLockReleased = (name: string): Effect.Effect<void> =>
-  Effect.callback<void>((resume) => {
-    const abort = new AbortController()
-    void navigator.locks
-      .request(name, { mode: "shared", signal: abort.signal }, () => {
-        resume(Effect.void)
-        return undefined
-      })
-      .catch(() => {})
-    return Effect.sync(() => abort.abort())
-  })
+export const awaitLockReleased = (name: string): Effect.Effect<void, LockError> =>
+  Effect.flatMap(request(name, { mode: "shared" }), (release) => Effect.sync(() => release?.()))
+
+/** Whether some agent currently holds `name` exclusively. */
+export const isLockHeld = (name: string): Effect.Effect<boolean, LockError> =>
+  Effect.tryPromise({
+    try: () => navigator.locks.query(),
+    catch: (cause) => lockError(name, cause)
+  }).pipe(Effect.map((snapshot) => (snapshot.held ?? []).some((lock) => lock.name === name)))
 
 /**
  * Whether this agent can host the leader: Web Locks plus OPFS synchronous access handles (worker-only

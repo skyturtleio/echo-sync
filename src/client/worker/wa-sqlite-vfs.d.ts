@@ -7,6 +7,10 @@ declare module "@effect/wa-sqlite/src/examples/AccessHandlePoolVFS.js" {
   export class AccessHandlePoolVFS {
     /** Opens (creating if needed) the OPFS directory `name` and takes a sync access handle on every file in it. */
     static create(name: string, module: unknown): Promise<AccessHandlePoolVFS>
+    /** Number of files in the pool (each backs one SQLite file: db, journal, temp). */
+    getCapacity(): number
+    /** Adds `n` files to the pool. */
+    addCapacity(n: number): Promise<number>
     /** Releases every access handle in the pool. */
     close(): Promise<void>
   }

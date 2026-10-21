@@ -14,7 +14,6 @@ import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
-import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
 import * as Stream from "effect/Stream"
@@ -46,20 +45,15 @@ const openDatabase = (identity: Platform.ReplicaIdentity) =>
   Effect.gen(function* () {
     const poolDirectory = Platform.poolDirectory(identity)
     yield* Platform.awaitOpfsPoolFree(poolDirectory)
+    // Fails here, before SqliteClient's (uninterruptible) wait for "ready" can start.
+    const serve = yield* OpfsSqlite.open({ poolDirectory, dbName: Platform.dbName(identity) })
     const channel = new MessageChannel()
-    const opfs = yield* OpfsSqlite.run({ port: channel.port1, poolDirectory, dbName: Platform.dbName(identity) }).pipe(
-      Effect.forkScoped
-    )
+    yield* Effect.forkScoped(serve(channel.port1))
     const context = yield* Layer.build(
       SqliteClient.layer({ worker: Effect.succeed(channel.port2), installReactivityHooks: true })
-    ).pipe(
-      // OpfsWorker failing to open never sends "ready", so the client would wait forever.
-      Effect.raceFirst(
-        Fiber.join(opfs).pipe(Effect.flatMap(() => Effect.die(new Error("OPFS SQLite worker exited before ready"))))
-      )
     )
     const sql = Context.get(context, SqlClient.SqlClient)
-    yield* Outbox.migrate.pipe(Effect.provideService(SqlClient.SqlClient, sql))
+    yield* Effect.andThen(Outbox.migrate, Outbox.pruneReleased()).pipe(Effect.provideService(SqlClient.SqlClient, sql))
     return sql
   })
 
@@ -100,13 +94,18 @@ const serveTab = (
     Effect.ensuring(Effect.sync(() => port.close()))
   )
 
-const program = (endpoint: Endpoint, inbox: Queue.Queue<ToLeader>) =>
+/** A dedicated worker's global scope, as far as the leader uses it. */
+export interface WorkerScope extends Endpoint {
+  close(): void
+}
+
+const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>) =>
   Effect.gen(function* () {
     let init = yield* Queue.take(inbox)
     while (init._tag !== "Init") init = yield* Queue.take(inbox)
     const identity: Platform.ReplicaIdentity = { appId: init.appId, profile: init.profile }
     const invalid = Platform.validateIdentity(identity) ?? Platform.leaderHostCapability()
-    if (invalid !== undefined) return send(endpoint, { _tag: "Failed", message: invalid })
+    if (invalid !== undefined) return yield* Effect.fail(new Error(invalid))
 
     if (!(yield* Platform.tryHoldLock(Platform.leaderLockName(identity)))) {
       send(endpoint, { _tag: "Waiting" })
@@ -135,10 +134,19 @@ const program = (endpoint: Endpoint, inbox: Queue.Queue<ToLeader>) =>
       }
     }
   }).pipe(
+    // Closing the scope releases the leader and epoch locks and the pool's access handles.
     Effect.scoped,
     Effect.catchCause((cause) =>
-      Effect.sync(() => send(endpoint, { _tag: "Failed", message: String(cause) })).pipe(
-        Effect.andThen(Effect.logError("echo leader failed", cause))
+      Effect.logError("echo leader candidate cannot serve", cause).pipe(
+        Effect.andThen(
+          Effect.sync(() => {
+            send(endpoint, { _tag: "Failed", message: String(cause) })
+            // A candidate that cannot serve must not linger (DESIGN §9): ending the worker guarantees that
+            // anything a failed open acquired outside the scope (e.g. a half-built handle pool) and every
+            // Web Lock is released, so the next queued candidate is elected.
+            endpoint.close()
+          })
+        )
       )
     )
   )
@@ -154,7 +162,7 @@ const listen = (
 }
 
 /** Entry point for the leader-candidate dedicated worker. Pass the worker's global `self`. */
-export const runLeaderWorker = (self: Endpoint): void => {
+export const runLeaderWorker = (self: WorkerScope): void => {
   const inbox = Effect.runSync(Queue.unbounded<ToLeader>())
   listen(self, inbox)
   Effect.runFork(program(self, inbox))
