@@ -291,6 +291,9 @@ export interface EchoStore {
   readonly scan: <T extends AnySyncTable>(table: T) => Effect.Effect<ReadonlyArray<RowOf<T>>, StoreUnavailable>
 }
 
+/** The read half of `EchoStore`: what a registered query's handler gets (DESIGN §10.1). */
+export type ReadStore = Pick<EchoStore, "get" | "query" | "scan">
+
 /** Pre-image of a row, captured before the first write to it in one store instance. */
 export interface UndoImage {
   readonly table: AnySyncTable

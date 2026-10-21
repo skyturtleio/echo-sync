@@ -1,10 +1,10 @@
 import { Effect, Schema } from "effect"
 import type { PureSchema } from "./Mutation.ts"
-import type { EchoStore, ReadError } from "./Store.ts"
+import type { EchoStore, ReadError, ReadStore } from "./Store.ts"
 
 /**
  * Registered read queries (DESIGN §10, §10.1), the read-side twin of `Mutation.make`. A query is a
- * deterministic function of its args and the rows it reads through `EchoStore`; the leader runs it in
+ * deterministic function of its args and the rows it reads through `ReadStore`; the leader runs it in
  * one read transaction and re-runs it when a table the latest run read changes.
  */
 
@@ -25,7 +25,7 @@ export interface AnyQuery {
    * Decode `args` (JSON), run the handler, encode its result (JSON). Transaction boundaries are the
    * caller's. A result that does not encode with `success` is a bug in the query: a defect.
    */
-  readonly execute: (db: EchoStore, args: Schema.Json) => Effect.Effect<Schema.Json, QueryArgsDecodeFailed | ReadError>
+  readonly execute: (db: ReadStore, args: Schema.Json) => Effect.Effect<Schema.Json, QueryArgsDecodeFailed | ReadError>
 }
 
 export interface Query<Name extends string, A extends PureSchema, S extends PureSchema> extends AnyQuery {
@@ -33,7 +33,7 @@ export interface Query<Name extends string, A extends PureSchema, S extends Pure
   readonly args: A
   /** Mandatory: results cross the worker boundary encoded and are decoded with it on the tab. */
   readonly success: S
-  readonly handler: (db: EchoStore, args: A["Type"]) => Effect.Effect<S["Type"], ReadError>
+  readonly handler: (db: ReadStore, args: A["Type"]) => Effect.Effect<S["Type"], ReadError>
 }
 
 export const make = <const Name extends string, A extends PureSchema, S extends PureSchema>(
@@ -41,7 +41,7 @@ export const make = <const Name extends string, A extends PureSchema, S extends 
   options: {
     readonly args: A
     readonly success: S
-    readonly handler: (db: EchoStore, args: A["Type"]) => Effect.Effect<S["Type"], ReadError>
+    readonly handler: (db: ReadStore, args: A["Type"]) => Effect.Effect<S["Type"], ReadError>
   }
 ): Query<Name, A, S> => {
   const decodeArgs: (u: unknown) => Effect.Effect<A["Type"], Schema.SchemaError> = Schema.decodeUnknownEffect(
@@ -82,7 +82,10 @@ export const makeRegistry = (queries: ReadonlyArray<AnyQuery>): QueryRegistry =>
   return { queries: byName }
 }
 
-/** Run one registered query by name over `db`. */
+/**
+ * Run one registered query by name over `db`. The handler is given a fresh object with only the read
+ * methods, so no cast inside a handler reaches `insert`/`patch`/`delete` (DESIGN §10.1).
+ */
 export const run = (
   registry: QueryRegistry,
   name: string,
@@ -90,5 +93,6 @@ export const run = (
   db: EchoStore
 ): Effect.Effect<Schema.Json, UnknownQuery | QueryArgsDecodeFailed | ReadError> => {
   const query = registry.queries.get(name)
-  return query === undefined ? Effect.fail(new UnknownQuery({ name })) : query.execute(db, args)
+  const reads: ReadStore = { get: db.get, query: db.query, scan: db.scan }
+  return query === undefined ? Effect.fail(new UnknownQuery({ name })) : query.execute(reads, args)
 }

@@ -137,6 +137,29 @@ const pair = Query.make("pair", {
     })
 })
 
+const addRaw = Mutation.make("raw.add", {
+  args: Schema.Struct({ id: Schema.String }),
+  handler: (ctx, { id }) => ctx.store.insert(Raw, { id: RowId.make(id), accessScopeId: scope, body: "x" })
+})
+/** Store writes need no services; a test-only guard so the runtime-reached write can be run. */
+const isStoreWrite = (u: unknown): u is Effect.Effect<void, unknown> => Effect.isEffect(u)
+
+/**
+ * A registered query that tries to write. `ReadStore` has no `patch`, so it looks the method up at runtime,
+ * as a buggy handler could; if the leader handed it a full store, this would patch `flags`.
+ */
+const flip = Query.make("flip", {
+  args: Schema.Struct({}),
+  success: Schema.String,
+  handler: (db) =>
+    Effect.suspend(() => {
+      const patch: unknown = Reflect.get(db, "patch")
+      if (typeof patch !== "function") return Effect.die(new Error("no write method on the query store"))
+      const written: unknown = Reflect.apply(patch, db, [Flags, RowId.make("f"), { body: "b" }])
+      return isStoreWrite(written) ? Effect.as(Effect.orDie(written), "flipped") : Effect.succeed("flipped")
+    })
+})
+
 const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
   Effect.gen(function* () {
     const reactivity = yield* Reactivity.make
@@ -161,7 +184,7 @@ const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
       actor: me,
       storage,
       registry: queryRegistry,
-      mutations: Mutation.makeRegistry([]),
+      mutations: Mutation.makeRegistry([addRaw]),
       transport: {
         push: () => Effect.die(new Error("no transport")),
         pull: () => Effect.die(new Error("no transport"))
@@ -174,7 +197,7 @@ const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
       engine,
       loop: undefined,
       actor: me,
-      queries: Query.makeRegistry([pick, pair]),
+      queries: Query.makeRegistry([pick, pair, flip]),
       allowRawExec: options.allowRawExec,
       info: { leaderId: "l", clientId: "c", dbName: "test", syncing: false }
     })
@@ -182,7 +205,11 @@ const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
     const row = (id: string, body = "x") => ({ id: RowId.make(id), accessScopeId: scope, body })
     const count = (table: string) =>
       Effect.map(sql.unsafe<{ readonly n: number }>(`SELECT count(*) AS n FROM ${table}`), (rs) => rs[0]?.n)
-    return { client, storage, put, write, row, count }
+    const flagBody = Effect.map(
+      sql<{ readonly body: string }>`SELECT body FROM flags WHERE id = 'f'`,
+      (rs) => rs[0]?.body
+    )
+    return { client, storage, engine, put, write, row, count, flagBody }
   })
 
 /** Collect a stream's emissions into a queue in the background. */
@@ -278,5 +305,37 @@ it.live("raw exec is refused, and writes nothing, on a leader started without al
       .pipe(Effect.flip)
     expect(result._tag).toBe("RawExecDisabled")
     expect(yield* count("raw")).toBe(0)
+  }).pipe(Effect.scoped)
+)
+
+it.live("raw subscribe is refused before any SQL runs on a leader started without allowRawExec", () =>
+  Effect.gen(function* () {
+    // Caller SQL can switch query_only off itself: only the flag keeps this from committing.
+    const query = {
+      statements: [
+        { sql: "PRAGMA query_only = OFF", params: [] },
+        { sql: "INSERT INTO raw (id, access_scope_id, body) VALUES ('w', 's', 'x')", params: [] }
+      ],
+      tables: ["raw"]
+    }
+    const refused = yield* leaderRpc({ allowRawExec: false })
+    const error = yield* Stream.runHead(refused.client.subscribeRaw({ query })).pipe(Effect.flip)
+    expect(error._tag).toBe("RawExecDisabled")
+    expect(yield* refused.count("raw")).toBe(0)
+    // With the flag the same subscription is served (the harness relies on it).
+    const allowed = yield* leaderRpc({ allowRawExec: true })
+    expect(Option.isSome(yield* Stream.runHead(allowed.client.subscribeRaw({ query })))).toBe(true)
+  }).pipe(Effect.scoped)
+)
+
+it.live("a registered query that writes fails, commits nothing, and leaves the next mutation writable", () =>
+  Effect.gen(function* () {
+    const { client, write, row, engine, count, flagBody } = yield* leaderRpc({ allowRawExec: false })
+    yield* write(Flags, row("f", "c"))
+    const result = yield* Stream.runHead(client.subscribe({ name: "flip", args: {} })).pipe(Effect.exit)
+    expect(Exit.isFailure(result) ? "failed" : "emitted").toBe("failed")
+    expect(yield* flagBody).toBe("c")
+    yield* engine.mutate(Ids.MutationId.make("m1"), "raw.add", { id: "r1" })
+    expect(yield* count("raw")).toBe(1)
   }).pipe(Effect.scoped)
 )

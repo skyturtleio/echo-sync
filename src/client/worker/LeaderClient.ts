@@ -81,7 +81,10 @@ export class LeaderClient extends Context.Service<
     readonly enqueue: (
       envelope: OutboxEnvelope
     ) => Effect.Effect<Enqueued, SqlFailure | LocallyRejected | LeaderUnavailable>
-    readonly subscribe: (query: LiveQuery) => Stream.Stream<QueryResult, SqlFailure | LeaderUnavailable>
+    /** Raw live query for the dev harness; `RawExecDisabled` unless the leader allows raw SQL. */
+    readonly subscribe: (
+      query: LiveQuery
+    ) => Stream.Stream<QueryResult, SqlFailure | RawExecDisabled | LeaderUnavailable>
     readonly leaderInfo: Effect.Effect<LeaderInfo, LeaderUnavailable>
     /** The leader's sync status; ends with `LeaderLost` on handover (re-subscribe, like `subscribe`). */
     readonly syncStatus: Stream.Stream<SyncStatus, SyncDisabled | LeaderUnavailable>

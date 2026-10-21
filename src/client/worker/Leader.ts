@@ -146,8 +146,18 @@ export const makeHandlers = ({
   queries,
   allowRawExec,
   info
-}: HandlerOptions) =>
-  LeaderRpcs.toHandlers({
+}: HandlerOptions) => {
+  /**
+   * Run `self` with the connection in `query_only`, so any write in it fails and its transaction rolls
+   * back. Use inside the admitted transaction: the flag is switched off again before COMMIT/ROLLBACK and
+   * before the permit is released, so the next admitted writer never sees it (DESIGN §10.1).
+   */
+  const readOnly = <A, E, R>(self: Effect.Effect<A, E, R>) =>
+    Effect.orDie(sql`PRAGMA query_only = ON`).pipe(
+      Effect.andThen(self),
+      Effect.ensuring(Effect.orDie(sql`PRAGMA query_only = OFF`))
+    )
+  return LeaderRpcs.toHandlers({
     // Every RPC takes the storage permit, so one queued behind a long install is cancellable while it waits.
     exec: ({ sql: text, params }) =>
       allowRawExec
@@ -162,22 +172,28 @@ export const makeHandlers = ({
       liveRuns(reactivity, (watch) =>
         // One read transaction per run: the result and the tables it read are one replica version, and
         // the new dependency set is registered before any later write is admitted (DESIGN §10.1).
+        // Read-only: a handler is handed the full `EchoStore`, and a write must not commit outside the outbox.
         storage
           .transaction(
-            Effect.gen(function* () {
-              const rows = storage.rows
-              const instance = Store.make(rows, { roleFor: Engine.roleFromGrants(rows, actor) })
-              const result = yield* Query.run(queries, name, args, instance.store).pipe(
-                // A failed run still read tables; the stream ends with its error either way.
-                Effect.ensuring(Effect.flatMap(instance.reads, (tables) => watch([...tables])))
-              )
-              return result
-            })
+            readOnly(
+              Effect.gen(function* () {
+                const rows = storage.rows
+                const instance = Store.make(rows, { roleFor: Engine.roleFromGrants(rows, actor) })
+                const result = yield* Query.run(queries, name, args, instance.store).pipe(
+                  // A failed run still read tables; the stream ends with its error either way.
+                  Effect.ensuring(Effect.flatMap(instance.reads, (tables) => watch([...tables])))
+                )
+                return result
+              })
+            )
           )
           .pipe(Effect.catchTag("StoreUnavailable", (error) => Effect.fail(unavailable(error))))
       ),
-    subscribeRaw: ({ query }) =>
-      sql
+    subscribeRaw: ({ query }) => {
+      // Caller SQL can switch `query_only` off itself, so it is no security boundary: raw reads are a
+      // harness tool behind the same flag as `exec`, refused before the connection is touched (DESIGN §10.1).
+      if (!allowRawExec) return Stream.fail(new RawExecDisabled())
+      return sql
         .reactive(
           query.tables,
           // One read transaction per emission, so a batch never mixes replica versions (DESIGN §10).
@@ -185,15 +201,16 @@ export const makeHandlers = ({
           // it is switched off again before COMMIT/ROLLBACK, still inside the permit (DESIGN §10.1).
           storage
             .transaction(
-              sql`PRAGMA query_only = ON`.pipe(
-                Effect.andThen(Effect.forEach(query.statements, (s) => sql.unsafe<Row>(s.sql, s.params))),
-                Effect.ensuring(Effect.orDie(sql`PRAGMA query_only = OFF`)),
-                Effect.mapError(toFailure)
+              readOnly(
+                Effect.forEach(query.statements, (s) => sql.unsafe<Row>(s.sql, s.params)).pipe(
+                  Effect.mapError(toFailure)
+                )
               )
             )
             .pipe(Effect.catchTag("StoreUnavailable", (error) => Effect.fail(unavailable(error))))
         )
-        .pipe(Stream.map((results) => ({ results }))),
+        .pipe(Stream.map((results) => ({ results })))
+    },
     leaderInfo: () => Effect.succeed(info),
     syncStatus: () => (loop === undefined ? Stream.fail(new SyncDisabled()) : loop.changes),
     notices: () => storage.admit(SqliteSyncStorage.notices(sql)).pipe(Effect.mapError(unavailable)),
@@ -204,6 +221,7 @@ export const makeHandlers = ({
         Effect.mapError(unavailable)
       )
   })
+}
 
 const serveTab = (
   identity: Platform.ReplicaIdentity,

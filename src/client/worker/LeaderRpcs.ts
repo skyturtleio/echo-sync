@@ -130,11 +130,14 @@ export class LeaderRpcs extends RpcGroup.make(
     ]),
     stream: true
   }),
-  /** Raw live query: emits the current result, then a fresh result after every write to `tables`. */
+  /**
+   * Raw live query: emits the current result, then a fresh result after every write to `tables`.
+   * `RawExecDisabled` unless the leader allows raw SQL (DESIGN §10.1).
+   */
   Rpc.make("subscribeRaw", {
     payload: { query: LiveQuery },
     success: QueryResult,
-    error: SqlFailure,
+    error: Schema.Union([SqlFailure, RawExecDisabled]),
     stream: true
   }),
   /** Identity of the serving leader (diagnostics / tests). */
