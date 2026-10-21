@@ -51,11 +51,12 @@ const server = Effect.gen(function* () {
 type PresenceClient = Effect.Success<ReturnType<Effect.Success<typeof server>>>
 
 const s1 = AccessScope.AccessScopeId.make("s1")
-const payload = (clientId: string, tabId: string, state: Protocol.PresenceEntry["state"] = null) => ({
+const payload = (clientId: string, tabId: string, state: Protocol.PresenceEntry["state"] = null, revision = 0) => ({
   clientId: Ids.ClientId.make(clientId),
   room: s1,
   tabId: Protocol.TabId.make(tabId),
-  state
+  state,
+  revision
 })
 
 const settle = Effect.repeat(Effect.yieldNow, { times: 50 })
@@ -254,9 +255,9 @@ describe("presence state (§12)", () => {
         // Changes first, then a heartbeat while the last change is still undelivered. Two changes, so
         // the last one is still pending even behind a stream stage that reads one element ahead.
         const a = yield* slowWatch
-        yield* a.presence.track({ ...entry("slow"), state: "earlier" })
+        yield* a.presence.track({ ...entry("slow"), state: "earlier", revision: 1 })
         yield* settle
-        yield* a.presence.track({ ...entry("slow"), state: "changed" })
+        yield* a.presence.track({ ...entry("slow"), state: "changed", revision: 2 })
         yield* settle
         yield* TestClock.adjust("15 seconds")
         yield* settle
@@ -267,11 +268,54 @@ describe("presence state (§12)", () => {
         const b = yield* slowWatch
         yield* TestClock.adjust("15 seconds")
         yield* settle
-        yield* b.presence.track({ ...entry("slow"), state: "changed" })
+        yield* b.presence.track({ ...entry("slow"), state: "changed", revision: 1 })
         yield* settle
         assert.strictEqual(yield* b.lastSnapshot, 'p/c1/slow="changed"')
         assert.include(b.seen, "(heartbeat)")
       })
+  )
+
+  it.effect(
+    "a track delayed before it applies cannot overwrite a newer one: s1 held, s2 applied, s1 released, the room shows s2",
+    () =>
+      Effect.gen(function* () {
+        const presence = yield* Presence.make({ heartbeatInterval: "1 hour" })
+        const state = Effect.map(presence.snapshot(s1), (r) => r.entries[0]?.state)
+        yield* Effect.forkChild(Stream.runDrain(presence.join(entry("t"))))
+        yield* settle
+        // s1's request is held before the server touches the entry (a slow network, a cancelled fetch).
+        const gate = yield* Deferred.make<void>()
+        const late = yield* Effect.forkChild(
+          Effect.andThen(Deferred.await(gate), presence.track({ ...entry("t"), state: "s1", revision: 1 }))
+        )
+        assert.isTrue(yield* presence.track({ ...entry("t"), state: "s2", revision: 2 }))
+        yield* Deferred.succeed(gate, undefined)
+        assert.isFalse(yield* Fiber.join(late))
+        assert.strictEqual(yield* state, "s2")
+      })
+  )
+
+  it.effect("after a handover rejoin with (s2, 2), a late track(s1, 1) from the old leader's attempt is ignored", () =>
+    Effect.gen(function* () {
+      const presence = yield* Presence.make({ heartbeatInterval: "1 hour" })
+      const state = Effect.map(presence.snapshot(s1), (r) => r.entries[0]?.state)
+      const old = yield* Effect.forkChild(Stream.runDrain(presence.join(entry("t"))))
+      yield* settle
+      const gate = yield* Deferred.make<void>()
+      const late = yield* Effect.forkChild(
+        Effect.andThen(Deferred.await(gate), presence.track({ ...entry("t"), state: "s1", revision: 1 }))
+      )
+      // The new leader re-joins with the tab's current pair; it replaces the old entry and ends its stream.
+      yield* Effect.forkChild(Stream.runDrain(presence.join({ ...entry("t"), state: "s2", revision: 2 })))
+      yield* settle
+      assert.isTrue(Exit.isSuccess(yield* Fiber.await(old)))
+      yield* Deferred.succeed(gate, undefined)
+      assert.isFalse(yield* Fiber.join(late))
+      assert.strictEqual(yield* state, "s2")
+      // A newer track still applies.
+      assert.isTrue(yield* presence.track({ ...entry("t"), state: "s3", revision: 3 }))
+      assert.strictEqual(yield* state, "s3")
+    })
   )
 
   it.effect("a track interrupted at any point either changed nothing or was announced to every observer", () =>
@@ -298,7 +342,7 @@ describe("presence state (§12)", () => {
           n++
           const tracking = yield* Effect.forkChild(
             presence
-              .track({ ...entry("watch"), state: n })
+              .track({ ...entry("watch"), state: n, revision: n })
               .pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, ops))
           )
           yield* Effect.repeat(Effect.yieldNow, { times: yields })
@@ -348,8 +392,8 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (§12)", () => {
         Option.some("Forbidden")
       )
       // Its track is a no-op (it holds no entry), and a later change shows the room without it.
-      yield* outsider.track(payload("cq", "t1", "sneaking in"))
-      yield* (yield* connect("p")).track(payload("c0", "watch", "changed"))
+      yield* outsider.track(payload("cq", "t1", "sneaking in", 1))
+      yield* (yield* connect("p")).track(payload("c0", "watch", "changed", 1))
       yield* until(observer.snapshots, ['p/c0/watch="changed"'])
       assert.deepStrictEqual(
         observer.seen.flat().filter((e) => !e.startsWith("p/")),
@@ -370,7 +414,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (§12)", () => {
         const tab2 = yield* open(client, payload("c1", "t2", "two"))
         yield* until(observer.snapshots, ["p/c0/watch=null", 'p/c1/t1="one"', 'p/c1/t2="two"'])
 
-        yield* client.track(payload("c1", "t1", "one, moved"))
+        yield* client.track(payload("c1", "t1", "one, moved", 1))
         yield* until(observer.snapshots, ["p/c0/watch=null", 'p/c1/t1="one, moved"', 'p/c1/t2="two"'])
 
         // Tab 2 reconnects before its old stream has ended: the old stream's end must not drop it.
@@ -380,7 +424,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (§12)", () => {
         assert.isTrue(Exit.isSuccess(yield* Fiber.join(tab2.fiber)))
         yield* Fiber.interrupt(tab1.fiber)
         yield* until(observer.snapshots, ["p/c0/watch=null", 'p/c1/t2="two, again"'])
-        yield* client.track(payload("c1", "t2", "still here"))
+        yield* client.track(payload("c1", "t2", "still here", 1))
         yield* until(observer.snapshots, ["p/c0/watch=null", 'p/c1/t2="still here"'])
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     30_000

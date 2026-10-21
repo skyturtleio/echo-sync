@@ -49,7 +49,9 @@ export class PresenceAlreadyOpen extends Schema.TaggedError<PresenceAlreadyOpen>
 export const PresencePayload = Schema.Struct({
   room: AccessScope.AccessScopeId,
   tabId: Protocol.TabId,
-  state: Schema.Json
+  state: Schema.Json,
+  /** The tab's revision of `state` (DESIGN §9.1); the leader keeps the highest and the server fences on it. */
+  revision: Protocol.PresencePayload.fields.revision
 })
 
 /**

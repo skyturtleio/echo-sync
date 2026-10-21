@@ -398,8 +398,8 @@ const passThrough = (client: Effect.Success<ReturnType<typeof leaderRpc>>["clien
   dismissNotices: (ids) => client.dismissNotices({ ids }),
   syncStatus: client.syncStatus(),
   requestSync: client.requestSync(),
-  presence: (room, state) => client.presence({ room, tabId: Protocol.TabId.make("tab"), state }),
-  track: (room, state) => client.track({ room, tabId: Protocol.TabId.make("tab"), state })
+  presence: (room, state, revision) => client.presence({ room, tabId: Protocol.TabId.make("tab"), state, revision }),
+  track: (room, state, revision) => client.track({ room, tabId: Protocol.TabId.make("tab"), state, revision })
 })
 
 it.live("mutate retried across LeaderLost after the lost leader committed leaves exactly one outbox row", () =>
@@ -808,6 +808,8 @@ it.live(
       })
       const joins: Array<Schema.Json> = []
       const tracks: Array<Schema.Json> = []
+      // Every (state, revision) pair a leader was asked to join or track with, in order.
+      const pairs: Array<string> = []
       // This tab's entry state as each leader's server would hold it (a join sets it, a track replaces it).
       const held: Array<Schema.Json | undefined> = [undefined, undefined, undefined]
       const lost = yield* Deferred.make<void>()
@@ -816,9 +818,10 @@ it.live(
       const calls: LeaderCalls = {
         ...passThrough((yield* leaderRpc({ allowRawExec: false })).client),
         // Leader 1 answers once, then is lost; leader 2 answers once elected. Each join echoes its state.
-        presence: (_room, state) =>
+        presence: (_room, state, revision) =>
           Stream.suspend(() => {
             joins.push(state)
+            pairs.push(`join ${JSON.stringify(state)}@${revision}`)
             held[leader] = state
             return leader === 1
               ? Stream.concat(Stream.make(snap(state)), Stream.never).pipe(
@@ -827,12 +830,13 @@ it.live(
               : Stream.unwrap(Effect.as(Deferred.await(elected), Stream.concat(Stream.make(snap(state)), Stream.never)))
           }),
         // While no leader serves this tab, a track is lost with it.
-        track: (_room, state) =>
+        track: (_room, state, revision) =>
           Effect.suspend(() =>
             Deferred.isDoneUnsafe(lost) && !Deferred.isDoneUnsafe(elected)
               ? Effect.fail(leaderLost)
               : Effect.sync(() => {
                   tracks.push(state)
+                  pairs.push(`track ${JSON.stringify(state)}@${revision}`)
                   held[leader] = state
                 })
           )
@@ -859,6 +863,8 @@ it.live(
       // The rejoin was read before s2 (whose track was lost with the leader): it carries the latest state at
       // that point, never the opening s0, and the catch-up after its first snapshot brings the new leader to s2.
       expect(joins).toEqual(["s0", "s1"])
+      // Revisions are the tab's: the rejoin re-sends its pair, and s2 (lost with the old leader) keeps 2.
+      expect(pairs).toEqual(['join "s0"@0', 'track "s1"@1', 'join "s1"@1', 'track "s2"@2'])
       expect(held[2]).toBe("s2")
       expect(yield* Deferred.isDone(ended)).toBe(false)
       // track on a room this tab has not joined is a no-op.

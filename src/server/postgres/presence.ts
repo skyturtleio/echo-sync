@@ -1,14 +1,17 @@
 import { Deferred, type Duration, Effect, PubSub, Ref, type Scope, Stream } from "effect"
 import type { AccessScope, Protocol } from "echo-sync"
 
-/** An entry and the room it is in. */
+/** An entry, the room it is in, and the revision of its state (DESIGN §12 revision fencing). */
 export interface Joined extends Protocol.PresenceEntry {
   readonly room: AccessScope.AccessScopeId
+  readonly revision: number
 }
 
 /** One open `room` stream's entry. */
 interface Member {
   readonly entry: Protocol.PresenceEntry
+  /** The revision `entry.state` was installed with; a `track` must exceed it. */
+  readonly revision: number
   /**
    * Completed when a later join with the same key replaces this entry; it ends this member's
    * stream. Also its identity: a replaced stream's release must not remove its successor.
@@ -93,7 +96,7 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
           const replaced = yield* Deferred.make<void>()
           const [changes, previous] = yield* Ref.modify(rooms, (all) => {
             const room = all.get(joined.room) ?? { members: new Map(), changes: fresh }
-            const members = new Map(room.members).set(key, { entry, replaced })
+            const members = new Map(room.members).set(key, { entry, revision: joined.revision, replaced })
             return [
               [room.changes, room.members.get(key)] as const,
               new Map(all).set(joined.room, { members, changes: room.changes })
@@ -143,7 +146,8 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
         ),
 
       /**
-       * Replaces the state of an existing entry; `false` (and no change) when there is none. The
+       * Replaces the state of an existing entry; `false` (and no change) when there is none, or when its
+       * revision is not greater than the entry's (a late request never overwrites a newer state). The
        * update and its announcement are one uninterruptible step: an interrupted `track` either
        * changed nothing or is seen by every observer.
        */
@@ -155,8 +159,14 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
             const changes = yield* Ref.modify(rooms, (all) => {
               const room = all.get(joined.room)
               const member = room?.members.get(key)
-              if (room === undefined || member === undefined) return [undefined, all] as const
-              const members = new Map(room.members).set(key, { entry, replaced: member.replaced })
+              if (room === undefined || member === undefined || joined.revision <= member.revision) {
+                return [undefined, all] as const
+              }
+              const members = new Map(room.members).set(key, {
+                entry,
+                revision: joined.revision,
+                replaced: member.replaced
+              })
               return [room.changes, new Map(all).set(joined.room, { members, changes: room.changes })] as const
             })
             if (changes === undefined) return false

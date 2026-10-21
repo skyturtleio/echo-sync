@@ -180,7 +180,8 @@ tab's state in a room it has joined; for a room it has not joined it does nothin
 - **Liveness.** Heartbeats stay on the leader and only snapshots reach the tab. No element at all for
   `idleTimeout` (the `LeaderOptions` value that `followPokes` uses, 45 s by default) ends the upstream
   stream, and so does any failure or clean end. The leader then rejoins after a backoff, and the tab
-  stream does not end. Only `Forbidden { room }` (no grant in the room's scope) ends it; `Unauthorized` is a
+  stream does not end. Each join is prepare-then-stream like `followPokes`: credentials (`syncHeaders`)
+  are resolved first, and the idle clock starts when the request is sent. Only `Forbidden { room }` (no grant in the room's scope) ends it; `Unauthorized` is a
   credential failure and is rejoined like any other (DESIGN §9.1 Credentials).
 - **Track and delivery (DESIGN §9.1, 07a8f48).** `track` completes once this tab has recorded the desired
   state, in one synchronous step before any message to the leader. Interrupting the caller afterwards does
@@ -194,6 +195,14 @@ tab's state in a room it has joined; for a room it has not joined it does nothin
   - a sender never ends or restarts its stream, and never waits for the stream to fail: a heartbeating room
     stream cannot strand a state. Snapshots never wait for a send, and the join's end (idle timeout,
     reconnect, handover, close) interrupts one in flight.
+- **Revision fencing (DESIGN §12, §9.1, 001eaaf).** Timeouts and fetch aborts do not stop a request the
+  server has already received, so latest-wins is enforced by the receiver. The tab assigns every state a
+  revision: 0 for the opening state, plus one for each accepted `track`. Every join and track carries the
+  `(state, revision)` pair; a rejoin or handover join carries the tab's current pair. The leader never
+  makes up a revision. It keeps the highest one it has accepted and never sends a lower one after it. The
+  server stores the revision each entry was installed with and ignores a `track` whose revision is not
+  greater; a join installs its pair unconditionally. A late `track` from a cancelled attempt, or from the
+  old leader after a handover, therefore cannot overwrite a newer state.
 - **Registration.** Each layer registers a subscription with `acquireRelease`, as one synchronous
   check-and-insert step. Its release removes only itself, so a stream cancelled at any point leaves nothing
   behind, and two simultaneous opens of one room in a tab produce exactly one upstream open; the other
@@ -207,7 +216,10 @@ Evidence:
   the stream stays open; a track that raced the join is delivered after its first snapshot; a hung send
   (room stream heartbeating, so no rejoin) and a send that dies are both retried with the latest state; a
   subscription cancelled at any point (swept under a small `MaxOpsBeforeYield`) sends no later track;
-  `Unauthorized` rejoins and only `Forbidden` ends the subscription.
+  `Unauthorized` rejoins and only `Forbidden` ends the subscription; a lower revision after a higher one
+  is never sent or rejoined with.
+- `presence.test.ts` (server): a track delayed before it applies cannot overwrite a newer one; after a
+  handover rejoin with `(s2, 2)`, a late `track(s1, 1)` is ignored.
 - `Leader.test.ts`: the tab re-joins with the latest state across handover; closing the stream drops the
   room; simultaneous opens give one upstream open; cancellation at any point frees the room; a hung tab
   send and a tab send lost with `LeaderLost` are retried with the latest state on the same join.

@@ -24,7 +24,11 @@ import { Cause, Deferred, Duration, Effect, Exit, Queue, type Schema, Stream } f
 import type { AccessScope, Protocol } from "echo-sync"
 
 export interface Upstream<E> {
-  readonly room: (payload: Join) => Stream.Stream<Protocol.RoomElement, E>
+  /**
+   * Prepare-then-stream, like `SyncTransport.pokes`: the Effect resolves this join's credentials (DESIGN
+   * §9.1) and the stream sends the request when run, so `idleTimeout` covers only the stream.
+   */
+  readonly room: (payload: Join) => Effect.Effect<Stream.Stream<Protocol.RoomElement, E>, E>
   readonly track: (payload: Join) => Effect.Effect<void, E>
 }
 
@@ -32,6 +36,8 @@ export interface Join {
   readonly room: AccessScope.AccessScopeId
   readonly tabId: Protocol.TabId
   readonly state: Schema.Json
+  /** The tab's revision of `state` (DESIGN §9.1, §12 revision fencing); the leader never assigns one. */
+  readonly revision: number
 }
 
 export interface Presence<F> {
@@ -46,8 +52,8 @@ export interface Presence<F> {
 
 interface Subscription {
   state: Schema.Json
-  /** Bumped by every `track`; delivery compares it with the version it last sent (or joined with). */
-  version: number
+  /** The highest revision accepted (the tab's); delivery compares it with the one it last sent or joined with. */
+  revision: number
   /** Completed by `track`; replaced by the delivery fiber before each check. */
   wake: Deferred.Deferred<void>
   /** Completing it ends the current connection (the subscription then rejoins). */
@@ -85,16 +91,18 @@ export const make = <E, F extends E>(options: {
         // Replaced before the check, so a `track` after the check always wakes the next wait.
         const wake = Deferred.makeUnsafe<void>()
         sub.wake = wake
-        if (sub.version === sent) {
+        if (sub.revision <= sent) {
           yield* Deferred.await(wake)
           continue
         }
-        const version = sub.version
+        // Read together: the pair is what the server fences on. A timed-out attempt may still land later;
+        // its lower revision makes it a no-op there, so no attempt is ever waited for.
+        const { state, revision } = sub
         const attempt = yield* Effect.exit(
-          upstream.track({ room, tabId, state: sub.state }).pipe(Effect.timeout(idleTimeout))
+          upstream.track({ room, tabId, state, revision }).pipe(Effect.timeout(idleTimeout))
         )
         if (Exit.isSuccess(attempt)) {
-          sent = version
+          sent = revision
           delay = base
           continue
         }
@@ -104,7 +112,7 @@ export const make = <E, F extends E>(options: {
       }
     })
 
-  const join = ({ room, tabId, state }: Join): Stream.Stream<Protocol.RoomSnapshot, F> =>
+  const join = ({ room, tabId, state, revision }: Join): Stream.Stream<Protocol.RoomSnapshot, F> =>
     Stream.callback<Protocol.RoomSnapshot, F>((out) =>
       Effect.gen(function* () {
         const k = key(room, tabId)
@@ -113,7 +121,7 @@ export const make = <E, F extends E>(options: {
           Effect.sync(() => {
             const fresh: Subscription = {
               state,
-              version: 0,
+              revision,
               wake: Deferred.makeUnsafe<void>(),
               restart: Deferred.makeUnsafe<void>(),
               replaced: Deferred.makeUnsafe<void>()
@@ -131,7 +139,7 @@ export const make = <E, F extends E>(options: {
         let delay = base
         while (true) {
           sub.restart = Deferred.makeUnsafe<void>()
-          const joinedVersion = sub.version
+          const joinedRevision = sub.revision
           const joined = Deferred.makeUnsafe<void>()
           let delivered = false
           const ended = yield* Effect.exit(
@@ -140,9 +148,11 @@ export const make = <E, F extends E>(options: {
                 // Scoped to this connection: its end interrupts a send in flight, and the next join's
                 // sender starts from the state that join carried.
                 yield* Effect.forkScoped(
-                  Effect.andThen(Deferred.await(joined), deliver(sub, room, tabId, joinedVersion))
+                  Effect.andThen(Deferred.await(joined), deliver(sub, room, tabId, joinedRevision))
                 )
-                yield* upstream.room({ room, tabId, state: sub.state }).pipe(
+                // Preparation (credentials) runs before the idle clock starts; a failure there is retried.
+                const connection = yield* upstream.room({ room, tabId, state: sub.state, revision: joinedRevision })
+                yield* connection.pipe(
                   Stream.timeout(idleTimeout),
                   Stream.interruptWhen(Deferred.await(sub.restart)),
                   Stream.runForEach((element) =>
@@ -174,13 +184,14 @@ export const make = <E, F extends E>(options: {
       })
     )
 
-  // Records the desired state in one synchronous step; the subscription's delivery fiber sends it.
-  const track = ({ room, tabId, state }: Join): Effect.Effect<void> =>
+  // Records the desired state in one synchronous step; the subscription's delivery fiber sends it. Only a
+  // higher revision is accepted, so the leader never sends a lower revision after a higher one.
+  const track = ({ room, tabId, state, revision }: Join): Effect.Effect<void> =>
     Effect.sync(() => {
       const sub = subscriptions.get(key(room, tabId))
-      if (sub === undefined) return
+      if (sub === undefined || revision <= sub.revision) return
       sub.state = state
-      sub.version++
+      sub.revision = revision
       Deferred.doneUnsafe(sub.wake, Effect.void)
     })
 

@@ -177,7 +177,13 @@ export const PresencePayload = Schema.Struct({
   clientId: ClientId,
   room: AccessScopeId,
   tabId: TabId,
-  state: Schema.Json
+  state: Schema.Json,
+  /**
+   * Tab-assigned, strictly increasing per `(room, tab)` for the life of its `presence` stream (DESIGN §9.1,
+   * §12 revision fencing): `track` is a no-op unless it is greater than the entry's, so a late request can
+   * never overwrite a newer state. A join installs its `(state, revision)` unconditionally.
+   */
+  revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 })
 
 /**
@@ -198,7 +204,10 @@ export const PresenceRpcs = RpcGroup.make(
     error: Schema.Union([ServerUnavailable, Unauthorized, Forbidden]),
     stream: true
   }),
-  /** Replaces the state of this `(clientId, tabId)` entry in `room`; a no-op without one. */
+  /**
+   * Replaces the state of this `(clientId, tabId)` entry in `room`; a no-op without one, or when `revision`
+   * is not greater than the entry's.
+   */
   Rpc.make("track", {
     payload: PresencePayload,
     error: Schema.Union([ServerUnavailable, Unauthorized])

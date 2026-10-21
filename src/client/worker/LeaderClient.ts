@@ -209,14 +209,16 @@ export interface LeaderCalls {
   readonly dismissNotices: (ids: ReadonlyArray<number>) => Effect.Effect<void, SqlFailure | LeaderUnavailable>
   readonly syncStatus: Stream.Stream<SyncStatus, SyncDisabled | LeaderUnavailable>
   readonly requestSync: Effect.Effect<void, SyncDisabled | LeaderUnavailable>
-  /** `room`/`track` with this tab's id filled in. */
+  /** `room`/`track` with this tab's id filled in; `revision` is the tab's (DESIGN §9.1). */
   readonly presence: (
     room: AccessScope.AccessScopeId,
-    state: Schema.Json
+    state: Schema.Json,
+    revision: number
   ) => Stream.Stream<Protocol.RoomSnapshot, SyncDisabled | Protocol.Forbidden | LeaderUnavailable>
   readonly track: (
     room: AccessScope.AccessScopeId,
-    state: Schema.Json
+    state: Schema.Json,
+    revision: number
   ) => Effect.Effect<void, SyncDisabled | LeaderUnavailable>
 }
 
@@ -268,7 +270,8 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
    */
   interface Cell {
     state: Schema.Json
-    version: number
+    /** Tab-assigned (DESIGN §9.1): 0 for the opening state, +1 per accepted `track`; every join and send carries it. */
+    revision: number
     wake: Deferred.Deferred<void>
   }
   const joined = new Map<string, Cell>()
@@ -283,14 +286,14 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
       while (true) {
         const wake = Deferred.makeUnsafe<void>()
         cell.wake = wake
-        if (cell.version === sent) {
+        if (cell.revision <= sent) {
           yield* Deferred.await(wake)
           continue
         }
-        const version = cell.version
-        const attempt = yield* Effect.exit(calls.track(room, cell.state).pipe(Effect.timeout(sendTimeout)))
+        const { state, revision } = cell
+        const attempt = yield* Effect.exit(calls.track(room, state, revision).pipe(Effect.timeout(sendTimeout)))
         if (Exit.isSuccess(attempt)) {
-          sent = version
+          sent = revision
           delay = retryBase
           continue
         }
@@ -305,7 +308,7 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
         const cell = yield* Effect.acquireRelease(
           Effect.sync((): Cell | undefined => {
             if (joined.has(room)) return undefined
-            const fresh: Cell = { state, version: 0, wake: Deferred.makeUnsafe<void>() }
+            const fresh: Cell = { state, revision: 0, wake: Deferred.makeUnsafe<void>() }
             joined.set(room, fresh)
             return fresh
           }),
@@ -317,12 +320,12 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
         if (cell === undefined) return Stream.fail<PresenceError>(new PresenceAlreadyOpen({ room }))
         const open = Stream.unwrap(
           Effect.gen(function* () {
-            const read = cell.version
+            const read = cell.revision
             const first = Deferred.makeUnsafe<void>()
             // Scoped to this join: its end (a lost leader, a closed stream) interrupts a send in flight.
             yield* Effect.forkScoped(Effect.andThen(Deferred.await(first), deliver(room, cell, read)))
             return calls
-              .presence(room, cell.state)
+              .presence(room, cell.state, read)
               .pipe(Stream.tap(() => Effect.sync(() => Deferred.doneUnsafe(first, Effect.void))))
           })
         )
@@ -335,7 +338,7 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
       const cell = joined.get(room)
       if (cell === undefined) return
       cell.state = state
-      cell.version++
+      cell.revision++
       Deferred.doneUnsafe(cell.wake, Effect.void)
     })
   return {
@@ -464,9 +467,10 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
         dismissNotices: (ids) => withLeader((client) => client.dismissNotices({ ids })),
         syncStatus: streamWithLeader((client) => client.syncStatus()),
         requestSync: withLeader((client) => client.requestSync()),
-        presence: (room, state) =>
-          streamWithLeader((client) => client.presence({ room, tabId: Protocol.TabId.make(tabId), state })),
-        track: (room, state) => withLeader((client) => client.track({ room, tabId: Protocol.TabId.make(tabId), state }))
+        presence: (room, state, revision) =>
+          streamWithLeader((client) => client.presence({ room, tabId: Protocol.TabId.make(tabId), state, revision })),
+        track: (room, state, revision) =>
+          withLeader((client) => client.track({ room, tabId: Protocol.TabId.make(tabId), state, revision }))
       }),
       leaderInfo: withLeader((client) => client.leaderInfo()),
       subscribeRaw: (query) => streamWithLeader((client) => client.subscribeRaw({ query })),

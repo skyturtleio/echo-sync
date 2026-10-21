@@ -108,6 +108,7 @@ export type PresenceError =
   | Protocol.Unauthorized
   | Protocol.ServerUnavailable
   | Protocol.Forbidden
+  | CredentialsUnavailable
 
 /**
  * Only a missing grant (`Forbidden`) ends a presence subscription. Everything else is rejoined, including
@@ -141,7 +142,13 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
           ),
 
     presence: (clientId) => ({
-      room: (payload) => presenceClient.room({ clientId, ...payload }),
+      // Prepare-then-stream like `pokes`, so the leader's `idleTimeout` starts at send.
+      room: (payload) =>
+        headers === undefined
+          ? Effect.succeed(presenceClient.room({ clientId, ...payload }))
+          : Effect.map(acquire(headers), (prepared) =>
+              presenceClient.room({ clientId, ...payload }).pipe(Stream.provideService(PreparedHeaders, prepared))
+            ),
       track: (payload) => presenceClient.track({ clientId, ...payload })
     })
   }
@@ -155,7 +162,8 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
  * pull, and each (re)connect of a stream. It is applied to the HTTP client under the RPC protocol, so
  * every RPC on this protocol (including streams added later, such as presence `room`) carries the
  * credential current at the moment it is sent; nothing is cached across requests. A stream's
- * (re)connect resolves them first (`SyncTransport.pokes`) and its request uses that result.
+ * (re)connect resolves them first (`SyncTransport.pokes`, presence `room`) and its request uses that
+ * result.
  *
  * Anything `headers` raises is a local acquisition failure (DESIGN §9.1): the request is not sent
  * and the call fails with a transport `RpcClientError` (an HTTP `TransportError` carrying
