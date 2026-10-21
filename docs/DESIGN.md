@@ -796,7 +796,8 @@ twice before appending so that peeking fails.
 **Test-harness placement (coordinator ruling):** `src/core/testing` holds only harnesses that
 need nothing from the client or the server at runtime: `Conformance`, `MemoryStore`, `SimApp`,
 `RefServer`, and the mutation-execution helpers they share (`runHandler`, `restore`,
-`initialMeta`, `roleFromGrants`, which live in core and are re-exported by the client engine).
+`roleFromGrants`, which live in core and are re-exported by the client engine; `initialMeta`
+stays engine-owned because core has no runtime use for it).
 The reconciliation engine (`Engine.make`, `applyPageSet`) is client code and stays in
 `src/client/sync`; harnesses that drive it (`Simulation`, `MemorySyncStorage`, their tests)
 live in `src/client/sync/testing`. A lint rule forbids runtime imports of `src/client` or
