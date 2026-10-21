@@ -228,6 +228,37 @@ describe.skipIf(!pgAvailable)("ledger expiry (DESIGN §16 item 5)", () => {
   )
 
   it.live(
+    "a resubmitted expired id is answered at its own recorded position whatever seq it carries, and only an unknown id at or below the floor gets the floor's position",
+    () =>
+      Effect.gen(function* () {
+        const c = yield* ledgerClient
+        const m1 = yield* c.submit("m1", 1)
+        const m2 = yield* c.submit("m2", 2)
+        yield* c.replica.sync()
+        yield* c.replica.sync() // both acked now
+        yield* ageAcks(10)
+        assert.deepStrictEqual(yield* expireAt(0), { clients: 1, expired: 2 })
+        assert.deepStrictEqual((yield* c.state).floor, [
+          { expired_through: "2", expired_position: String(m2.position) }
+        ])
+        const answer = (mutationId: string, seq: number) =>
+          Effect.map(c.submit(mutationId, seq), (p) => [
+            p.outcome._tag === "Rejected" ? p.outcome.error._tag : p.outcome._tag,
+            p.position
+          ])
+        // At or below the floor (its own seq) and above it (a fresh seq): its own position both times.
+        assert.deepStrictEqual(yield* answer("m1", 1), ["ClientExpired", m1.position])
+        assert.deepStrictEqual(yield* answer("m1", 3), ["ClientExpired", m1.position])
+        assert.deepStrictEqual(yield* answer("m2", 2), ["ClientExpired", m2.position])
+        assert.deepStrictEqual(yield* answer("m2", 1), ["ClientExpired", m2.position])
+        // Control: an id the server never recorded, at a seq at or below the floor, gets the floor's position.
+        assert.deepStrictEqual(yield* answer("never-seen", 1), ["ClientExpired", m2.position])
+        assert.strictEqual(c.counter.executions, 2)
+        assert.deepStrictEqual(yield* c.identities, [1, 2], "the retries recorded nothing")
+      }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live(
     "an acked row younger than the retention, and an unacked row of any age, survive; age is measured from the ack, not from receipt",
     () =>
       Effect.gen(function* () {

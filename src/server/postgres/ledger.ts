@@ -208,9 +208,10 @@ const lockClient = Effect.fnUntraced(function* (principalId: string, clientId: s
  * outcome is not committed when returned, so that is a defect.
  *
  * One transaction: lock the client row (concurrent submissions of one client serialize here,
- * so a duplicate waits and then sees the winner's row) → `seq ≤ expired_through` ⇒
- * `Rejected{clientExpired}` at `expired_position`, body untouched → known identity ⇒ recorded
- * outcome → else body in a savepoint (a permanent failure discards its writes) → ledger row
+ * so a duplicate waits and then sees the winner's row) → known identity ⇒ its recorded outcome,
+ * or `Rejected{clientExpired}` at its own position if expired (whatever `seq` the attempt carries)
+ * → unknown id with `seq ≤ expired_through` ⇒ `Rejected{clientExpired}` at `expired_position`,
+ * body untouched → else body in a savepoint (a permanent failure discards its writes) → ledger row
  * whose position is allocated under the engine lock after the body's log entries → commit.
  * A mutation that writes nothing still gets an orderable position, so pull delivers its ack.
  */
@@ -234,16 +235,6 @@ export const runMutation = <R>(
         // 40001, which retries the whole attempt (§6).
         yield* sql`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`
         const client = yield* lockClient(envelope.principalId, envelope.clientId)
-        if (envelope.seq <= client.expired_through) {
-          const expired: Processed = {
-            outcome: {
-              _tag: "Rejected",
-              error: new Mutation.ClientExpired({ mutationId: Ids.MutationId.make(envelope.mutationId) })
-            },
-            position: client.expired_position
-          }
-          return expired
-        }
         const recorded = yield* sql<{ outcome: unknown; position: bigint }>`
           SELECT outcome, position FROM echo_sync.mutations
           WHERE client_id = ${envelope.clientId} AND mutation_id = ${envelope.mutationId}`
@@ -264,6 +255,19 @@ export const runMutation = <R>(
         if (row !== undefined) {
           const replay: Processed = { outcome: yield* Effect.orDie(decodeOutcome(row.outcome)), position: row.position }
           return replay
+        }
+        // Every seq ≤ the floor was processed and kept its identity, so an unknown id here is a
+        // different id under an already-processed seq: the floor answers it (DESIGN §16.5), never
+        // the body. A known id was answered above at its own position, whatever its seq.
+        if (envelope.seq <= client.expired_through) {
+          const expired: Processed = {
+            outcome: {
+              _tag: "Rejected",
+              error: new Mutation.ClientExpired({ mutationId: Ids.MutationId.make(envelope.mutationId) })
+            },
+            position: client.expired_position
+          }
+          return expired
         }
 
         const outcome: MutationOutcome = yield* sql.withTransaction(body).pipe(

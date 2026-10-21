@@ -213,9 +213,12 @@ returns, so that is a defect (tested). In one transaction:
    and then sees its ledger row. The body of a duplicate never runs, even in an aborted
    attempt, and an app-level unique violation in a duplicate's body can't mask the winner's
    outcome.
-2. `seq ≤ expired_through` ⇒ `Rejected{ClientExpired}` at `expired_position`. The body is not
-   run, and nothing is recorded or allocated.
-3. A known `(client_id, mutation_id)` ⇒ the recorded outcome and its original position.
+2. A known `(client_id, mutation_id)` ⇒ the recorded outcome and its original position, or, if
+   its outcome expired, `Rejected{ClientExpired}` at that same position, whatever `seq` the
+   attempt carries (checked before the floor, so two expired ids never share the floor's
+   position).
+3. An unknown id with `seq ≤ expired_through` ⇒ `Rejected{ClientExpired}` at `expired_position`.
+   The body is not run, and nothing is recorded or allocated.
 4. Otherwise: run the body inside a savepoint, so a rejection rolls back its writes;
    then insert the ledger row with `next_position()` `RETURNING position`; then commit. The
    ledger position is allocated after the body's log entries and under the same lock, so a
@@ -419,10 +422,10 @@ seq, position)` is kept forever; only its `outcome` (and `acked_at`) is cleared.
   outcome and dies if one does, rolling back the clear and the floor (tested with a forged
   non-prefix). It returns `{ clients, expired }`. A ledger transaction holds the client row
   `FOR UPDATE`, so it sees the floor before or after a job, never half of one.
-- **Push.** After the floor check (`seq ≤ expired_through` ⇒ `Rejected{ClientExpired}` at
-  `expired_position`), a known `(client_id, mutation_id)` whose outcome was cleared is answered
+- **Push.** A known `(client_id, mutation_id)` whose outcome was cleared is answered
   `Rejected{ClientExpired}` at that row's own `position` and is not executed, whatever `seq` the
-  attempt carries. A tab's `enqueue` retried after its reply was lost can arrive after any delay
+  attempt carries; this is checked before the floor, which answers (at `expired_position`) only
+  an id it has no row for at `seq ≤ expired_through`. A tab's `enqueue` retried after its reply was lost can arrive after any delay
   (`LeaderLost` is retried indefinitely, and a tab can be suspended for days), after its
   released-row marker was pruned, so the outbox gives it a fresh `seq` above the floor; only the
   kept identity recognises it. No retention value would bound that delay (DESIGN §16 item 5).
