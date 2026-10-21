@@ -1,10 +1,32 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Cause, Effect, Exit, Schedule } from "effect"
+import { Cause, Deferred, Effect, Exit, Option, Ref, Schedule, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { SqlError, UnknownError } from "effect/sql/SqlError"
-import { Ids, Mutation } from "echo-sync"
+import { AccessScope, Ids, Mutation, Registry, Store, SyncTable } from "echo-sync"
 import { runBatch, runMutation } from "./ledger.ts"
-import { pgAvailable, Replica, TestDatabase } from "./test-support.ts"
+import * as RowStore from "./rowStore.ts"
+import { resolveTables } from "./schema.ts"
+import { Items, Notes, pgAvailable, Replica, RowId, TestDatabase } from "./test-support.ts"
+
+/**
+ * A barrier for `n` concurrent attempts: each waits until all `n` have arrived once. Retried
+ * attempts pass straight through, so a conflict retry is not blocked forever.
+ */
+const makeBarrier = (n: number) =>
+  Effect.gen(function* () {
+    const arrived = yield* Ref.make(0)
+    const open = yield* Deferred.make<void>()
+    return Effect.gen(function* () {
+      if ((yield* Ref.updateAndGet(arrived, (k) => k + 1)) >= n) yield* Deferred.succeed(open, undefined)
+      yield* Deferred.await(open)
+    })
+  })
+
+const asOwner = { roleFor: () => Effect.succeed(Option.some<AccessScope.Role>("owner")) }
+const attachedRowStore = (registry: Registry.SyncRegistry) =>
+  Effect.flatMap(resolveTables(registry), (tables) =>
+    RowStore.make(new Map(tables.map((t) => [t.table.name, t.schema])))
+  )
 
 const fastRetry = { conflictRetry: Schedule.recurs(2) }
 
@@ -338,6 +360,82 @@ describe.skipIf(!pgAvailable)("mutation ledger (§6)", () => {
       assert.strictEqual(attempts, 1)
       assert.isTrue(diedWithBug(exit))
       assert.deepStrictEqual(yield* ledgerIds, [])
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("two clients' concurrent read-modify-write mutations on one row both take effect (no lost update)", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      yield* sql`INSERT INTO items (id, access_scope_id, body) VALUES ('n', 's1', '0')`
+      const barrier = yield* makeBarrier(2)
+      // Both read before either writes; the write is computed from the read.
+      const increment = Effect.gen(function* () {
+        const [row] = yield* sql<{ body: string }>`SELECT body FROM items WHERE id = 'n'`
+        yield* barrier
+        yield* sql`UPDATE items SET body = ${String(Number(row?.body ?? "0") + 1)} WHERE id = 'n'`
+      })
+      const results = yield* Effect.all(
+        ["c1", "c2"].map((clientId) =>
+          runMutation({ principalId: "p", clientId, mutationId: `inc-${clientId}`, seq: 1n }, increment)
+        ),
+        { concurrency: "unbounded" }
+      )
+      assert.deepStrictEqual(
+        results.map((r) => r.outcome._tag),
+        ["Applied", "Applied"]
+      )
+      const [row] = yield* sql<{ body: string }>`SELECT body FROM items WHERE id = 'n'`
+      assert.strictEqual(row?.body, "2")
+      assert.strictEqual((yield* ledgerIds).length, 2)
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("two clients' concurrent inserts of one id through the Store: one applies, the other is rejected", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      const barrier = yield* makeBarrier(2)
+      const insert = (clientId: string) =>
+        Effect.gen(function* () {
+          const rows = yield* attachedRowStore(Registry.make([Items, Notes]))
+          yield* barrier
+          const { store } = Store.make(rows, asOwner)
+          yield* store.insert(Items, {
+            id: RowId.make("x"),
+            accessScopeId: AccessScope.AccessScopeId.make("s1"),
+            body: clientId
+          })
+        })
+      const results = yield* Effect.all(
+        ["c1", "c2"].map((clientId) =>
+          runMutation({ principalId: "p", clientId, mutationId: `ins-${clientId}`, seq: 1n }, insert(clientId))
+        ),
+        { concurrency: "unbounded" }
+      )
+      const outcomes = results.map((r) => (r.outcome._tag === "Rejected" ? r.outcome.error._tag : r.outcome._tag))
+      assert.deepStrictEqual(outcomes.toSorted(), ["Applied", "RowAlreadyExists"])
+      const winner = results[0]?.outcome._tag === "Applied" ? "c1" : "c2"
+      const rows = yield* sql<{ body: string }>`SELECT body FROM items WHERE id = 'x'`
+      assert.deepStrictEqual(rows, [{ body: winner }])
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("a registry table without capture attached is never written: the mutation dies, nothing ledgered", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      const Unattached = SyncTable.make("unattached", {
+        id: RowId,
+        accessScopeId: AccessScope.AccessScopeId,
+        body: Schema.String
+      })
+      yield* sql.unsafe(Unattached.postgres.createTable)
+      const body = Effect.gen(function* () {
+        const rows = yield* attachedRowStore(Registry.make([Items, Notes, Unattached]))
+        yield* rows.write(Unattached, "u1", Option.some({ id: "u1", access_scope_id: "s1", body: "lost" }))
+      })
+      const exit = yield* Effect.exit(runMutation(env("m", 1n), body))
+      assert.isTrue(Exit.hasDies(exit))
+      assert.deepStrictEqual(yield* ledgerIds, [])
+      assert.deepStrictEqual(yield* sql`SELECT id FROM unattached`, [])
     }).pipe(Effect.provide(TestDatabase))
   )
 })

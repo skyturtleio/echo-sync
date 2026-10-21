@@ -205,6 +205,11 @@ export const runMutation = <R>(
 
     const execute = sql.withTransaction(
       Effect.gen(function* () {
+        // SERIALIZABLE, first statement of every attempt: handlers read-modify-write through the
+        // Store (patch, counters, query-then-insert), and under READ COMMITTED two clients'
+        // concurrent mutations would both commit on one stale read (lost update). A conflict is
+        // 40001, which retries the whole attempt (§6).
+        yield* sql`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`
         const client = yield* registerClient(envelope.principalId, envelope.clientId)
         if (envelope.seq <= client.expired_through) {
           const expired: Processed = {
