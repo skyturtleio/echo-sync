@@ -476,12 +476,13 @@ const todosByProject = Query.make("todos.byProject", {
 })
 ```
 
-- `db.get(T, id)`, `db.query(T).withIndex(name, q => q.eq(...).gt(...)).order(...).take(n)/first()`,
+- `db.get(T, id)`, `db.query(T).withIndex(name, q => q.eq(...).gt(...)).order(...).take(n)` / `.first` /
+  `.collect` (`first` and `collect` are Effect-valued properties, not methods),
   `db.scan(T)` for small tables. Joins/aggregates happen in ordinary typed code.
 - `take(n)` requires a non-negative safe integer (`Number.isSafeInteger(n) && n >= 0`); anything
   else (`NaN`, `±Infinity`, negatives, fractions, `2**53`) is a programmer error and is a defect in
   every store, never silently clamped, truncated, or treated as unlimited. `take(0)` is `[]`.
-  `collect()` is unlimited by construction (plan `limit = None`), not a sentinel passed through `take`.
+  `collect` is unlimited by construction (plan `limit = None`), not a sentinel passed through `take`.
 - Index ordering is pinned so Postgres, SQLite, and the in-memory reference agree exactly:
   order by the index fields, then `id`. `NULL` is the smallest value (`NULLS FIRST` ascending,
   `NULLS LAST` descending, written explicitly in Postgres index DDL and `ORDER BY` so the index
