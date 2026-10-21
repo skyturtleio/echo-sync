@@ -97,7 +97,22 @@ is never read from the payload. `ClientForbidden` becomes `Unauthorized`.
 - `client_scopes(client_id, position, scope_ids)`: the set of scopes a client holds as of a
   completed pull. The reason this table exists is under "Pull" below.
 
-### `scope_grants` id CHECK
+### Scope creation
+
+`ctx.store.createScope(scopeId)` (core Store, DESIGN §4) calls `StoreOptions.claimScope`. The
+server's claim is `claimScope` in rpc.ts:
+`INSERT INTO echo_sync.access_scopes … ON CONFLICT DO NOTHING RETURNING id`, run in the
+mutation's transaction and savepoint. The `access_scopes` row therefore commits or rolls back
+together with the owner grant. A rejected mutation leaves the id fresh, and an orphaned scope,
+whose grants are all gone, keeps its row and is never fresh again.
+
+Mutations run at SERIALIZABLE. A concurrent second creator blocks on the first creator's
+uncommitted row. When the first commits, the second fails with 40001 and the ledger retries it.
+On the retry the claim returns no row, so the outcome is `ScopeForbidden { required: "owner" }`.
+The concurrent-creator test (scopeCreate.test.ts) asserts one `Applied`, one `ScopeForbidden`,
+and three body attempts, which shows the retry path was taken.
+
+
 
 Migration 002 adds `scope_grants_id_derived`: `id = char_length(access_scope_id) || ':' ||
 access_scope_id || ':' || principal_id` (DESIGN §4, 5242acf). core's `grantId` prefixes the

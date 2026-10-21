@@ -48,9 +48,13 @@ titles with a declared domain error, which the client receives as a ledger outco
 row needs `owner`. Owners grant and revoke through ordinary mutations on `ScopeGrants.ScopeGrants`,
 with `id: ScopeGrants.grantId(scope, principal)`.
 
-**Creating a scope is not an engine API yet.** DESIGN §4's "scope creation" primitive does not exist
-today. The server side of your app inserts the `echo_sync.access_scopes` row and the first
-`owner` grant in SQL. The example's `/admin/grant` route shows the two statements.
+A handler creates a scope with `ctx.store.createScope(scopeId)` (DESIGN §4). The scope id must be
+fresh, and the actor becomes its first `owner`. A second creator gets
+`ScopeForbidden { required: "owner" }`: "already exists" reads as "not yours". So does anyone
+creating a scope whose grants were all revoked, because the server keeps every scope id it has
+seen. On the client the claim is optimistic, and the server's rejection undoes it on the next
+pull. The example's `/admin/grant` route still writes grants in SQL; that is an admin shortcut
+for the scenarios, not the app path.
 
 ## 3. App migrations
 
