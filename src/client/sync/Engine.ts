@@ -334,10 +334,17 @@ export const make = <TE>(options: {
                 // §8 corollary: an outcome at a position ≤ the installed cursor is already in
                 // the replica, and no later pull will ack it (acks cover (cursor, nextCursor]).
                 // This is how a duplicate enqueued after its original was released terminates.
+                // Second corollary: `Rejected{ClientExpired}` answers an expired identity, which
+                // no pull ever acks, so it is released on receipt whatever its position (after a
+                // rebuild the cursor is null); its effect, if any, arrives with the next pull.
                 const cursor = current.cursor
                 const covered = new Map(
                   response.results
-                    .filter((result) => cursor !== null && result.position <= cursor)
+                    .filter(
+                      (result) =>
+                        (cursor !== null && result.position <= cursor) ||
+                        (result.outcome._tag === "Rejected" && result.outcome.error._tag === "ClientExpired")
+                    )
                     .map((result) => [result.mutationId, result.outcome])
                 )
                 if (covered.size > 0) {

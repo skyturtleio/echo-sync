@@ -429,6 +429,25 @@ seq, position)` is kept forever; only its `outcome` (and `acked_at`) is cleared.
 - **Pull.** Acks carry only rows that still have an outcome: an expired row is never acked again.
   A device that lost an ack to expiry (its storage went back in time: a restored backup, a copied
   profile) is told by `expiredThrough ≥` that seq and releases the mutation as `OutcomeUnknown`.
+- **Client release.** A `Rejected{ClientExpired}` push result is released on receipt whatever its
+  position, with an `OutcomeUnknown` notice (DESIGN §8, second release corollary; `Engine.ts`):
+  an expired identity is never acked, and after a replica rebuild (null cursor) the first
+  corollary (`position ≤ cursor`) could never release it.
+- **Reconcile simulation** (40 seeds × 400 steps, naive ledger GC = `gcLedger` by position with
+  the log, ignoring acks; each seed counted by its first violated invariant). Rows before the
+  identity ruling were measured at 832c948; the last row is this branch, now the committed test.
+
+  | ledger GC model | floor + `expiredThrough` | late retries of pruned ids | double apply | never released | pass |
+  | --- | --- | --- | --- | --- | --- |
+  | rows deleted | no | off | 14 | 23 | 3 |
+  | rows deleted | no | on | 23 | 14 | 3 |
+  | rows deleted | yes | off | 0 | 0 | 40 |
+  | rows deleted | yes | on | 13 | 0 | 27 |
+  | identities kept, no client release rule | yes | on | 0 | 3 | 37 |
+  | identities kept + ClientExpired released on receipt | yes | on (committed) | 0 | 0 | 40 |
+
+  `SIM_SEEDS=120` also passes 120/120. The time-dependent shape (a retry days after the ack) is
+  the Postgres E2E above.
 - **Head.** Pull's head is the greatest of the GC horizon, the log's and the ledger's highest
   positions, and `max(clients.expired_position)`, so expiring the newest ledger row never moves
   a cursor or a resumed page set back (tested).

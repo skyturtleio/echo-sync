@@ -552,11 +552,10 @@ export const run = (options: Options) =>
             }
             return
           }
-          // Marker pruned: the duplicate gets a fresh seq and only the §8 position backstop
-          // ends it. Off with ledger expiry, modelling DESIGN §16.5: expiry is allowed only after
-          // the released-row retention window, so no such duplicate exists when rows expire (a
-          // duplicate's fresh seq is above the floor, and nothing could recognise it).
-          if (options.ledgerGc !== true) {
+          // Marker pruned: the duplicate gets a fresh seq. The server still knows the id: its
+          // ledger entry answers it, or, once expired, its kept identity answers ClientExpired
+          // (DESIGN §16.5), so it never executes again, with or without ledger expiry.
+          {
             note(`${client.clientId}: retry enqueue of released ${original.mutationId} (pruned)`)
             return yield* ignoreExpected(
               withClock(

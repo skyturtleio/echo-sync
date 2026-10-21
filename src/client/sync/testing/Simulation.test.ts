@@ -2,7 +2,7 @@ import { assert, describe, it } from "@effect/vitest"
 import type { Scheduler } from "effect/Scheduler"
 import { DateTime, Deferred, Effect, Fiber, Option, Schema } from "effect"
 import * as Engine from "../Engine.ts"
-import { Ids, Protocol, ScopeGrants } from "../../../core/index.ts"
+import { Ids, Mutation, Protocol, ScopeGrants } from "../../../core/index.ts"
 import type { SyncTable } from "../../../core/index.ts"
 import * as MemoryStore from "../../../core/testing/MemoryStore.ts"
 import * as MemorySyncStorage from "./MemorySyncStorage.ts"
@@ -138,14 +138,22 @@ describe("reconciliation simulation", () => {
   )
 
   it.effect(
-    // Late enqueue retries of pruned ids are off in this run: DESIGN §16.5 allows ledger expiry
-    // only after the released-row retention window (§9 rule 1), so no duplicate exists then.
-    "ledger GC'd while a client is behind (no duplicates, per §16.5): processed intents are released by the floor, never re-executed",
+    // Late enqueue retries of pruned ids run here too: the server keeps every expired identity
+    // (DESIGN §16.5), so a retry under a fresh seq above the floor is still recognised.
+    "ledger GC'd while a client is behind, with late retries of pruned ids: processed intents are released by the floor or the kept identity, never re-executed",
     () =>
       Effect.gen(function* () {
         let expired = 0
-        for (const seed of seeds) expired += (yield* Simulation.run({ seed, steps: 400, ledgerGc: true })).expired
-        if (only === 0) assert.isAbove(expired, 0, "no mutation was released by ledger expiry")
+        let lateRetries = 0
+        for (const seed of seeds) {
+          const stats = yield* Simulation.run({ seed, steps: 400, ledgerGc: true })
+          expired += stats.expired
+          lateRetries += stats.lateRetries
+        }
+        if (only === 0) {
+          assert.isAbove(expired, 0, "no mutation was released by ledger expiry")
+          assert.isAbove(lateRetries, 0, "no late retry of a pruned id ran")
+        }
       }),
     60_000
   )
@@ -406,6 +414,48 @@ describe("reconciliation simulation", () => {
       assert.strictEqual(valueOf(disk, "x"), 5) // 10 would mean the intent was replayed over its own result
       assert.strictEqual(disk.meta.cursor, position(3n))
     })
+  )
+
+  it.effect(
+    "a Rejected{ClientExpired} push result above the installed cursor is released on receipt with an OutcomeUnknown notice; an Applied one there still waits for its ack",
+    () =>
+      Effect.gen(function* () {
+        const disk = installedDisk() // cursor 1
+        const base = valueOf(disk, "x")
+        const engine = yield* Engine.make({
+          ...engineOptions,
+          storage: MemorySyncStorage.make(disk),
+          transport: {
+            // An expired identity answers m1 at position 5, above the cursor; no pull will ever ack it.
+            push: () =>
+              Effect.succeed<Protocol.PushResponse>({
+                results: [
+                  {
+                    mutationId: id("m1"),
+                    position: position(5n),
+                    outcome: { _tag: "Rejected", error: new Mutation.ClientExpired({ mutationId: id("m1") }) }
+                  },
+                  { mutationId: id("m2"), position: position(6n), outcome: { _tag: "Applied" } }
+                ]
+              }),
+            pull: () => Effect.die("unused")
+          }
+        })
+        yield* engine.mutate(id("m1"), "increment", { id: "x", by: 1 })
+        yield* engine.mutate(id("m2"), "increment", { id: "x", by: 10 })
+        assert.strictEqual((yield* engine.push).processed, 2)
+        assert.deepStrictEqual(
+          disk.outbox.map((entry) => entry.envelope.mutationId),
+          ["m2"],
+          "m1 released, m2 waits"
+        )
+        assert.deepStrictEqual(
+          disk.notices.map((notice) => [notice._tag, notice.envelope.mutationId]),
+          [["OutcomeUnknown", "m1"]]
+        )
+        // m1's optimistic effect is gone (its effect, if any, comes with a pull); m2's stays.
+        assert.strictEqual(valueOf(disk, "x"), Number(base) + 10)
+      })
   )
 
   it.effect("a known-table row that does not decode fails the install whole: no ack, cursor or staging change", () =>
