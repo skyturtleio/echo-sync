@@ -263,7 +263,8 @@ needed to keep the invariant.
 | Chrome / Edge desktop | 69+ | yes | 102+ | `shared-worker` | Documentation (MDN / caniuse); not run here |
 | Chrome Android | yes | historically **no** | yes | `single-tab` | Documentation; the runtime check decides |
 | Firefox desktop | 96+ | yes | 111+ | `shared-worker` | Documentation; not run here |
-| Safari macOS / iOS | 15.4+ | 16+ (re-added) | 15.2+ (`createSyncAccessHandle`), full sync API later | `shared-worker` expected | Documentation; not run here |
+| WebKit (Playwright 1.64.1, WebKit 27.2, Linux GTK, headless) | yes | yes, **but dies with its creating tab** | yes (persistent context only) | `shared-worker` | **Run here**: scenarios 28/32, slice 11/12; see "WebKit smoke" |
+| Safari macOS / iOS | 15.4+ | 16+ (re-added) | 15.2+ (`createSyncAccessHandle`), full sync API later | `shared-worker` expected | Documentation; desktop WebKit run above, not Safari itself |
 | Language runtime (ES2023: `Array.prototype.toSorted`, used by core) | — | — | — | — | Chrome/Edge 110+, Firefox 115+, Safari 16+ |
 
 **Effective minimum browser** is the maximum over all rows: **Chrome/Edge 110, Firefox 115, Safari 16**.
@@ -279,6 +280,123 @@ Caveats, all from documentation and untested here:
   matter here.
 - The leader also checks `createSyncAccessHandle` itself; a browser lacking it reports `LeaderFailed`
   with the reason instead of hanging.
+
+## WebKit smoke (DESIGN §16 browser matrix)
+
+Run on Playwright's WebKit build in the orb, against the Vite harness and examples/server with real
+Postgres. **This is desktop WebKit on Linux (the GTK port, headless), not Safari, and not iPhone Safari.**
+It shares WebCore and JavaScriptCore with Safari, but not Safari's process model, storage backend, or iOS's
+background suspension, so each finding below says whether it is expected to carry over.
+
+### Running it
+
+agent-browser drives Chromium over CDP only. `WEBKIT=1` makes lib.sh use
+`examples/browser-spike/webkit/driver.ts` instead: a small Playwright daemon that answers the same `ab`
+subcommands (`open`, `tab new|--json|<id>|close`, `eval --json --stdin`, `reload`, `close`), one per run
+on its own port, stopped on exit. Chromium runs are unchanged.
+
+```sh
+mkdir -p ~/.cache/echo-webkit && cd ~/.cache/echo-webkit && bun add playwright@1.64.1
+bunx playwright install-deps webkit          # system libraries (apt)
+bunx playwright install webkit               # in this orb its unzip step hung: download
+#   https://cdn.playwright.dev/dbazure/download/playwright/builds/webkit/2370/webkit-debian-12.zip,
+#   unzip it into ~/.cache/ms-playwright/webkit-2370 and touch INSTALLATION_COMPLETE there instead
+cd -
+WEBKIT=1 examples/browser-spike/scenarios.sh
+WEBKIT=1 examples/browser-spike/slice.sh
+[WEBKIT=1] examples/browser-spike/webkit/sharedworker-lifetime.sh   # the router finding, isolated
+```
+
+Playwright is not a repo dependency; the driver loads it from `$ECHO_PLAYWRIGHT_DIR` (default
+`~/.cache/echo-webkit`). `ECHO_WEBKIT_COMMAND_TIMEOUT_MS` (default 180 s) fails a command that never
+settles; `ECHO_WEBKIT_DAEMON_LOG=<file>` with `ECHO_WEBKIT_LOG=1` records every command, page and worker
+console line. The driver uses a persistent context (a fresh profile per run): WebKit's ephemeral contexts
+behave like private browsing, where OPFS is absent. Playwright before the fix for
+[microsoft/playwright#18235](https://github.com/microsoft/playwright/issues/18235) (1.56.1, WebKit 26.0 here)
+ships Linux WebKit with `StorageAPI`, `FileSystem` and `AccessHandle` off and no way to enable them, so
+`navigator.storage` is `undefined` and every tab correctly reports `mode: "unsupported"` /
+`LeaderUnavailable{Unsupported}`. `eval` results are JSON-encoded in the page, as CDP's `returnByValue`
+does; Playwright's own serializer turns an `Error` subclass (a `Schema.TaggedError` notice) into
+`{ name, message, stack }`.
+
+### What works
+
+Web Locks election (single owner across 4 tabs), OPFS sync access handles in the dedicated leader worker,
+the wa-sqlite AccessHandlePool VFS (reload persistence, hard-kill durability, gap-free ordering under two
+concurrent tabs, reactivity across tabs), BroadcastChannel, MessagePort transfer tab ↔ router ↔ leader,
+JSON functions, fetch streaming of the pokes stream (live A → B delivery, server restart catch-up) and the
+presence room stream, offline queueing across a reload, conflicts and rejections, reset, and the
+no-SharedWorker fallback. No SharedArrayBuffer or COOP/COEP is needed: the page is not cross-origin
+isolated (`crossOriginIsolated` false, `SharedArrayBuffer` undefined) and everything above runs. FTS5 is
+absent here exactly as in Chromium (same wasm build, see below).
+
+A leader worker busy inside a long wasm query is terminated when its tab closes (the in-flight request
+fails `LeaderLost`), so [WebKit bug 289686](https://bugs.webkit.org/show_bug.cgi?id=289686) (non-yielding
+wasm survives `terminate()`) did not show up here.
+
+### Findings
+
+1. **The router SharedWorker dies with the tab that created it.** With tabs A (first) and B connected, closing
+   A terminates the SharedWorker although B is still connected; messages B posts are lost, and the next
+   `new SharedWorker()` from any tab relaunches a fresh instance (B's old port is reattached to it, with
+   none of its state). `webkit/sharedworker-lifetime.sh` isolates it (Chromium PASS, WebKit FAIL). In the
+   substrate, the router loses its route and every tab's registration exactly when the leader tab is the
+   router's creator, so the new leader's announcement is dropped: the successor holds the leader lock
+   (`isLeaderTab: true`) but no tab is ever served. Handover with the creating tab still open works (the
+   worker-only crash, OPFS startup failure and presence/sync handover scenarios pass). Whether Safari's own
+   process model shares this is **unverified**: no WebKit bug report found; the HTML spec says a shared
+   worker lives while any document holds it ([MDN](https://developer.mozilla.org/en-US/docs/Web/API/SharedWorker)).
+2. **OPFS names are limited to 255 UTF-8 bytes per path segment** (`getDirectoryHandle`/`getFileHandle` with
+   256 bytes fails `UnknownError`; 127 two-byte characters succeed, 128 fail). Chromium accepts 480. The
+   identity check bounds only the whole path (appId + profile ≤ 488), so on WebKit a profile of 256–488
+   bytes passes validation and the leader fails `LeaderFailed{UnknownError}` (closed, not hung). Expected on
+   Safari too (Apple file systems also cap a name at 255 bytes), unverified.
+
+### Scenario results (scenarios.sh and slice.sh, `WEBKIT=1`)
+
+| Scenario | WebKit | Error / cause |
+|---|---|---|
+| single owner across 4 tabs | pass | |
+| single owner after handover | **fail** | no tab served after the leader (router creator) tab closes: finding 1 |
+| handover: in-flight request → `LeaderLost` | pass | |
+| handover: open subscription → `LeaderLost` | pass | |
+| handover: lost enqueue retried, lands once | **fail** | retry never finds a leader (finding 1) |
+| handover: replica and outbox persist | flaky | failed in run 1 (no leader to read through, finding 1), passed in run 2 |
+| router ignores a stale announcement | **fail** | every tab's request times out: no live route (finding 1) |
+| crash after commit | pass | |
+| worker-only crash (both orders) | pass | the creating tab stays open, so the router survives |
+| OPFS startup failure releases the lock | pass | |
+| saved means durable (reload, hard kill) | pass | |
+| gap-free ordering, 2 tabs × 150 | pass | |
+| reactivity across tabs | pass | |
+| fallback without SharedWorker (fail closed, take over) | pass | |
+| sync: `MalformedEnvelope` halt; halt after handover | pass | |
+| 36-character profile | pass | |
+| longest database path the pool holds | **fail** | `LeaderFailed{UnknownError}`: finding 2 (the over-limit half passes) |
+| reset (7 checks) | pass | |
+| presence: entry while open; across handover | pass | |
+| identity `.` refused | pass | |
+| slice S1–S4, S6–S8 (two clients, rejection, revoke/re-grant, server restart, offline, conflicts, delete/edit) | pass | |
+| slice S5: leader closed while its push is held | **fail** | the next leader never gets a route (finding 1) |
+
+### iPhone Safari: what this run cannot tell
+
+From documentation, not run: iOS Safari has SharedWorker from 16.0 ([caniuse](https://caniuse.com/sharedworkers)),
+`FileSystemSyncAccessHandle` from 15.2 ([caniuse](https://caniuse.com/mdn-api_filesystemsyncaccesshandle);
+see the 15.x async-method caveat above), Web Locks from 15.4, and the full Storage API (`persist()`,
+quota) from 17 ([WebKit: Updates to Storage Policy](https://webkit.org/blog/14403/updates-to-storage-policy/)).
+Not covered by any desktop run:
+
+- **Eviction.** Best-effort origins are evicted under storage pressure and after a period without user
+  interaction (Intelligent Tracking Prevention), deleting the replica *and the outbox*; `persist()` is
+  granted by heuristics such as running as a Home Screen web app (same link). A pending write is lost
+  with it.
+- **Private browsing** has no OPFS ([playwright#18235](https://github.com/microsoft/playwright/issues/18235)
+  reproduces it with ephemeral contexts): the tab reports `Unsupported`.
+- **Background suspension.** iOS suspends background tabs and may kill their processes; a suspended
+  leader tab keeps its locks until killed, and a killed creator tab would hit finding 1. Needs a device.
+- Process-per-tab and SharedWorker hosting differ from the GTK port; finding 1 must be rechecked on a
+  real iPhone (and macOS Safari) before anything is built on either outcome.
 
 ## SQLite build capabilities (`@effect/wa-sqlite` 0.1.2, SQLite 3.47.0)
 

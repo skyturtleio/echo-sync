@@ -13,7 +13,23 @@ export AGENT_BROWSER_SESSION=echo-${SESSION_PREFIX:-scenarios}-$RUN
 fails=0
 total=0
 
-ab() { agent-browser "$@"; }
+if [ "${WEBKIT:-0}" = 1 ]; then
+  # WebKit (Playwright) instead of agent-browser's Chromium: webkit/driver.ts answers the same subcommands.
+  # One daemon per run, on a port of its own, stopped when the script exits.
+  WEBKIT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  export ECHO_WEBKIT_PORT=$((20000 + $$ % 20000))
+  bun "$WEBKIT_DIR/webkit/driver.ts" serve >"${ECHO_WEBKIT_DAEMON_LOG:-/dev/null}" 2>&1 &
+  WEBKIT_PID=$!
+  trap 'kill "$WEBKIT_PID" 2>/dev/null' EXIT
+  for _ in $(seq 1 150); do [ "$(curl -s "http://127.0.0.1:$ECHO_WEBKIT_PORT/")" = "webkit driver" ] && break; sleep 0.1; done
+  if [ "$(curl -s "http://127.0.0.1:$ECHO_WEBKIT_PORT/")" != "webkit driver" ]; then
+    echo "the WebKit driver did not start (see \$ECHO_WEBKIT_DAEMON_LOG; Playwright in ~/.cache/echo-webkit?)" >&2
+    exit 2
+  fi
+  ab() { bun "$WEBKIT_DIR/webkit/driver.ts" "$@"; }
+else
+  ab() { agent-browser "$@"; }
+fi
 # Evaluate the async JS body on stdin in the active tab (after window.echo exists); prints the JSON result.
 ev() {
   local body
