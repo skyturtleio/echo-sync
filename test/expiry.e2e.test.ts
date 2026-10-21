@@ -4,10 +4,12 @@ import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { assert, describe, it } from "@effect/vitest"
 import type * as PgClient from "@effect/sql-pg/PgClient"
 import { Context, Effect, Layer, Option, Schema } from "effect"
+import { TestClock } from "effect/testing"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
 import { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation } from "echo-sync"
+import * as Outbox from "../src/client/Outbox.ts"
 import * as Engine from "../src/client/sync/Engine.ts"
 import * as SqliteSyncStorage from "../src/client/sync/SqliteSyncStorage.ts"
 import * as Transport from "../src/client/sync/Transport.ts"
@@ -27,7 +29,15 @@ const addItem = Mutation.make("items.add", {
       body: args.body
     })
 })
-const mutations = Mutation.makeRegistry([addItem])
+/** Not idempotent by construction: a second execution of one intent shows up as a doubled suffix. */
+const appendItem = Mutation.make("items.append", {
+  args: Schema.Struct({ id: Schema.String, suffix: Schema.String }),
+  handler: (ctx, args) =>
+    Effect.flatMap(ctx.store.get(Items, RowId.make(args.id)), (item) =>
+      ctx.store.patch(Items, item.id, { body: item.body + args.suffix })
+    )
+})
+const mutations = Mutation.makeRegistry([addItem, appendItem])
 const clientId = Ids.ClientId.make("expiry-client")
 const mid = Ids.MutationId.make
 
@@ -199,7 +209,7 @@ describe.skipIf(!pgAvailable)("expiry floor (DESIGN §16.5) against the real ser
 
           // Ten days later the ledger row has been acked longer than the default 7-day retention.
           yield* pg`UPDATE echo_sync.mutations SET acked_at = acked_at - interval '10 days'`
-          assert.deepStrictEqual(yield* expireLedger(), { clients: 1, deleted: 1 })
+          assert.deepStrictEqual(yield* expireLedger(), { clients: 1, expired: 1 })
 
           // The device's storage is restored from the backup: m1 pending, the old cursor, no ack.
           const restored = yield* device
@@ -221,6 +231,71 @@ describe.skipIf(!pgAvailable)("expiry floor (DESIGN §16.5) against the real ser
           assert.strictEqual((yield* restored.engine.push).processed, 0)
           assert.strictEqual(sent.push, before)
           assert.deepStrictEqual(yield* executions, [{ n: 1 }])
+        }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+      }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
+    60_000
+  )
+
+  it.live(
+    "a tab's enqueue retried after its reply was lost, the released marker pruned (24 h) and the ledger row expired (7 d) gets a fresh seq and is answered ClientExpired at the original position: executed once, an OutcomeUnknown notice, the outbox drained",
+    () =>
+      Effect.gen(function* () {
+        const pg = yield* SqlClient
+        yield* grant("p", "s1")
+        yield* pg`UPDATE echo_sync.scope_grants SET role = 'writer' WHERE principal_id = 'p'`
+        yield* pg`INSERT INTO items (id, access_scope_id, body) VALUES ('i1', 's1', '')`
+        const { fetch } = yield* serve
+        const leader = yield* device
+        const serverBody = Effect.map(
+          pg<{ body: string }>`SELECT body FROM items WHERE id = 'i1'`,
+          (rows) => rows[0]?.body
+        )
+        const append = leader.engine.mutate(mid("m1"), "items.append", { id: "i1", suffix: "x" })
+
+        yield* Effect.gen(function* () {
+          yield* leader.engine.pull
+          // The tab's enqueue commits; its reply is lost, so the tab will retry with the same id.
+          const original = yield* append
+          assert.strictEqual(original.seq, 1)
+          // Meanwhile a leader pushes it, installs its ack (releasing it) and presents the cursor (stamp).
+          assert.strictEqual((yield* leader.engine.push).processed, 1)
+          yield* leader.engine.pull
+          yield* leader.engine.pull
+          assert.deepStrictEqual(yield* leader.storage.transaction(leader.storage.pending), [])
+          const recorded = yield* pg<{ position: string }>`SELECT position::text FROM echo_sync.mutations`
+          const position = recorded[0]?.position ?? assert.fail("m1 has a ledger row")
+          // Within the released-row window a retry is answered by the marker: same seq, no new intent.
+          assert.strictEqual((yield* append).seq, 1)
+
+          // 25 hours on, the leader prunes released rows; ten days on, the server expires the row.
+          yield* Effect.andThen(TestClock.setTime(Date.now() + 25 * 60 * 60 * 1000), Outbox.pruneReleased()).pipe(
+            Effect.provide(TestClock.layer()),
+            Effect.provideService(SqlClient, leader.sqlite)
+          )
+          yield* pg`UPDATE echo_sync.mutations SET acked_at = acked_at - interval '10 days'`
+          assert.strictEqual((yield* expireLedger()).clients, 1, "the job expired m1")
+
+          // The suspended tab resumes and retries: the id is forgotten locally, so it gets seq 2.
+          const retry = yield* append
+          assert.strictEqual(retry.seq, 2)
+          assert.strictEqual((yield* leader.engine.push).processed, 1)
+          yield* leader.engine.pull
+
+          assert.strictEqual(yield* serverBody, "x", "the server executed the intent exactly once")
+          const ledger = yield* pg<{ seq: string; position: string; outcome: unknown }>`
+            SELECT seq::text, position::text, outcome FROM echo_sync.mutations ORDER BY seq`
+          assert.deepStrictEqual(ledger, [{ seq: "1", position, outcome: null }], "the retry recorded nothing")
+          const notices = yield* SqliteSyncStorage.notices(leader.sqlite)
+          assert.deepStrictEqual(
+            notices.map(({ notice }) => [notice._tag, notice.envelope.mutationId, notice.envelope.seq]),
+            [["OutcomeUnknown", "m1", 2]]
+          )
+          assert.deepStrictEqual(yield* leader.storage.transaction(leader.storage.pending), [])
+          assert.deepStrictEqual(
+            yield* Effect.orDie(leader.sqlite<{ body: string }>`SELECT body FROM items WHERE id = 'i1'`),
+            [{ body: "x" }],
+            "the replica converged on the single execution"
+          )
         }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     60_000

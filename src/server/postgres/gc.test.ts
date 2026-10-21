@@ -163,14 +163,18 @@ const ledgerClient = Effect.gen(function* () {
     )
   const state = Effect.flatMap(SqlClient, (sql) =>
     Effect.all({
-      rows: sql<{ seq: string; acked: boolean }>`
-        SELECT seq::text, acked_at IS NOT NULL AS acked FROM echo_sync.mutations WHERE client_id = 'c1' ORDER BY seq`,
+      rows: sql<{ seq: string; acked: boolean; live: boolean }>`
+        SELECT seq::text, acked_at IS NOT NULL AS acked, outcome IS NOT NULL AS live
+        FROM echo_sync.mutations WHERE client_id = 'c1' ORDER BY seq`,
       floor: sql<{ expired_through: string; expired_position: string }>`
         SELECT expired_through::text, expired_position::text FROM echo_sync.clients WHERE client_id = 'c1'`
     })
   )
-  const seqs = Effect.map(state, (s) => s.rows.map((r) => Number(r.seq)))
-  return { replica, counter, submit, state, seqs, ageAcks }
+  /** Rows that still hold their outcome; an expired row keeps only its identity. */
+  const seqs = Effect.map(state, (s) => s.rows.filter((r) => r.live).map((r) => Number(r.seq)))
+  /** Every identity in the ledger, expired or not: expiry never removes one. */
+  const identities = Effect.map(state, (s) => s.rows.map((r) => Number(r.seq)))
+  return { replica, counter, submit, state, seqs, identities, ageAcks }
 })
 
 describe.skipIf(!pgAvailable)("ledger expiry (DESIGN §16 item 5)", () => {
@@ -186,8 +190,9 @@ describe.skipIf(!pgAvailable)("ledger expiry (DESIGN §16 item 5)", () => {
         yield* c.replica.sync() // presents the cursor past m1: acked from now
 
         const run = yield* expireAt(7 * day + 60_000)
-        assert.deepStrictEqual(run, { clients: 1, deleted: 1 })
+        assert.deepStrictEqual(run, { clients: 1, expired: 1 })
         assert.deepStrictEqual(yield* c.seqs, [])
+        assert.deepStrictEqual(yield* c.identities, [1], "the identity outlives the outcome")
 
         const again = yield* c.submit("m1", 1, "a")
         assert.strictEqual(again.outcome._tag === "Rejected" && again.outcome.error._tag, "ClientExpired")
@@ -195,6 +200,30 @@ describe.skipIf(!pgAvailable)("ledger expiry (DESIGN §16 item 5)", () => {
         assert.strictEqual(c.counter.executions, 1)
         const rows = yield* Effect.flatMap(SqlClient, (sql) => sql`SELECT id FROM items`)
         assert.deepStrictEqual(rows, [{ id: "a" }])
+      }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live(
+    "a retry of an expired mutation under a fresh seq above the floor is answered Rejected{ClientExpired} at its original position, not executed again",
+    () =>
+      Effect.gen(function* () {
+        const c = yield* ledgerClient
+        const first = yield* c.submit("m1", 1, "a")
+        yield* c.replica.sync()
+        yield* c.replica.sync() // m1 acked now
+        yield* ageAcks(10)
+        assert.deepStrictEqual(yield* expireAt(0), { clients: 1, expired: 1 })
+        // The client forgot m1 (its released-row marker was pruned) and enqueues it again as seq 2.
+        const retry = yield* c.submit("m1", 2, "a")
+        assert.strictEqual(retry.outcome._tag === "Rejected" && retry.outcome.error._tag, "ClientExpired")
+        assert.strictEqual(retry.position, first.position)
+        assert.strictEqual(c.counter.executions, 1)
+        assert.deepStrictEqual(yield* c.identities, [1], "the retry recorded nothing")
+        // A cleared row is never acked or expired again: later pulls and jobs leave it alone.
+        yield* c.replica.sync()
+        yield* c.replica.sync()
+        yield* ageAcks(10)
+        assert.deepStrictEqual(yield* expireAt(0), { clients: 0, expired: 0 })
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -212,7 +241,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (DESIGN §16 item 5)", () => {
         yield* c.submit("m2", 2) // pushed, never pulled: unacked
         yield* sql`UPDATE echo_sync.mutations SET received_at = now() - interval '400 days' WHERE mutation_id = 'm2'`
 
-        assert.deepStrictEqual(yield* expireAt(7 * day - 60_000), { clients: 0, deleted: 0 })
+        assert.deepStrictEqual(yield* expireAt(7 * day - 60_000), { clients: 0, expired: 0 })
         assert.deepStrictEqual(yield* c.seqs, [1, 2])
         // A year on, m1 has been acked longer than the retention; m2 never was.
         yield* expireAt(365 * day)
@@ -236,7 +265,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (DESIGN §16 item 5)", () => {
         yield* c.replica.sync() // m3 acked now
         yield* c.submit("m4", 4) // unacked
 
-        assert.deepStrictEqual(yield* expireAt(0), { clients: 1, deleted: 2 })
+        assert.deepStrictEqual(yield* expireAt(0), { clients: 1, expired: 2 })
         assert.deepStrictEqual(yield* c.seqs, [3, 4])
         assert.deepStrictEqual((yield* c.state).floor, [
           { expired_through: "2", expired_position: String(p2.position) }
@@ -293,7 +322,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (DESIGN §16 item 5)", () => {
           sql`SELECT * FROM echo_sync.clients ORDER BY client_id`
         ])
         const before = yield* snapshot
-        assert.deepStrictEqual(yield* expireAt(0), { clients: 0, deleted: 0 })
+        assert.deepStrictEqual(yield* expireAt(0), { clients: 0, expired: 0 })
         assert.deepStrictEqual(yield* snapshot, before)
       }).pipe(Effect.provide(TestDatabase))
   )
@@ -334,7 +363,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (DESIGN §16 item 5)", () => {
         assert.strictEqual((yield* other.pullOnce(1))._tag, "PullPage")
 
         yield* ageAcks(10)
-        assert.deepStrictEqual(yield* expireAt(0), { clients: 1, deleted: 1 })
+        assert.deepStrictEqual(yield* expireAt(0), { clients: 1, expired: 1 })
 
         yield* c.replica.sync()
         assert.strictEqual(c.replica.cursor, last.position, "the cursor does not regress")
@@ -359,7 +388,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (DESIGN §16 item 5)", () => {
         yield* sql`INSERT INTO echo_sync.mutations (client_id, mutation_id, seq, position, outcome, received_at)
                  VALUES ('c1', 'm1', 1, 1, '{"_tag":"Applied"}', now() - interval '365 days')`
         yield* migrate
-        assert.deepStrictEqual(yield* expireAt(0), { clients: 0, deleted: 0 })
+        assert.deepStrictEqual(yield* expireAt(0), { clients: 0, expired: 0 })
         const rows = yield* sql<{ mutation_id: string; acked: boolean }>`
         SELECT mutation_id, acked_at IS NOT NULL AS acked FROM echo_sync.mutations`
         assert.deepStrictEqual(rows, [{ mutation_id: "m1", acked: false }])

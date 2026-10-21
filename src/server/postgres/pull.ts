@@ -223,6 +223,7 @@ export const pull = Effect.fnUntraced(function* (registry: Registry.SyncRegistry
       const ackRows = yield* sql<{ mutation_id: string; position: bigint; outcome: unknown }>`
         SELECT mutation_id, position, outcome FROM echo_sync.mutations
         WHERE client_id = ${request.clientId} AND position > ${ackFloor} AND position <= ${nextPosition}
+          AND outcome IS NOT NULL
         ORDER BY position`
       const acks: Array<Protocol.Ack> = []
       for (const row of ackRows) {
@@ -276,7 +277,8 @@ export const pull = Effect.fnUntraced(function* (registry: Registry.SyncRegistry
     // first stamp counts; a row is never expired before it has one.
     yield* sql`
       UPDATE echo_sync.mutations SET acked_at = now()
-      WHERE client_id = ${request.clientId} AND position <= ${request.cursor} AND acked_at IS NULL`
+      WHERE client_id = ${request.clientId} AND position <= ${request.cursor} AND acked_at IS NULL
+        AND outcome IS NOT NULL`
   }
   if (response.result._tag === "PullDone") {
     yield* sql`

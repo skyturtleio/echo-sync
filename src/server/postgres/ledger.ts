@@ -248,6 +248,19 @@ export const runMutation = <R>(
           SELECT outcome, position FROM echo_sync.mutations
           WHERE client_id = ${envelope.clientId} AND mutation_id = ${envelope.mutationId}`
         const row = recorded[0]
+        // An expired row (outcome cleared, identity kept): processed before, outcome reclaimed.
+        // Answered at its own position whatever seq this attempt carries, so a retry enqueued
+        // under a fresh seq after the client forgot the id is never executed again (DESIGN §16.5).
+        if (row !== undefined && row.outcome === null) {
+          const expired: Processed = {
+            outcome: {
+              _tag: "Rejected",
+              error: new Mutation.ClientExpired({ mutationId: Ids.MutationId.make(envelope.mutationId) })
+            },
+            position: row.position
+          }
+          return expired
+        }
         if (row !== undefined) {
           const replay: Processed = { outcome: yield* Effect.orDie(decodeOutcome(row.outcome)), position: row.position }
           return replay

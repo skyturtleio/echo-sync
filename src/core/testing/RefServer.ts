@@ -8,8 +8,9 @@
  *   page is served, not when the entry was logged (§8). Membership is a state diff against the
  *   per-client held-scope record (`client_scopes`); a null cursor holds nothing, so it walks
  *   every readable scope and then continues with the log.
- * - Log and ledger are independently GC-able; ledger GC keeps a per-client floor so
- *   resubmissions are answered `ClientExpired` instead of re-executed (§16.5).
+ * - Log and ledger are independently GC-able; ledger GC clears an entry's outcome but keeps its
+ *   identity, and keeps a per-client floor, so resubmissions (under any seq) are answered
+ *   `ClientExpired` instead of re-executed (§16.5).
  * - Mutations run through the same `Mutation.runHandler` (core `Store.make` + `Mutation.run`)
  *   the client runs optimistically, against the server's rows and grants.
  *
@@ -42,7 +43,8 @@ interface LogEntry {
 interface LedgerEntry {
   readonly position: Position
   readonly seq: number
-  readonly outcome: MutationOutcome
+  /** `null` once expired: the identity stays, the outcome is reclaimed (§16.5). */
+  readonly outcome: MutationOutcome | null
 }
 
 /** Server-side state of an in-progress page set (the client only sees an opaque token). */
@@ -177,13 +179,14 @@ export const make = (options: { readonly pageSize: number }) => {
           const floor = ledgerFloor.get(request.clientId)
           // Clients push in seq order and every processed mutation is in the ledger, so a seq at
           // or below the floor was processed and its row is gone: answer terminally, never re-execute.
+          const expired: MutationOutcome = {
+            _tag: "Rejected",
+            error: new Mutation.ClientExpired({ mutationId: item.mutationId })
+          }
           const result: { outcome: MutationOutcome; position: Ids.Position } =
-            (recorded && { outcome: recorded.outcome, position: asPosition(recorded.position) }) ??
+            (recorded && { outcome: recorded.outcome ?? expired, position: asPosition(recorded.position) }) ??
             (floor !== undefined && item.seq <= floor.seq
-              ? {
-                  outcome: { _tag: "Rejected", error: new Mutation.ClientExpired({ mutationId: item.mutationId }) },
-                  position: asPosition(floor.position)
-                }
+              ? { outcome: expired, position: asPosition(floor.position) }
               : yield* execute({ clientId: request.clientId, ...item }, now))
           results.push({ mutationId: item.mutationId, ...result })
         }
@@ -287,6 +290,7 @@ export const make = (options: { readonly pageSize: number }) => {
 
         const acks: Array<Protocol.Ack> = []
         for (const [mutationId, entry] of ledgerOf(clientId)) {
+          if (entry.outcome === null) continue
           if ((state.start === null || entry.position > state.start) && entry.position <= head) {
             acks.push({ mutationId, position: asPosition(entry.position), outcome: entry.outcome })
           }
@@ -312,8 +316,13 @@ export const make = (options: { readonly pageSize: number }) => {
     history,
     executions,
     head: () => head,
-    ledgerEntry: (clientId: string, mutationId: Ids.MutationId) =>
-      Option.fromNullishOr(ledger.get(clientId)?.get(mutationId)),
+    /** The entry while it still holds its outcome; none once expired (or never processed). */
+    ledgerEntry: (clientId: string, mutationId: Ids.MutationId) => {
+      const entry = ledger.get(clientId)?.get(mutationId)
+      return entry === undefined || entry.outcome === null
+        ? Option.none()
+        : Option.some({ position: entry.position, seq: entry.seq, outcome: entry.outcome })
+    },
     register: (clientId: string, principal: AccessScope.PrincipalId) => principals.set(clientId, principal),
     /** The server's table object for a sync name. */
     table: (name: string) => Option.getOrThrow(serverRegistry.get(name)),
@@ -325,12 +334,12 @@ export const make = (options: { readonly pageSize: number }) => {
       log = log.filter((entry) => entry.position > through)
       if (through > logFloor) logFloor = through
     },
-    /** Drops ledger entries with position ≤ `through`. */
+    /** Expires ledger entries with position ≤ `through`: outcome cleared, identity kept (§16.5). */
     gcLedger: (through: Position) => {
       for (const [clientId, entries] of ledger) {
         for (const [id, entry] of entries) {
-          if (entry.position > through) continue
-          entries.delete(id)
+          if (entry.position > through || entry.outcome === null) continue
+          entries.set(id, { ...entry, outcome: null })
           const floor = ledgerFloor.get(clientId)
           ledgerFloor.set(clientId, {
             seq: Math.max(floor?.seq ?? 0, entry.seq),
