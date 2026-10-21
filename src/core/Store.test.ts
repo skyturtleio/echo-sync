@@ -159,7 +159,7 @@ const memoryRows = () => {
         if (Option.isSome(row)) table(t).set(id, row.value)
         else table(t).delete(id)
       }),
-    range: (t, p) => Effect.sync(() => Store.planResult(p, table(t).values(), (id) => table(ScopeGrants).has(id))),
+    range: (t, p) => Effect.sync(() => Store.planResult(p, table(t).values(), table(ScopeGrants).values())),
     scan: (t) => Effect.sync(() => [...table(t).values()])
   }
   const snapshot = () => new Map([...data].map(([name, m]) => [name, new Map(m)]))

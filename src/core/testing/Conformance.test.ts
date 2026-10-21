@@ -148,13 +148,16 @@ describe("the suite's expectations come from fixtures, not from the subject (DES
 const filtersAfter = (rewrite: (plan: Store.IndexRangePlan) => Store.IndexRangePlan) =>
   Effect.sync((): Conformance.RowStoreSubject => {
     const store = MemoryStore.make()
-    const grants = (id: string) => store.tables().get("scope_grants")?.has(id) ?? false
     return {
       rows: {
         ...store,
         range: (table, plan) =>
           Effect.map(store.range(table, rewrite(plan)), (rows) =>
-            Store.planResult({ ...plan, limit: Option.none() }, rows, grants)
+            Store.planResult(
+              { ...plan, limit: Option.none() },
+              rows,
+              store.tables().get("scope_grants")?.values() ?? []
+            )
           )
       },
       transaction: store.transaction

@@ -122,8 +122,12 @@ const theirs = AccessScope.AccessScopeId.make("theirs")
 export const grantedScopes: ReadonlyArray<AccessScope.AccessScopeId> = [mine, open, theirs]
 const READABLE: ReadonlyArray<AccessScope.AccessScopeId> = [mine, open]
 const UNREADABLE: ReadonlyArray<AccessScope.AccessScopeId> = [theirs, s2]
-const grant = (scope: AccessScope.AccessScopeId, principal: AccessScope.PrincipalId, role: AccessScope.Role) => {
-  const id = ScopeGrants.grantId(scope, principal)
+const grant = (
+  scope: AccessScope.AccessScopeId,
+  principal: AccessScope.PrincipalId,
+  role: AccessScope.Role,
+  id = ScopeGrants.grantId(scope, principal)
+) => {
   const row = Schema.encodeSync(ScopeGrants.ScopeGrants.wire)({
     id,
     accessScopeId: scope,
@@ -135,7 +139,8 @@ const grant = (scope: AccessScope.AccessScopeId, principal: AccessScope.Principa
 }
 const GRANTS = [
   grant(mine, u1, "reader"),
-  grant(open, AccessScope.Everyone, "writer"),
+  // Written around the store with a non-derived id: readability follows the grant's columns, not its id.
+  grant(open, AccessScope.Everyone, "writer", ScopeGrants.ScopeGrantId.make("not-derived")),
   grant(theirs, AccessScope.PrincipalId.make("u2"), "owner")
 ]
 const encodeItem = Schema.encodeSync(Items.wire)
@@ -493,14 +498,19 @@ export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): R
             }
             // Random plans (eq prefixes, bounds, both orders) with the scope constraint and a limit,
             // against core's reference over the same fixture.
-            const granted = new Set<string>(GRANTS.map(([id]) => id))
             for (let p = 0; p < 30; p++) {
               const plan: Store.IndexRangePlan = {
                 ...randomPlan(rng, data),
                 readableBy: Option.some(READERS),
                 limit: rng.chance(0.2) ? Option.none() : Option.some(rng.int(6))
               }
-              const want = canonical(Store.planResult(plan, data, (id) => granted.has(id)))
+              const want = canonical(
+                Store.planResult(
+                  plan,
+                  data,
+                  GRANTS.map(([, row]) => row)
+                )
+              )
               const got = canonical(yield* transaction(rows.range(Items, plan)))
               if (got !== want)
                 return yield* fail(`seed ${seed}, plan ${describePlan(plan)}:\n got ${got}\nwant ${want}`)

@@ -120,22 +120,25 @@ export const planOrder = (plan: IndexRangePlan): ((a: EncodedRow, b: EncodedRow)
   return plan.order === "asc" ? asc : (a, b) => asc(b, a)
 }
 
+const grantPair = (scope: unknown, principal: unknown) => JSON.stringify([scope, principal])
+
 /**
  * Reference result of `plan` over `rows` (a table's rows) given `grants` (the `scope_grants`
  * table's rows): match, scope, order, then limit. MemoryStore uses it; SQL stores must agree.
+ * A grant is matched by its `access_scope_id` and `principal_id` columns, as the SQL semi-join
+ * does, never by its id (storage does not enforce `id = grantId(...)` for rows written around
+ * the store).
  */
 export const planResult = (
   plan: IndexRangePlan,
   rows: Iterable<EncodedRow>,
-  grants: (id: string) => boolean
+  grants: Iterable<EncodedRow>
 ): ReadonlyArray<EncodedRow> => {
+  const granted = new Set(Array.from(grants, (g) => grantPair(g["access_scope_id"], g["principal_id"])))
   const readable = (row: EncodedRow) =>
     Option.match(plan.readableBy, {
       onNone: () => true,
-      onSome: (principals) => {
-        const scope = row["access_scope_id"]
-        return typeof scope === "string" && principals.some((p) => grants(grantId(AccessScopeIdSchema.make(scope), p)))
-      }
+      onSome: (principals) => principals.some((p) => granted.has(grantPair(row["access_scope_id"], p)))
     })
   const ordered = [...rows].filter((row) => planMatches(plan, row) && readable(row)).toSorted(planOrder(plan))
   return Option.match(plan.limit, { onNone: () => ordered, onSome: (n) => ordered.slice(0, n) })
