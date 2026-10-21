@@ -1,0 +1,145 @@
+/**
+ * Dev harness page. Exposes `window.echo` so agent-browser (or a human in devtools) can drive
+ * scenarios across tabs; see docs/browser-substrate.md "Running the browser scenarios".
+ */
+import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
+import * as Scope from "effect/Scope"
+import * as Stream from "effect/Stream"
+import * as LeaderClientModule from "../../src/client/worker/LeaderClient.ts"
+import type { OutboxEnvelope, QueryResult, SqlParams } from "../../src/client/worker/LeaderRpcs.ts"
+
+const params = new URLSearchParams(location.search)
+const appId = params.get("app") ?? "spike"
+const profile = params.get("profile") ?? "default"
+const noSharedWorker = params.has("noSharedWorker")
+
+if (noSharedWorker) {
+  // Simulates a browser without SharedWorker (e.g. Chrome Android) to exercise the fail-closed fallback.
+  Reflect.deleteProperty(globalThis, "SharedWorker")
+}
+
+const $ = (id: string) => document.getElementById(id)
+const log = (line: string) => {
+  const el = $("log")
+  if (el) el.textContent = `${new Date().toISOString().slice(11, 23)} ${line}\n${el.textContent ?? ""}`
+}
+
+const scope = Effect.runSync(Scope.make())
+const client = await Effect.runPromise(
+  LeaderClientModule.make({
+    appId,
+    profile,
+    spawnLeader: (name) => new Worker(new URL("./leader.worker.ts", import.meta.url), { type: "module", name }),
+    spawnRouter: (name) => new SharedWorker(new URL("./router.worker.ts", import.meta.url), { type: "module", name })
+  }).pipe(Scope.provide(scope))
+)
+addEventListener("pagehide", () => Effect.runFork(Scope.close(scope, Exit.void)))
+
+/** Errors are returned as values so the driving script can assert on `_tag`/`reason`. */
+type Outcome<A> = { readonly ok: true; readonly value: A } | { readonly ok: false; readonly error: unknown }
+const run = <A, E>(effect: Effect.Effect<A, E>): Promise<Outcome<A>> =>
+  Effect.runPromise(
+    effect.pipe(
+      Effect.match({
+        onSuccess: (value): Outcome<A> => ({ ok: true, value }),
+        onFailure: (error): Outcome<A> => ({ ok: false, error: JSON.parse(JSON.stringify(error)) })
+      })
+    )
+  )
+
+interface Subscription {
+  readonly emissions: Array<QueryResult>
+  ended: unknown
+  readonly cancel: () => void
+}
+
+const echo = {
+  status: () => Effect.runPromise(client.status),
+  /** Status once a leader is connected, or the current status after `timeoutMs`. */
+  ready: async (timeoutMs = 10_000) => {
+    const deadline = Date.now() + timeoutMs
+    let status = await Effect.runPromise(client.status)
+    while (status.leaderId === undefined && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      status = await Effect.runPromise(client.status)
+    }
+    return status
+  },
+  info: () => run(client.leaderInfo),
+  exec: (sql: string, sqlParams: SqlParams = []) => run(client.exec(sql, sqlParams)),
+  enqueue: (envelope: OutboxEnvelope) => run(client.enqueue(envelope)),
+  /** Retry on LeaderUnavailable{LeaderLost} — safe because enqueue is idempotent on mutationId. */
+  enqueueRetrying: (envelope: OutboxEnvelope) =>
+    run(
+      client.enqueue(envelope).pipe(
+        Effect.retry({
+          times: 50,
+          while: (e) => e._tag === "LeaderUnavailable" && e.reason === "LeaderLost"
+        })
+      )
+    ),
+  /** Live query over `statements` (all read in one transaction per emission); collects emissions. */
+  subscribe: (statements: ReadonlyArray<string>, tables: ReadonlyArray<string>): Subscription => {
+    const sub: Subscription = { emissions: [], ended: undefined, cancel: () => Effect.runFork(Fiber.interrupt(fiber)) }
+    const fiber = Effect.runFork(
+      client.subscribe({ statements: statements.map((sql) => ({ sql, params: [] })), tables }).pipe(
+        Stream.runForEach((result) => Effect.sync(() => void sub.emissions.push(result))),
+        Effect.exit,
+        Effect.map((exit) => {
+          sub.ended = Exit.isFailure(exit) ? JSON.parse(JSON.stringify(exit.cause)) : "completed"
+        })
+      )
+    )
+    return sub
+  }
+}
+
+declare global {
+  interface Window {
+    echo: typeof echo
+  }
+}
+window.echo = echo
+
+// Live UI: status badge and a live count, re-subscribing on handover.
+const render = async () => {
+  const status = await echo.status()
+  const info = await Effect.runPromise(client.leaderInfo.pipe(Effect.option, Effect.timeoutOption("50 millis")))
+  const tab = $("tab")
+  if (tab) tab.textContent = status.tabId.slice(0, 8)
+  const mode = $("mode")
+  if (mode) mode.textContent = status.mode
+  const leader = $("leader")
+  if (leader) leader.textContent = status.leaderId?.slice(0, 8) ?? "—"
+  const db = $("db")
+  if (db) db.textContent = info._tag === "Some" && info.value._tag === "Some" ? info.value.value.dbName : "—"
+  const badge = $("badge")
+  if (badge) {
+    badge.className = `badge ${status.leaderId === undefined ? "down" : status.isLeaderTab ? "leader" : "follower"}`
+    badge.textContent = status.leaderId === undefined ? "no leader" : status.isLeaderTab ? "LEADER TAB" : "follower"
+  }
+}
+setInterval(() => void render(), 250)
+
+const liveCount = Effect.gen(function* () {
+  yield* client.exec("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+  yield* client
+    .subscribe({ statements: [{ sql: "SELECT count(*) AS n FROM items", params: [] }], tables: ["items"] })
+    .pipe(
+      Stream.runForEach((r) =>
+        Effect.sync(() => {
+          const el = $("live")
+          const n = r.results[0]?.[0]?.["n"]
+          if (el) el.textContent = String(n)
+          log(`live count = ${String(n)}`)
+        })
+      )
+    )
+}).pipe(
+  Effect.tapError((e) => Effect.sync(() => log(`subscription ended: ${e._tag} ${"reason" in e ? e.reason : ""}`))),
+  Effect.retry({ while: (e) => e._tag === "LeaderUnavailable" && e.reason === "LeaderLost" }),
+  Effect.catch((e) => Effect.sync(() => log(`live query stopped: ${JSON.stringify(e)}`)))
+)
+Effect.runFork(liveCount)
