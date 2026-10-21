@@ -603,6 +603,16 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
   and no client-side reconciliation against snapshots is needed. Accepted residue: two attempts
   carrying the *same* revision (a leader rejoin retried with no intervening `track`) may replace
   each other once, which costs one extra rejoin and never strands or regresses state.
+  As landed (5b122f3, `src/client/worker/LeaderClient.ts`): `presence(room: AccessScopeId,
+  state: Json): Stream<RoomSnapshot, PresenceError>` with `PresenceError = SyncDisabled |
+  Forbidden | PresenceAlreadyOpen | LeaderUnavailable` (`LeaderLost` is absorbed by the rejoin;
+  the other `LeaderUnavailable` reasons fail the stream); `track(room, state): Effect<void>` has
+  no error channel. Revisions never appear in the tab API. Deadlines: the leader's per-send
+  deadline and the room stream's idle timeout (after header preparation) are both
+  `LeaderOptions.idleTimeout` (45 s); the tab's sender uses `tabApi(calls, tuning)`'s
+  `TabApiOptions { presenceSendTimeout = 45 s, presenceRetryDelay = 1 s doubling to 30 s }`,
+  which the production `LeaderClient` layer does not expose, so the tab deadline is fixed for
+  now (§16 item 14).
 - **Typed notice decoding** (ruling from the HeyBabe trial): a retained notice carries the
   envelope's `args` and a `DomainError.error` as `Schema.Json`, so a mutation's static types stop
   at the notice. The stored notice shape, `Notice = Rejected { envelope, error } |
@@ -940,3 +950,4 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
 11. Replica reset on sign-out — **resolved (user: a)**, see §9.1 `resetReplica`: engine-owned, guarded by the leader lock (`ReplicaInUse`) and by the outbox (`PendingWrites { count }` unless `discardPending`), deletes only the identity's OPFS directory.
 12. Presence — **resolved (user: a)**, implement as designed: §12 `PresenceRpcs` (`room` stream joins and observes, `track` updates, entries keyed by `(clientId, tabId)`, scope-grant authorization, process-local in-memory state) and §9.1 `presence` / `track` on the tab client, leader-owned and handover-surviving. Multi-instance presence is a later item.
 13. Presence liveness and revocation (v1 gaps declared by ws/presence-server). **Liveness resolved (coordinator ruling, before the tab client exists so the wire never changes):** the `room` stream element becomes `RoomSnapshot | Heartbeat` (the same `Heartbeat` tagged struct as `pokes`), the server emits a heartbeat every `heartbeatInterval` on every open `room` stream, and the tab client's `presence` applies the same `idleTimeout` as `followPokes` (end and rejoin a silent stream; a rejoin re-sends the latest desired state since `track`'s ack cannot confirm application). A heartbeat is never a snapshot and never changes room state. Revocation stays open: a grant revoked while a `room` stream is open leaves the entry until that stream ends; re-check the grant on each snapshot only if an app needs it. Not scheduled.
+14. Presence tab-side tuning (declared with ws/presence-client 5b122f3): `TabApiOptions` (`presenceSendTimeout`, `presenceRetryDelay`) exists on `tabApi` but the `LeaderClient` layer does not thread it through its config, so apps get the 45 s / 1 s defaults. Thread it through only when an app needs a different tab deadline. Not scheduled.
