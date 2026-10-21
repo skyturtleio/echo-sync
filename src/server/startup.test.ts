@@ -6,7 +6,16 @@ import * as HttpRouter from "effect/http/HttpRouter"
 import { RpcClient, RpcSerialization } from "effect/rpc"
 import { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation, Protocol, Registry, SyncTable } from "echo-sync"
-import { grant, Items, Notes, pgAvailable, registry, RowId, TestDatabase } from "./postgres/test-support.ts"
+import {
+  EmptyDatabase,
+  grant,
+  Items,
+  Notes,
+  pgAvailable,
+  registry,
+  RowId,
+  TestDatabase
+} from "./postgres/test-support.ts"
 import * as Startup from "./startup.ts"
 
 const options: Startup.StartupOptions = {
@@ -107,6 +116,57 @@ describe.skipIf(!pgAvailable)("server startup (§11)", () => {
       assert.deepStrictEqual(
         results.map((r) => r._tag),
         ["Success", "Success", "Success", "Success"]
+      )
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("concurrent first starts on an empty database all succeed and run the app migration exactly once", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      const appMigrations = {
+        "001_init": Effect.gen(function* () {
+          const db = yield* SqlClient
+          for (const table of [Items, Notes]) yield* db.unsafe(table.postgres.createTable)
+          yield* db`CREATE TABLE app_migration_runs (n int)`
+          yield* db`INSERT INTO app_migration_runs VALUES (1)`
+        })
+      }
+      const results = yield* Effect.all(
+        Array.from({ length: 20 }, () => Effect.exit(Startup.prepare({ registry, appMigrations }))),
+        { concurrency: "unbounded" }
+      )
+      const failed = results.filter(Exit.isFailure).map((r) => String(r.cause))
+      assert.deepStrictEqual(failed, [])
+      assert.deepStrictEqual(yield* sql`SELECT n FROM app_migration_runs`, [{ n: 1 }])
+    }).pipe(Effect.provide(EmptyDatabase))
+  )
+
+  it.live("a table captured in two schemas fails startup with one Drift naming both, with every other mismatch", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      // public.items is attached; zz.items is captured behind attach's back (a hand-written trigger).
+      yield* sql`CREATE SCHEMA zz`
+      yield* sql`CREATE TABLE zz.items (LIKE public.items INCLUDING ALL)`
+      yield* sql`CREATE TRIGGER echo_sync_capture AFTER INSERT OR UPDATE OR DELETE ON zz.items
+                 FOR EACH ROW EXECUTE FUNCTION echo_sync.echo_sync_capture_changes()`
+      yield* sql`CREATE TRIGGER echo_sync_reject_truncate BEFORE TRUNCATE ON zz.items
+                 FOR EACH STATEMENT EXECUTE FUNCTION echo_sync.reject_truncate()`
+      // An unrelated mismatch that must arrive in the same Drift.
+      yield* sql`ALTER TABLE notes DROP COLUMN body`
+      const exit = yield* Effect.exit(Startup.prepare(options))
+      if (Exit.isSuccess(exit)) return assert.fail("startup accepted a table captured in two schemas")
+      const [reason] = exit.cause.reasons
+      const error = reason !== undefined && reason._tag === "Fail" ? reason.error : undefined
+      if (error === undefined || !("_tag" in error) || error._tag !== "Drift") {
+        return assert.fail(`expected Drift, got ${String(exit.cause)}`)
+      }
+      assert.isTrue(
+        error.mismatches.some((m) => m.table === "items" && m.problem.includes("captured in 2 schemas (public, zz)")),
+        JSON.stringify(error.mismatches)
+      )
+      assert.isTrue(
+        error.mismatches.some((m) => m.table === "notes" && m.problem.includes("body")),
+        JSON.stringify(error.mismatches)
       )
     }).pipe(Effect.provide(TestDatabase))
   )

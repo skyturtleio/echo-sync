@@ -40,31 +40,35 @@ const admin = (statement: string) =>
     yield* sql.unsafe(statement)
   }).pipe(Effect.provide(PgClient.layer({ url: Redacted.make(adminUrl ?? ""), maxConnections: 1 })))
 
-/**
- * A fresh, migrated database per test, dropped afterwards, with one synced table `items` (and
- * `notes`, so table-agnostic paths see more than one table).
- */
-export const TestDatabase = Layer.unwrap(
+/** A fresh, empty database per test (no engine schema), dropped afterwards. */
+export const EmptyDatabase = Layer.unwrap(
   Effect.gen(function* () {
     const name = `echo_test_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
     yield* admin(`CREATE DATABASE ${name}`)
     yield* Effect.addFinalizer(() => Effect.orDie(admin(`DROP DATABASE ${name} WITH (FORCE)`)))
     const url = new URL(adminUrl ?? "")
     url.pathname = `/${name}`
-    const client = PgClient.layer({ url: Redacted.make(url.toString()), maxConnections: 80 })
-    const setup = Layer.effectDiscard(
-      Effect.gen(function* () {
-        const sql = yield* SqlClient
-        yield* migrate
-        for (const table of [Items, Notes]) {
-          yield* createSynced(table)
-          // Lets tests write raw SQL without naming every column; not part of the SyncTable.
-          yield* sql`ALTER TABLE ${sql(table.name)} ALTER COLUMN body SET DEFAULT ''`
-        }
-      })
-    )
-    return Layer.provideMerge(setup, client)
+    return PgClient.layer({ url: Redacted.make(url.toString()), maxConnections: 80 })
   })
+)
+
+/**
+ * A fresh, migrated database per test, dropped afterwards, with one synced table `items` (and
+ * `notes`, so table-agnostic paths see more than one table).
+ */
+export const TestDatabase = Layer.provideMerge(
+  Layer.effectDiscard(
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      yield* migrate
+      for (const table of [Items, Notes]) {
+        yield* createSynced(table)
+        // Lets tests write raw SQL without naming every column; not part of the SyncTable.
+        yield* sql`ALTER TABLE ${sql(table.name)} ALTER COLUMN body SET DEFAULT ''`
+      }
+    })
+  ),
+  EmptyDatabase
 )
 
 /** Creates scopes and grants `principal` read access to each. Grant ids are derived from the pair. */

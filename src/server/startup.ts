@@ -17,8 +17,8 @@ export interface StartupOptions extends SyncServerOptions {
  * `Migrate.verify` (fails with one `Drift` listing every mismatch). `scope_grants` is attached by
  * the engine migration.
  *
- * Safe to run concurrently from several instances: `migrate` and `migrateApp` lock their history
- * tables, `attach` is idempotent and serialized on its own advisory lock, `verify` only reads.
+ * Safe to run concurrently from several instances, including first starts on an empty database:
+ * `migrate` serializes its schema bootstrap, `migrate` and `migrateApp` lock their history tables, `attach` is idempotent and serialized on its own advisory lock, `verify` only reads.
  */
 export const prepare = (options: Pick<StartupOptions, "registry" | "appMigrations">) =>
   Effect.gen(function* () {
@@ -36,7 +36,11 @@ export const prepare = (options: Pick<StartupOptions, "registry" | "appMigration
       const [found] = yield* sql<{
         exists: boolean
       }>`SELECT to_regclass(quote_ident(${table.name})) IS NOT NULL AS exists`
-      if (found?.exists === true) yield* attach(table)
+      if (found?.exists !== true) continue
+      // A same-name relation already captured in another schema: leave it to verify, which
+      // reports the multi-schema capture in the one Drift with every other mismatch (§11).
+      // Every other attach failure still stops startup.
+      yield* attach(table).pipe(Effect.catchTag("TableNameConflict", () => Effect.void))
     }
     yield* verify(options.registry)
   })

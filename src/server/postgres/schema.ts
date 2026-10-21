@@ -9,7 +9,8 @@ export const migrationsTable = "echo_sync.migrations"
 
 /**
  * Brings the `echo_sync` schema up to date. Safe to run concurrently from several server
- * instances: the migrator locks its history table.
+ * instances, including the first start on an empty database: the schema bootstrap is serialized
+ * on an advisory lock and the migrator locks its history table.
  *
  * Uses `PgMigrator.make` without a schema dumper so the only requirement is `SqlClient`
  * (`PgMigrator.run` also demands process/filesystem services for `pg_dump`).
@@ -17,7 +18,12 @@ export const migrationsTable = "echo_sync.migrations"
 export const migrate = Effect.gen(function* () {
   const sql = yield* SqlClient
   // The history table lives in `echo_sync`, so the schema must exist before the migrator runs.
-  yield* sql`CREATE SCHEMA IF NOT EXISTS echo_sync`
+  // Concurrent first starts would race CREATE SCHEMA IF NOT EXISTS into a unique violation on
+  // pg_namespace, so the bootstrap is serialized on its own advisory lock ("echosync" + 2). The
+  // lock is held only for this short transaction; a later holder's statement sees the schema.
+  yield* sql.withTransaction(
+    Effect.andThen(sql`SELECT pg_advisory_xact_lock(7305797848413072997)`, sql`CREATE SCHEMA IF NOT EXISTS echo_sync`)
+  )
   return yield* PgMigrator.make({})({
     loader: PgMigrator.fromRecord({ "001_engine": engine }),
     table: migrationsTable
