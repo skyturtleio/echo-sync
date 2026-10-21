@@ -289,7 +289,13 @@ backoff per sync cycle (push then pull), not one per operation: a transient push
 delays the next pull. A halted push does not count as a failure and does not delay pull.
 Transport: `SyncRpcs` over HTTP POST with NDJSON (`RpcServer.layerHttp({ protocol: "http" })`
 + `RpcSerialization.layerNdjson` on the server; `RpcClient` over the platform fetch on the
-client).
+client). The HTTP transport is one composition of exported server seams, not the only one
+(main 57a0008, ws/server-pipeline): push is `principalFor(headers)` → `executeBatch(options,
+actor, request)` → `pushFailures`; pull is `principalFor` → `pull(registry, request)` →
+`serverFailures`; pokes applies the same failure mapping to its stream. The combinators carry the
+failure classification above (infrastructure ⇒ transient stop or `ServerUnavailable`,
+`ClientForbidden` ⇒ `Unauthorized`, other defects stay defects) so any transport that composes
+them gets identical behavior; `docs/server-substrate.md` “Composing a transport” is the contract.
 
 ## 7. Log ordering invariant
 
