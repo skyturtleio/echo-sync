@@ -233,7 +233,14 @@ a cause that also carries any non-SQL defect stays a defect (§6 precedence, def
 So a defect from the server always means a bug. The client
 treats a pull defect as transient anyway (below) as a safety net, not as the contract. The
 `pokes` stream ending for any reason (failure, defect, clean end) is reconnected by the client
-with backoff; it is a hint stream and nothing is lost. Transient push failures
+with backoff; it is a hint stream and nothing is lost **because of the subscribe-then-poke
+guarantee**: the server emits one poke on every `pokes` stream immediately after its `LISTEN` is
+confirmed (the pinned `PgClient.listen` resolves only after PostgreSQL acknowledges `LISTEN`),
+before any notification, and the client pulls on every poke. A change committed between the
+client's last pull and the `LISTEN` is therefore covered by the pull that initial poke triggers,
+and a change committed after it produces a notification. The client must not rely on a pull
+issued *before* the stream is established to close a reconnect gap, and v1 adds no periodic
+resync timer. Transient push failures
 (`RpcClientError`, `Unauthorized`, interruption) and every pull failure (including a pull defect
 or an undecodable page, mapped to a transient pull error) are retried with backoff. v1 uses one
 backoff per sync cycle (push then pull), not one per operation: a transient push failure also
