@@ -13,7 +13,7 @@
  * `Mutation.MutationRejection`, and undo images store their table by sync name, resolved through the
  * registry when read (a rebuild empties them, so a name is always registered).
  */
-import { Effect, Option, Schema } from "effect"
+import { Effect, Option, Schema, Semaphore } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
 import { Ids, Mutation, Protocol, type Registry, type Store, SyncTable } from "echo-sync"
@@ -163,6 +163,7 @@ const toEnvelope = (entry: Outbox.OutboxEntry): Effect.Effect<Mutation.MutationE
  */
 export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry): Engine.SyncStorage => {
   const rows = SqliteRowStore.make(sql, registry)
+  const permit = Semaphore.makeUnsafe(1)
   const run = <A>(effect: Effect.Effect<A, SqlError, SqlClient.SqlClient>) =>
     SqliteRowStore.unavailable(Effect.provideService(effect, SqlClient.SqlClient, sql))
 
@@ -193,9 +194,12 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
 
   return {
     // BEGIN/COMMIT failures map like any statement's; the body's own errors pass through unchanged.
+    // `withTransaction` waits for the connection lease uninterruptibly; waiting for `permit` first makes
+    // a transaction queued behind a long one (e.g. a pull install) cancellable while it waits, in FIFO
+    // order. The lease still serializes against SQL that bypasses this storage.
     transaction: (self) =>
-      sql
-        .withTransaction(self)
+      permit
+        .withPermit(sql.withTransaction(self))
         .pipe(Effect.catchIf(isSqlError, (error) => SqliteRowStore.unavailable(Effect.fail(error)))),
     rows,
     meta: Effect.gen(function* () {

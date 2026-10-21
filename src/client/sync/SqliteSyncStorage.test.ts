@@ -390,3 +390,51 @@ it.effect("a database created by main's first outbox DDL migrates forward: undo 
     expect((yield* storage.pending).map((e) => e.envelope.mutationId)).toEqual(["old1"])
   }).pipe(Effect.provide(SqliteClient.layerMemory({})))
 )
+
+it.live("a transaction queued behind a long one can be interrupted while it waits; the rest run in FIFO order", () =>
+  Effect.gen(function* () {
+    const { storage } = yield* makeStorage
+    const ran: Array<string> = []
+    const holding = yield* Deferred.make<void>()
+    const gate = yield* Deferred.make<void>()
+    // The holder plays a long pull install: it owns the connection until `gate` opens.
+    const holder = yield* Effect.forkChild(
+      storage.transaction(
+        Effect.gen(function* () {
+          yield* Deferred.succeed(holding, undefined)
+          yield* Deferred.await(gate)
+          ran.push("holder")
+        })
+      )
+    )
+    yield* Deferred.await(holding)
+    const queued = (name: string) =>
+      Effect.forkChild(
+        storage.transaction(
+          Effect.gen(function* () {
+            ran.push(name)
+            yield* storage.appendPending(entry(yield* storage.nextSeq, name))
+          })
+        )
+      )
+    const a = yield* queued("a")
+    const x = yield* queued("x")
+    const b = yield* queued("b")
+    for (let i = 0; i < 100; i++) yield* Effect.yieldNow
+    const interrupting = yield* Effect.forkChild(Fiber.interrupt(x))
+    for (let i = 0; i < 100; i++) yield* Effect.yieldNow
+    // The interrupt completes while the holder still owns the connection.
+    const done = interrupting.pollUnsafe() !== undefined
+    yield* Deferred.succeed(gate, undefined)
+    yield* Fiber.join(holder)
+    yield* Fiber.join(a)
+    yield* Fiber.join(b)
+    yield* Fiber.join(interrupting)
+    expect(done).toBe(true)
+    expect(ran).toEqual(["holder", "a", "b"])
+    expect((yield* storage.pending).map((e) => [e.envelope.mutationId, e.envelope.seq])).toEqual([
+      ["a", 1],
+      ["b", 2]
+    ])
+  }).pipe(Effect.provide(Db))
+)
