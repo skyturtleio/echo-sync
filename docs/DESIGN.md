@@ -94,6 +94,20 @@ entirely app-owned. Authorization:
   scope (both the old and the new scope on a move). Mutators add domain checks on top.
 - Grant management is itself done through mutations against the `scope_grants` system table via
   a small engine-provided API, so grant changes are captured in the log like any other change.
+- **Scope creation** is `ctx.store.createScope(scopeId)` inside a mutation (never reachable from
+  a query's `ReadStore`). It claims the id (`StoreOptions.claimScope`) and, only if the claim
+  succeeds, writes the first grant `{ id: grantId(scopeId, actor), role: owner }` **for the
+  actor** through the normal write path (undo image, log, touched rows) with the owner check
+  skipped; a handler cannot name another principal. Server claim = `INSERT INTO access_scopes …
+  ON CONFLICT DO NOTHING RETURNING` inside the mutation's transaction and savepoint, so the
+  access row and the grant commit or roll back together and two concurrent creators get exactly
+  one `Applied` and one `Rejected{ScopeForbidden{required: owner}}` (the existing rejection; the
+  wire does not change). A claim that fails for any other reason (the id exists, including a
+  scope whose grants were all revoked: the `access_scopes` row is kept, so an orphaned scope can
+  never be hijacked) is the same `ScopeForbidden`. Client claim is optimistic: fresh iff the
+  replica holds no `scope_grants` row for that scope; the server is authoritative and a
+  rejection undoes the optimistic grant like any other row. The actor `*` can never create a
+  scope (that would make everyone its owner).
 
 Store layering: the typed `Store` (`get/insert/patch/delete/query/scan`, codecs, scope-role
 checks, touched-row/undo capture) is written once in `src/core` over a small per-dialect
@@ -528,8 +542,8 @@ const todosByProject = Query.make("todos.byProject", {
   several statements, so the only protection against untrusted raw SQL is not exposing the RPC.
   The vertical-slice harness sets the flag; apps and the FoldKit adapter never do, and the
   adapter exposes neither RPC.
-- `take(n)` pushdown through the scope filter is still open item 8; `Query.make` must not wait
-  for it (the fix is inside `Store.make`, behind the same `EchoStore` interface).
+- `take(n)` pushdown through the scope filter landed (open item 8, resolved) inside `Store.make`,
+  behind the same `EchoStore` interface; `Query.make` is unaffected.
 
 ## 11. Schema evolution
 
@@ -709,6 +723,6 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
    - **Expiry depends on §9's outbox rule (1).** The §8 push-position backstop (rule 2) does not survive expiry: a duplicate enqueued after its original was released gets a fresh `seq` above the floor, and once the original's ledger row is gone the server cannot recognise it and executes it again (shown by the reconcile simulation). Only a released-row memory in the outbox rules such a duplicate out. Any expiry policy must therefore expire a client's ledger rows only after the released-row retention window (§9, default 24 h) has passed since those rows were acked, and never rows newer than the client's last presented cursor. When to raise the floor beyond that is the remaining open question.
 6. Local full-text search: the pinned wa-sqlite build lacks FTS5 (§10); decide custom build vs. non-FTS search when the search primitive is scheduled.
 7. Additive schema evolution across a deploy — **resolved in §11** (codecs drop excess keys, fail on missing; new columns nullable/defaulted; deploy server first). Remaining: a wire manifest/version gate so a newer client against an older server degrades cleanly instead of failing row decode; needed before clients can ship ahead of the server.
-8. Query `limit` is applied after the scope filter in `Store.make` (v1), so `take(n)` is not pushed down to `RowStore.range` and a query over a large table with many unreadable rows scans past them. Fix by pushing the scope predicate into the range plan when queries are built.
+8. Query `limit` pushdown through the scope filter — **resolved** (main 41b878a): `IndexRangePlan` carries `readableBy` (principals) and `limit`; every `RowStore` applies readability as a `scope_grants` semi-join on `(access_scope_id, principal_id)` and stops after `limit` readable rows; `Store.planResult` is the shared reference. Covered by the `Conformance.rowStore` invariant run by Memory, SQLite and PG. Integration rule still owed by `ws/query` at landing: a registered-query run must record `scope_grants` as read whenever the plan carries `readableBy`, so a revoke re-runs the query.
 9. Pokes liveness. An idle client's only wake source is the `pokes` stream (§6: no resync timer, client pulls on every poke), and the HTTP RPC transport has no heartbeat, so an intermediary that holds a dead response open (observed with Vite's dev proxy, `docs/vertical-slice.md`) leaves the client deaf until a local enqueue. **User decision**, since it touches `Protocol`: (a) server heartbeat element on `pokes` distinguishable from a poke, plus a client idle timeout that reconnects; (b) a capped `pokes` connection lifetime with reconnect, no heartbeat; (c) accept for v1 and document. Until ruled, the vertical slice breaks the proxied response in the harness only.
 10. Credential refresh. `LeaderOptions.syncHeaders(principal)` is evaluated once per leader, so a renewed token takes effect only after a leader restart, while `Unauthorized` is retried (§6) and never fatal — a client with an expired token retries forever until the tab is reloaded. Lean: make `syncHeaders` an Effect evaluated per outgoing request (push, pull, pokes reconnect), with the app owning the refresh. Not scheduled; raise before any app relies on short-lived tokens.
