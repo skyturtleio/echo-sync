@@ -100,14 +100,17 @@ Only after all four does it mount `Protocol.SyncRpcs` (HTTP POST + NDJSON) at `p
 `/sync`. Several instances may start concurrently, including against an empty database:
 migrations and attach are serialized, and verify only reads.
 
-`Startup.layer` must be built before you accept traffic. Otherwise a startup failure only appears
-on the first request. The example builds it into a shared `MemoMap` and exits on failure, then
-hands the same layer and `MemoMap` to `HttpRouter.toWebHandler`, which reuses that build:
+Build `Startup.layer` and check the result before you accept traffic. `HttpRouter.toWebHandler`
+starts building its layer immediately, but it gives you no result to await: a failed build only
+shows up as the rejection of each request. The example builds the layer into a shared `MemoMap`
+and exits on failure. It then hands the same layer and `MemoMap` to `toWebHandler`, which reuses
+that build. The startup scope owns the build, so keep it and close it after `web.dispose()`:
 
 ```ts
 const memoMap = Layer.makeMemoMapUnsafe()
+const startupScope = Scope.makeUnsafe()
 const started = await Effect.runPromiseExit(
-  Layer.buildWithMemoMap(Layer.provideMerge(sync, HttpRouter.layer), memoMap, Scope.makeUnsafe())
+  Layer.buildWithMemoMap(Layer.provideMerge(sync, HttpRouter.layer), memoMap, startupScope)
 )
 if (Exit.isFailure(started)) {
   console.error(Cause.pretty(started.cause))
@@ -115,6 +118,9 @@ if (Exit.isFailure(started)) {
 }
 const web = HttpRouter.toWebHandler(sync, { memoMap })
 Bun.serve({ fetch: (request) => web.handler(request) })
+
+// On shutdown, every step runs even if an earlier one rejects:
+// web.dispose().finally(() => Effect.runPromise(Scope.close(startupScope, Exit.void)))
 ```
 
 Other options are `pageLimit`, the number of pull rows per page (default 500), and `ledger`.

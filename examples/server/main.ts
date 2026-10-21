@@ -161,10 +161,12 @@ console.log(`echo-sync slice server on http://127.0.0.1:${server.port}/sync (dat
 
 const shutdown = () => {
   void server.stop(true)
+  // Each step runs even if the one before it rejects: the startup scope owns the shared build.
   void web
     .dispose()
-    .then(() => Effect.runPromise(Scope.close(startupScope, Exit.void)))
-    .finally(() => admin.dispose().finally(() => process.exit(0)))
+    .finally(() => Effect.runPromise(Scope.close(startupScope, Exit.void)))
+    .finally(() => admin.dispose())
+    .finally(() => process.exit(0))
 }
 process.on("SIGTERM", shutdown)
 process.on("SIGINT", shutdown)
