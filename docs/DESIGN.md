@@ -513,13 +513,21 @@ const todosByProject = Query.make("todos.byProject", {
   run did not read cannot change that run's result, and a run that newly reads a table widens
   the set before the next change can be missed. Result + dependency set come from one read
   transaction, so an emission is never a mixed snapshot.
-- **Raw SQL.** The declared-tables `LiveQuery` subscription stays as §10's read escape hatch,
-  wrapped on the tab with an explicit result Schema; the leader runs it with the connection in
-  `PRAGMA query_only` for that admitted transaction, so a raw statement that writes fails
-  instead of committing (admission is serialized, so toggling the pragma is safe). Raw
-  **`exec`** (writes outside the outbox, which break the §9 replica invariant) is a harness
-  tool: it exists only when the leader is started with `allowRawExec: true`; otherwise the RPC
-  fails with a typed error. The vertical-slice harness sets the flag; apps never do.
+- **Registered queries are read-only by construction.** A query handler receives `ReadStore`,
+  the read projection of `EchoStore` (`get`, `query`, `scan`; no `insert`/`patch`/`delete`),
+  and `Query.run` hands it an object that carries only those three members, so a write from a
+  query is a compile error and has no runtime path either. The leader additionally runs each
+  registered-query transaction under `PRAGMA query_only` (toggled off again inside the same
+  admitted permit, before COMMIT/ROLLBACK) as defense in depth: any write that reaches SQLite
+  fails and the transaction rolls back, leaving the replica and the next mutation unaffected.
+- **Raw SQL is a harness tool, both directions.** The declared-tables `LiveQuery` subscription
+  (`subscribeRaw`) and raw **`exec`** exist only when the leader is started with
+  `allowRawExec: true`; otherwise both RPCs fail with the same typed error before touching the
+  connection. `PRAGMA query_only` around raw statements is kept as defense in depth but is
+  **not** a security boundary: the caller's text can itself contain `PRAGMA query_only = OFF` or
+  several statements, so the only protection against untrusted raw SQL is not exposing the RPC.
+  The vertical-slice harness sets the flag; apps and the FoldKit adapter never do, and the
+  adapter exposes neither RPC.
 - `take(n)` pushdown through the scope filter is still open item 8; `Query.make` must not wait
   for it (the fix is inside `Store.make`, behind the same `EchoStore` interface).
 
