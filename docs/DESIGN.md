@@ -158,8 +158,11 @@ const setCompleted = Mutation.make("todos.setCompleted", {
 - Mutation identity: `{ clientId, mutationId }` (the idempotency key; `mutationId` is generated
   by the caller before enqueue so an enqueue retry across leader handover is idempotent, hence it
   is **not** ordered). Envelope: `{ clientId, mutationId, seq, name, args }` where `seq` is the
-  client's outbox sequence: per-client monotone, gap-free, never reused. Clients push in `seq`
-  order; `seq` is the only field the ledger-expiry floor (§16.5) compares against.
+  client's outbox sequence: per-client monotone, gap-free, never reused, **starting at 1** (the
+  server's expiry floor defaults to 0, so `seq = 0` would be born expired). `seq` is allocated by
+  the durable outbox (§9), never from in-memory engine state: a pull failure, `ResnapshotRequired`
+  or reload must not reset the counter. Clients push in `seq` order; `seq` is the only field the
+  ledger-expiry floor (§16.5) compares against.
 - **Version the mutation args, never the rows.** Rows are always at current server schema. Arg
   evolution uses Schema unions/transforms with upcast; old queued intents must still decode.
 - No network, filesystem, secrets, raw SQL, or wall-clock reads inside handlers. Anything that
@@ -307,7 +310,10 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   id, pending or released, returns its original `seq` and inserts nothing; `pending()` excludes
   released rows; released rows are pruned after a retention window (default 24 h, far beyond any
   handover retry). The §8 position rule is the backstop if a released row has already been
-  pruned.
+  pruned. This rule is part of the engine's client storage port, not only the browser outbox:
+  the sync engine (§8) must consult the outbox for a known id, pending or released, **before**
+  executing an intent optimistically; the in-memory simulation's store must honour the same
+  contract or it cannot catch the double-execution it exists to catch.
 - Replica is disposable; outbox is not. Schema manifest change ⇒ rebuild replica, keep outbox.
 - `navigator.storage.persist()`, pending-writes warning on clear/sign-out, export of pending
   mutations.
