@@ -208,7 +208,16 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   `PullDone { changes, acks, nextCursor: Position, expiredThrough }` (page set complete; `expiredThrough` per §16.5). `PullContinuation` is
   opaque to the client (resent verbatim) but a Schema'd value on the server (row-walk progress,
   `head`, and the cursor it belongs to); a stale or invalid continuation fails with
-  `ResnapshotRequired`. `changes` is an **ordered list** of upserts (row payload as of that
+  `ResnapshotRequired`. The continuation is **untrusted input**, not merely opaque: every value
+  in it is validated against the request and the page's snapshot, not just decoded. In
+  particular its `position`/`head` must lie in `[gcHorizon, max position visible in this
+  snapshot]` — a **future position is `staleContinuation`**, never clamped or carried forward.
+  Otherwise a forged future position becomes `nextCursor`, and because `client_scopes` keeps the
+  first held set written for a cursor, two page sets ending at that same cursor with different
+  scope sets leave a scope held-but-unrecorded, so its later revocation never purges. The
+  "forgery only harms the forger" argument covers payload leakage (payloads are filtered by the
+  principal's current grants) but **not** the one-cursor-one-held-set invariant, which must hold
+  for every input. `changes` is an **ordered list** of upserts (row payload as of that
   page's snapshot), tombstones, and `scopePurged`, applied strictly in order (so a purge
   precedes a re-grant's upserts); `acks` are ledger entries for this client with
   `position ∈ (cursor, nextCursor]` across the set.
