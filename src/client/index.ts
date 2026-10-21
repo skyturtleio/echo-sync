@@ -1,2 +1,3 @@
-// Placeholder entry point for echo-sync/client; replace with real exports.
-export const placeholder = undefined
+export * as LeaderClient from "./worker/LeaderClient.ts"
+export * as LeaderRpcs from "./worker/LeaderRpcs.ts"
+export * as Outbox from "./Outbox.ts"
