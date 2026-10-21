@@ -130,6 +130,11 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (§4)", () => {
         const constraints = yield* sql<{ n: number }>`
         SELECT count(*)::int AS n FROM pg_constraint WHERE conname = 'scope_grants_id_derived'`
         assert.deepStrictEqual(constraints, [{ n: 0 }])
+        // The engine migrations run in one migrator transaction: 001's DDL and history roll back too.
+        const [state] = yield* sql<{ grants: boolean; history: number }>`
+          SELECT to_regclass('echo_sync.scope_grants') IS NOT NULL AS grants,
+                 (SELECT count(*)::int FROM echo_sync.migrations) AS history`
+        assert.deepStrictEqual(state, { grants: false, history: 0 })
       }).pipe(Effect.provide(emptyDatabase("ENCODING 'SQL_ASCII' TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'")))
   )
 })

@@ -7,8 +7,8 @@ import { SqlClient } from "effect/sql/SqlClient"
  * column lookup disagree.
  *
  * core's `grantId` prefixes the code-point count of the scope id, which is `char_length` only in
- * a UTF8 database (under SQL_ASCII it counts bytes). So the engine requires UTF8 and this
- * migration refuses any other server encoding before adding the CHECK (DESIGN §4).
+ * a UTF8 database (under SQL_ASCII, for one, it counts bytes). UTF8 is the supported contract, so
+ * this migration refuses any other server encoding before adding the CHECK (DESIGN §4).
  *
  * Validated, not `NOT VALID`: on an existing database a row that violates it fails this migration
  * (23514, naming the constraint), the migrator rolls back and startup stops.
@@ -22,7 +22,7 @@ export default Effect.gen(function* () {
       IF enc <> 'UTF8' THEN
         RAISE EXCEPTION 'echo_sync requires a UTF8 database; % has encoding %', current_database(), enc
           USING ERRCODE = 'feature_not_supported',
-                HINT = 'grant ids count code points with char_length, which counts bytes under other encodings';
+                HINT = 'UTF8 is the only supported server encoding: grant ids count code points with char_length, which under SQL_ASCII counts bytes';
       END IF;
     END
     $$`
