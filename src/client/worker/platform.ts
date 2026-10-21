@@ -27,8 +27,10 @@ export const dbName = ({ appId, profile }: ReplicaIdentity): string => `echo-syn
  * `src/examples/AccessHandlePoolVFS.js`). The pool stores each file's path in a header of
  * `HEADER_MAX_PATH_SIZE = 512` bytes and refuses a path whose UTF-8 encoding fills it (`written >= 512`),
  * so a stored path is at most 511 bytes. The stored path is the URL pathname of SQLite's name: a leading
- * "/" plus the name (the identity charset needs no percent-encoding), and the longest name SQLite derives
- * from the database's is its rollback journal, `<db>-journal` (8 more bytes). 511 - 1 - 8 = 502.
+ * "/" plus the name (the identity charset needs no percent-encoding), and for our single persistent
+ * database the longest name SQLite derives from it is its rollback journal, `<db>-journal` (8 more bytes).
+ * 511 - 1 - 8 = 502. (A multi-database ATTACH transaction can use a longer super-journal name; the leader
+ * never attaches a second database, so that case is unsupported here.)
  */
 export const maxDbNameLength = 512 - 1 - 1 - "-journal".length
 
