@@ -96,7 +96,7 @@ entirely app-owned. Authorization:
 
 Store layering: the typed `Store` (`get/insert/patch/delete/query/scan`, codecs, scope-role
 checks, touched-row/undo capture) is written once in `src/core` over a small per-dialect
-`RowStore` (read / write / range / purgeScope over wire-encoded rows, called inside a
+`RowStore` (read / write / range / purgeScope / clearAll over wire-encoded rows, called inside a
 transaction the substrate owns). Postgres, SQLite, and the in-memory reference implement
 `RowStore` only. All three must produce identical range ordering (§10).
 
@@ -221,6 +221,14 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   per-page snapshots, records the max position `head` at the first page, then continues with
   log entries `> head` until `PullDone`. Same staging rule applies. A newly granted scope is
   delivered the same way (row walk of that scope, then log) within the ordinary pull.
+- **A page set that started from cursor `null` replaces the replica; it does not patch it.**
+  After a resnapshot (log GC'd past the client's cursor, or a stale continuation) the server
+  can only send what is readable *now*: revocations and deletes that happened while the client
+  was behind have no surviving log entries, so no `scopePurged` or tombstone will ever arrive
+  for rows the client still holds. Inside the install transaction the client therefore clears
+  every replicated row (all `SyncTable`s, system tables included; not the outbox, not the
+  staging table), installs the set, and replays pending mutations on top. For a first sync the
+  clear is a no-op. `RowStore` gains a `clearAll` primitive for this; it is the only caller.
 - Realtime: a poke stream (RPC stream) says "something may have changed"; it is a hint, never
   data. Pull is the only truth.
 
