@@ -1,11 +1,15 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Option } from "effect"
+import * as PgMigrator from "@effect/sql-pg/PgMigrator"
+import { Cause, type Duration, Effect, Exit, Option } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { TestClock } from "effect/testing"
-import { collectGarbage } from "./gc.ts"
+import { collectGarbage, expireLedger, LedgerRetentionTooShort } from "./gc.ts"
 import { runMutation } from "./ledger.ts"
 import { pull } from "./pull.ts"
-import { grant, pgAvailable, Replica, serverView, TestDatabase, registry } from "./test-support.ts"
+import engine from "./migrations/001_engine.ts"
+import grantIdCheck from "./migrations/002_grant_id_check.ts"
+import { migrate, migrationsTable } from "./schema.ts"
+import { EmptyDatabase, grant, pgAvailable, Replica, serverView, TestDatabase, registry } from "./test-support.ts"
 
 const insert = (id: string) =>
   Effect.gen(function* () {
@@ -119,6 +123,227 @@ describe.skipIf(!pgAvailable)("log GC (§7)", () => {
       assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "gcHorizon")
     }).pipe(Effect.provide(TestDatabase))
   )
+})
+
+const day = 24 * 60 * 60 * 1000
+
+/** `expireLedger` run at `offset` ms after the database's current time on a TestClock. */
+const expireAt = (offset: number, retention?: Duration.Input) =>
+  Effect.flatMap(databaseNow, (ms) =>
+    Effect.andThen(
+      TestClock.setTime(ms + offset),
+      expireLedger(retention === undefined ? undefined : { retention })
+    ).pipe(Effect.provide(TestClock.layer()))
+  )
+
+/** Moves every acked row's ack time back by `days` (the time between its ack and the job). */
+const ageAcks = (days: number) =>
+  Effect.flatMap(
+    SqlClient,
+    (sql) => sql`UPDATE echo_sync.mutations SET acked_at = acked_at - make_interval(days => ${days})
+                 WHERE client_id = 'c1' AND acked_at IS NOT NULL`
+  )
+
+/**
+ * One client `c1` of `p` that pushes `items.insert(id)` mutations through the real ledger and pulls
+ * through a stand-in replica. `executions` counts bodies run, i.e. real (re-)executions.
+ */
+const ledgerClient = Effect.gen(function* () {
+  yield* grant("p", "s1")
+  const replica = new Replica("p", "c1")
+  yield* replica.sync()
+  const counter = { executions: 0 }
+  const submit = (mutationId: string, seq: number, id = mutationId) =>
+    runMutation(
+      { principalId: "p", clientId: "c1", mutationId, seq: BigInt(seq) },
+      Effect.andThen(
+        Effect.sync(() => void counter.executions++),
+        insert(id)
+      )
+    )
+  const state = Effect.flatMap(SqlClient, (sql) =>
+    Effect.all({
+      rows: sql<{ seq: string; acked: boolean }>`
+        SELECT seq::text, acked_at IS NOT NULL AS acked FROM echo_sync.mutations WHERE client_id = 'c1' ORDER BY seq`,
+      floor: sql<{ expired_through: string; expired_position: string }>`
+        SELECT expired_through::text, expired_position::text FROM echo_sync.clients WHERE client_id = 'c1'`
+    })
+  )
+  const seqs = Effect.map(state, (s) => s.rows.map((r) => Number(r.seq)))
+  return { replica, counter, submit, state, seqs, ageAcks }
+})
+
+describe.skipIf(!pgAvailable)("ledger expiry (DESIGN §16 item 5)", () => {
+  it.live(
+    "an acked row older than the retention expires, and its resubmission answers Rejected{ClientExpired} at the recorded position instead of executing again",
+    () =>
+      Effect.gen(function* () {
+        const c = yield* ledgerClient
+        const first = yield* c.submit("m1", 1, "a")
+        assert.strictEqual(first.outcome._tag, "Applied")
+        yield* c.replica.sync() // PullDone with m1's ack
+        assert.isTrue(c.replica.acked.has("m1"))
+        yield* c.replica.sync() // presents the cursor past m1: acked from now
+
+        const run = yield* expireAt(7 * day + 60_000)
+        assert.deepStrictEqual(run, { clients: 1, deleted: 1 })
+        assert.deepStrictEqual(yield* c.seqs, [])
+
+        const again = yield* c.submit("m1", 1, "a")
+        assert.strictEqual(again.outcome._tag === "Rejected" && again.outcome.error._tag, "ClientExpired")
+        assert.strictEqual(again.position, first.position)
+        assert.strictEqual(c.counter.executions, 1)
+        const rows = yield* Effect.flatMap(SqlClient, (sql) => sql`SELECT id FROM items`)
+        assert.deepStrictEqual(rows, [{ id: "a" }])
+      }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live(
+    "an acked row younger than the retention, and an unacked row of any age, survive; age is measured from the ack, not from receipt",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient
+        const c = yield* ledgerClient
+        yield* c.submit("m1", 1)
+        yield* c.replica.sync()
+        yield* c.replica.sync() // m1 acked now
+        // Received long ago, acked only now: young by the rule.
+        yield* sql`UPDATE echo_sync.mutations SET received_at = now() - interval '400 days' WHERE mutation_id = 'm1'`
+        yield* c.submit("m2", 2) // pushed, never pulled: unacked
+        yield* sql`UPDATE echo_sync.mutations SET received_at = now() - interval '400 days' WHERE mutation_id = 'm2'`
+
+        assert.deepStrictEqual(yield* expireAt(7 * day - 60_000), { clients: 0, deleted: 0 })
+        assert.deepStrictEqual(yield* c.seqs, [1, 2])
+        // A year on, m1 has been acked longer than the retention; m2 never was.
+        yield* expireAt(365 * day)
+        assert.deepStrictEqual(yield* c.seqs, [2])
+        assert.strictEqual((yield* c.state).floor[0]?.expired_through, "1")
+      }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live(
+    "the floor after a job is the highest seq of an expired prefix, PullDone.expiredThrough reports it, and the recorded position is the highest expired row's",
+    () =>
+      Effect.gen(function* () {
+        const c = yield* ledgerClient
+        const p1 = yield* c.submit("m1", 1)
+        const p2 = yield* c.submit("m2", 2)
+        yield* c.replica.sync()
+        yield* c.replica.sync() // m1, m2 acked now
+        yield* c.ageAcks(10) // ... ten days before the job
+        yield* c.submit("m3", 3)
+        yield* c.replica.sync()
+        yield* c.replica.sync() // m3 acked now
+        yield* c.submit("m4", 4) // unacked
+
+        assert.deepStrictEqual(yield* expireAt(0), { clients: 1, deleted: 2 })
+        assert.deepStrictEqual(yield* c.seqs, [3, 4])
+        assert.deepStrictEqual((yield* c.state).floor, [
+          { expired_through: "2", expired_position: String(p2.position) }
+        ])
+        assert.isBelow(Number(p1.position), Number(p2.position))
+        const done = yield* pull(registry, {
+          principalId: "p",
+          clientId: "c1",
+          cursor: c.replica.cursor,
+          continuation: Option.none(),
+          limit: 100
+        })
+        assert.strictEqual(done._tag === "PullDone" ? Number(done.expiredThrough) : "not PullDone", 2)
+        // A later job that expires nothing never lowers it.
+        yield* expireAt(0)
+        assert.strictEqual((yield* c.state).floor[0]?.expired_through, "2")
+      }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live(
+    "expired rows that would not be a seq prefix fail the job loudly and roll back: no row deleted, no floor raised",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient
+        const c = yield* ledgerClient
+        yield* c.submit("m1", 1)
+        yield* c.submit("m2", 2)
+        // Impossible through the protocol (acks are installed in seq order); forged here.
+        yield* sql`UPDATE echo_sync.mutations SET acked_at = now() - interval '30 days' WHERE mutation_id = 'm2'`
+        const before = yield* c.state
+        const exit = yield* Effect.exit(expireAt(0))
+        assert.isTrue(Exit.isFailure(exit) && Cause.hasDies(exit.cause), "the job dies")
+        assert.deepStrictEqual(yield* c.state, before)
+      }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live(
+    "a job run with no eligible rows changes nothing: young acks, unacked rows and earlier floors stay as they are",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient
+        const c = yield* ledgerClient
+        yield* c.submit("m1", 1)
+        yield* c.replica.sync()
+        yield* c.replica.sync()
+        yield* c.ageAcks(10)
+        yield* expireAt(0) // floor 1
+        yield* c.submit("m2", 2)
+        yield* c.replica.sync()
+        yield* c.replica.sync() // m2 acked now
+        yield* c.submit("m3", 3) // unacked
+        const snapshot = Effect.all([
+          sql`SELECT client_id, mutation_id, seq, position, outcome, acked_at FROM echo_sync.mutations ORDER BY position`,
+          sql`SELECT * FROM echo_sync.clients ORDER BY client_id`
+        ])
+        const before = yield* snapshot
+        assert.deepStrictEqual(yield* expireAt(0), { clients: 0, deleted: 0 })
+        assert.deepStrictEqual(yield* snapshot, before)
+      }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live(
+    "a late retry of an acked mutation under a fresh seq, landing within the retention of its ack, is answered from the ledger, not executed again",
+    () =>
+      Effect.gen(function* () {
+        // The reconcile simulation's naive-GC double apply: the original is acked and released, its
+        // released-row marker is pruned (24 h), and a late enqueue retry gets a fresh seq above any
+        // floor. Only the ledger row recognises it, so it must outlive every retry the client can
+        // still produce; the minimum retention is 48 h after the ack.
+        const c = yield* ledgerClient
+        const first = yield* c.submit("m1", 1, "a")
+        yield* c.replica.sync()
+        yield* c.replica.sync() // acked now
+        yield* expireAt(48 * 60 * 60 * 1000 - 60_000, "48 hours")
+        const retry = yield* c.submit("m1", 2, "a")
+        assert.deepStrictEqual(retry, first)
+        assert.strictEqual(c.counter.executions, 1)
+      }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live(
+    "ledger rows written before migration 003 come through it unstamped and are never expired until a pull acks them",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient
+        // A database deployed at 001 + 002, with a year-old ledger row.
+        yield* sql`CREATE SCHEMA echo_sync`
+        yield* PgMigrator.make({})({
+          loader: PgMigrator.fromRecord({ "001_engine": engine, "002_grant_id_check": grantIdCheck }),
+          table: migrationsTable
+        })
+        yield* sql`INSERT INTO echo_sync.clients (client_id, principal_id) VALUES ('c1', 'p')`
+        yield* sql`INSERT INTO echo_sync.mutations (client_id, mutation_id, seq, position, outcome, received_at)
+                 VALUES ('c1', 'm1', 1, 1, '{"_tag":"Applied"}', now() - interval '365 days')`
+        yield* migrate
+        assert.deepStrictEqual(yield* expireAt(0), { clients: 0, deleted: 0 })
+        const rows = yield* sql<{ mutation_id: string; acked: boolean }>`
+        SELECT mutation_id, acked_at IS NOT NULL AS acked FROM echo_sync.mutations`
+        assert.deepStrictEqual(rows, [{ mutation_id: "m1", acked: false }])
+      }).pipe(Effect.provide(EmptyDatabase))
+  )
+
+  it("a retention below 48 h is refused when the job is constructed", () => {
+    assert.throws(() => expireLedger({ retention: "47 hours" }), LedgerRetentionTooShort)
+    assert.doesNotThrow(() => expireLedger({ retention: "48 hours" }))
+    assert.doesNotThrow(() => expireLedger())
+  })
 })
 
 /** A well-formed, decodable continuation for client `d` of principal `p`. */

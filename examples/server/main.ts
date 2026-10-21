@@ -13,11 +13,11 @@
  * scenarios grant, revoke and inspect the ledger.
  */
 import * as PgClient from "@effect/sql-pg/PgClient"
-import { Cause, Effect, Exit, Layer, ManagedRuntime, Redacted, Scope } from "effect"
+import { Cause, Effect, Exit, Layer, ManagedRuntime, Redacted, Schedule, Scope } from "effect"
 import * as HttpRouter from "effect/http/HttpRouter"
 import { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, Protocol, ScopeGrants } from "../../src/core/index.ts"
-import { Startup } from "../../src/server/index.ts"
+import { Postgres, Startup } from "../../src/server/index.ts"
 import createTodos from "./migrations/001_create_todos.ts"
 import addTodoNote from "./migrations/002_add_todo_note.ts"
 import { principalHeader, registry, serverHooks, serverMutations, Todos } from "../browser-spike/app.ts"
@@ -161,6 +161,14 @@ const server = Bun.serve({
     return web.handler(request)
   }
 })
+// Ledger expiry (DESIGN §16 item 5): the app's server schedules it. Hourly, default 7-day retention;
+// a failed run is logged and the next one retries.
+admin.runFork(
+  Effect.repeat(
+    Effect.catchCause(Postgres.expireLedger(), (cause) => Effect.logWarning("ledger expiry failed", cause)),
+    Schedule.spaced("1 hour")
+  )
+)
 console.log(`echo-sync slice server on http://127.0.0.1:${server.port}/sync (database ${dbName})`)
 
 const shutdown = () => {

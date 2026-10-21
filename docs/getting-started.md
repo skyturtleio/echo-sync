@@ -128,8 +128,10 @@ Bun.serve({ fetch: (request) => web.handler(request) })
 ```
 
 Other options are `pageLimit`, the number of pull rows per page (default 500), and `ledger`.
-Log GC (`Postgres.collectGarbage(retention)`) is not scheduled by `Startup`. Run it from your own
-job if you want a retention horizon (docs/server-substrate.md, GC).
+Log GC (`Postgres.collectGarbage(retention)`) and ledger expiry (`Postgres.expireLedger({ retention })`,
+default 7 days, at least 48 h) are not scheduled by `Startup`. Run them from your own job if you want
+a retention horizon; without ledger expiry the ledger grows with every mutation
+(docs/server-substrate.md, GC and Ledger expiry; examples/server runs ledger expiry hourly).
 
 ## 5. Headers and the principal
 

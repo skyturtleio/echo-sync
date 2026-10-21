@@ -1,4 +1,4 @@
-export { collectGarbage } from "./gc.ts"
+export { collectGarbage, expireLedger, LedgerRetentionTooShort, minimumLedgerRetention } from "./gc.ts"
 export {
   type BatchItem,
   type BatchResult,

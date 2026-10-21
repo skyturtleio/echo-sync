@@ -15,7 +15,7 @@ unordered idempotency key, `seq` the client's outbox sequence.
 | `pull.ts` | `pull(registry, request)` (one page per call), the continuation |
 | `rowStore.ts` | core's `RowStore` on Postgres; declared-column projection and row codec |
 | `rpc.ts` | `handlers` / `layerHttp`: `Protocol.SyncRpcs` over HTTP POST + NDJSON |
-| `gc.ts` | `collectGarbage(retention)` |
+| `gc.ts` | `collectGarbage(retention)`, `expireLedger({ retention })` |
 
 For how a consumer app wires the server (registry, mutations, app migrations, `Startup.layer`,
 principal, Drift), see [getting-started.md](getting-started.md).
@@ -163,7 +163,9 @@ an expired token is honoured on a live one. The client evaluates `syncHeaders` p
   the same trigger as any synced table, so a grant row is logged inside the scope it grants.
 - `engine_state.gc_horizon`: the only engine fact that cannot be derived from other tables.
 - `clients.expired_through` / `expired_position` (default 0): the §16.5 expiry floor and the
-  position of the highest expired ledger row. No v1 job raises them.
+  position of the highest expired ledger row. Raised only by `expireLedger`; never deleted.
+- `mutations.acked_at` (migration 003, `NULL` until stamped): when the client proved it installed
+  the row's ack. See "Ledger expiry" below.
 - `client_scopes(client_id, position, scope_ids)`: the set of scopes a client holds as of a
   completed pull. The reason this table exists is under "Pull" below.
 
@@ -370,7 +372,7 @@ was collected disappears after the resnapshot.
 ### `expiredThrough`
 
 `PullDone.expiredThrough` is the client's `clients.expired_through`, read in the page's snapshot.
-It is always 0 in v1.
+It stays 0 unless the app runs `expireLedger`.
 
 ### Acks
 
@@ -392,10 +394,49 @@ never trusted. For the bigints: `@effect/sql-pg` 4.0.5 already decodes `int8` to
 `collectGarbage(retention)` deletes log entries whose `committed_at` is older than
 `Clock.now - retention` and raises `gc_horizon` to the highest deleted position, in one
 transaction. It never touches the ledger, `clients`, or `client_scopes` (tested). §16.5: a
-resnapshot acks only the ledger rows that survive. Expiring ledger rows while mutations are
-still pending would therefore re-execute them. Any future expiry must raise
-`clients.expired_through` / `expired_position` in the same transaction that deletes ledger rows.
+resnapshot acks only the ledger rows that survive; ledger rows have their own policy below.
 A cursor or continuation below the horizon gets `ResnapshotRequired { reason: "gcHorizon" }`.
+
+### Ledger expiry (DESIGN §16 item 5)
+
+- **Ack stamp.** A pull that presents a cursor (accepted: the read snapshot found its
+  `client_scopes` record) sets `acked_at = now()` on this client's rows with `position ≤ cursor`
+  and no stamp yet, after the snapshot, beside the other idempotent post-pull statements. A
+  presented cursor proves the client installed every ack at or below it (§8: acks for
+  `(cursor, nextCursor]` arrive in the set that produced the cursor). A row never stamped is never
+  expired, whatever its age.
+- **`expireLedger({ retention })`** (default 7 days; a retention below 48 h throws
+  `LedgerRetentionTooShort` when the job is constructed) is one run, by the Effect `Clock` like
+  `collectGarbage`; the app schedules it (`examples/server` runs it hourly). One READ COMMITTED
+  transaction deletes every row with `acked_at ≤ now − retention`, and per client raises
+  `expired_through` to the highest deleted `seq` and `expired_position` to the highest deleted
+  position, both with `GREATEST`, so they only move forward. It then checks that no surviving row
+  of a raised client has `seq ≤` its floor and dies if one does, rolling back the delete and the
+  floor (tested with a forged non-prefix). A ledger transaction holds the client row `FOR UPDATE`,
+  so it sees the floor before or after a job, never half of one.
+- **Why the stamp and not receipt time.** A row may only go once its client can no longer
+  resubmit it under a fresh `seq` (a late enqueue retry whose released-row marker was pruned,
+  §9): only the ledger row recognises that duplicate. Retries land within the released-row window
+  (24 h) after release, release happens no later than the ack install, and the stamp is after the
+  install, so 48 h after the stamp covers it with margin. The reconcile simulation has no time
+  model to express "48 h after the ack", so that shape is covered by a Postgres test instead (a
+  late retry within the retention is answered from the ledger; with a naive cutoff it executes
+  again). Simulation counts at 832c948 (40 seeds, 400 steps, naive ledger GC = `gcLedger` by
+  position with the log, ignoring acks; each seed counted by its first violated invariant):
+
+  | floor + `expiredThrough` handling | late retries of pruned ids | double apply | never released | pass |
+  | --- | --- | --- | --- | --- |
+  | yes (current) | off (committed test) | 0 | 0 | 40 |
+  | yes (current) | on | 13 | 0 | 27 |
+  | no | off | 14 | 23 | 3 |
+  | no | on | 23 | 14 | 3 |
+
+- **What expiry can still surface.** Because a row expires only after its client presented a
+  cursor past it, a device loses an ack to expiry only if its storage went back in time (restored
+  from a backup, copied profile). Its next pull then reports `expiredThrough ≥` that seq, and the
+  client releases the mutation as `OutcomeUnknown` (tested end to end with the real Engine).
+- Floors are permanent: nothing deletes a `clients` row's floor. Forgetting idle clients is out
+  of scope (DESIGN §16 item 5).
 
 ## Running the Postgres tests
 

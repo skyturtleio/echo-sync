@@ -237,7 +237,7 @@ export const pull = Effect.fnUntraced(function* (registry: Registry.SyncRegistry
             acks,
             nextCursor: Ids.Position.make(nextPosition),
             // Number() is exact only up to Number.MAX_SAFE_INTEGER; that matches SeqFloor being an
-            // Int (DESIGN §16.5), and no v1 job raises the floor at all.
+            // Int (DESIGN §16.5). Raised only by `expireLedger`.
             expiredThrough: Ids.SeqFloor.make(Number(state.expired_through))
           }
         : {
@@ -268,6 +268,12 @@ export const pull = Effect.fnUntraced(function* (registry: Registry.SyncRegistry
     yield* sql`
       DELETE FROM echo_sync.client_scopes WHERE client_id = ${request.clientId} AND position < ${request.cursor}`
     yield* sql`UPDATE echo_sync.clients SET cursor = ${request.cursor} WHERE client_id = ${request.clientId}`
+    // Ledger expiry (DESIGN §16 item 5): presenting a cursor the server completed a set at proves
+    // the client installed every ack at or below it, so those rows are acked from now. Only the
+    // first stamp counts; a row is never expired before it has one.
+    yield* sql`
+      UPDATE echo_sync.mutations SET acked_at = now()
+      WHERE client_id = ${request.clientId} AND position <= ${request.cursor} AND acked_at IS NULL`
   }
   if (response.result._tag === "PullDone") {
     yield* sql`
