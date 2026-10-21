@@ -534,6 +534,14 @@ Not wanted: one test per function, tests of private helpers, snapshot tests of g
 strings without a behavioral assertion, tests whose expected values were copied from the
 implementation.
 
+Conformance suites (`src/core/testing/Conformance.ts`, run against every `RowStore` /
+`SyncStorage` implementation) derive their expected values from the fixtures they write, never
+from the subject's own reads: "before reopen equals after reopen" is not an assertion, because a
+subject that drops every write satisfies it. A no-op subject must fail every conformance check,
+and that stub is kept as a test so the rule stays true. The suite is core-only (no runtime
+import of `src/client` or `src/server`), scopes each case separately, and pairs every `nextSeq`
+with its `appendPending`, since real stores reserve a seq only on insert.
+
 Use `@effect/vitest`, `effect/testing` (`TestClock`), and `Arbitrary` where they fit.
 
 ## 15. Prior art (for orientation only)
