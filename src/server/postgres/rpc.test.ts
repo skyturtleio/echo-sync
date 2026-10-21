@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import type * as PgClient from "@effect/sql-pg/PgClient"
+import * as PgClient from "@effect/sql-pg/PgClient"
 import {
   Array as Arr,
   Cause,
@@ -10,6 +10,7 @@ import {
   Layer,
   Option,
   Queue,
+  Ref,
   Schedule,
   Schema,
   Stream
@@ -223,6 +224,25 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (§6, §8)", () => {
       yield* sql`INSERT INTO items (id, access_scope_id) VALUES ('a', 's1')`
       const second = yield* Effect.timeoutOption(Queue.take(received), "3 seconds")
       assert.isTrue(Option.isSome(second), "no poke after a committed captured write")
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
+  it.live("a pokes subscription whose LISTEN fails emits nothing: the initial poke never precedes LISTEN", () =>
+    Effect.gen(function* () {
+      const db = yield* Effect.context<SqlClient | PgClient.PgClient>()
+      const pg = Context.get(db, PgClient.PgClient)
+      const sqlError = new SqlError({ reason: new UnknownError({ cause: null, message: "listen refused" }) })
+      const failingListen: PgClient.PgClient = new Proxy(pg, {
+        get: (target, key, receiver) =>
+          key === "listen" ? () => Effect.fail(sqlError) : Reflect.get(target, key, receiver)
+      })
+      const client = yield* connectTo(Context.add(db, PgClient.PgClient, failingListen))
+      const emitted = yield* Ref.make(0)
+      const exit = yield* Effect.exit(
+        Stream.runForEach(client.pokes({ clientId: Ids.ClientId.make("d") }), () => Ref.update(emitted, (n) => n + 1))
+      )
+      assert.deepStrictEqual(failureTag(exit), "ServerUnavailable")
+      assert.strictEqual(yield* Ref.get(emitted), 0)
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
