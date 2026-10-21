@@ -37,6 +37,11 @@ tab B ──spawns──▶ leader-candidate worker B (queued on the leader lock
     to), and the router never links a tab twice to the same leader, so no connection is displaced and no
     request or stream fails. A re-announcement goes through the same `accept` epoch-lock fence as any
     other. Old router ports stay open so a `Connected` already in flight on one is still delivered.
+  - Bound (accepted for v1): a tab keeps one router port for each reconnect for its lifetime, so it holds
+    at most 1 + router relaunches + leader epoch ends it has seen. The count grows with browser and user
+    events, not with traffic. The router likewise keeps one queued tab-lock watcher per `Hello`, and all of
+    them are released when the tab dies. A constant bound would need the router to acknowledge `Hello`
+    before an old port can be closed; deferred.
   - Only the leader lock gates opening the database, so a relaunched router cannot create a second owner;
     the browser keeps one instance per SharedWorker name.
 - Tab↔leader traffic is Effect RPC (`RpcClient.layerProtocolWorker` / `RpcServer.layerProtocolWorkerRunner`
