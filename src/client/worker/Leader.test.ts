@@ -904,7 +904,14 @@ it.live(
 )
 
 /** Tab-side presence calls over a fake leader: counts opens, records tracks, `hangTracks` never answers one. */
-const presenceCalls = (client: Effect.Success<ReturnType<typeof leaderRpc>>["client"], hangTracks = false) => {
+/**
+ * Tab-side presence calls over a fake leader: counts opens, records every track attempt, and answers a
+ * track of `state` with `answer(state)` (default: at once).
+ */
+const presenceCalls = (
+  client: Effect.Success<ReturnType<typeof leaderRpc>>["client"],
+  answer: (state: Schema.Json) => Effect.Effect<void, LeaderUnavailable> = () => Effect.void
+) => {
   const seen = { opens: 0, open: 0, tracks: new Array<Schema.Json>() }
   const calls: LeaderCalls = {
     ...passThrough(client),
@@ -926,7 +933,7 @@ const presenceCalls = (client: Effect.Success<ReturnType<typeof leaderRpc>>["cli
     track: (_r, state) =>
       Effect.andThen(
         Effect.sync(() => void seen.tracks.push(state)),
-        hangTracks ? Effect.never : Effect.void
+        answer(state)
       )
   }
   return { calls, seen }
@@ -988,26 +995,52 @@ it.live(
     })
 )
 
+// Short deadlines for the tab's sender, so these run in live time.
+const quickSender = { presenceSendTimeout: "100 millis", presenceRetryDelay: "20 millis" } as const
+
 it.live(
-  "a tab track whose send never completes returns at once and blocks no snapshot; the next join carries the latest state",
+  "a tab send that never completes: track returns at once, snapshots flow, and the latest state is retried without a rejoin",
   () =>
     Effect.gen(function* () {
       const room = AccessScope.AccessScopeId.make("room-1")
-      const { calls, seen } = presenceCalls((yield* leaderRpc({ allowRawExec: false })).client, true)
-      const api = tabApi(calls)
-      const first = yield* Stream.runHead(api.presence(room, "a"))
-      expect(Option.isSome(first)).toBe(true)
-      const holder = yield* Effect.forkScoped(Stream.runDrain(api.presence(room, "b")))
-      yield* Effect.sleep("50 millis")
+      const { client } = yield* leaderRpc({ allowRawExec: false })
+      const { calls, seen } = presenceCalls(client, (state) => (state === "c" ? Effect.never : Effect.void))
+      const api = tabApi(calls, quickSender)
+      const emissions = yield* Queue.unbounded<Protocol.RoomSnapshot>()
+      const holder = yield* Effect.forkScoped(
+        Stream.runForEach(api.presence(room, "b"), (s) => Queue.offer(emissions, s))
+      )
+      yield* Queue.take(emissions).pipe(Effect.timeout("5 seconds"))
       // Two tracks while the first send hangs: both return immediately.
       yield* api.track(room, "c").pipe(Effect.timeout("100 millis"))
+      yield* Effect.sleep("20 millis")
       yield* api.track(room, "d").pipe(Effect.timeout("100 millis"))
-      yield* Effect.sleep("50 millis")
-      expect(seen.tracks).toEqual(["c"])
+      // c's deadline expires and the retry carries d, on the same join: the presence stream never ended.
+      yield* Effect.sleep("400 millis")
+      expect([seen.tracks, seen.opens, seen.open]).toEqual([["c", "d"], 1, 1])
       yield* Fiber.interrupt(holder)
-      // The closed stream interrupted the hung send; a later track is dropped.
+      // The closed stream ended its sender; a later track is dropped.
       expect(seen.open).toBe(0)
       yield* api.track(room, "e")
-      expect(seen.tracks).toEqual(["c"])
+      yield* Effect.sleep("50 millis")
+      expect(seen.tracks).toEqual(["c", "d"])
     }).pipe(Effect.scoped)
+)
+
+it.live("a tab send lost with LeaderLost while the presence stream stays up is retried with the latest state", () =>
+  Effect.gen(function* () {
+    const room = AccessScope.AccessScopeId.make("room-1")
+    const { client } = yield* leaderRpc({ allowRawExec: false })
+    // Only the track call sees the leader go away (a unary RPC error); the room stream itself is healthy.
+    const { calls, seen } = presenceCalls(client, (state) => (state === "s1" ? Effect.fail(leaderLost) : Effect.void))
+    const api = tabApi(calls, quickSender)
+    const emissions = yield* Queue.unbounded<Protocol.RoomSnapshot>()
+    yield* Effect.forkScoped(Stream.runForEach(api.presence(room, "s0"), (s) => Queue.offer(emissions, s)))
+    yield* Queue.take(emissions).pipe(Effect.timeout("5 seconds"))
+    yield* api.track(room, "s1")
+    yield* Effect.sleep("5 millis")
+    yield* api.track(room, "s2")
+    yield* Effect.sleep("300 millis")
+    expect([seen.tracks, seen.opens, seen.open]).toEqual([["s1", "s2"], 1, 1])
+  }).pipe(Effect.scoped)
 )

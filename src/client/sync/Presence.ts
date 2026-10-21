@@ -7,11 +7,11 @@
  *   The subscription then rejoins after a backoff (from `retryDelay`, doubling to `maxRetryDelay`, reset
  *   once a connection delivered a snapshot). The tab stream does not end.
  * - `track` only records the desired state, synchronously, and returns; it never waits on the network
- *   (DESIGN §9.1, 22741e2). The subscription owns delivery: every join carries the latest state, and a
- *   per-connection delivery fiber sends any newer state after the join's first snapshot, one send at a
- *   time, latest wins. Snapshots never wait for it. It lives in the connection's scope, so an idle
- *   timeout or reconnect interrupts a send that hangs; a failed send ends the connection, so the rejoin
- *   carries the state instead.
+ *   (DESIGN §9.1, 07a8f48). The subscription owns delivery: every join carries the latest state, and a
+ *   supervised sender per connection sends any newer state after the join's first snapshot, one send at
+ *   a time, latest wins. Each send has the `idleTimeout` deadline; one that fails, dies or times out is
+ *   retried with backoff, never by ending the connection, so a healthy room stream never strands a state.
+ *   Snapshots never wait for a send; the connection's end (idle timeout, reconnect, close) interrupts it.
  * - Only an error `isFatal` classifies (the server's `Forbidden`: no grant in the room's scope) ends the
  *   subscription; an `Unauthorized` credential failure is rejoined like any other.
  *
@@ -72,9 +72,15 @@ export const make = <E, F extends E>(options: {
   const cap = Duration.toMillis(Duration.fromInputUnsafe(options.maxRetryDelay ?? "30 seconds"))
   const subscriptions = new Map<string, Subscription>()
 
-  /** Sends every state newer than `sent` once `joined` completes, latest wins; ends on a failed send. */
+  /**
+   * The connection's supervised sender (DESIGN §9.1, 07a8f48): sends every state newer than `sent`, one at
+   * a time, latest wins. Each attempt has the `idleTimeout` deadline; an attempt that fails, dies or runs
+   * out of time is retried with backoff, with the latest state. It never ends or restarts the connection:
+   * a healthy room stream must not hold a stranded state back. Only the connection's scope ends it.
+   */
   const deliver = (sub: Subscription, room: AccessScope.AccessScopeId, tabId: Protocol.TabId, sent: number) =>
     Effect.gen(function* () {
+      let delay = base
       while (true) {
         // Replaced before the check, so a `track` after the check always wakes the next wait.
         const wake = Deferred.makeUnsafe<void>()
@@ -84,12 +90,17 @@ export const make = <E, F extends E>(options: {
           continue
         }
         const version = sub.version
-        const failed = yield* upstream.track({ room, tabId, state: sub.state }).pipe(
-          Effect.as(false),
-          Effect.catch(() => Effect.succeed(true))
+        const attempt = yield* Effect.exit(
+          upstream.track({ room, tabId, state: sub.state }).pipe(Effect.timeout(idleTimeout))
         )
-        if (failed) return yield* Deferred.succeed(sub.restart, undefined)
-        sent = version
+        if (Exit.isSuccess(attempt)) {
+          sent = version
+          delay = base
+          continue
+        }
+        yield* Effect.logDebug(`echo-sync: presence track failed; retrying in ${delay} ms`, attempt.cause)
+        yield* Effect.sleep(Duration.millis(delay))
+        delay = Math.min(delay * 2, cap)
       }
     })
 
@@ -126,7 +137,8 @@ export const make = <E, F extends E>(options: {
           const ended = yield* Effect.exit(
             Effect.scoped(
               Effect.gen(function* () {
-                // Scoped to this connection: its end interrupts a send in flight.
+                // Scoped to this connection: its end interrupts a send in flight, and the next join's
+                // sender starts from the state that join carried.
                 yield* Effect.forkScoped(
                   Effect.andThen(Deferred.await(joined), deliver(sub, room, tabId, joinedVersion))
                 )

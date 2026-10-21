@@ -182,15 +182,18 @@ tab's state in a room it has joined; for a room it has not joined it does nothin
   stream, and so does any failure or clean end. The leader then rejoins after a backoff, and the tab
   stream does not end. Only `Forbidden { room }` (no grant in the room's scope) ends it; `Unauthorized` is a
   credential failure and is rejoined like any other (DESIGN §9.1 Credentials).
-- **Track and delivery (DESIGN §9.1, 22741e2).** `track` records the desired state in one synchronous step
-  and returns. It never waits on the network, so interrupting the caller afterwards does not retract the
-  state, and a `track` for a closed stream is dropped. The open stream owns delivery, in the tab (to the
-  leader) and on the leader (to the server):
-  - every join carries the latest state;
-  - after the join's first snapshot, a delivery fiber scoped to that join sends any newer state, one send
-    at a time, latest wins (an undelivered older state may be skipped);
-  - snapshots never wait for a send, and an idle timeout, reconnect, handover or close interrupts a hung one;
-  - a failed send on the leader ends the connection, so the rejoin carries the state instead.
+- **Track and delivery (DESIGN §9.1, 07a8f48).** `track` completes once this tab has recorded the desired
+  state, in one synchronous step before any message to the leader. Interrupting the caller afterwards does
+  not retract it, and a `track` for a closed stream is dropped. Delivery is two hops of the same shape, tab
+  to leader and leader to server, each a supervised sender owned by the open stream:
+  - every join carries the latest state, and after the join's first snapshot the sender sends any newer
+    state, one send at a time, latest wins (an undelivered older state may be skipped);
+  - each attempt has a deadline (`idleTimeout` on the leader, 45 s by default in the tab). An attempt that
+    fails (`LeaderLost` included: the retry goes to the current leader), dies or times out is retried with
+    backoff and the latest state;
+  - a sender never ends or restarts its stream, and never waits for the stream to fail: a heartbeating room
+    stream cannot strand a state. Snapshots never wait for a send, and the join's end (idle timeout,
+    reconnect, handover, close) interrupts one in flight.
 - **Registration.** Each layer registers a subscription with `acquireRelease`, as one synchronous
   check-and-insert step. Its release removes only itself, so a stream cancelled at any point leaves nothing
   behind, and two simultaneous opens of one room in a tab produce exactly one upstream open; the other
@@ -201,13 +204,13 @@ tab's state in a room it has joined; for a room it has not joined it does nothin
 
 Evidence:
 - `Presence.test.ts`: heartbeats are filtered; a silent connection is rejoined with the latest state while
-  the stream stays open; a track that raced the join is delivered after its first snapshot; a send that
-  never completes blocks neither snapshots nor the idle rejoin; a subscription cancelled at any point
-  (swept under a small `MaxOpsBeforeYield`) sends no later track; `Unauthorized` rejoins and only
-  `Forbidden` ends the subscription.
+  the stream stays open; a track that raced the join is delivered after its first snapshot; a hung send
+  (room stream heartbeating, so no rejoin) and a send that dies are both retried with the latest state; a
+  subscription cancelled at any point (swept under a small `MaxOpsBeforeYield`) sends no later track;
+  `Unauthorized` rejoins and only `Forbidden` ends the subscription.
 - `Leader.test.ts`: the tab re-joins with the latest state across handover; closing the stream drops the
   room; simultaneous opens give one upstream open; cancellation at any point frees the room; a hung tab
-  send never blocks `track` or snapshots.
+  send and a tab send lost with `LeaderLost` are retried with the latest state on the same join.
 - `scenarios.sh` (real server): an entry is listed only while its stream is open, and after the leader tab
   closes, the new leader re-joins F with its last tracked state.
 

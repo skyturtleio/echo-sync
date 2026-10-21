@@ -20,6 +20,7 @@
 import * as BrowserWorker from "@effect/platform-browser/BrowserWorker"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
@@ -130,8 +131,9 @@ export class LeaderClient extends Context.Service<
      */
     readonly presence: PresenceFn
     /**
-     * Record this tab's desired state in a room it has joined through `presence` (a no-op otherwise). Returns
-     * at once; the open stream delivers the latest state (DESIGN §9.1).
+     * Record this tab's desired state in a room it has joined through `presence` (a no-op otherwise).
+     * Completes once this tab has recorded it, before any message to the leader; the open stream then
+     * delivers the latest state, eventually, while it stays open (DESIGN §9.1).
      */
     readonly track: TrackFn
     /** Retained notices, current list then every change; survives handover. */
@@ -222,7 +224,16 @@ export interface LeaderCalls {
  * The DESIGN §9.1 semantics over `calls`: id generation, `LeaderLost` retry and re-subscription, and the
  * tab-side encode/decode. Exported so they are tested against a real leader without a browser.
  */
-export const tabApi = (calls: LeaderCalls) => {
+export interface TabApiOptions {
+  /** Deadline of one presence send to the leader (DESIGN §9.1 sender). Default 45 s, the default `idleTimeout`. */
+  readonly presenceSendTimeout?: Duration.Input
+  /** First retry delay of a failed presence send; doubles up to 30 s. Default 1 s. */
+  readonly presenceRetryDelay?: Duration.Input
+}
+
+export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
+  const sendTimeout = tuning.presenceSendTimeout ?? "45 seconds"
+  const retryBase = Duration.toMillis(Duration.fromInputUnsafe(tuning.presenceRetryDelay ?? "1 second"))
   const mutate: MutateFn = (mutation, args, options) =>
     Effect.gen(function* () {
       // A bad value of the mutation's own `args` type is the caller's bug, not an outcome.
@@ -250,9 +261,10 @@ export const tabApi = (calls: LeaderCalls) => {
     )
   /**
    * The latest desired state per joined room, kept in the tab: a new leader knows nothing of the old one's
-   * (DESIGN §9.1, 22741e2). `track` records it in one synchronous step and returns. The open stream owns
-   * delivery: every (re)join carries the latest state, and a delivery fiber scoped to that join sends any
-   * newer one after the join's first snapshot, one at a time, latest wins, never blocking snapshots.
+   * (DESIGN §9.1, 07a8f48). `track` completes once this tab has recorded it, before any leader IPC. The open
+   * stream owns delivery to the leader: every (re)join carries the latest state, and a supervised sender
+   * scoped to that join sends any newer one after the join's first snapshot, one at a time, latest wins,
+   * never blocking snapshots.
    */
   interface Cell {
     state: Schema.Json
@@ -260,8 +272,14 @@ export const tabApi = (calls: LeaderCalls) => {
     wake: Deferred.Deferred<void>
   }
   const joined = new Map<string, Cell>()
+  /**
+   * Each attempt has a deadline; one that fails (`LeaderLost` included: the retry goes to whichever leader
+   * is current), dies or times out is retried with backoff and the latest state. It never ends the stream,
+   * and never waits for the stream to fail or rejoin. Only the join's scope ends it.
+   */
   const deliver = (room: AccessScope.AccessScopeId, cell: Cell, sent: number) =>
     Effect.gen(function* () {
+      let delay = retryBase
       while (true) {
         const wake = Deferred.makeUnsafe<void>()
         cell.wake = wake
@@ -270,14 +288,14 @@ export const tabApi = (calls: LeaderCalls) => {
           continue
         }
         const version = cell.version
-        // A lost leader ends this join; the rejoin carries the state. Any other failure stops delivery
-        // for this join only (the stream itself reports it).
-        const ok = yield* calls.track(room, cell.state).pipe(
-          Effect.as(true),
-          Effect.catch(() => Effect.succeed(false))
-        )
-        if (!ok) return
-        sent = version
+        const attempt = yield* Effect.exit(calls.track(room, cell.state).pipe(Effect.timeout(sendTimeout)))
+        if (Exit.isSuccess(attempt)) {
+          sent = version
+          delay = retryBase
+          continue
+        }
+        yield* Effect.sleep(Duration.millis(delay))
+        delay = Math.min(delay * 2, 30_000)
       }
     })
   const presence: PresenceFn = (room, state) =>
@@ -301,7 +319,7 @@ export const tabApi = (calls: LeaderCalls) => {
           Effect.gen(function* () {
             const read = cell.version
             const first = Deferred.makeUnsafe<void>()
-            // Scoped to this join: a lost leader or a closed stream interrupts a send in flight.
+            // Scoped to this join: its end (a lost leader, a closed stream) interrupts a send in flight.
             yield* Effect.forkScoped(Effect.andThen(Deferred.await(first), deliver(room, cell, read)))
             return calls
               .presence(room, cell.state)

@@ -15,7 +15,13 @@ const snapshot = (state: Schema.Json): Protocol.RoomElement => ({
 const heartbeat: Protocol.RoomElement = { _tag: "heartbeat" }
 
 /** A server whose every `room` connection is a queue the test feeds; records joins and tracks. */
-const makeServer = (options: { readonly hangTracks?: boolean } = {}) =>
+const makeServer = (
+  options: {
+    readonly hangTracks?: boolean
+    /** How the server answers a track of `state` once it recorded it (default: at once). */
+    readonly answer?: (state: Schema.Json) => Effect.Effect<void, Transport.PresenceError>
+  } = {}
+) =>
   Effect.gen(function* () {
     const joins: Array<Schema.Json> = []
     const tracks: Array<Schema.Json> = []
@@ -37,7 +43,7 @@ const makeServer = (options: { readonly hangTracks?: boolean } = {}) =>
       track: (payload) =>
         Effect.andThen(
           Effect.sync(() => void tracks.push(payload.state)),
-          options.hangTracks === true ? Effect.never : Effect.void
+          options.hangTracks === true ? Effect.never : (options.answer?.(payload.state) ?? Effect.void)
         )
     }
     const nextConnection = Queue.take(connections)
@@ -187,5 +193,66 @@ it.effect("a subscription cancelled at any point leaves nothing registered: a la
         expect({ ops, turns, tracks: server.tracks }).toEqual({ ops, turns, tracks: [] })
       }
     }
+  })
+)
+
+/** Heartbeats on `connection` every 5 ms of test time, for `ms`; the room stream stays healthy throughout. */
+const heartbeatFor = (connection: Queue.Queue<Protocol.RoomElement, Transport.PresenceError>, ms: number) =>
+  Effect.gen(function* () {
+    for (let t = 0; t < ms; t += 5) {
+      yield* Queue.offer(connection, heartbeat)
+      yield* TestClock.adjust("5 millis")
+      yield* settle
+    }
+  })
+
+it.effect(
+  "a hung send is retried with the latest state while heartbeats keep the room stream healthy: no rejoin needed",
+  () =>
+    Effect.gen(function* () {
+      const server = yield* makeServer({ answer: (state) => (state === "s1" ? Effect.never : Effect.void) })
+      const presence = Presence.make({
+        upstream: server.upstream,
+        isFatal: Transport.isFatalPresence,
+        idleTimeout: "30 millis",
+        retryDelay: "10 millis"
+      })
+      const fiber = yield* Effect.forkChild(Stream.runDrain(presence.join({ room, tabId, state: "s0" })))
+      const first = yield* server.nextConnection
+      yield* Queue.offer(first, snapshot("s0"))
+      yield* settle
+      yield* presence.track({ room, tabId, state: "s1" })
+      yield* settle
+      yield* presence.track({ room, tabId, state: "s2" })
+      yield* heartbeatFor(first, 200)
+      // s1's send never answers; its deadline expires and the retry carries s2. The connection never ended.
+      expect(server.tracks).toEqual(["s1", "s2"])
+      expect(server.joins).toEqual(["s0"])
+      expect(fiber.pollUnsafe()).toBeUndefined()
+    })
+)
+
+it.effect("a send that dies is retried with the latest state; the stream and its connection stay up", () =>
+  Effect.gen(function* () {
+    const server = yield* makeServer({
+      answer: (state) => (state === "s1" ? Effect.die(new Error("transport bug")) : Effect.void)
+    })
+    const presence = Presence.make({
+      upstream: server.upstream,
+      isFatal: Transport.isFatalPresence,
+      idleTimeout: "30 millis",
+      retryDelay: "10 millis"
+    })
+    const fiber = yield* Effect.forkChild(Stream.runDrain(presence.join({ room, tabId, state: "s0" })))
+    const first = yield* server.nextConnection
+    yield* Queue.offer(first, snapshot("s0"))
+    yield* settle
+    yield* presence.track({ room, tabId, state: "s1" })
+    yield* settle
+    yield* presence.track({ room, tabId, state: "s2" })
+    yield* heartbeatFor(first, 100)
+    expect(server.tracks).toEqual(["s1", "s2"])
+    expect(server.joins).toEqual(["s0"])
+    expect(fiber.pollUnsafe()).toBeUndefined()
   })
 )
