@@ -67,7 +67,8 @@ an expired token is honoured on a live one. The client evaluates `syncHeaders` p
   delivers at commit and coalesces per transaction. The stream carries no data.
   **One `LISTEN` per server process** (DESIGN §6): `PgClient.listen` pins a pool connection for
   its scope, so a `LISTEN` per stream would exhaust the pool at `maxConnections` open streams and
-  block every push and pull. The handlers layer owns the single `LISTEN` (`sharedPokes` in rpc.ts)
+  block every push and pull. `layerNotifications` owns the single `LISTEN` (`sharedPokes` in
+  rpc.ts, provided as the `Notifications` service to both the sync and the presence handlers)
   and fans notifications out through a sliding `PubSub` of capacity 1. A stream subscribes first,
   then emits its initial poke. If no `LISTEN` is confirmed, a new stream fails `ServerUnavailable`.
   A lost `LISTEN` connection ends every open stream with `ServerUnavailable` (tested by
@@ -86,8 +87,8 @@ an expired token is honoured on a live one. The client evaluates `syncHeaders` p
 - presence (DESIGN §12, `presence.ts` plus `presenceHandlers` in rpc.ts): process-local, no
   tables. A `Ref` of rooms, each a map of entries plus a sliding `PubSub<void>` of capacity 1;
   a room exists while it has an entry. `room` checks `roleFor` (any role, the principal's or
-  `*`, as for reads) before joining, so an unauthorized caller fails `Unauthorized` and never
-  enters. The entry is added with `acquireRelease` in the stream's scope and removed when the
+  `*`, as for reads) before joining, so an unauthorized caller fails `Forbidden { room }` and
+  never enters. The entry is added with `acquireRelease` in the stream's scope and removed when the
   stream ends for any reason; on HTTP that includes the client aborting its request. A stream
   subscribes before announcing its join, and each tick is turned into a fresh `RoomSnapshot`
   (entries ordered by principal, client, tab), so snapshots coalesce under load and never miss
@@ -104,8 +105,26 @@ an expired token is honoured on a live one. The client evaluates `syncHeaders` p
   timer merged beside its change subscription, started only after the join snapshot has been
   emitted (so that snapshot is always the first element). A heartbeat therefore never slides out a pending
   change tick, is never a snapshot, and reads or changes no room state. `track` needs no grant lookup: it only
-  changes an entry the same principal holds. Not handled in v1: a grant revoked while a `room`
-  stream is open leaves the entry until the stream ends (DESIGN §16 item 13).
+  changes an entry the same principal holds.
+  **Revocation** (DESIGN §16 item 13): a watcher in `presenceHandlers` consumes its own
+  `Notifications` subscription. On every poke (one per committed writing transaction, so every
+  grant change, plus one when the subscription starts) it asks one query which `(room, principal)`
+  pairs with an open stream still hold the scope (a `scope_grants` row for the principal or for
+  `*`, the join predicate). For each pair that does not, `Presence.reevaluate` removes every
+  entry of that principal in that room in one `Ref` update, fails each of their streams
+  `Forbidden { room }` (the per-member `Deferred` now carries that failure; a replacement still
+  succeeds it), and announces once, so the remaining members get one snapshot without them.
+  Only entries present when the query was asked are removed, so a rejoin after a re-grant is
+  not ended by a stale check. A stream never emits a snapshot that lacks its own entry, so a
+  revoked principal receives nothing after its removal. The check runs on every commit rather
+  than only on `scope_grants` entries: the pokes carry no data, and one indexed query per
+  committed transaction (coalesced while one runs, skipped while no room is open) costs less
+  than reading the log tail to filter. Join race: `room` checks the grant before installing the
+  entry and again after (`join`'s `admit`, before announcing). A revoke committed before the
+  second check's snapshot fails the join; one committed after it notifies a check that starts
+  after the entry is installed. A lost `LISTEN` or failed check restarts the watch after 1 s,
+  and its first poke re-checks everything. A re-grant does nothing automatically; across a
+  server restart presence state is gone anyway and a rejoin re-checks the grant.
 
 ## Engine state
 

@@ -1,5 +1,5 @@
 import { Deferred, type Duration, Effect, PubSub, Ref, type Scope, Stream } from "effect"
-import type { AccessScope, Protocol } from "echo-sync"
+import { type AccessScope, Protocol } from "echo-sync"
 
 /** An entry, the room it is in, and the revision of its state (DESIGN §12 revision fencing). */
 export interface Joined extends Protocol.PresenceEntry {
@@ -13,10 +13,11 @@ interface Member {
   /** The revision `entry.state` was installed with; a `track` must exceed it. */
   readonly revision: number
   /**
-   * Completed when a later join with the same key replaces this entry; it ends this member's
-   * stream. Also its identity: a replaced stream's release must not remove its successor.
+   * Ends this member's stream: succeeded when a later join with the same key replaces the entry,
+   * failed `Forbidden` when its principal no longer holds the room's scope. Also its identity: an
+   * ended stream's release must not remove its successor.
    */
-  readonly replaced: Deferred.Deferred<void>
+  readonly ended: Deferred.Deferred<void, Protocol.Forbidden>
 }
 
 interface Room {
@@ -36,6 +37,15 @@ const entryOf = (joined: Joined): Protocol.PresenceEntry => ({
   clientId: joined.clientId,
   tabId: joined.tabId,
   state: joined.state
+})
+
+const snapshotOf = (
+  all: ReadonlyMap<AccessScope.AccessScopeId, Room>,
+  room: AccessScope.AccessScopeId
+): Protocol.RoomSnapshot => ({
+  _tag: "snapshot",
+  room,
+  entries: [...(all.get(room)?.members.values() ?? [])].map((m) => m.entry).toSorted(byKey)
 })
 
 const heartbeat: Protocol.RoomElement = { _tag: "heartbeat" }
@@ -67,16 +77,11 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
   Effect.gen(function* () {
     const rooms = yield* Ref.make<ReadonlyMap<AccessScope.AccessScopeId, Room>>(new Map())
 
-    const snapshot = (room: AccessScope.AccessScopeId) =>
-      Effect.map(Ref.get(rooms), (all): Protocol.RoomSnapshot => ({
-        _tag: "snapshot",
-        room,
-        entries: [...(all.get(room)?.members.values() ?? [])].map((m) => m.entry).toSorted(byKey)
-      }))
+    const snapshot = (room: AccessScope.AccessScopeId) => Effect.map(Ref.get(rooms), (all) => snapshotOf(all, room))
 
     /**
      * Adds the entry for the scope's lifetime. A later join with the same key replaces it and ends
-     * the earlier stream (its `replaced`), so no open stream is ever left without an entry: every
+     * the earlier stream (its `ended`), so no open stream is ever left without an entry: every
      * open stream keeps its room, and with it the room's `PubSub`, alive. Otherwise the replacing
      * stream could leave as the room's last member, the room would be recreated on a new `PubSub`,
      * and the replaced stream would observe the abandoned one forever.
@@ -88,7 +93,8 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
     const enter = (
       joined: Joined
     ): Effect.Effect<
-      { readonly changes: PubSub.PubSub<void>; readonly replaced: Deferred.Deferred<void> } | undefined,
+      | { readonly changes: PubSub.PubSub<void>; readonly ended: Deferred.Deferred<void, Protocol.Forbidden> }
+      | undefined,
       never,
       Scope.Scope
     > => {
@@ -97,12 +103,12 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
       return Effect.acquireRelease(
         Effect.gen(function* () {
           const fresh = yield* PubSub.sliding<void>(1)
-          const replaced = yield* Deferred.make<void>()
+          const ended = yield* Deferred.make<void, Protocol.Forbidden>()
           const installed = yield* Ref.modify(rooms, (all) => {
             const room = all.get(joined.room) ?? { members: new Map(), changes: fresh }
             const stored = room.members.get(key)
             if (stored !== undefined && joined.revision < stored.revision) return [undefined, all] as const
-            const members = new Map(room.members).set(key, { entry, revision: joined.revision, replaced })
+            const members = new Map(room.members).set(key, { entry, revision: joined.revision, ended })
             return [
               [room.changes, room.members.get(key)] as const,
               new Map(all).set(joined.room, { members, changes: room.changes })
@@ -110,16 +116,17 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
           })
           if (installed === undefined) return undefined
           const [changes, previous] = installed
-          if (previous !== undefined) yield* Deferred.succeed(previous.replaced, undefined)
-          return { changes, replaced }
+          if (previous !== undefined) yield* Deferred.succeed(previous.ended, undefined)
+          return { changes, ended }
         }),
         (entered) => {
           if (entered === undefined) return Effect.void
-          const { changes, replaced } = entered
+          const { changes, ended } = entered
           return Ref.modify(rooms, (all) => {
             const room = all.get(joined.room)
-            // A later stream with the same key took the entry over: it is not this stream's to drop.
-            if (room?.members.get(key)?.replaced !== replaced) return [false, all] as const
+            // A later stream with the same key took the entry over, or a revocation already removed
+            // it: it is not this stream's to drop.
+            if (room?.members.get(key)?.ended !== ended) return [false, all] as const
             const members = new Map(room.members)
             members.delete(key)
             const next = new Map(all)
@@ -134,30 +141,101 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
     return {
       /**
        * The entry is present exactly while the returned stream runs: added before its first
-       * snapshot, removed when it ends for any reason (completion, failure, interruption). The
-       * first snapshot already contains it; every later change produces another. A superseded join
+       * snapshot, removed when it ends for any reason (completion, failure, interruption,
+       * revocation). The first snapshot already contains it; every later change produces another,
+       * and a stream only ever emits a snapshot that contains its own entry. A superseded join
        * (revision lower than the stored entry's) ends at once without an element and changes nothing.
+       *
+       * `admit` runs once the entry is installed, before anyone is told of it: `false` ends the
+       * stream `Forbidden` and removes the entry. It closes the race with `reevaluate`: a revocation
+       * that `reevaluate` ran too early to see this entry for is one `admit` observes.
        */
-      join: (joined: Joined): Stream.Stream<Protocol.RoomElement> =>
+      join: <E>(
+        joined: Joined,
+        admit: Effect.Effect<boolean, E> = Effect.succeed(true)
+      ): Stream.Stream<Protocol.RoomElement, Protocol.Forbidden | E> =>
         Stream.unwrap(
           Effect.gen(function* () {
             const entered = yield* enter(joined)
             if (entered === undefined) return Stream.empty
-            const { changes, replaced } = entered
+            const { changes, ended } = entered
             const subscription = yield* PubSub.subscribe(changes)
+            if (!(yield* admit)) return yield* new Protocol.Forbidden({ room: joined.room })
+            const key = keyOf(joined.principalId, joined.clientId, joined.tabId)
+            // Only while this stream's own entry is in the room. Once it is replaced or revoked
+            // (`ended` completes right after the removal) the stream ends with nothing more.
+            const own = Effect.map(Ref.get(rooms), (all) =>
+              all.get(joined.room)?.members.get(key)?.ended === ended ? [snapshotOf(all, joined.room)] : []
+            )
             // Subscribed before announcing: the other streams see the join, and this stream consumes
             // the tick itself, so its first element is the join snapshot, emitted before the merge
             // (and with it the heartbeat timer) starts. A change after this take ticks again.
             yield* PubSub.publish(changes, undefined)
             yield* PubSub.take(subscription)
             return Stream.concat(
-              Stream.fromEffect(snapshot(joined.room)),
-              Stream.mapEffect(Stream.fromSubscription(subscription), () => snapshot(joined.room)).pipe(
+              Stream.flattenIterable(Stream.fromEffect(own)),
+              Stream.flattenIterable(Stream.mapEffect(Stream.fromSubscription(subscription), () => own)).pipe(
                 Stream.merge(Stream.fromEffectRepeat(Effect.as(Effect.sleep(options.heartbeatInterval), heartbeat)))
               )
-            ).pipe(Stream.interruptWhen(Deferred.await(replaced)))
+            ).pipe(Stream.interruptWhen(Deferred.await(ended)))
           })
         ),
+
+      /**
+       * Revocation (DESIGN §16 item 13): asks `holds` which `(room, principal)` pairs with an open
+       * stream still hold the room's scope, then, for each pair that does not, removes every entry
+       * of that principal in that room in one step, ends each of those streams `Forbidden`, and
+       * announces the removal once. Only entries already present when `holds` was asked are removed:
+       * one that joined meanwhile is checked by its own `admit`.
+       */
+      reevaluate: <E>(
+        holds: (
+          pairs: ReadonlyArray<{ readonly room: AccessScope.AccessScopeId; readonly principalId: string }>
+        ) => Effect.Effect<(room: AccessScope.AccessScopeId, principalId: string) => boolean, E>
+      ) =>
+        Effect.gen(function* () {
+          const seen = yield* Ref.get(rooms)
+          const pairs = [...seen].flatMap(([room, { members }]) =>
+            [...new Set([...members.values()].map((m) => m.entry.principalId))].map((principalId) => ({
+              room,
+              principalId
+            }))
+          )
+          if (pairs.length === 0) return
+          const held = yield* holds(pairs)
+          for (const { room, principalId } of pairs) {
+            if (held(room, principalId)) continue
+            const asked = new Set(
+              [...(seen.get(room)?.members.values() ?? [])]
+                .filter((m) => m.entry.principalId === principalId)
+                .map((m) => m.ended)
+            )
+            yield* Effect.uninterruptible(
+              Effect.gen(function* () {
+                const removed = yield* Ref.modify(rooms, (all) => {
+                  const current = all.get(room)
+                  if (current === undefined) return [undefined, all] as const
+                  const members = new Map(current.members)
+                  const gone: Array<Member> = []
+                  for (const [key, member] of current.members) {
+                    if (asked.has(member.ended)) {
+                      members.delete(key)
+                      gone.push(member)
+                    }
+                  }
+                  if (gone.length === 0) return [undefined, all] as const
+                  const next = new Map(all)
+                  if (members.size === 0) next.delete(room)
+                  else next.set(room, { members, changes: current.changes })
+                  return [{ gone, changes: current.changes }, next] as const
+                })
+                if (removed === undefined) return
+                for (const member of removed.gone) yield* Deferred.fail(member.ended, new Protocol.Forbidden({ room }))
+                yield* PubSub.publish(removed.changes, undefined)
+              })
+            )
+          }
+        }),
 
       /**
        * Replaces the state of an existing entry; `false` (and no change) when there is none, or when its
@@ -179,7 +257,7 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
               const members = new Map(room.members).set(key, {
                 entry,
                 revision: joined.revision,
-                replaced: member.replaced
+                ended: member.ended
               })
               return [room.changes, new Map(all).set(joined.room, { members, changes: room.changes })] as const
             })

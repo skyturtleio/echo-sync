@@ -1,5 +1,19 @@
 import * as PgClient from "@effect/sql-pg/PgClient"
-import { Cause, DateTime, Deferred, Duration, Effect, Layer, Option, PubSub, Queue, Ref, Schema, Stream } from "effect"
+import {
+  Cause,
+  Context,
+  DateTime,
+  Deferred,
+  Duration,
+  Effect,
+  Layer,
+  Option,
+  PubSub,
+  Queue,
+  Ref,
+  Schema,
+  Stream
+} from "effect"
 import type { Headers } from "effect/http/Headers"
 import type * as HttpRouter from "effect/http/HttpRouter"
 import { RpcSerialization, RpcServer } from "effect/rpc"
@@ -136,9 +150,9 @@ const listenBackoff = (attempt: number) => Duration.millis(Math.min(50 * 2 ** at
 /**
  * The process's single `LISTEN` on `pokeChannel` (DESIGN §6). `PgClient.listen` reserves a pool
  * connection for its scope, so one per `pokes` stream would exhaust the pool at `poolSize`
- * connected clients and block every push and pull. Lives in the caller's (the handlers layer's)
- * scope and returns once the first attempt has settled, so a server normally serves with its
- * `LISTEN` already in place.
+ * connected clients and block every push and pull. Lives in the caller's scope
+ * (`layerNotifications`) and returns once the first attempt has settled, so a server normally
+ * serves with its `LISTEN` already in place.
  *
  * Each attempt (reserve, `LISTEN`, pump notifications) is one scoped session, and every session
  * ends in failure: a `LISTEN` that fails after its reservation, or a confirmed one whose
@@ -221,6 +235,27 @@ export const sharedPokes = (
   })
 
 /**
+ * The process's single `LISTEN` (`sharedPokes`), shared by the sync handlers (each `pokes` stream)
+ * and the presence handlers (revocation, DESIGN §16 item 13). Each run of the stream is one
+ * subscription: an immediate `poke`, then one per committed writing transaction, plus heartbeats.
+ */
+export class Notifications extends Context.Service<
+  Notifications,
+  Stream.Stream<typeof Protocol.PokesElement.Type, Protocol.ServerUnavailable | SqlError>
+>()("echo-sync/server/Notifications") {}
+
+/** Builds `Notifications` in the layer's scope; requires `PgClient`. */
+export const layerNotifications = (options: Pick<SyncServerOptions, "heartbeatInterval">) =>
+  Layer.effect(
+    Notifications,
+    Effect.gen(function* () {
+      return yield* sharedPokes(yield* PgClient.PgClient, {
+        heartbeatInterval: options.heartbeatInterval ?? "15 seconds"
+      })
+    })
+  )
+
+/**
  * Handlers for `Protocol.SyncRpcs` over Postgres (DESIGN §6, §8).
  *
  * Pull and pokes report infrastructure failures as `ServerUnavailable`.
@@ -232,9 +267,7 @@ export const handlers = (options: SyncServerOptions) =>
   Protocol.SyncRpcs.toLayer(
     Effect.gen(function* () {
       const sql = yield* SqlClient
-      const pokes = yield* sharedPokes(yield* PgClient.PgClient, {
-        heartbeatInterval: options.heartbeatInterval ?? "15 seconds"
-      })
+      const pokes = yield* Notifications
       return Protocol.SyncRpcs.of({
         push: (request, { headers }) =>
           Effect.gen(function* () {
@@ -315,31 +348,71 @@ export const handlers = (options: SyncServerOptions) =>
 /**
  * Handlers for `Protocol.PresenceRpcs` (DESIGN §12): process-local presence, authorized like
  * reads. `room` requires a grant of any role in the room's scope (the principal's or `*`), checked
- * on join; an entry, once joined, stays until its stream ends, and `track` only changes an entry
- * the same principal holds, so it needs no grant lookup of its own.
+ * on join and again once the entry is installed (`Presence.join`'s `admit`); `track` only changes
+ * an entry the same principal holds, so it needs no grant lookup of its own.
+ *
+ * Revocation (DESIGN §16 item 13): every notification on the shared `LISTEN` (one per committed
+ * writing transaction, grant changes included, plus one when each subscription starts) re-checks
+ * every `(room, principal)` with an open stream against `scope_grants` in one query, and
+ * `Presence.reevaluate` removes and ends `Forbidden` the ones that no longer hold the scope. A
+ * notification that arrives while a check runs coalesces into one more check after it, so the
+ * last committed revoke is always seen by a check that starts after it. A lost `LISTEN` or a
+ * failed check restarts the watch, whose first poke re-checks everything.
  */
 export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor" | "heartbeatInterval">) =>
   Protocol.PresenceRpcs.toLayer(
     Effect.gen(function* () {
       const sql = yield* SqlClient
+      const notifications = yield* Notifications
       const presence = yield* Presence.make({ heartbeatInterval: options.heartbeatInterval ?? "15 seconds" })
+      const holds = (
+        pairs: ReadonlyArray<{ readonly room: AccessScope.AccessScopeId; readonly principalId: string }>
+      ) =>
+        sql<{ scope: string; principal: string }>`
+          SELECT DISTINCT access_scope_id AS scope, principal_id AS principal FROM echo_sync.scope_grants
+          WHERE access_scope_id IN ${sql.in([...new Set(pairs.map((p) => p.room))])}
+            AND principal_id IN ${sql.in([...new Set(pairs.map((p) => p.principalId)), "*"])}`.pipe(
+          Effect.map((rows) => {
+            const granted = new Set(rows.map((r) => JSON.stringify([r.scope, r.principal])))
+            return (room: AccessScope.AccessScopeId, principalId: string) =>
+              granted.has(JSON.stringify([room, principalId])) || granted.has(JSON.stringify([room, "*"]))
+          })
+        )
+      const watch = Stream.runForEach(
+        Stream.filter(notifications, (element) => element._tag === "poke"),
+        () => presence.reevaluate(holds)
+      )
+      yield* Effect.forkScoped(
+        Effect.forever(
+          Effect.catchCause(watch, (cause) =>
+            Cause.hasInterrupts(cause)
+              ? Effect.failCause(cause)
+              : Effect.andThen(
+                  Effect.logWarning("presence revocation watch restarting", cause),
+                  Effect.sleep("1 second")
+                )
+          )
+        )
+      )
+      const holdsRoom = (principalId: AccessScope.PrincipalId, room: AccessScope.AccessScopeId) =>
+        roleFor(
+          sql,
+          principalId
+        )(room).pipe(
+          Effect.map(Option.isSome),
+          Effect.catchTag("StoreUnavailable", (e) =>
+            Effect.fail(new Protocol.ServerUnavailable({ message: e.message }))
+          )
+        )
       return Protocol.PresenceRpcs.of({
         room: (payload, { headers }) =>
           Stream.unwrap(
             Effect.gen(function* () {
               const principalId = yield* options.principalFor(headers)
-              const role = yield* roleFor(
-                sql,
-                principalId
-              )(payload.room).pipe(
-                Effect.catchTag("StoreUnavailable", (e) =>
-                  Effect.fail(new Protocol.ServerUnavailable({ message: e.message }))
-                )
-              )
-              if (Option.isNone(role)) {
+              if (!(yield* holdsRoom(principalId, payload.room))) {
                 return yield* new Protocol.Forbidden({ room: payload.room })
               }
-              return presence.join({ principalId, ...payload })
+              return presence.join({ principalId, ...payload }, holdsRoom(principalId, payload.room))
             })
           ),
         track: (payload, { headers }) =>
@@ -361,4 +434,7 @@ export const layerHttp = (options: SyncServerOptions & { readonly path?: HttpRou
     group: Protocol.SyncRpcs.merge(Protocol.PresenceRpcs),
     path: options.path ?? "/sync",
     protocol: "http"
-  }).pipe(Layer.provide([handlers(options), presenceHandlers(options), RpcSerialization.layerNdjson]))
+  }).pipe(
+    Layer.provide([handlers(options), presenceHandlers(options), RpcSerialization.layerNdjson]),
+    Layer.provide(layerNotifications(options))
+  )

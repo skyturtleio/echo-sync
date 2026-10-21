@@ -9,7 +9,7 @@ import type { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation, Protocol } from "echo-sync"
 import * as Presence from "./presence.ts"
 import { layerHttp } from "./rpc.ts"
-import { grant, pgAvailable, registry, TestDatabase } from "./test-support.ts"
+import { grant, pgAvailable, registry, revoke, TestDatabase } from "./test-support.ts"
 
 const principalHeader = "x-test-principal"
 
@@ -88,6 +88,11 @@ const show = (element: Protocol.RoomElement) =>
   element._tag === "heartbeat"
     ? ["(heartbeat)"]
     : element.entries.map((e) => `${e.principalId}/${e.clientId}/${e.tabId}=${JSON.stringify(e.state)}`)
+
+/** A stream's typed failure as JSON; `expected` is the one a revoked or ungranted stream ends with. */
+const forbidden = (exit: Exit.Exit<unknown, unknown>) =>
+  Exit.isFailure(exit) ? Option.map(Exit.findErrorOption(exit), (e) => JSON.stringify(e)) : Option.none()
+const expected = Option.some(JSON.stringify(new Protocol.Forbidden({ room: s1 })))
 
 /** Takes snapshots until one shows exactly `want`; fails with the last one seen after 5 s. */
 const until = (snapshots: Queue.Queue<Protocol.RoomSnapshot>, want: ReadonlyArray<string>) =>
@@ -407,6 +412,75 @@ describe("presence state (§12)", () => {
       }
     })
   )
+  it.effect(
+    "a revoke committed while a join is in flight cannot leave an entry behind: revoke checked before the entry exists, while its admit runs, and after it",
+    () =>
+      Effect.gen(function* () {
+        const presence = yield* Presence.make({ heartbeatInterval: "1 hour" })
+        const room = Effect.map(presence.snapshot(s1), show)
+        // The grant table: does p hold s1? `holds` and `admit` both read it, as the handlers read
+        // scope_grants; the join's pre-check is the caller's and passed before each case starts.
+        const granted = { p: true }
+        const holds = () => Effect.succeed((_: unknown, principalId: string) => principalId !== "p" || granted.p)
+        const revoked = Effect.andThen(
+          Effect.sync(() => void (granted.p = false)),
+          presence.reevaluate(holds)
+        )
+
+        // 1. The revoke commits and its check runs before the entry is installed: the check sees
+        //    no stream, so only the join's own re-check (admit) can catch it.
+        yield* revoked
+        const early = yield* Effect.exit(
+          Stream.runCollect(
+            presence.join(
+              entry("early"),
+              Effect.sync(() => granted.p)
+            )
+          )
+        )
+        assert.deepStrictEqual(forbidden(early), expected, "early revoke")
+        assert.deepStrictEqual(yield* room, [])
+
+        // 2. The admit read the grant before the revoke, and the revoke's check runs while the
+        //    admit is still in flight: the check removes the installed entry.
+        granted.p = true
+        const gate = yield* Deferred.make<void>()
+        const seen: Array<ReadonlyArray<string>> = []
+        const during = yield* Effect.forkChild(
+          Effect.exit(
+            Stream.runForEach(
+              presence.join(entry("during"), Effect.sync(() => granted.p).pipe(Effect.tap(() => Deferred.await(gate)))),
+              (element) => Effect.sync(() => void seen.push(show(element)))
+            )
+          )
+        )
+        yield* settle
+        assert.deepStrictEqual(yield* room, ["p/c1/during=null"], "installed, admit pending")
+        yield* revoked
+        yield* Deferred.succeed(gate, undefined)
+        assert.deepStrictEqual(forbidden(yield* Fiber.join(during)), expected, "revoke during admit")
+        assert.deepStrictEqual(seen, [], "a revoked join emits no snapshot")
+        assert.deepStrictEqual(yield* room, [])
+
+        // 3. The revoke lands after the join completed: the check ends it.
+        granted.p = true
+        const late = yield* Effect.forkChild(
+          Effect.exit(
+            Stream.runDrain(
+              presence.join(
+                entry("late"),
+                Effect.sync(() => granted.p)
+              )
+            )
+          )
+        )
+        yield* settle
+        assert.deepStrictEqual(yield* room, ["p/c1/late=null"])
+        yield* revoked
+        assert.deepStrictEqual(forbidden(yield* Fiber.join(late)), expected, "late revoke")
+        assert.deepStrictEqual(yield* room, [])
+      })
+  )
 })
 
 describe.skipIf(!pgAvailable)("presence over the sync mount (§12)", () => {
@@ -452,6 +526,87 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (§12)", () => {
         []
       )
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
+  it.live(
+    "a revoked principal's room streams end Forbidden and all its entries leave the others' next snapshot, with no action from them",
+    () =>
+      Effect.gen(function* () {
+        yield* grant("p", "s1")
+        yield* grant("q", "s1")
+        const connect = yield* server
+        const observer = yield* open(yield* connect("p"), payload("c0", "watch"))
+        const q = yield* connect("q")
+        const tab1 = yield* open(q, payload("cq", "t1"))
+        const tab2 = yield* open(q, payload("cq", "t2"))
+        const all = ["p/c0/watch=null", "q/cq/t1=null", "q/cq/t2=null"]
+        yield* until(observer.snapshots, all)
+        yield* until(tab2.snapshots, all)
+        const before = observer.seen.length
+
+        yield* revoke("q", "s1")
+        for (const tab of [tab1, tab2]) {
+          const exit = yield* Fiber.join(tab.fiber).pipe(Effect.timeout("5 seconds"))
+          assert.deepStrictEqual(forbidden(exit), expected)
+          // It never saw the room without itself: nothing of the room reached it after removal.
+          assert.isTrue(tab.seen.every((snapshot) => snapshot.some((e) => e.startsWith("q/"))))
+        }
+        yield* until(observer.snapshots, ["p/c0/watch=null"])
+        // Both entries left in one step: no snapshot showed one of them gone and the other still there.
+        assert.deepStrictEqual(
+          observer.seen.slice(before).filter((snapshot) => snapshot.filter((e) => e.startsWith("q/")).length === 1),
+          []
+        )
+        // A track for a removed entry is the existing no-op.
+        yield* q.track(payload("cq", "t1", "after revoke", 1))
+        yield* (yield* connect("p")).track(payload("c0", "watch", "changed", 1))
+        yield* until(observer.snapshots, ['p/c0/watch="changed"'])
+      }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
+    30_000
+  )
+
+  it.live(
+    "a grant change that leaves the principal holding the scope, or touches another principal or scope, ends no stream",
+    () =>
+      Effect.gen(function* () {
+        yield* grant("p", "s1")
+        yield* grant("q", "s1", "s2")
+        yield* grant("*", "s1")
+        yield* grant("r", "s2")
+        const connect = yield* server
+        const observer = yield* open(yield* connect("p"), payload("c0", "watch"))
+        const q = yield* connect("q")
+        const qs1 = yield* open(q, payload("cq", "t1"))
+        const qs2 = yield* open(q, { ...payload("cq", "t2"), room: AccessScope.AccessScopeId.make("s2") })
+        const r = yield* open(yield* connect("r"), {
+          ...payload("cr", "t1"),
+          room: AccessScope.AccessScopeId.make("s2")
+        })
+        yield* until(observer.snapshots, ["p/c0/watch=null", "q/cq/t1=null"])
+        yield* until(qs2.snapshots, ["q/cq/t2=null", "r/cr/t1=null"])
+
+        yield* revoke("q", "s1") // q still holds s1 through `*`
+        yield* grant("u", "s1", "s3") // an unrelated principal gains grants
+        yield* revoke("u", "s1")
+        yield* grant("q", "s3") // q gains an unrelated scope
+        yield* revoke("q", "s3")
+        // r loses its only grant in s2: once its stream has ended, every earlier change has been checked.
+        yield* revoke("r", "s2")
+        yield* until(qs2.snapshots, ["q/cq/t2=null"])
+        assert.isTrue(Exit.isFailure(yield* Fiber.join(r.fiber).pipe(Effect.timeout("5 seconds"))))
+        assert.isUndefined(qs1.fiber.pollUnsafe(), "q's s1 stream is open")
+        assert.isUndefined(qs2.fiber.pollUnsafe(), "q's s2 stream is open")
+        assert.isUndefined(observer.fiber.pollUnsafe(), "p's stream is open")
+
+        // The `*` grant was what kept q in s1: revoking it ends q there, and only there.
+        yield* revoke("*", "s1")
+        yield* until(observer.snapshots, ["p/c0/watch=null"])
+        assert.isTrue(Exit.isFailure(yield* Fiber.join(qs1.fiber).pipe(Effect.timeout("5 seconds"))))
+        yield* q.track({ ...payload("cq", "t2", "still here", 1), room: AccessScope.AccessScopeId.make("s2") })
+        yield* until(qs2.snapshots, ['q/cq/t2="still here"'])
+        assert.isUndefined(observer.fiber.pollUnsafe(), "p's own grant still holds")
+      }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
+    30_000
   )
 
   it.live(
