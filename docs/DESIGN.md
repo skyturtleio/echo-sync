@@ -267,8 +267,15 @@ const todosByProject = Query.make("todos.byProject", {
   snapshot.
 - `success` Schema is mandatory because results cross the worker boundary (structured clone).
 - Raw SQL escape hatch with explicit result Schema and declared read tables.
-- Full-text search (`FTS5` locally — confirmed present in `@effect/wa-sqlite`'s build) is a
-  later primitive; design must leave room.
+- Full-text search is a later primitive; design must leave room. **The pinned
+  `@effect/wa-sqlite` 0.1.2 build (SQLite 3.47.0, the only version in `@effect/sql-sqlite-wasm`
+  4.0.5's peer range) does NOT include FTS5** — verified in Chromium: `CREATE VIRTUAL TABLE …
+  USING fts5` fails with "no such module: fts5", `pragma_compile_options` lacks
+  `ENABLE_FTS5`, and none of the shipped `.wasm` files contain the string. JSON functions
+  (`json_extract`) do work. Options when search is built: a custom wa-sqlite build with FTS5
+  (requires our own `OpfsWorker` equivalent or a package override, since `OpfsWorker`
+  hard-imports `@effect/wa-sqlite/dist/wa-sqlite.mjs`), or search without FTS (e.g. `LIKE` over
+  indexed columns / trigram-ish helper columns). Tracked as open item 6.
 
 ## 11. Schema evolution
 
@@ -344,3 +351,4 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
 3. Global catalog snapshot format (leaning NDJSON+gzip) — deferred past v1 vertical slice.
 4. Protocol conformance test suite for a future non-TS client.
 5. Ledger retention / client epoch expiry policy, separate from log GC.
+6. Local full-text search: the pinned wa-sqlite build lacks FTS5 (§10); decide custom build vs. non-FTS search when the search primitive is scheduled.
