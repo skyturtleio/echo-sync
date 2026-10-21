@@ -56,7 +56,7 @@ import {
 import { isFromLeader, isFromRouter, type ToLeader, type ToRouter } from "./messages.ts"
 import * as Platform from "./platform.ts"
 
-export interface LeaderClientConfig {
+export interface LeaderClientConfig extends TabApiOptions {
   readonly appId: string
   readonly profile: string
   /** The principal this replica acts as (DESIGN §4). One profile belongs to one principal. */
@@ -476,18 +476,21 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     const service = LeaderClient.of({
       exec: (sql, params = []) => withLeader((client) => client.exec({ sql, params })),
       enqueue,
-      ...tabApi({
-        enqueue,
-        subscribe: (name, args) => streamWithLeader((client) => client.subscribe({ name, args })),
-        notices: streamWithLeader((client) => client.notices()),
-        dismissNotices: (ids) => withLeader((client) => client.dismissNotices({ ids })),
-        syncStatus: streamWithLeader((client) => client.syncStatus()),
-        requestSync: withLeader((client) => client.requestSync()),
-        presence: (room, state, revision) =>
-          streamWithLeader((client) => client.presence({ room, tabId: Protocol.TabId.make(tabId), state, revision })),
-        track: (room, state, revision) =>
-          withLeader((client) => client.track({ room, tabId: Protocol.TabId.make(tabId), state, revision }))
-      }),
+      ...tabApi(
+        {
+          enqueue,
+          subscribe: (name, args) => streamWithLeader((client) => client.subscribe({ name, args })),
+          notices: streamWithLeader((client) => client.notices()),
+          dismissNotices: (ids) => withLeader((client) => client.dismissNotices({ ids })),
+          syncStatus: streamWithLeader((client) => client.syncStatus()),
+          requestSync: withLeader((client) => client.requestSync()),
+          presence: (room, state, revision) =>
+            streamWithLeader((client) => client.presence({ room, tabId: Protocol.TabId.make(tabId), state, revision })),
+          track: (room, state, revision) =>
+            withLeader((client) => client.track({ room, tabId: Protocol.TabId.make(tabId), state, revision }))
+        },
+        config
+      ),
       leaderInfo: withLeader((client) => client.leaderInfo()),
       subscribeRaw: (query) => streamWithLeader((client) => client.subscribeRaw({ query })),
       exportPending: withLeader((client) => client.exportPending()),
