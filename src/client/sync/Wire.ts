@@ -94,7 +94,7 @@ export interface RowWriter<E> {
   readonly write: (table: string, id: string, row: Option.Option<EncodedRow>) => Effect.Effect<void, E>
   readonly purgeScope: (scopeId: string) => Effect.Effect<void, E>
   /** Deletes every replica row; used when installing a snapshot (page set from `null`). */
-  readonly clear: Effect.Effect<void, E>
+  readonly clearAll: Effect.Effect<void, E>
 }
 
 /** First-touch pre-image of a row written by one handler run (reported by core's Store). */

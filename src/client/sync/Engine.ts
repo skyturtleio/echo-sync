@@ -42,9 +42,17 @@ export interface SyncMeta {
   readonly lastMutationId: number
   /** Highest mutation id the server has reported as processed; never resent. */
   readonly pushedThrough: number
+  /**
+   * The server demanded a resnapshot: the next page set starts from `null` and replaces the
+   * replica. `cursor` keeps describing the installed replica until then.
+   */
+  readonly resnapshot: boolean
 }
 
-export const initialMeta: SyncMeta = { cursor: null, lastMutationId: 0, pushedThrough: 0 }
+export const initialMeta: SyncMeta = { cursor: null, lastMutationId: 0, pushedThrough: 0, resnapshot: false }
+
+/** The cursor the in-progress page set started from. */
+const pullFrom = (meta: SyncMeta): Cursor => (meta.resnapshot ? null : meta.cursor)
 
 /** A server-rejected mutation, retained for inspection after leaving the outbox (§9). */
 export interface Notice {
@@ -138,7 +146,7 @@ export const applyPageSet = <E>(
     const meta = yield* storage.meta
     const pending = yield* storage.pending
     for (const entry of Arr.reverse(pending)) yield* restore(storage.rows, entry.undo)
-    if (meta.cursor === null) yield* storage.rows.clear
+    if (pullFrom(meta) === null) yield* storage.rows.clearAll
 
     const set: ReadonlyArray<PullResponse> = [...pages, done]
     for (const page of set) {
@@ -175,7 +183,7 @@ export const applyPageSet = <E>(
     // The server processes a client's mutations in order, so an ack for id k means every id
     // up to k has been processed.
     const pushedThrough = Math.max(meta.pushedThrough, ...outcomes.keys())
-    yield* storage.setMeta({ ...meta, cursor: done.nextCursor, pushedThrough })
+    yield* storage.setMeta({ ...meta, cursor: done.nextCursor, pushedThrough, resnapshot: false })
     yield* storage.clearStaged
   })
 
@@ -264,18 +272,18 @@ export const make = <E, TE>(options: {
             Effect.all({ meta: storage.meta, staged: storage.staged })
           )
           const continuation = Option.fromNullishOr(staged.at(-1)?.continuation)
-          const request: PullRequest = { clientId, cursor: meta.cursor, continuation }
+          const request: PullRequest = { clientId, cursor: pullFrom(meta), continuation }
           const page = yield* transport.pull(request).pipe(
             Effect.map(Option.some<PullResponse>),
             // Generic `TE` defeats `catchTag`'s tag extraction, so narrow by class.
             Effect.catch((error) =>
               Effect.gen(function* () {
                 if (!(error instanceof ResnapshotRequired)) return yield* Effect.fail(error)
-                if (meta.cursor === null && Option.isNone(continuation)) return yield* error
+                if (request.cursor === null && Option.isNone(continuation)) return yield* error
                 // Never apply a partial set: drop it and start a snapshot from null. The
-                // replica keeps serving reads until that snapshot is installed atomically.
+                // replica (and its cursor) keeps serving reads until that snapshot is installed.
                 yield* storage.transaction(
-                  Effect.andThen(storage.clearStaged, storage.setMeta({ ...meta, cursor: null }))
+                  Effect.andThen(storage.clearStaged, storage.setMeta({ ...meta, resnapshot: true }))
                 )
                 return Option.none<PullResponse>()
               })
