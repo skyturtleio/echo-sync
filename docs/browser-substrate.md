@@ -180,21 +180,34 @@ tab's state in a room it has joined; for a room it has not joined it does nothin
 - **Liveness.** Heartbeats stay on the leader and only snapshots reach the tab. No element at all for
   `idleTimeout` (the `LeaderOptions` value that `followPokes` uses, 45 s by default) ends the upstream
   stream, and so does any failure or clean end. The leader then rejoins after a backoff, and the tab
-  stream does not end. Only `Unauthorized` (no grant in the room's scope) ends it.
-- **Latest desired state.** `track` cannot confirm that it was applied: one that races a join can be a no-op
-  on the server, or land on an entry the join then replaces. So every join carries the latest tracked state,
-  and after the first snapshot of each join, a state tracked since the join was read is sent again. That
-  holds on the leader (idle and reconnect rejoins) and in the tab (handover rejoins: a new leader knows
-  nothing of the old one's state). `track` and that catch-up are serialized, so states arrive in order.
+  stream does not end. Only `Forbidden { room }` (no grant in the room's scope) ends it; `Unauthorized` is a
+  credential failure and is rejoined like any other (DESIGN §9.1 Credentials).
+- **Track and delivery (DESIGN §9.1, 22741e2).** `track` records the desired state in one synchronous step
+  and returns. It never waits on the network, so interrupting the caller afterwards does not retract the
+  state, and a `track` for a closed stream is dropped. The open stream owns delivery, in the tab (to the
+  leader) and on the leader (to the server):
+  - every join carries the latest state;
+  - after the join's first snapshot, a delivery fiber scoped to that join sends any newer state, one send
+    at a time, latest wins (an undelivered older state may be skipped);
+  - snapshots never wait for a send, and an idle timeout, reconnect, handover or close interrupts a hung one;
+  - a failed send on the leader ends the connection, so the rejoin carries the state instead.
+- **Registration.** Each layer registers a subscription with `acquireRelease`, as one synchronous
+  check-and-insert step. Its release removes only itself, so a stream cancelled at any point leaves nothing
+  behind, and two simultaneous opens of one room in a tab produce exactly one upstream open; the other
+  fails `PresenceAlreadyOpen`.
 - **Handover.** Like `subscribe`, the stream re-joins on the next leader and emits nothing in between. A
   same-key rejoin ends the older server stream (DESIGN §12), which is expected. Other tabs see this tab's
   entry disappear for at most the reconnect gap.
 
 Evidence:
-- `Presence.test.ts`: heartbeats are filtered, a silent connection is rejoined with the latest state while
-  the stream stays open, a racing track is re-sent, and only a fatal error ends the subscription.
-- `Leader.test.ts`: the tab re-joins with the latest state across handover, and closing the stream drops
-  the room.
+- `Presence.test.ts`: heartbeats are filtered; a silent connection is rejoined with the latest state while
+  the stream stays open; a track that raced the join is delivered after its first snapshot; a send that
+  never completes blocks neither snapshots nor the idle rejoin; a subscription cancelled at any point
+  (swept under a small `MaxOpsBeforeYield`) sends no later track; `Unauthorized` rejoins and only
+  `Forbidden` ends the subscription.
+- `Leader.test.ts`: the tab re-joins with the latest state across handover; closing the stream drops the
+  room; simultaneous opens give one upstream open; cancellation at any point frees the room; a hung tab
+  send never blocks `track` or snapshots.
 - `scenarios.sh` (real server): an entry is listed only while its stream is open, and after the leader tab
   closes, the new leader re-joins F with its last tracked state.
 

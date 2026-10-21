@@ -180,6 +180,12 @@ export const PresencePayload = Schema.Struct({
   state: Schema.Json
 })
 
+/**
+ * The principal holds no grant in the room's scope (DESIGN §9.1 Presence). Unlike `Unauthorized` (a
+ * credential failure, retried), this is a fact about access, and the only error that ends a presence stream.
+ */
+export class Forbidden extends Schema.TaggedError<Forbidden>()("Forbidden", { room: AccessScopeId }) {}
+
 export const PresenceRpcs = RpcGroup.make(
   /**
    * Joins `room` with `state` and observes it: a `RoomSnapshot` on join and after every change
@@ -189,7 +195,7 @@ export const PresenceRpcs = RpcGroup.make(
   Rpc.make("room", {
     payload: PresencePayload,
     success: RoomElement,
-    error: Schema.Union([ServerUnavailable, Unauthorized]),
+    error: Schema.Union([ServerUnavailable, Unauthorized, Forbidden]),
     stream: true
   }),
   /** Replaces the state of this `(clientId, tabId)` entry in `room`; a no-op without one. */

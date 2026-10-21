@@ -25,7 +25,6 @@ import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Schedule from "effect/Schedule"
-import * as Semaphore from "effect/Semaphore"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
@@ -130,7 +129,10 @@ export class LeaderClient extends Context.Service<
      * room's snapshots; survives handover (re-joined on the new leader with the latest `track`ed state).
      */
     readonly presence: PresenceFn
-    /** Replace this tab's state in a room it has joined through `presence`; a no-op otherwise. */
+    /**
+     * Record this tab's desired state in a room it has joined through `presence` (a no-op otherwise). Returns
+     * at once; the open stream delivers the latest state (DESIGN §9.1).
+     */
     readonly track: TrackFn
     /** Retained notices, current list then every change; survives handover. */
     readonly notices: Stream.Stream<ReadonlyArray<StoredNotice>, SqlFailure | LeaderUnavailable>
@@ -153,10 +155,10 @@ type PresenceFn = (
   room: AccessScope.AccessScopeId,
   state: Schema.Json
 ) => Stream.Stream<Protocol.RoomSnapshot, PresenceError>
-type TrackFn = (room: AccessScope.AccessScopeId, state: Schema.Json) => Effect.Effect<void, SyncDisabled>
+type TrackFn = (room: AccessScope.AccessScopeId, state: Schema.Json) => Effect.Effect<void>
 
-/** `Unauthorized`: no grant in the room's scope. `PresenceAlreadyOpen`: one stream per room per tab. */
-export type PresenceError = SyncDisabled | Protocol.Unauthorized | PresenceAlreadyOpen | LeaderUnavailable
+/** `Forbidden`: no grant in the room's scope. `PresenceAlreadyOpen`: one stream per room per tab. */
+export type PresenceError = SyncDisabled | Protocol.Forbidden | PresenceAlreadyOpen | LeaderUnavailable
 
 /** Errors a registered query's stream can end with (a run's `ReadError`s, minus the transient one). */
 export type SubscribeError =
@@ -209,7 +211,7 @@ export interface LeaderCalls {
   readonly presence: (
     room: AccessScope.AccessScopeId,
     state: Schema.Json
-  ) => Stream.Stream<Protocol.RoomSnapshot, SyncDisabled | Protocol.Unauthorized | LeaderUnavailable>
+  ) => Stream.Stream<Protocol.RoomSnapshot, SyncDisabled | Protocol.Forbidden | LeaderUnavailable>
   readonly track: (
     room: AccessScope.AccessScopeId,
     state: Schema.Json
@@ -247,51 +249,76 @@ export const tabApi = (calls: LeaderCalls) => {
       })
     )
   /**
-   * The latest desired state per joined room, kept in the tab: a new leader knows nothing of the old one's.
-   * Each (re)join reads it; after the first snapshot of each, a state tracked since that read is sent
-   * again (a `track` racing a join may be a no-op on the leader or the server). `track` and that catch-up
-   * are serialized, so the leader sees this tab's states in order.
+   * The latest desired state per joined room, kept in the tab: a new leader knows nothing of the old one's
+   * (DESIGN §9.1, 22741e2). `track` records it in one synchronous step and returns. The open stream owns
+   * delivery: every (re)join carries the latest state, and a delivery fiber scoped to that join sends any
+   * newer one after the join's first snapshot, one at a time, latest wins, never blocking snapshots.
    */
-  const joined = new Map<string, { state: Schema.Json; version: number; readonly lock: Semaphore.Semaphore }>()
+  interface Cell {
+    state: Schema.Json
+    version: number
+    wake: Deferred.Deferred<void>
+  }
+  const joined = new Map<string, Cell>()
+  const deliver = (room: AccessScope.AccessScopeId, cell: Cell, sent: number) =>
+    Effect.gen(function* () {
+      while (true) {
+        const wake = Deferred.makeUnsafe<void>()
+        cell.wake = wake
+        if (cell.version === sent) {
+          yield* Deferred.await(wake)
+          continue
+        }
+        const version = cell.version
+        // A lost leader ends this join; the rejoin carries the state. Any other failure stops delivery
+        // for this join only (the stream itself reports it).
+        const ok = yield* calls.track(room, cell.state).pipe(
+          Effect.as(true),
+          Effect.catch(() => Effect.succeed(false))
+        )
+        if (!ok) return
+        sent = version
+      }
+    })
   const presence: PresenceFn = (room, state) =>
     Stream.unwrap(
       Effect.gen(function* () {
-        if (joined.has(room)) return Stream.fail<PresenceError>(new PresenceAlreadyOpen({ room }))
-        const cell = { state, version: 0, lock: yield* Semaphore.make(1) }
-        joined.set(room, cell)
-        const open = Stream.suspend(() => {
-          const read = cell.version
-          let first = true
-          return calls.presence(room, cell.state).pipe(
-            Stream.tap(() =>
-              first
-                ? Effect.suspend(() => {
-                    first = false
-                    return cell.lock.withPermit(
-                      Effect.suspend(() =>
-                        cell.version === read ? Effect.void : Effect.ignore(calls.track(room, cell.state))
-                      )
-                    )
-                  })
-                : Effect.void
-            )
-          )
-        })
-        return resubscribing(open).pipe(Stream.ensuring(Effect.sync(() => joined.delete(room))))
+        // Check and insert in one synchronous step, released on every exit; release only removes itself.
+        const cell = yield* Effect.acquireRelease(
+          Effect.sync((): Cell | undefined => {
+            if (joined.has(room)) return undefined
+            const fresh: Cell = { state, version: 0, wake: Deferred.makeUnsafe<void>() }
+            joined.set(room, fresh)
+            return fresh
+          }),
+          (registered) =>
+            Effect.sync(() => {
+              if (registered !== undefined && joined.get(room) === registered) joined.delete(room)
+            })
+        )
+        if (cell === undefined) return Stream.fail<PresenceError>(new PresenceAlreadyOpen({ room }))
+        const open = Stream.unwrap(
+          Effect.gen(function* () {
+            const read = cell.version
+            const first = Deferred.makeUnsafe<void>()
+            // Scoped to this join: a lost leader or a closed stream interrupts a send in flight.
+            yield* Effect.forkScoped(Effect.andThen(Deferred.await(first), deliver(room, cell, read)))
+            return calls
+              .presence(room, cell.state)
+              .pipe(Stream.tap(() => Effect.sync(() => Deferred.doneUnsafe(first, Effect.void))))
+          })
+        )
+        return resubscribing(open)
       })
     )
+  // Records the desired state; the open stream delivers it. A room this tab has not joined: dropped.
   const track: TrackFn = (room, state) =>
-    Effect.suspend(() => {
+    Effect.sync(() => {
       const cell = joined.get(room)
-      if (cell === undefined) return Effect.void
-      return cell.lock.withPermit(
-        Effect.suspend(() => {
-          cell.state = state
-          cell.version++
-          // A lost leader is fine: the next join carries `state`.
-          return calls.track(room, state).pipe(Effect.catchIf(isLeaderLost, () => Effect.void))
-        })
-      )
+      if (cell === undefined) return
+      cell.state = state
+      cell.version++
+      Deferred.doneUnsafe(cell.wake, Effect.void)
     })
   return {
     mutate,

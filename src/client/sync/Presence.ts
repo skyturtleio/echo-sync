@@ -6,20 +6,21 @@
  * - No element at all for `idleTimeout` ends the connection, and so does any failure, defect or clean end.
  *   The subscription then rejoins after a backoff (from `retryDelay`, doubling to `maxRetryDelay`, reset
  *   once a connection delivered a snapshot). The tab stream does not end.
- * - Every join carries the latest desired state: the one from the subscription's last `track`, not the
- *   state it opened with. `track`'s ack cannot confirm application (a `track` that races a join is a
- *   no-op on the server, or lands on an entry the join then replaces), so after the first snapshot of
- *   every connection, a state that changed since the join was read is sent again. `track` and that
- *   catch-up are serialized, so the server sees states in order.
- * - A failed `track` ends the connection, so the rejoin carries the state instead.
- * - Only an error `isFatal` classifies (the server's `Unauthorized`: no grant in the room's scope) ends
- *   the subscription.
+ * - `track` only records the desired state, synchronously, and returns; it never waits on the network
+ *   (DESIGN §9.1, 22741e2). The subscription owns delivery: every join carries the latest state, and a
+ *   per-connection delivery fiber sends any newer state after the join's first snapshot, one send at a
+ *   time, latest wins. Snapshots never wait for it. It lives in the connection's scope, so an idle
+ *   timeout or reconnect interrupts a send that hangs; a failed send ends the connection, so the rejoin
+ *   carries the state instead.
+ * - Only an error `isFatal` classifies (the server's `Forbidden`: no grant in the room's scope) ends the
+ *   subscription; an `Unauthorized` credential failure is rejoined like any other.
  *
- * A rejoin with the same `(clientId, tabId)` key ends the older server stream (DESIGN §12); the older
- * one is always ours and already abandoned here, so that is expected. Presence never touches the
- * replica or the outbox.
+ * One subscription per `(room, tabId)`: registering it is one synchronous step, and a newer one replaces
+ * (and ends) an older one; its release only removes itself, never a successor. A rejoin with the same
+ * key ends the older server stream (DESIGN §12); the older one is always ours and already abandoned
+ * here, so that is expected. Presence never touches the replica or the outbox.
  */
-import { Cause, Deferred, Duration, Effect, Exit, Queue, Semaphore, type Schema, Stream } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Queue, type Schema, Stream } from "effect"
 import type { AccessScope, Protocol } from "echo-sync"
 
 export interface Upstream<E> {
@@ -45,11 +46,14 @@ export interface Presence<F> {
 
 interface Subscription {
   state: Schema.Json
-  /** Bumped by every `track`; a join compares it to see whether its state is still the latest. */
+  /** Bumped by every `track`; delivery compares it with the version it last sent (or joined with). */
   version: number
-  readonly lock: Semaphore.Semaphore
+  /** Completed by `track`; replaced by the delivery fiber before each check. */
+  wake: Deferred.Deferred<void>
   /** Completing it ends the current connection (the subscription then rejoins). */
   restart: Deferred.Deferred<void>
+  /** Completed when a newer subscription for the same key replaces this one. */
+  readonly replaced: Deferred.Deferred<void>
 }
 
 const key = (room: string, tabId: string) => JSON.stringify([room, tabId])
@@ -68,51 +72,81 @@ export const make = <E, F extends E>(options: {
   const cap = Duration.toMillis(Duration.fromInputUnsafe(options.maxRetryDelay ?? "30 seconds"))
   const subscriptions = new Map<string, Subscription>()
 
-  const send = (sub: Subscription, room: AccessScope.AccessScopeId, tabId: Protocol.TabId) =>
-    upstream.track({ room, tabId, state: sub.state }).pipe(
-      Effect.catchCause((cause) =>
-        Cause.hasInterrupts(cause) ? Effect.interrupt : Deferred.succeed(sub.restart, undefined)
-      ),
-      Effect.asVoid
-    )
+  /** Sends every state newer than `sent` once `joined` completes, latest wins; ends on a failed send. */
+  const deliver = (sub: Subscription, room: AccessScope.AccessScopeId, tabId: Protocol.TabId, sent: number) =>
+    Effect.gen(function* () {
+      while (true) {
+        // Replaced before the check, so a `track` after the check always wakes the next wait.
+        const wake = Deferred.makeUnsafe<void>()
+        sub.wake = wake
+        if (sub.version === sent) {
+          yield* Deferred.await(wake)
+          continue
+        }
+        const version = sub.version
+        const failed = yield* upstream.track({ room, tabId, state: sub.state }).pipe(
+          Effect.as(false),
+          Effect.catch(() => Effect.succeed(true))
+        )
+        if (failed) return yield* Deferred.succeed(sub.restart, undefined)
+        sent = version
+      }
+    })
 
   const join = ({ room, tabId, state }: Join): Stream.Stream<Protocol.RoomSnapshot, F> =>
     Stream.callback<Protocol.RoomSnapshot, F>((out) =>
       Effect.gen(function* () {
-        const sub: Subscription = {
-          state,
-          version: 0,
-          lock: yield* Semaphore.make(1),
-          restart: Deferred.makeUnsafe<void>()
-        }
         const k = key(room, tabId)
-        subscriptions.set(k, sub)
-        yield* Effect.addFinalizer(() => Effect.sync(() => subscriptions.get(k) === sub && subscriptions.delete(k)))
+        // Registration is one synchronous step, released on every exit, and only ever removes itself.
+        const sub = yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            const fresh: Subscription = {
+              state,
+              version: 0,
+              wake: Deferred.makeUnsafe<void>(),
+              restart: Deferred.makeUnsafe<void>(),
+              replaced: Deferred.makeUnsafe<void>()
+            }
+            const previous = subscriptions.get(k)
+            subscriptions.set(k, fresh)
+            if (previous !== undefined) Deferred.doneUnsafe(previous.replaced, Effect.void)
+            return fresh
+          }),
+          (registered) =>
+            Effect.sync(() => {
+              if (subscriptions.get(k) === registered) subscriptions.delete(k)
+            })
+        )
         let delay = base
         while (true) {
           sub.restart = Deferred.makeUnsafe<void>()
-          const joined = { state: sub.state, version: sub.version }
+          const joinedVersion = sub.version
+          const joined = Deferred.makeUnsafe<void>()
           let delivered = false
           const ended = yield* Effect.exit(
-            upstream.room({ room, tabId, state: joined.state }).pipe(
-              Stream.timeout(idleTimeout),
-              Stream.interruptWhen(Deferred.await(sub.restart)),
-              Stream.runForEach((element) =>
-                element._tag === "heartbeat"
-                  ? Effect.void
-                  : Effect.gen(function* () {
-                      if (!delivered) {
-                        delivered = true
-                        // The entry exists now: a state tracked since the join read it is applied from here.
-                        yield* sub.lock.withPermit(
-                          Effect.suspend(() => (sub.version === joined.version ? Effect.void : send(sub, room, tabId)))
-                        )
-                      }
-                      yield* Queue.offer(out, element)
-                    })
-              )
-            )
+            Effect.scoped(
+              Effect.gen(function* () {
+                // Scoped to this connection: its end interrupts a send in flight.
+                yield* Effect.forkScoped(
+                  Effect.andThen(Deferred.await(joined), deliver(sub, room, tabId, joinedVersion))
+                )
+                yield* upstream.room({ room, tabId, state: sub.state }).pipe(
+                  Stream.timeout(idleTimeout),
+                  Stream.interruptWhen(Deferred.await(sub.restart)),
+                  Stream.runForEach((element) =>
+                    element._tag === "heartbeat"
+                      ? Effect.void
+                      : Effect.suspend(() => {
+                          delivered = true
+                          Deferred.doneUnsafe(joined, Effect.void)
+                          return Queue.offer(out, element)
+                        })
+                  )
+                )
+              })
+            ).pipe(Effect.raceFirst(Deferred.await(sub.replaced)))
           )
+          if (Deferred.isDoneUnsafe(sub.replaced)) return yield* Queue.end(out)
           if (Exit.isFailure(ended)) {
             const fatal = ended.cause.reasons
               .filter(Cause.isFailReason)
@@ -121,23 +155,21 @@ export const make = <E, F extends E>(options: {
             if (fatal !== undefined) return yield* Effect.fail(fatal)
           }
           if (delivered) delay = base
-          yield* Effect.sleep(Duration.millis(delay))
+          yield* Effect.raceFirst(Effect.sleep(Duration.millis(delay)), Deferred.await(sub.replaced))
+          if (Deferred.isDoneUnsafe(sub.replaced)) return yield* Queue.end(out)
           delay = Math.min(delay * 2, cap)
         }
       })
     )
 
+  // Records the desired state in one synchronous step; the subscription's delivery fiber sends it.
   const track = ({ room, tabId, state }: Join): Effect.Effect<void> =>
-    Effect.suspend(() => {
+    Effect.sync(() => {
       const sub = subscriptions.get(key(room, tabId))
-      if (sub === undefined) return Effect.void
-      return sub.lock.withPermit(
-        Effect.suspend(() => {
-          sub.state = state
-          sub.version++
-          return send(sub, room, tabId)
-        })
-      )
+      if (sub === undefined) return
+      sub.state = state
+      sub.version++
+      Deferred.doneUnsafe(sub.wake, Effect.void)
     })
 
   return { join, track }

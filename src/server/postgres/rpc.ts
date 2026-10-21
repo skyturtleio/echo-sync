@@ -337,7 +337,7 @@ export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor"
                 )
               )
               if (Option.isNone(role)) {
-                return yield* new Protocol.Unauthorized({ message: `no grant in scope ${payload.room}` })
+                return yield* new Protocol.Forbidden({ room: payload.room })
               }
               return presence.join({ principalId, ...payload })
             })

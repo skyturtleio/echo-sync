@@ -331,7 +331,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (§12)", () => {
     30_000
   )
 
-  it.live("a principal without a grant in the room gets Unauthorized and never appears in it", () =>
+  it.live("a principal without a grant in the room gets Forbidden and never appears in it", () =>
     Effect.gen(function* () {
       yield* grant("p", "s1")
       yield* grant("q", "elsewhere") // a grant, but not in this room
@@ -345,7 +345,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (§12)", () => {
       )
       assert.deepStrictEqual(
         Exit.isFailure(exit) ? Option.map(Exit.findErrorOption(exit), (e) => e._tag) : Option.none(),
-        Option.some("Unauthorized")
+        Option.some("Forbidden")
       )
       // Its track is a no-op (it holds no entry), and a later change shows the room without it.
       yield* outsider.track(payload("cq", "t1", "sneaking in"))

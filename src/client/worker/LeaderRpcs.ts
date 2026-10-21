@@ -162,12 +162,12 @@ export class LeaderRpcs extends RpcGroup.make(
   /**
    * Join `room` as this tab and observe it (DESIGN §9.1 Presence): room snapshots only (heartbeats stay on
    * the leader). The leader keeps the upstream stream up (idle timeout, rejoin with the latest tracked
-   * state); the entry lives exactly while this stream is open. `Unauthorized`: no grant in the room's scope.
+   * state); the entry lives exactly while this stream is open. `Forbidden`: no grant in the room's scope.
    */
   Rpc.make("presence", {
     payload: PresencePayload,
     success: Protocol.RoomSnapshot,
-    error: Schema.Union([SyncDisabled, Protocol.Unauthorized]),
+    error: Schema.Union([SyncDisabled, Protocol.Forbidden]),
     stream: true
   }),
   /** Replace this tab's state in `room`; a no-op unless its `presence` stream is open on this leader. */

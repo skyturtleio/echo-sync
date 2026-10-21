@@ -2,7 +2,21 @@
 import "../testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { expect, it } from "@effect/vitest"
-import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Schema, Scope, Stream } from "effect"
+import {
+  Cause,
+  DateTime,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Queue,
+  References,
+  Schema,
+  Scope,
+  Stream
+} from "effect"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import { RpcTest } from "effect/rpc"
 import * as Schedule from "effect/Schedule"
@@ -886,5 +900,114 @@ it.live(
       expect(second._tag).toBe("PresenceAlreadyOpen")
       yield* Fiber.interrupt(holder)
       expect(Option.isSome(yield* Stream.runHead(api.presence(room, "e")))).toBe(true)
+    }).pipe(Effect.scoped)
+)
+
+/** Tab-side presence calls over a fake leader: counts opens, records tracks, `hangTracks` never answers one. */
+const presenceCalls = (client: Effect.Success<ReturnType<typeof leaderRpc>>["client"], hangTracks = false) => {
+  const seen = { opens: 0, open: 0, tracks: new Array<Schema.Json>() }
+  const calls: LeaderCalls = {
+    ...passThrough(client),
+    presence: (r, state) => {
+      const snap: Protocol.RoomSnapshot = {
+        _tag: "snapshot",
+        room: r,
+        entries: [{ principalId: me, clientId: Ids.ClientId.make("c"), tabId: Protocol.TabId.make("tab"), state }]
+      }
+      // `ensuring` also runs for a stream interrupted before it started: count only a started one.
+      return Stream.suspend(() => {
+        let started = false
+        return Stream.concat(Stream.make(snap), Stream.never).pipe(
+          Stream.onStart(Effect.sync(() => ((started = true), seen.opens++, seen.open++))),
+          Stream.ensuring(Effect.sync(() => void (started && seen.open--)))
+        )
+      })
+    },
+    track: (_r, state) =>
+      Effect.andThen(
+        Effect.sync(() => void seen.tracks.push(state)),
+        hangTracks ? Effect.never : Effect.void
+      )
+  }
+  return { calls, seen }
+}
+
+// The races below need preemption inside each opening fiber: a tiny scheduler budget on the fiber
+// itself, swept against how long the parent lets it run before acting.
+const preempted = <A, E>(self: Effect.Effect<A, E>, ops: number) =>
+  Effect.provideService(self, References.MaxOpsBeforeYield, ops)
+
+it.live(
+  "two presence opens of one room at the same time: exactly one reaches the leader, the other is PresenceAlreadyOpen",
+  () =>
+    Effect.gen(function* () {
+      const room = AccessScope.AccessScopeId.make("room-1")
+      const { client } = yield* leaderRpc({ allowRawExec: false })
+      for (let ops = 3; ops < 30; ops++) {
+        const { calls, seen } = presenceCalls(client)
+        const api = tabApi(calls)
+        const a = yield* Effect.forkChild(preempted(Effect.exit(Stream.runDrain(api.presence(room, "a"))), ops))
+        const b = yield* Effect.forkChild(preempted(Effect.exit(Stream.runDrain(api.presence(room, "b"))), ops))
+        yield* Effect.repeat(Effect.yieldNow, { times: 100 })
+        const ended = [a.pollUnsafe(), b.pollUnsafe()].filter((x) => x !== undefined)
+        const refused = ended[0]?._tag === "Success" ? ended[0].value : undefined
+        expect({ ops, opens: seen.opens, ended: ended.length }).toEqual({ ops, opens: 1, ended: 1 })
+        expect(
+          refused !== undefined && Exit.isFailure(refused) && String(refused.cause).includes("PresenceAlreadyOpen")
+        ).toBe(true)
+        yield* Fiber.interrupt(a)
+        yield* Fiber.interrupt(b)
+      }
+    })
+)
+
+it.live(
+  "a presence stream cancelled at any point frees its room: reopening succeeds and a later track is dropped",
+  () =>
+    Effect.gen(function* () {
+      const room = AccessScope.AccessScopeId.make("room-1")
+      const { client } = yield* leaderRpc({ allowRawExec: false })
+      for (let ops = 3; ops < 35; ops++) {
+        for (let turns = 0; turns < 20; turns++) {
+          const { calls, seen } = presenceCalls(client)
+          const api = tabApi(calls)
+          const fiber = yield* Effect.forkChild(preempted(Stream.runDrain(api.presence(room, "a")), ops))
+          yield* Effect.repeat(Effect.yieldNow, { times: turns })
+          yield* Fiber.interrupt(fiber)
+          yield* api.track(room, "late")
+          const reopened = yield* Effect.exit(Stream.runHead(api.presence(room, "b")))
+          expect({ ops, turns, ok: Exit.isSuccess(reopened), open: seen.open, tracks: seen.tracks }).toEqual({
+            ops,
+            turns,
+            ok: true,
+            open: 0,
+            tracks: []
+          })
+        }
+      }
+    })
+)
+
+it.live(
+  "a tab track whose send never completes returns at once and blocks no snapshot; the next join carries the latest state",
+  () =>
+    Effect.gen(function* () {
+      const room = AccessScope.AccessScopeId.make("room-1")
+      const { calls, seen } = presenceCalls((yield* leaderRpc({ allowRawExec: false })).client, true)
+      const api = tabApi(calls)
+      const first = yield* Stream.runHead(api.presence(room, "a"))
+      expect(Option.isSome(first)).toBe(true)
+      const holder = yield* Effect.forkScoped(Stream.runDrain(api.presence(room, "b")))
+      yield* Effect.sleep("50 millis")
+      // Two tracks while the first send hangs: both return immediately.
+      yield* api.track(room, "c").pipe(Effect.timeout("100 millis"))
+      yield* api.track(room, "d").pipe(Effect.timeout("100 millis"))
+      yield* Effect.sleep("50 millis")
+      expect(seen.tracks).toEqual(["c"])
+      yield* Fiber.interrupt(holder)
+      // The closed stream interrupted the hung send; a later track is dropped.
+      expect(seen.open).toBe(0)
+      yield* api.track(room, "e")
+      expect(seen.tracks).toEqual(["c"])
     }).pipe(Effect.scoped)
 )

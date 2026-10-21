@@ -103,11 +103,18 @@ export interface SyncTransport extends Engine.Transport<TransportError> {
   readonly presence: (clientId: Ids.ClientId) => Presence.Upstream<PresenceError>
 }
 
-export type PresenceError = RpcClientError.RpcClientError | Protocol.Unauthorized | Protocol.ServerUnavailable
+export type PresenceError =
+  | RpcClientError.RpcClientError
+  | Protocol.Unauthorized
+  | Protocol.ServerUnavailable
+  | Protocol.Forbidden
 
-/** Only a missing grant ends a presence subscription; everything else is rejoined. */
-export const isFatalPresence = (error: PresenceError): error is Protocol.Unauthorized =>
-  Predicate.isTagged(error, "Unauthorized")
+/**
+ * Only a missing grant (`Forbidden`) ends a presence subscription. Everything else is rejoined, including
+ * `Unauthorized`: a credential failure, retried like every other one (DESIGN §9.1 Credentials).
+ */
+export const isFatalPresence = (error: PresenceError): error is Protocol.Forbidden =>
+  Predicate.isTagged(error, "Forbidden")
 
 export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scope.Scope> = Effect.gen(function* () {
   const client = yield* RpcClient.make(Protocol.SyncRpcs)

@@ -144,7 +144,7 @@ export interface HandlerOptions {
   readonly engine: Engine.Engine<unknown>
   readonly loop: SyncLoop.SyncLoop | undefined
   /** The leader's presence (DESIGN §9.1); `undefined` on a local-only replica, like `loop`. */
-  readonly presence: Presence.Presence<Protocol.Unauthorized> | undefined
+  readonly presence: Presence.Presence<Protocol.Forbidden> | undefined
   readonly actor: AccessScope.PrincipalId
   readonly queries: Query.QueryRegistry
   readonly allowRawExec: boolean
@@ -410,7 +410,7 @@ const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: L
     )
     const storage = SqliteSyncStorage.make(sql, registry)
     let loop: SyncLoop.SyncLoop | undefined
-    let presence: Presence.Presence<Protocol.Unauthorized> | undefined
+    let presence: Presence.Presence<Protocol.Forbidden> | undefined
     let engine: Engine.Engine<unknown>
     if (syncUrl === undefined) {
       engine = yield* Engine.make({ clientId, actor, storage, registry, mutations, transport: localOnly })
