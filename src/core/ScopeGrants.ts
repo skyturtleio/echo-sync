@@ -8,10 +8,11 @@ export type ScopeGrantId = typeof ScopeGrantId.Type
 /**
  * Deterministic, injective grant id (DESIGN §4): `(accessScopeId, principalId)` is unique by
  * construction because the id is derived from the pair. Length-prefixed so no separator can
- * be forged by either part.
+ * be forged by either part. The prefix is the code-point count, not `.length` (UTF-16 code units),
+ * so it equals Postgres `char_length` (UTF8) and the server CHECK derives the same id.
  */
 export const grantId = (scopeId: AccessScopeId, principalId: PrincipalId): ScopeGrantId =>
-  ScopeGrantId.make(`${scopeId.length}:${scopeId}:${principalId}`)
+  ScopeGrantId.make(`${[...scopeId].length}:${scopeId}:${principalId}`)
 
 /**
  * System table of scope grants (DESIGN §4). Replicated like any row (a grant lives in the scope

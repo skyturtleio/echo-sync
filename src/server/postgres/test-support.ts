@@ -40,17 +40,21 @@ const admin = (statement: string) =>
     yield* sql.unsafe(statement)
   }).pipe(Effect.provide(PgClient.layer({ url: Redacted.make(adminUrl ?? ""), maxConnections: 1 })))
 
+/** A fresh, empty database (no engine schema), dropped afterwards; `with` is appended to CREATE DATABASE. */
+export const emptyDatabase = (with_ = "") =>
+  Layer.unwrap(
+    Effect.gen(function* () {
+      const name = `echo_test_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+      yield* admin(`CREATE DATABASE ${name} ${with_}`)
+      yield* Effect.addFinalizer(() => Effect.orDie(admin(`DROP DATABASE ${name} WITH (FORCE)`)))
+      const url = new URL(adminUrl ?? "")
+      url.pathname = `/${name}`
+      return PgClient.layer({ url: Redacted.make(url.toString()), maxConnections: 80 })
+    })
+  )
+
 /** A fresh, empty database per test (no engine schema), dropped afterwards. */
-export const EmptyDatabase = Layer.unwrap(
-  Effect.gen(function* () {
-    const name = `echo_test_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
-    yield* admin(`CREATE DATABASE ${name}`)
-    yield* Effect.addFinalizer(() => Effect.orDie(admin(`DROP DATABASE ${name} WITH (FORCE)`)))
-    const url = new URL(adminUrl ?? "")
-    url.pathname = `/${name}`
-    return PgClient.layer({ url: Redacted.make(url.toString()), maxConnections: 80 })
-  })
-)
+export const EmptyDatabase = emptyDatabase()
 
 /**
  * A fresh, migrated database per test, dropped afterwards, with one synced table `items` (and

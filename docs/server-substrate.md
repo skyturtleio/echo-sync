@@ -100,11 +100,12 @@ is never read from the payload. `ClientForbidden` becomes `Unauthorized`.
 ### `scope_grants` id CHECK
 
 Migration 002 adds `scope_grants_id_derived`: `id = char_length(access_scope_id) || ':' ||
-access_scope_id || ':' || principal_id`, and `access_scope_id` has no character above U+FFFF
-(DESIGN §4). core's `grantId` prefixes the JS length (UTF-16 code units); for BMP-only text that
-equals `char_length`, so the CHECK accepts exactly the ids core derives and rejects non-BMP scope
-ids instead of mis-deriving them. The constraint is validated, so a database holding a
-non-derived grant fails 002 (23514) and startup stops until the row is repaired.
+access_scope_id || ':' || principal_id` (DESIGN §4, 5242acf). core's `grantId` prefixes the
+code-point count (`[...scopeId].length`), which equals `char_length` in a UTF8 database, so core
+and the CHECK derive the same id for every scope id. Under SQL_ASCII `char_length` counts bytes,
+so 002 first refuses any server encoding other than UTF8. The constraint is validated, so a
+database holding a non-derived grant fails 002 (23514) and startup stops until the row is
+repaired.
 
 `Migrate.verify` does not check that the constraint exists. It compares the catalog with the
 registry's manifests, which carry no CHECKs, and `scope_grants`' other engine constraints (the
