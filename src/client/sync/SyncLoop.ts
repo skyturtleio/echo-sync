@@ -9,7 +9,7 @@
  * exportable. The engine writes nothing durable when its transport fails, so classifying in the caller
  * (who owns the transport's error union) loses nothing.
  */
-import { Duration, Effect, Option, Queue, Schema, type Stream, SubscriptionRef } from "effect"
+import { Cause, Duration, Effect, Exit, Option, Queue, Schema, type Stream, SubscriptionRef } from "effect"
 import type { Errors } from "echo-sync"
 import type * as Engine from "./Engine.ts"
 
@@ -39,6 +39,21 @@ export interface SyncLoop {
 const describe = (error: unknown): string =>
   error instanceof Error ? `${error.name}: ${error.message}` : typeof error === "string" ? error : JSON.stringify(error)
 
+/**
+ * Classifies a whole failure `Cause` (DESIGN §6: defect > transient > rejection), never just its
+ * first `Fail`: a defect anywhere halts push, even beside a transient failure, since an RPC request
+ * decode failure arrives as an untagged defect. Interruption is re-raised (the loop is stopping).
+ */
+const classify = <E>(cause: Cause.Cause<E>, isFatal: ((error: E) => boolean) | undefined) =>
+  Effect.gen(function* () {
+    if (Cause.hasInterrupts(cause)) return yield* Effect.interrupt
+    const failures = cause.reasons.filter(Cause.isFailReason).map((reason) => reason.error)
+    const fatalFailure = isFatal === undefined ? undefined : failures.find(isFatal)
+    const halts = isFatal !== undefined && (Cause.hasDies(cause) || fatalFailure !== undefined)
+    const first = fatalFailure ?? failures[0]
+    return { halts, message: Cause.hasDies(cause) || first === undefined ? Cause.pretty(cause) : describe(first) }
+  })
+
 export const make = <TE>(options: {
   readonly engine: Engine.Engine<TE>
   /** Whether a push failure is an integrity error that must stop pushing (see module doc). */
@@ -58,22 +73,26 @@ export const make = <TE>(options: {
     const cycle = Effect.gen(function* () {
       let transient = Option.none<string>()
       if ((yield* SubscriptionRef.get(status)).push._tag === "Active") {
-        const pushed = yield* Effect.result(engine.push)
-        if (pushed._tag === "Failure") {
-          if (options.isFatalPush(pushed.failure)) {
-            const message = describe(pushed.failure)
+        const pushed = yield* Effect.exit(engine.push)
+        if (Exit.isFailure(pushed)) {
+          const { halts, message } = yield* classify(pushed.cause, options.isFatalPush)
+          if (halts) {
             yield* Effect.logError(`echo-sync: push halted by an integrity error: ${message}`)
             const halted: PushState = { _tag: "Halted", message }
             yield* SubscriptionRef.update(status, (s) => ({ ...s, push: halted }))
           } else {
-            transient = Option.some(describe(pushed.failure))
+            transient = Option.some(message)
           }
-        } else if (pushed.success.stopped) {
+        } else if (pushed.value.stopped) {
           transient = Option.some("server stopped the push batch at a transient failure")
         }
       }
-      const pulled = yield* Effect.result(engine.pull)
-      if (pulled._tag === "Failure" && Option.isNone(transient)) transient = Option.some(describe(pulled.failure))
+      // Every pull failure, a defect included, is transient (§6): nothing was installed.
+      const pulled = yield* Effect.exit(engine.pull)
+      if (Exit.isFailure(pulled)) {
+        const { message } = yield* classify(pulled.cause, undefined)
+        if (Option.isNone(transient)) transient = Option.some(message)
+      }
       yield* SubscriptionRef.update(status, (s) => ({ ...s, lastError: Option.getOrNull(transient) }))
       return Option.isSome(transient)
     })

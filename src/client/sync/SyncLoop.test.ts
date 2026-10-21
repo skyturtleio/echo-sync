@@ -1,5 +1,6 @@
 import { expect, it } from "@effect/vitest"
-import { Effect, Schema } from "effect"
+import { Cause, Effect, Schema } from "effect"
+import { RpcClientError } from "effect/rpc"
 import { TestClock } from "effect/testing"
 import { Ids, Protocol } from "echo-sync"
 import type * as Engine from "./Engine.ts"
@@ -78,5 +79,63 @@ it.effect("a transient push failure is retried with backoff and clears once a cy
     yield* settle
     expect(calls.push).toBe(3)
     expect(yield* loop.status).toEqual({ push: { _tag: "Active" }, lastError: null })
+  })
+)
+
+const rpcFailure = () =>
+  new RpcClientError.RpcClientError({
+    reason: new RpcClientError.RpcClientDefect({ message: "socket closed", cause: null })
+  })
+
+it.effect(
+  "a defect beside a transient failure halts push (whole-cause classification); a pull defect is transient",
+  () =>
+    Effect.gen(function* () {
+      const calls = { push: 0, pull: 0 }
+      const engine: Engine.Engine<RpcClientError.RpcClientError> = {
+        mutate: () => Effect.die("unused"),
+        push: Effect.suspend(() => {
+          calls.push++
+          return Effect.failCause(Cause.combine(Cause.fail(rpcFailure()), Cause.die(new Error("undecodable request"))))
+        }),
+        pull: Effect.suspend(() => {
+          calls.pull++
+          return Effect.die(new Error("bad page"))
+        })
+      }
+      const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush })
+      const fiber = yield* Effect.forkChild(loop.run)
+      yield* settle
+      const status = yield* loop.status
+      expect(status.push._tag).toBe("Halted")
+      // The loop survived the pull defect and reports it as a transient failure.
+      expect(status.lastError).toContain("bad page")
+      expect(fiber.pollUnsafe()).toBeUndefined()
+      yield* TestClock.adjust("1 minute")
+      yield* settle
+      // Push never retried; pull kept retrying with backoff.
+      expect(calls.push).toBe(1)
+      expect(calls.pull).toBeGreaterThan(2)
+    })
+)
+
+it.effect("a transient failure alone (RpcClientError) is retried, never halts", () =>
+  Effect.gen(function* () {
+    const calls = { push: 0 }
+    const engine: Engine.Engine<RpcClientError.RpcClientError> = {
+      mutate: () => Effect.die("unused"),
+      push: Effect.suspend(() => {
+        calls.push++
+        return Effect.fail(rpcFailure())
+      }),
+      pull: Effect.void
+    }
+    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush })
+    yield* Effect.forkChild(loop.run)
+    yield* settle
+    yield* TestClock.adjust("1 second")
+    yield* settle
+    expect(calls.push).toBe(2)
+    expect((yield* loop.status).push).toEqual({ _tag: "Active" })
   })
 )
