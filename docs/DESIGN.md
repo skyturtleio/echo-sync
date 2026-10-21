@@ -329,6 +329,13 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   unknown names with a log line, inside the same install transaction. A defect here would kill
   sync for every stale client until the app updated. (Rows of a *known* table at a newer server
   schema are the separate additive-evolution question, open item 7.)
+- **A known table's row is never installed raw.** `Protocol.Change` carries the row as generic
+  JSON; the install path decodes every `upsert` payload through `table.wire` and writes the
+  canonical re-encoding, so the replica only ever holds rows the table codec produced (the §11
+  excess-key drop and missing-key failure happen here). A row that fails to decode fails the
+  whole page-set install: the transaction rolls back, nothing from the set is installed, the
+  cursor does not move, and the failure is a transient pull failure per §6. Decoding, not an
+  `id` type check, is what makes the row's key trustworthy.
 - Realtime: a poke stream (RPC stream) says "something may have changed"; it is a hint, never
   data. Pull is the only truth.
 
