@@ -537,6 +537,16 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
   handover like `subscribe` (re-joined on the new leader). `track(room, state)` replaces this
   tab's state in a room it has joined (no-op otherwise). Both are leader-owned like the sync
   loop. Presence never touches the replica or the outbox (§3).
+  Two rulings from the ws/presence-client review (coordinator): (1) one `presence` stream per
+  room per tab; a second `presence(room, …)` while one is open fails `PresenceAlreadyOpen`
+  (§12 allows one server entry per `(clientId, tabId)` key, and two tab subscriptions would
+  fight over it); an app that needs several observers of one room multiplexes the one stream.
+  (2) `Unauthorized` on a `room` stream is a credential failure like everywhere else and is
+  retried per §9.1 Credentials, never fatal. A principal with no grant in the room's scope is a
+  different fact: the server fails `room` with `Forbidden { room }` (new `Protocol` error, added
+  to the `room` RPC's error union; `track` is unchanged), and `Forbidden` is the only error that
+  ends a presence stream. `Forbidden` is wire-additive and lands with the presence client, before
+  any app consumes presence.
 - **Typed notice decoding** (ruling from the HeyBabe trial): a retained notice carries the
   envelope's `args` and a `DomainError.error` as `Schema.Json`, so a mutation's static types stop
   at the notice. The stored notice shape, `Notice = Rejected { envelope, error } |
