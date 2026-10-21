@@ -146,7 +146,7 @@ worker_crash() { # $1 = label, $2 = extra page flags
   ab tab "$L" >/dev/null
   ev <<<"echo.watchStatus(); await echo.enqueue({ mutationId: 'crash-after-commit-worker-only', name: 't', args: {} }); return true" >/dev/null
   ab tab "$F" >/dev/null
-  f=$(ev <<<"return await echo.until(async () => { const s = await echo.status(); return s.isLeaderTab ? s : undefined }, 15000) ?? null")
+  f=$(ev <<<"return await echo.until(async () => { const s = await echo.status(); return s.isLeaderTab && s.leaderId !== undefined ? s : undefined }, 15000) ?? null")
   ab tab "$L" >/dev/null
   # Connected to F's leader; with `holdEpochWatch`, L has still not seen its own epoch end.
   connected=$(ev <<<"return (await echo.until(() => echo.statusLog.some((s) => s.leaderId === '$(jq -r .leaderId <<<"$f")'), 15000)) === true")
