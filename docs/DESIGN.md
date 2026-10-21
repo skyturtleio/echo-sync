@@ -502,11 +502,16 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
 - **Replica reset / sign-out purge** of an identity's local data: open, §16 item 11.
 - **Typed notice decoding** (ruling from the HeyBabe trial): a retained notice carries the
   envelope's `args` and a `DomainError.error` as `Schema.Json`, so a mutation's static types stop
-  at the notice. `src/core/Mutation.ts` provides `decodeNotice(mutation, { envelope, outcome })`
-  which, when `envelope.name === mutation.name`, decodes `args` with the mutation's `args`
-  schema and a `DomainError` payload with its `error` schema and returns them typed; a different
-  mutation name or a decode failure is a typed `NoticeMismatch`, never a defect. Pure (no
-  services), core-only, usable on the tab and the server.
+  at the notice. The stored notice shape, `Notice = Rejected { envelope, error } |
+  OutcomeUnknown { envelope }`, is defined in `src/core/Mutation.ts` (it uses only core schemas;
+  client storage and the engine reference it rather than redeclaring it). `Mutation.decodeNotice(mutation, notice)`
+  takes that `Notice` directly: when `notice.envelope.name === mutation.name` it decodes `args`
+  with the mutation's `args` schema and, for a `Rejected` whose error is a `DomainError` of this
+  mutation, decodes the payload with its `error` schema, and returns the notice with those fields
+  typed (`OutcomeUnknown` keeps only typed args; other rejections pass through unchanged). A
+  different mutation name, a `DomainError` naming another mutation, or any decode failure is a
+  typed `NoticeMismatch`, never a defect. Pure (no services), core-only, usable on the tab and
+  the server. (Corrected from an earlier `{ envelope, outcome }` shape that no consumer holds.)
 - **Credentials**: `syncHeaders` is evaluated once per leader (§6: `Unauthorized` is retried,
   so a renewed credential needs a new leader today). Refresh without a leader restart is §16
   item 10.
