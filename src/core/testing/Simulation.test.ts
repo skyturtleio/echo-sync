@@ -56,7 +56,8 @@ describe("reconciliation simulation", () => {
           backstopReleases: 0,
           unknownTableWrites: 0,
           crashes: 0,
-          interleaved: 0
+          interleaved: 0,
+          rebuildInstalls: 0
         }
         for (const seed of seeds) {
           const stats = yield* Simulation.run({ seed, steps: 400 })
@@ -68,6 +69,7 @@ describe("reconciliation simulation", () => {
           reached.unknownTableWrites += stats.unknownTableWrites
           reached.crashes += stats.crashes
           reached.interleaved += stats.interleaved
+          reached.rebuildInstalls += stats.rebuildInstalls
         }
         // The schedule must actually reach the hard paths, or the sweep proves nothing.
         if (only === 0) {

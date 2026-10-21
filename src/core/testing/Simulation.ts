@@ -99,6 +99,10 @@ export interface Stats {
   readonly interleaved: number
   /** Pending mutations released by an expired ledger row rather than an ack. */
   readonly expired: number
+  /** Schema rebuilds (replica emptied, cursor nulled, pending undo emptied). */
+  readonly rebuilds: number
+  /** Null-cursor installs after a rebuild that had pending entries to replay. */
+  readonly rebuildInstalls: number
 }
 
 /** mulberry32: small, fast, good enough for schedules. */
@@ -206,7 +210,9 @@ export const run = (options: Options) =>
       backstopReleases: 0,
       unknownTableWrites: 0,
       crashes: 0,
-      interleaved: 0
+      interleaved: 0,
+      rebuilds: 0,
+      rebuildInstalls: 0
     }
     const committed: Array<MutationEnvelope> = []
     const ids: Array<string> = []
@@ -283,6 +289,11 @@ export const run = (options: Options) =>
           transport,
           online: true,
           skew: 0,
+          /**
+           * Set by a schema rebuild to the last seq allocated before it: those entries' optimistic
+           * effects are invisible until the null-cursor set installs (DESIGN §9).
+           */
+          rebuiltThrough: Option.none<{ readonly seq: number; readonly pending: number }>(),
           engine: yield* Engine.make({
             clientId,
             actor: principal,
@@ -349,7 +360,9 @@ export const run = (options: Options) =>
         const snapshot = cursor === null ? new Map() : server.history.get(cursor)
         if (snapshot === undefined) return yield* violated("cursor names a server commit", `${cursor}`)
         const store = MemoryStore.make(yield* view(snapshot, client.principal))
+        const hiddenThrough = Option.match(client.rebuiltThrough, { onNone: () => 0, onSome: (r) => r.seq })
         for (const entry of client.disk.outbox) {
+          if (entry.envelope.seq <= hiddenThrough) continue
           const result = yield* Effect.orDie(
             Engine.runHandler(store, mutations, client.principal, entry.envelope, entry.createdAt)
           )
@@ -360,6 +373,11 @@ export const run = (options: Options) =>
 
     const checkClient = (client: Client) =>
       Effect.gen(function* () {
+        // The null-cursor set installed: from here every pending entry must be replayed again.
+        if (Option.isSome(client.rebuiltThrough) && client.disk.meta.cursor !== null) {
+          if (client.rebuiltThrough.value.pending > 0) stats.rebuildInstalls++
+          client.rebuiltThrough = Option.none()
+        }
         const expected = yield* expectedReplica(client)
         const actual = canonical(client.disk.replica.tables())
         if (actual !== expected) {
@@ -631,6 +649,24 @@ export const run = (options: Options) =>
         yield* reload(client)
       })
 
+    /**
+     * A new app version with a different `dataHash` (DESIGN §9, browser `migrate`): the replica is
+     * emptied, the cursor nulled and pending undo emptied; outbox and push watermark are kept.
+     * The next install must restore nothing and replay every unsettled pending entry.
+     */
+    const rebuildStep = (client: Client) =>
+      Effect.gen(function* () {
+        const { disk } = client
+        note(`${client.clientId}: schema rebuild (${disk.outbox.length} pending)`)
+        stats.rebuilds++
+        disk.replica.replace(new Map())
+        disk.meta = { ...disk.meta, cursor: null, resnapshot: false }
+        disk.staged = []
+        disk.outbox = disk.outbox.map((entry) => ({ ...entry, undo: [] }))
+        client.rebuiltThrough = Option.some({ seq: disk.lastSeq, pending: disk.outbox.length })
+        yield* reload(client)
+      })
+
     const clientStep = (client: Client) =>
       Effect.gen(function* () {
         const roll = rng.int(100)
@@ -648,10 +684,11 @@ export const run = (options: Options) =>
           note(`${client.clientId}: reload (${client.disk.staged.length} staged)`)
           return yield* reload(client)
         }
-        if (roll < 97) {
+        if (roll < 95) {
           client.online = !client.online
           return note(`${client.clientId}: ${client.online ? "online" : "offline"}`)
         }
+        if (roll < 97) return yield* rebuildStep(client)
         client.skew = rng.int(2) === 0 ? 0 : (rng.int(2) === 0 ? -1 : 1) * rng.int(3_600_000)
         note(`${client.clientId}: clock skew ${client.skew}ms`)
       })
