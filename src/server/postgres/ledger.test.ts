@@ -2,7 +2,8 @@ import { assert, describe, it } from "@effect/vitest"
 import { Cause, Effect, Exit, Schedule } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { SqlError, UnknownError } from "effect/sql/SqlError"
-import { MutationRejected, runBatch, runMutation } from "./ledger.ts"
+import { Ids, Mutation } from "echo-sync"
+import { runBatch, runMutation } from "./ledger.ts"
 import { pgAvailable, Replica, TestDatabase } from "./test-support.ts"
 
 const fastRetry = { conflictRetry: Schedule.recurs(2) }
@@ -43,16 +44,16 @@ const diedWithBug = (exit: Exit.Exit<unknown, unknown>) =>
   exit.cause.reasons.some((r) => Cause.isDieReason(r) && r.defect === programmerBug) &&
   !exit.cause.reasons.some(Cause.isFailReason)
 
-const rejection = new MutationRejected({ reason: "domain", message: "no" })
+const rejection = new Mutation.DomainError({ mutation: "test", error: "no" })
 
 /** Fails with a real SQLSTATE 40001 plus `other` in one compound cause. */
-const conflictAnd = (other: Cause.Reason<MutationRejected>) =>
+const conflictAnd = (other: Cause.Reason<Mutation.DomainError>) =>
   Effect.flatMap(Effect.orDie(Effect.flip(serializationFailure)), (conflict) =>
-    Effect.failCause(Cause.fromReasons<SqlError | MutationRejected>([Cause.makeFailReason(conflict), other]))
+    Effect.failCause(Cause.fromReasons<SqlError | Mutation.DomainError>([Cause.makeFailReason(conflict), other]))
   )
 
 const env = (mutationId: string, seq: bigint) => ({ principalId: "p", clientId: "c1", mutationId, seq })
-const reject = (message: string) => Effect.fail(new MutationRejected({ reason: "domain", message }))
+const reject = (message: string) => Effect.fail(new Mutation.DomainError({ mutation: "test", error: message }))
 
 describe.skipIf(!pgAvailable)("mutation ledger (§6)", () => {
   it.live("a resubmitted envelope (lost response) returns the recorded outcome and position without re-executing", () =>
@@ -86,9 +87,12 @@ describe.skipIf(!pgAvailable)("mutation ledger (§6)", () => {
     Effect.gen(function* () {
       const rejected = yield* runMutation(
         env("m", 1n),
-        Effect.andThen(appendEffect("x"), Effect.fail(new MutationRejected({ reason: "forbidden", message: "nope" })))
+        Effect.andThen(appendEffect("x"), Effect.fail(new Mutation.DomainError({ mutation: "test", error: "nope" })))
       )
-      assert.deepStrictEqual(rejected.outcome, { _tag: "Rejected", reason: "forbidden", message: "nope" })
+      assert.deepStrictEqual(rejected.outcome, {
+        _tag: "Rejected",
+        error: new Mutation.DomainError({ mutation: "test", error: "nope" })
+      })
       assert.strictEqual(yield* counterBody, "")
       // Recorded: a retry returns the same rejection without running the (now succeeding) body.
       assert.deepStrictEqual(yield* runMutation(env("m", 1n), appendEffect("y")), rejected)
@@ -206,7 +210,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (§6)", () => {
       yield* sql`UPDATE echo_sync.clients SET expired_through = 2, expired_position = 41 WHERE client_id = 'c1'`
       const expired = yield* runMutation(env("m2", 2n), appendEffect("x"))
       assert.deepStrictEqual(expired, {
-        outcome: { _tag: "Rejected", reason: "clientExpired", message: "ledger expired for this seq" },
+        outcome: { _tag: "Rejected", error: new Mutation.ClientExpired({ mutationId: Ids.MutationId.make("m2") }) },
         position: 41n
       })
       assert.strictEqual(yield* counterBody, "")
@@ -216,7 +220,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (§6)", () => {
 
       const replica = new Replica("p", "c1")
       const done = yield* replica.pullOnce(100)
-      assert.deepStrictEqual(done._tag === "PullDone" && done.expiredThrough, 2n)
+      assert.deepStrictEqual(done._tag === "PullDone" && done.expiredThrough, Ids.SeqFloor.make(2))
     }).pipe(Effect.provide(TestDatabase))
   )
 

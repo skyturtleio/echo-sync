@@ -1,8 +1,28 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Deferred, Effect, Exit, Fiber } from "effect"
+import { Deferred, Effect, Exit, Fiber, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
+import { AccessScope, Registry, SyncTable } from "echo-sync"
 import { attach, syncedTables } from "./schema.ts"
-import { grant, pgAvailable, Replica, serverView, TestDatabase } from "./test-support.ts"
+import {
+  bareTable,
+  grant,
+  Items,
+  Notes,
+  pgAvailable,
+  Replica,
+  RowId,
+  serverView,
+  TestDatabase
+} from "./test-support.ts"
+
+const Parents = bareTable("parents")
+const Children = SyncTable.make("children", {
+  id: RowId,
+  accessScopeId: AccessScope.AccessScopeId,
+  parentId: Schema.String
+})
+const Dup = bareTable("dup")
+const Half = bareTable("half")
 
 describe.skipIf(!pgAvailable)("change capture (§7)", () => {
   it.live("TRUNCATE on a synced table fails instead of silently bypassing the log", () =>
@@ -28,16 +48,18 @@ describe.skipIf(!pgAvailable)("change capture (§7)", () => {
       yield* sql`CREATE TABLE children (
         id text PRIMARY KEY, access_scope_id text NOT NULL,
         parent_id text NOT NULL REFERENCES parents (id) ON DELETE CASCADE)`
-      yield* attach("parents")
-      yield* attach("children")
+      yield* attach(Parents)
+      yield* attach(Children)
+      const tables = Registry.make([Items, Notes, Parents, Children])
       yield* sql`INSERT INTO parents VALUES ('p1', 's1')`
       yield* sql`INSERT INTO children VALUES ('c1', 's1', 'p1'), ('c2', 's1', 'p1')`
-      const replica = new Replica("p", "d")
+      const replica = new Replica("p", "d", tables)
       yield* replica.sync()
+      assert.isTrue(replica.rows.has("children/c1") && replica.rows.has("children/c2"))
       yield* sql`DELETE FROM parents WHERE id = 'p1'`
       yield* replica.sync()
       assert.isFalse(replica.rows.has("children/c1") || replica.rows.has("children/c2"))
-      assert.deepStrictEqual(replica.view(), yield* serverView("p"))
+      assert.deepStrictEqual(replica.view(), yield* serverView("p", tables))
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -46,7 +68,7 @@ describe.skipIf(!pgAvailable)("change capture (§7)", () => {
       const sql = yield* SqlClient
       yield* sql`CREATE SCHEMA other`
       yield* sql`CREATE TABLE other.items (id text PRIMARY KEY, access_scope_id text NOT NULL)`
-      const failure = yield* Effect.flip(attach("other.items"))
+      const failure = yield* Effect.flip(attach(Items, { schema: "other" }))
       assert.strictEqual(failure._tag, "TableNameConflict")
     }).pipe(Effect.provide(TestDatabase))
   )
@@ -70,7 +92,7 @@ describe.skipIf(!pgAvailable)("change capture (§7)", () => {
         END $$`
       yield* sql`CREATE EVENT TRIGGER slow_capture_ddl ON ddl_command_end
                  WHEN TAG IN ('CREATE TRIGGER') EXECUTE FUNCTION slow_capture_ddl()`
-      const results = yield* Effect.forEach(["a.dup", "b.dup"], (table) => Effect.result(attach(table)), {
+      const results = yield* Effect.forEach(["a", "b"], (schema) => Effect.result(attach(Dup, { schema })), {
         concurrency: "unbounded"
       })
       assert.deepStrictEqual(results.filter((r) => r._tag === "Success").length, 1)
@@ -94,7 +116,7 @@ describe.skipIf(!pgAvailable)("change capture (§7)", () => {
         END $$`
       yield* sql`CREATE EVENT TRIGGER fail_truncate_guard ON ddl_command_end
                  WHEN TAG IN ('CREATE TRIGGER') EXECUTE FUNCTION fail_truncate_guard()`
-      const failure = yield* Effect.flip(attach("half"))
+      const failure = yield* Effect.flip(attach(Half))
       assert.strictEqual(failure._tag, "SqlError")
       const triggers = yield* sql<{ tgname: string }>`SELECT tgname FROM pg_trigger WHERE tgrelid = 'half'::regclass`
       assert.deepStrictEqual(triggers, [])
@@ -122,13 +144,13 @@ describe.skipIf(!pgAvailable)("change capture (§7)", () => {
                 yield* sql`SELECT 1`
                 yield* Deferred.succeed(snapshotTaken, undefined)
                 yield* Deferred.await(otherAttached)
-                yield* attach("b.dup")
+                yield* attach(Dup, { schema: "b" })
               })
             )
           )
         )
         yield* Deferred.await(snapshotTaken)
-        yield* attach("a.dup")
+        yield* attach(Dup, { schema: "a" })
         yield* Deferred.succeed(otherAttached, undefined)
         const exit = yield* Fiber.join(t2)
         assert.isTrue(Exit.hasDies(exit))

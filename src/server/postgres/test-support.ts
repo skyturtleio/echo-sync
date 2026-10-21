@@ -1,10 +1,31 @@
-import { Effect, Layer, Option, Redacted } from "effect"
+import { Effect, Layer, Option, Redacted, Schema } from "effect"
 import * as PgClient from "@effect/sql-pg/PgClient"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
+import { AccessScope, type Protocol, Registry, ScopeGrants, SyncTable } from "echo-sync"
 import type { ClientForbidden } from "./ledger.ts"
-import { type Change, pull, type PullResponse, type ResnapshotRequired } from "./pull.ts"
-import { attach, migrate, syncedTables } from "./schema.ts"
+import { pull } from "./pull.ts"
+import { decodeRow, q, selectList } from "./rowStore.ts"
+import { attach, migrate, resolveTables } from "./schema.ts"
+
+export const RowId = Schema.String.pipe(Schema.brand("test/RowId"))
+const fields = { id: RowId, accessScopeId: AccessScope.AccessScopeId, body: Schema.String }
+export const Items = SyncTable.make("items", fields)
+export const Notes = SyncTable.make("notes", fields)
+/** The app's tables in the tests (scope_grants is added by `Registry.make`). */
+export const registry = Registry.make([Items, Notes])
+
+/** A SyncTable with only the required columns, for tables a test creates itself. */
+export const bareTable = (name: string) => SyncTable.make(name, { id: RowId, accessScopeId: AccessScope.AccessScopeId })
+
+/** Creates a synced table from its SyncTable DDL, as an app migration would, and attaches it. */
+export const createSynced = (table: SyncTable.AnySyncTable) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient
+    yield* sql.unsafe(table.postgres.createTable)
+    for (const ddl of table.postgres.createIndexes) yield* sql.unsafe(ddl)
+    yield* attach(table)
+  })
 
 /**
  * Postgres tests run only when `ECHO_PG_URL` is set (see docs/server-substrate.md), so
@@ -35,13 +56,10 @@ export const TestDatabase = Layer.unwrap(
       Effect.gen(function* () {
         const sql = yield* SqlClient
         yield* migrate
-        for (const table of ["items", "notes"]) {
-          yield* sql`CREATE TABLE ${sql(table)} (
-            id text PRIMARY KEY,
-            access_scope_id text NOT NULL,
-            body text NOT NULL DEFAULT ''
-          )`
-          yield* attach(table)
+        for (const table of [Items, Notes]) {
+          yield* createSynced(table)
+          // Lets tests write raw SQL without naming every column; not part of the SyncTable.
+          yield* sql`ALTER TABLE ${sql(table.name)} ALTER COLUMN body SET DEFAULT ''`
         }
       })
     )
@@ -55,8 +73,9 @@ export const grant = (principalId: string, ...scopeIds: ReadonlyArray<string>) =
     const sql = yield* SqlClient
     for (const scopeId of scopeIds) {
       yield* sql`INSERT INTO echo_sync.access_scopes (id) VALUES (${scopeId}) ON CONFLICT DO NOTHING`
-      yield* sql`INSERT INTO echo_sync.scope_grants (id, access_scope_id, principal_id, role)
-                 VALUES (${`${scopeId}:${principalId}`}, ${scopeId}, ${principalId}, 'reader')
+      const id = ScopeGrants.grantId(AccessScope.AccessScopeId.make(scopeId), AccessScope.PrincipalId.make(principalId))
+      yield* sql`INSERT INTO echo_sync.scope_grants (id, access_scope_id, principal_id, role, granted_at)
+                 VALUES (${id}, ${scopeId}, ${principalId}, 'reader', now())
                  ON CONFLICT DO NOTHING`
     }
   })
@@ -72,21 +91,26 @@ export const revoke = (principalId: string, scopeId: string) =>
  * set, acks included, only at `PullDone`.
  */
 export class Replica {
-  readonly rows = new Map<string, { readonly scopeId: string; readonly row: unknown }>()
+  readonly rows = new Map<string, SyncTable.EncodedRow>()
   readonly acked = new Set<string>()
   cursor: bigint | null = null
   continuation: Option.Option<string> = Option.none()
   /** Every change ever received, for leak checks. */
-  readonly received: Array<Change> = []
-  private staged: Array<Change> = []
+  readonly received: Array<Protocol.Change> = []
+  private staged: Array<Protocol.Change> = []
   private stagedAcks: Array<string> = []
+  readonly principalId: string
+  readonly clientId: string
 
-  constructor(
-    readonly principalId: string,
-    readonly clientId: string
-  ) {}
+  readonly registry: Registry.SyncRegistry
 
-  private stage(response: PullResponse) {
+  constructor(principalId: string, clientId: string, tables: Registry.SyncRegistry = registry) {
+    this.principalId = principalId
+    this.clientId = clientId
+    this.registry = tables
+  }
+
+  private stage(response: Protocol.PullResponse) {
     this.received.push(...response.changes)
     this.staged.push(...response.changes)
     this.stagedAcks.push(...response.acks.map((a) => a.mutationId))
@@ -97,9 +121,9 @@ export class Replica {
     // A set started from cursor null replaces the replica (§8): nothing older survives.
     if (this.cursor === null) this.rows.clear()
     for (const change of this.staged) {
-      if (change._tag === "Upsert") this.rows.set(`${change.table}/${change.rowId}`, change)
-      else if (change._tag === "Delete") this.rows.delete(`${change.table}/${change.rowId}`)
-      else for (const [key, row] of this.rows) if (row.scopeId === change.scopeId) this.rows.delete(key)
+      if (change._tag === "upsert") this.rows.set(`${change.table}/${String(change.row["id"])}`, change.row)
+      else if (change._tag === "tombstone") this.rows.delete(`${change.table}/${change.id}`)
+      else for (const [key, row] of this.rows) if (row["access_scope_id"] === change.scopeId) this.rows.delete(key)
     }
     for (const id of this.stagedAcks) this.acked.add(id)
     this.staged = []
@@ -111,7 +135,7 @@ export class Replica {
   /** One pull request, staged (and applied if it completes the set). */
   pullOnce(limit: number) {
     return Effect.map(
-      pull({
+      pull(this.registry, {
         principalId: this.principalId,
         clientId: this.clientId,
         cursor: this.cursor,
@@ -137,7 +161,7 @@ export class Replica {
   sync(limit = 1000) {
     const loop = (
       remaining: number
-    ): Effect.Effect<void, ResnapshotRequired | ClientForbidden | SqlError, SqlClient> =>
+    ): Effect.Effect<void, Protocol.ResnapshotRequired | ClientForbidden | SqlError, SqlClient> =>
       remaining === 0
         ? Effect.die(`pull did not reach PullDone from cursor ${String(this.cursor)}`)
         : Effect.flatMap(this.pullOnce(limit), (response) =>
@@ -148,21 +172,26 @@ export class Replica {
 
   /** Applied replica contents in a comparable form: `table/id` → row JSON. */
   view() {
-    return new Map([...this.rows].map(([key, value]) => [key, JSON.stringify(value.row)]))
+    return new Map([...this.rows].map(([key, row]) => [key, JSON.stringify(row)]))
   }
 }
 
 /** What the principal should hold right now: every synced row (grants included) in a readable scope. */
-export const serverView = (principalId: string) =>
+export const serverView = (principalId: string, tables: Registry.SyncRegistry = registry) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient
     const view = new Map<string, string>()
-    for (const table of yield* syncedTables) {
-      const rows = yield* sql<{ id: string; row: unknown }>`
-        SELECT t.id, to_jsonb(t) AS row FROM ${sql(table.schema)}.${sql(table.name)} t
-        WHERE t.access_scope_id IN (
-          SELECT access_scope_id FROM echo_sync.scope_grants WHERE principal_id IN (${principalId}, '*'))`
-      for (const row of rows) view.set(`${table.name}/${row.id}`, JSON.stringify(row.row))
+    for (const { table, schema } of yield* resolveTables(tables)) {
+      const rows = yield* sql.unsafe<Record<string, unknown>>(
+        `SELECT ${selectList(table, "t")} FROM ${q(schema)}.${q(table.name)} t
+         WHERE t.access_scope_id IN (
+           SELECT access_scope_id FROM echo_sync.scope_grants WHERE principal_id IN ($1, '*'))`,
+        [principalId]
+      )
+      for (const raw of rows) {
+        const row = yield* decodeRow(table, raw)
+        view.set(`${table.name}/${String(row["id"])}`, JSON.stringify(row))
+      }
     }
     return view
   })

@@ -1,7 +1,25 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Fiber, Random, Ref } from "effect"
+import { Effect, Fiber, Random, Ref, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
-import { grant, pgAvailable, Replica, revoke, serverView, TestDatabase } from "./test-support.ts"
+import { AccessScope, Registry, SyncTable } from "echo-sync"
+import {
+  createSynced,
+  grant,
+  Items,
+  Notes,
+  pgAvailable,
+  Replica,
+  revoke,
+  RowId,
+  serverView,
+  TestDatabase
+} from "./test-support.ts"
+
+const Events = SyncTable.make("events", {
+  id: RowId,
+  accessScopeId: AccessScope.AccessScopeId,
+  at: Schema.DateTimeUtc
+})
 
 const insert = (table: string, id: string, scope: string, body = "") =>
   Effect.gen(function* () {
@@ -36,9 +54,9 @@ describe.skipIf(!pgAvailable)("scope delivery (§4, §8)", () => {
       yield* newReader.sync()
       assert.isFalse(oldReader.rows.has("items/a"))
       assert.deepStrictEqual(newReader.view(), yield* serverView("new"))
-      assert.strictEqual(newReader.rows.get("items/a")?.scopeId, "s2")
+      assert.strictEqual(newReader.rows.get("items/a")?.["access_scope_id"], "s2")
       // The old-scope reader received the move as a tombstone, never the new payload.
-      assert.isFalse(oldReader.received.some((c) => c._tag === "Upsert" && c.scopeId === "s2"))
+      assert.isFalse(oldReader.received.some((c) => c._tag === "upsert" && c.row["access_scope_id"] === "s2"))
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -59,10 +77,10 @@ describe.skipIf(!pgAvailable)("scope delivery (§4, §8)", () => {
       yield* replica.sync()
       const after = replica.received.slice(before)
       assert.deepStrictEqual(
-        after.filter((c) => c._tag === "ScopePurged"),
-        [{ _tag: "ScopePurged", scopeId: "s1" }]
+        after.filter((c) => c._tag === "scopePurged"),
+        [{ _tag: "scopePurged", scopeId: "s1" }]
       )
-      assert.isFalse(after.some((c) => c._tag === "Upsert" && c.scopeId === "s1"))
+      assert.isFalse(after.some((c) => c._tag === "upsert" && c.row["access_scope_id"] === "s1"))
       assert.deepStrictEqual(replica.view(), yield* serverView("p"))
     }).pipe(Effect.provide(TestDatabase))
   )
@@ -77,7 +95,7 @@ describe.skipIf(!pgAvailable)("scope delivery (§4, §8)", () => {
         for (let i = 0; i < 30; i++) yield* insert(i % 2 === 0 ? "items" : "notes", `pre${i}`, "shared", "v0")
         const replica = new Replica("p", "d")
         yield* replica.sync()
-        assert.isFalse([...replica.rows.values()].some((r) => r.scopeId === "shared"))
+        assert.isFalse([...replica.rows.values()].some((r) => r["access_scope_id"] === "shared"))
 
         yield* grant("p", "shared")
         // Writers keep changing the shared scope (updates, deletes, inserts, moves out) while the
@@ -144,7 +162,10 @@ describe.skipIf(!pgAvailable)("scope delivery (§4, §8)", () => {
             const readable = yield* readableScopes(replica.principalId)
             const response = yield* replica.pullOnce(yield* Random.nextIntBetween(1, 5))
             for (const change of response.changes) {
-              if (change._tag === "Upsert") assert.isTrue(readable.has(change.scopeId), `leaked ${change.scopeId}`)
+              if (change._tag === "upsert") {
+                const rowScope = String(change.row["access_scope_id"])
+                assert.isTrue(readable.has(rowScope), `leaked ${rowScope}`)
+              }
             }
           }
         }
@@ -154,5 +175,36 @@ describe.skipIf(!pgAvailable)("scope delivery (§4, §8)", () => {
         }
       }).pipe(Random.withSeed("echo-sync-scopes"), Effect.provide(TestDatabase)),
     60_000
+  )
+
+  it.live(
+    "pulled rows are the wire form: epoch-ms timestamps, and no column the SyncTable does not declare (§11)",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient
+        yield* createSynced(Events)
+        // A column the app added to the relation but not to the SyncTable: must never leave the database.
+        yield* sql`ALTER TABLE events ADD COLUMN secret text NOT NULL DEFAULT 'do not ship'`
+        const tables = Registry.make([Items, Notes, Events])
+        yield* grant("p", "s1")
+        const at = Date.UTC(2026, 9, 21, 6, 30, 15, 123)
+        yield* sql`INSERT INTO events (id, access_scope_id, at) VALUES ('walked', 's1', ${new Date(at)})`
+        const replica = new Replica("p", "d", tables)
+        yield* replica.sync()
+        // After the initial walk, a change arrives through the log path.
+        yield* sql`INSERT INTO events (id, access_scope_id, at) VALUES ('logged', 's1', ${new Date(at + 1)})`
+        yield* replica.sync()
+
+        const decode = Schema.decodeUnknownSync(Events.wire)
+        for (const [id, ms] of [
+          ["walked", at],
+          ["logged", at + 1]
+        ] as const) {
+          const row = replica.rows.get(`events/${id}`)
+          assert.deepStrictEqual(row, { id, access_scope_id: "s1", at: ms })
+          assert.strictEqual(decode(row).at.epochMilliseconds, ms)
+        }
+        assert.isFalse(JSON.stringify(replica.received).includes("do not ship"))
+      }).pipe(Effect.provide(TestDatabase))
   )
 })

@@ -1,7 +1,9 @@
-import { Array as Arr, Effect, Option, Order, Schema } from "effect"
+import { Array as Arr, Effect, Option, type Order, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
-import { MutationOutcome, registerClient } from "./ledger.ts"
-import { type SyncedTable, syncedTables } from "./schema.ts"
+import { AccessScope, Ids, Mutation, Protocol, type Registry, type SyncTable } from "echo-sync"
+import { registerClient } from "./ledger.ts"
+import { decodeRow, q, selectList } from "./rowStore.ts"
+import { type Resolved, resolveTables } from "./schema.ts"
 
 /** Keyset position of a scope row walk: rows are walked in `(table, id)` code-point order. */
 const RowKey = Schema.Struct({ table: Schema.String, rowId: Schema.String })
@@ -35,55 +37,8 @@ const ContinuationJson = Schema.fromJsonString(Continuation)
 const encodeContinuation = Schema.encodeSync(ContinuationJson)
 const decodeContinuation = Schema.decodeUnknownEffect(ContinuationJson)
 
-export type Change =
-  | {
-      readonly _tag: "Upsert"
-      readonly table: string
-      readonly rowId: string
-      readonly scopeId: string
-      /** Current row as JSON (`to_jsonb`), snake_case columns, as of this page's snapshot. */
-      readonly row: unknown
-    }
-  | { readonly _tag: "Delete"; readonly table: string; readonly rowId: string }
-  | { readonly _tag: "ScopePurged"; readonly scopeId: string }
-
-export interface Ack {
-  readonly mutationId: string
-  readonly outcome: MutationOutcome
-}
-
-/** Stage `changes` (in order) and `acks`; the set is consistent only at `PullDone`. */
-export type PullResponse =
-  | {
-      readonly _tag: "PullPage"
-      readonly changes: ReadonlyArray<Change>
-      readonly acks: ReadonlyArray<Ack>
-      /** Opaque; send back verbatim with the same cursor. */
-      readonly continuation: string
-    }
-  | {
-      readonly _tag: "PullDone"
-      readonly changes: ReadonlyArray<Change>
-      readonly acks: ReadonlyArray<Ack>
-      readonly nextCursor: bigint
-      /** The client's ledger-expiry floor (§16.5), as of this page's snapshot. */
-      readonly expiredThrough: bigint
-    }
-
-/** The client must discard staged pages and pull from a `null` cursor. */
-export class ResnapshotRequired extends Schema.TaggedError<ResnapshotRequired>()("ResnapshotRequired", {
-  reason: Schema.Literals([
-    /** Log GC passed the cursor or continuation. */
-    "gcHorizon",
-    /** The server has no record of the scopes held at this cursor. */
-    "unknownCursor",
-    /** The continuation belongs to another client, principal, or cursor. */
-    "staleContinuation"
-  ])
-}) {}
-
+/** The server-side request: the principal is authenticated by the app, never taken from the wire. */
 export interface PullRequest {
-  /** Authenticated by the app (`principalFor`), never taken from the wire. */
   readonly principalId: string
   readonly clientId: string
   readonly cursor: bigint | null
@@ -92,7 +47,7 @@ export interface PullRequest {
   readonly limit: number
 }
 
-const decodeOutcome = Schema.decodeUnknownEffect(MutationOutcome)
+const decodeOutcome = Schema.decodeUnknownEffect(Schema.toCodecJson(Mutation.MutationOutcome))
 
 interface LogEntry {
   readonly position: bigint
@@ -101,11 +56,23 @@ interface LogEntry {
   readonly op: "upsert" | "delete"
 }
 
-interface RowPayload {
-  readonly row_id: string
-  readonly access_scope_id: string
-  readonly row: unknown
+/** A current row as the wire row (declared columns only, decoded through `table.postgres.row`). */
+interface Payload {
+  readonly id: string
+  readonly scopeId: string
+  readonly row: SyncTable.EncodedRow
 }
+
+const payloadOf = Effect.fnUntraced(function* (table: SyncTable.AnySyncTable, raw: unknown) {
+  const row = yield* decodeRow(table, raw)
+  const id = row["id"]
+  const scopeId = row["access_scope_id"]
+  if (typeof id !== "string" || typeof scopeId !== "string") {
+    return yield* Effect.die(`${table.name}: decoded row lacks a string id or access_scope_id`)
+  }
+  const payload: Payload = { id, scopeId, row }
+  return payload
+})
 
 /**
  * Pull one page (DESIGN.md §8) in its own `REPEATABLE READ` snapshot:
@@ -120,10 +87,10 @@ interface RowPayload {
  * At `PullDone` the held set is recorded under `nextCursor`, so the next page set starts from it.
  * See docs/server-substrate.md.
  */
-export const pull = Effect.fnUntraced(function* (request: PullRequest) {
+export const pull = Effect.fnUntraced(function* (registry: Registry.SyncRegistry, request: PullRequest) {
   const sql = yield* SqlClient
   yield* registerClient(request.principalId, request.clientId)
-  const stale = new ResnapshotRequired({ reason: "staleContinuation" })
+  const stale = new Protocol.ResnapshotRequired({ reason: "staleContinuation" })
   const resumed: Continuation | undefined = Option.isSome(request.continuation)
     ? yield* decodeContinuation(request.continuation.value).pipe(Effect.mapError(() => stale))
     : undefined
@@ -161,7 +128,7 @@ export const pull = Effect.fnUntraced(function* (request: PullRequest) {
       }
       const base = resumed?.position ?? request.cursor
       if (base !== null && base < state.gc_horizon) {
-        return yield* new ResnapshotRequired({ reason: "gcHorizon" })
+        return yield* new Protocol.ResnapshotRequired({ reason: "gcHorizon" })
       }
 
       // The originating cursor must be one the server completed a set at, resumed or not.
@@ -171,7 +138,7 @@ export const pull = Effect.fnUntraced(function* (request: PullRequest) {
           SELECT scope_ids FROM echo_sync.client_scopes
           WHERE client_id = ${request.clientId} AND position = ${request.cursor}`
         const row = recorded[0]
-        if (row === undefined) return yield* new ResnapshotRequired({ reason: "unknownCursor" })
+        if (row === undefined) return yield* new Protocol.ResnapshotRequired({ reason: "unknownCursor" })
         held = row.scope_ids
       }
       // What the client holds at the start of this page.
@@ -186,22 +153,19 @@ export const pull = Effect.fnUntraced(function* (request: PullRequest) {
           SELECT DISTINCT access_scope_id FROM echo_sync.scope_grants
           WHERE principal_id IN (${request.principalId}, '*')`).map((r) => r.access_scope_id)
       )
-      const tables = Arr.sort(
-        yield* syncedTables,
-        Order.mapInput(compare, (t: SyncedTable) => t.name)
-      )
+      const tables = yield* resolveTables(registry)
       const position = base ?? state.head
-      const changes: Array<Change> = []
+      const changes: Array<Protocol.Change> = []
 
       // 1 + 2. Membership diff.
       const scopes: Array<string> = []
       for (const scopeId of held) {
         if (readable.has(scopeId)) scopes.push(scopeId)
-        else changes.push({ _tag: "ScopePurged", scopeId })
+        else changes.push(purged(scopeId))
       }
       walking = walking.filter((walk) => {
         if (readable.has(walk.scopeId)) return true
-        changes.push({ _tag: "ScopePurged", scopeId: walk.scopeId })
+        changes.push(purged(walk.scopeId))
         return false
       })
       const known = new Set([...scopes, ...walking.map((w) => w.scopeId)])
@@ -242,16 +206,10 @@ export const pull = Effect.fnUntraced(function* (request: PullRequest) {
         for (const entry of entries) {
           const current = entry.op === "upsert" ? payloads.get(payloadKey(entry.table_name, entry.row_id)) : undefined
           changes.push(
-            current !== undefined && readable.has(current.access_scope_id)
-              ? {
-                  _tag: "Upsert",
-                  table: entry.table_name,
-                  rowId: entry.row_id,
-                  scopeId: current.access_scope_id,
-                  row: current.row
-                }
+            current !== undefined && readable.has(current.scopeId)
+              ? { _tag: "upsert", table: entry.table_name, row: current.row }
               : // Deleted, or its current scope is not readable: never leak a payload.
-                { _tag: "Delete", table: entry.table_name, rowId: entry.row_id }
+                { _tag: "tombstone", table: entry.table_name, id: entry.row_id }
           )
         }
       }
@@ -259,29 +217,41 @@ export const pull = Effect.fnUntraced(function* (request: PullRequest) {
       // Acks: ledger rows in (cursor, nextCursor] across the set, each page covering the log
       // range it advanced. An initial sync covers every committed mutation of this client.
       const ackFloor = resumed?.position ?? request.cursor ?? -1n
-      const ackRows = yield* sql<{ mutation_id: string; outcome: unknown }>`
-        SELECT mutation_id, outcome FROM echo_sync.mutations
+      const ackRows = yield* sql<{ mutation_id: string; position: bigint; outcome: unknown }>`
+        SELECT mutation_id, position, outcome FROM echo_sync.mutations
         WHERE client_id = ${request.clientId} AND position > ${ackFloor} AND position <= ${nextPosition}
         ORDER BY position`
-      const acks: Array<Ack> = []
+      const acks: Array<Protocol.Ack> = []
       for (const row of ackRows) {
-        acks.push({ mutationId: row.mutation_id, outcome: yield* Effect.orDie(decodeOutcome(row.outcome)) })
+        acks.push({
+          mutationId: Ids.MutationId.make(row.mutation_id),
+          position: Ids.Position.make(row.position),
+          outcome: yield* Effect.orDie(decodeOutcome(row.outcome))
+        })
       }
 
-      const result: PullResponse = logDone
-        ? { _tag: "PullDone", changes, acks, nextCursor: nextPosition, expiredThrough: state.expired_through }
+      const result: Protocol.PullResponse = logDone
+        ? {
+            _tag: "PullDone",
+            changes,
+            acks,
+            nextCursor: Ids.Position.make(nextPosition),
+            expiredThrough: Ids.SeqFloor.make(Number(state.expired_through))
+          }
         : {
             _tag: "PullPage",
             changes,
             acks,
-            continuation: encodeContinuation({
-              clientId: request.clientId,
-              principalId: request.principalId,
-              cursor: request.cursor,
-              position: nextPosition,
-              scopes,
-              walking
-            })
+            continuation: Protocol.PullContinuation.make(
+              encodeContinuation({
+                clientId: request.clientId,
+                principalId: request.principalId,
+                cursor: request.cursor,
+                position: nextPosition,
+                scopes,
+                walking
+              })
+            )
           }
       // At PullDone the delivered set is the readable set of this snapshot (every readable scope
       // was kept or walked, every other purged). Record that directly, not what the request claimed.
@@ -309,53 +279,60 @@ export const pull = Effect.fnUntraced(function* (request: PullRequest) {
 /** Code-point order, matching `COLLATE "C"` (DESIGN.md §10). Table names are ASCII identifiers. */
 const compare: Order.Order<string> = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
 const payloadKey = (table: string, rowId: string) => `${table}\u0000${rowId}`
+const purged = (scopeId: string): Protocol.Change => ({
+  _tag: "scopePurged",
+  scopeId: AccessScope.AccessScopeId.make(scopeId)
+})
 
-const fetchPayloads = Effect.fnUntraced(function* (
-  tables: ReadonlyArray<SyncedTable>,
-  entries: ReadonlyArray<LogEntry>
-) {
+const fetchPayloads = Effect.fnUntraced(function* (tables: ReadonlyArray<Resolved>, entries: ReadonlyArray<LogEntry>) {
   const sql = yield* SqlClient
-  const payloads = new Map<string, RowPayload>()
-  for (const table of tables) {
+  const payloads = new Map<string, Payload>()
+  for (const { table, schema } of tables) {
     const ids = [
       ...new Set(entries.filter((e) => e.op === "upsert" && e.table_name === table.name).map((e) => e.row_id))
     ]
     if (ids.length === 0) continue
-    const rows = yield* sql<RowPayload>`
-      SELECT t.id::text AS row_id, t.access_scope_id, to_jsonb(t) AS row
-      FROM ${sql(table.schema)}.${sql(table.name)} t
-      WHERE t.id::text = ANY(${ids}::text[])`
-    for (const row of rows) payloads.set(payloadKey(table.name, row.row_id), row)
+    // Declared columns only (DESIGN §11): an undeclared column never leaves the database.
+    const rows = yield* sql.unsafe<Record<string, unknown>>(
+      `SELECT ${selectList(table, "t")} FROM ${q(schema)}.${q(table.name)} t WHERE t.id::text = ANY($1::text[])`,
+      [ids]
+    )
+    for (const raw of rows) {
+      const payload = yield* payloadOf(table, raw)
+      payloads.set(payloadKey(table.name, payload.id), payload)
+    }
   }
-  // Entries of tables detached since they were written have no payload: delivered as deletes.
+  // Entries of tables detached or unregistered since they were written have no payload: tombstones.
   return payloads
 })
 
 const walkPage = Effect.fnUntraced(function* (
-  tables: ReadonlyArray<SyncedTable>,
+  tables: ReadonlyArray<Resolved>,
   scopeId: string,
   after: typeof RowKey.Type | null,
   budget: number
 ) {
   const sql = yield* SqlClient
-  const changes: Array<Change> = []
+  const changes: Array<Protocol.Change> = []
   let reached = after
-  for (const table of tables) {
+  for (const { table, schema } of tables) {
     if (after !== null && table.name < after.table) continue
     const remaining = budget - changes.length
     // Budget spent exactly at a table boundary: resume after the last delivered row.
     if (remaining === 0) return { changes, after: reached }
     const afterRowId = after !== null && after.table === table.name ? after.rowId : null
-    const rows = yield* sql<RowPayload>`
-      SELECT t.id::text AS row_id, t.access_scope_id, to_jsonb(t) AS row
-      FROM ${sql(table.schema)}.${sql(table.name)} t
-      WHERE t.access_scope_id = ${scopeId}
-        AND (${afterRowId}::text IS NULL OR t.id::text COLLATE "C" > ${afterRowId}::text COLLATE "C")
-      ORDER BY t.id::text COLLATE "C"
-      LIMIT ${remaining + 1}`
-    for (const row of rows.slice(0, remaining)) {
-      changes.push({ _tag: "Upsert", table: table.name, rowId: row.row_id, scopeId, row: row.row })
-      reached = { table: table.name, rowId: row.row_id }
+    const rows = yield* sql.unsafe<Record<string, unknown>>(
+      `SELECT ${selectList(table, "t")} FROM ${q(schema)}.${q(table.name)} t
+       WHERE t.access_scope_id = $1
+         AND ($2::text IS NULL OR t.id::text COLLATE "C" > $2::text COLLATE "C")
+       ORDER BY t.id::text COLLATE "C"
+       LIMIT $3`,
+      [scopeId, afterRowId, remaining + 1]
+    )
+    for (const raw of rows.slice(0, remaining)) {
+      const payload = yield* payloadOf(table, raw)
+      changes.push({ _tag: "upsert", table: table.name, row: payload.row })
+      reached = { table: table.name, rowId: payload.id }
     }
     if (rows.length > remaining) return { changes, after: reached }
   }

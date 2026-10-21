@@ -1,28 +1,13 @@
+import * as PgTypes from "@effect/sql-pg/PgTypes"
 import { Cause, Effect, Option, Schedule, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
+import { Errors, Ids, Mutation, Protocol } from "echo-sync"
+import { isConflictUnavailable } from "./rowStore.ts"
 
-/**
- * A permanent failure of a mutation body (DESIGN.md §6). Recorded in the ledger as the
- * mutation's outcome; the batch continues.
- */
-export class MutationRejected extends Schema.TaggedError<MutationRejected>()("MutationRejected", {
-  reason: Schema.Literals(["decode", "forbidden", "domain"]),
-  message: Schema.String
-}) {}
-
-/**
- * The result of a processed mutation. Identical on every resubmission. `clientExpired` is never
- * recorded: it is answered from the client's expiry floor (§16.5).
- */
-export const MutationOutcome = Schema.Union([
-  Schema.TaggedStruct("Applied", {}),
-  Schema.TaggedStruct("Rejected", {
-    reason: Schema.Literals(["decode", "forbidden", "domain", "clientExpired"]),
-    message: Schema.String
-  })
-])
-export type MutationOutcome = typeof MutationOutcome.Type
+type MutationOutcome = Mutation.MutationOutcome
+const MutationOutcomeJson = Schema.toCodecJson(Mutation.MutationOutcome)
+const isRejection = Schema.is(Mutation.MutationRejection)
 
 /** A push outcome and the ledger position it was recorded at (§6). */
 export interface Processed {
@@ -42,19 +27,20 @@ export class MutationTransient extends Schema.TaggedError<MutationTransient>()("
 }) {}
 
 /**
- * The envelope itself is invalid (`seq < 1`, DESIGN §6): a request-level rejection. Nothing is
+ * `seq < 1` (DESIGN §6) is refused at request level with core's `MalformedEnvelope`: nothing
  * executed or recorded. Without this, `seq ≤ 0` would fall under the default expiry floor 0 and
- * be answered `clientExpired` although it was never processed.
+ * be answered `ClientExpired` although it was never processed. Core's `Seq` already refuses it
+ * on the wire; this guard keeps the ledger's own input honest.
  */
-export class MalformedEnvelope extends Schema.TaggedError<MalformedEnvelope>()("MalformedEnvelope", {
-  clientId: Schema.String,
-  mutationId: Schema.String,
-  message: Schema.String
-}) {}
-
 const checkEnvelope = (clientId: string, mutationId: string, seq: bigint) =>
   seq < 1n
-    ? Effect.fail(new MalformedEnvelope({ clientId, mutationId, message: `seq must be ≥ 1, got ${seq}` }))
+    ? Effect.fail(
+        new Protocol.MalformedEnvelope({
+          clientId: Ids.ClientId.make(clientId),
+          mutationId: Ids.MutationId.make(mutationId),
+          message: `seq must be ≥ 1, got ${seq}`
+        })
+      )
     : Effect.void
 
 /** The client id is registered to a different principal. */
@@ -78,20 +64,24 @@ export interface LedgerOptions {
 
 const defaultConflictRetry = Schedule.exponential("10 millis").pipe(Schedule.upTo({ times: 4 }))
 
-const decodeOutcome = Schema.decodeUnknownEffect(MutationOutcome)
-const encodeOutcome = Schema.encodeSync(MutationOutcome)
+const decodeOutcome = Schema.decodeUnknownEffect(MutationOutcomeJson)
+const encodeOutcome = Schema.encodeSync(MutationOutcomeJson)
 
-const transient = (envelope: Envelope, error: SqlError) =>
+const transient = (envelope: Envelope, error: SqlError | Errors.StoreUnavailable) =>
   new MutationTransient({
     clientId: envelope.clientId,
     mutationId: envelope.mutationId,
-    message: `${error.reason._tag}: ${error.message}`
+    message: isSqlError(error) ? `${error.reason._tag}: ${error.message}` : error.message
   })
 
-type AttemptError = SqlError | ClientForbidden | MutationRejected
+/** What a mutation body may fail with: core's rejections and transients, or raw SQL. */
+export type BodyError = Mutation.MutationRejection | Errors.StoreUnavailable | SqlError
+
+type AttemptError = BodyError | ClientForbidden
 
 const isConflict = (error: unknown) =>
-  isSqlError(error) && (error.reason._tag === "SerializationError" || error.reason._tag === "DeadlockError")
+  (isSqlError(error) && (error.reason._tag === "SerializationError" || error.reason._tag === "DeadlockError")) ||
+  (error instanceof Errors.StoreUnavailable && isConflictUnavailable(error))
 
 /** A reason that makes the attempt a defect (DESIGN §6 precedence: defect > transient > rejection). */
 const isDefectReason = (r: Cause.Reason<unknown>) =>
@@ -121,12 +111,15 @@ class FailedAttempt {
 const wrapAttempt = <A, R>(attempt: Effect.Effect<A, AttemptError, R>): Effect.Effect<A, FailedAttempt, R> =>
   Effect.catchCause(attempt, (cause) => Effect.fail(new FailedAttempt(cause)))
 
-/** The body failed with only `MutationRejected`: a permanent, recordable outcome. */
-const asRejection = (cause: Cause.Cause<MutationRejected | SqlError>): MutationOutcome | undefined => {
-  const [first] = cause.reasons
-  const onlyRejections = cause.reasons.every((r) => Cause.isFailReason(r) && r.error instanceof MutationRejected)
-  return onlyRejections && first !== undefined && Cause.isFailReason(first) && first.error instanceof MutationRejected
-    ? { _tag: "Rejected", reason: first.error.reason, message: first.error.message }
+/** The body failed with only rejections: a permanent, recordable outcome (the first one). */
+const asRejection = (cause: Cause.Cause<BodyError>): MutationOutcome | undefined => {
+  const errors = cause.reasons.flatMap((r) => (Cause.isFailReason(r) ? [r.error] : []))
+  const [first] = errors
+  return errors.length === cause.reasons.length &&
+    first !== undefined &&
+    isRejection(first) &&
+    errors.every(isRejection)
+    ? { _tag: "Rejected", error: first }
     : undefined
 }
 
@@ -156,10 +149,12 @@ const classify = (
     )
   )
   if (cause.reasons.some(isDefectReason)) return die
-  const sqlError = cause.reasons
+  const failure = cause.reasons
     .map((r) => (Cause.isFailReason(r) ? r.error : Cause.isDieReason(r) ? r.defect : undefined))
-    .find(isSqlError)
-  if (sqlError !== undefined) return Effect.fail(transient(envelope, sqlError))
+    .find((e) => isSqlError(e) || e instanceof Errors.StoreUnavailable)
+  if (isSqlError(failure) || failure instanceof Errors.StoreUnavailable) {
+    return Effect.fail(transient(envelope, failure))
+  }
   for (const r of cause.reasons) {
     if (Cause.isFailReason(r) && r.error instanceof ClientForbidden) return Effect.fail(r.error)
   }
@@ -198,9 +193,9 @@ export const registerClient = Effect.fnUntraced(function* (principalId: string, 
  */
 export const runMutation = <R>(
   envelope: Envelope,
-  body: Effect.Effect<void, MutationRejected | SqlError, R>,
+  body: Effect.Effect<void, BodyError, R>,
   options?: LedgerOptions
-): Effect.Effect<Processed, MutationTransient | ClientForbidden | MalformedEnvelope, R | SqlClient> =>
+): Effect.Effect<Processed, MutationTransient | ClientForbidden | Protocol.MalformedEnvelope, R | SqlClient> =>
   Effect.gen(function* () {
     const sql = yield* SqlClient
     yield* checkEnvelope(envelope.clientId, envelope.mutationId, envelope.seq)
@@ -213,7 +208,10 @@ export const runMutation = <R>(
         const client = yield* registerClient(envelope.principalId, envelope.clientId)
         if (envelope.seq <= client.expired_through) {
           const expired: Processed = {
-            outcome: { _tag: "Rejected", reason: "clientExpired", message: "ledger expired for this seq" },
+            outcome: {
+              _tag: "Rejected",
+              error: new Mutation.ClientExpired({ mutationId: Ids.MutationId.make(envelope.mutationId) })
+            },
             position: client.expired_position
           }
           return expired
@@ -239,7 +237,7 @@ export const runMutation = <R>(
         const inserted = yield* sql<{ position: bigint }>`
           INSERT INTO echo_sync.mutations (client_id, mutation_id, seq, position, outcome)
           VALUES (${envelope.clientId}, ${envelope.mutationId}, ${envelope.seq}, echo_sync.next_position(),
-                  ${JSON.stringify(encodeOutcome(outcome))}::jsonb)
+                  ${PgTypes.jsonb(encodeOutcome(outcome))})
           RETURNING position`
         const position = inserted[0]?.position
         if (position === undefined) return yield* Effect.die("INSERT … RETURNING returned no row")
@@ -258,7 +256,7 @@ export const runMutation = <R>(
 export interface BatchItem<R> {
   readonly mutationId: string
   readonly seq: bigint
-  readonly body: Effect.Effect<void, MutationRejected | SqlError, R>
+  readonly body: Effect.Effect<void, BodyError, R>
 }
 
 export interface BatchResult {
@@ -278,7 +276,7 @@ export const runBatch = <R>(
   clientId: string,
   items: ReadonlyArray<BatchItem<R>>,
   options?: LedgerOptions
-): Effect.Effect<BatchResult, ClientForbidden | MalformedEnvelope, R | SqlClient> =>
+): Effect.Effect<BatchResult, ClientForbidden | Protocol.MalformedEnvelope, R | SqlClient> =>
   Effect.gen(function* () {
     // Request-level: one malformed envelope rejects the push before anything executes.
     for (const item of items) yield* checkEnvelope(clientId, item.mutationId, item.seq)

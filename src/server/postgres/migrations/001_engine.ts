@@ -1,5 +1,6 @@
 import { Effect } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
+import { ScopeGrants } from "echo-sync"
 
 /**
  * Engine schema v1 (DESIGN.md §4, §6, §7).
@@ -31,16 +32,21 @@ export default Effect.gen(function* () {
 
   // A system synced table (DESIGN.md §4): each grant is a row in the scope it grants, so it
   // replicates to that scope's readers and its changes are ordered with data changes in the log.
-  // `id` is derived from (access_scope_id, principal_id) by core; uniqueness is enforced here.
+  // The table is core's SyncTable DDL (one definition, including UNIQUE (access_scope_id,
+  // principal_id)), created inside `echo_sync`. Caveat: a fresh database runs this migration with
+  // the core version it is deployed with, so a change to ScopeGrants' storage shape needs its own
+  // migration for existing databases, like any SyncTable change (DESIGN §11).
+  const [{ search_path } = { search_path: "public" }] = yield* sql<{ search_path: string }>`SHOW search_path`
+  yield* sql`SELECT set_config('search_path', 'echo_sync', true)`
+  yield* sql.unsafe(ScopeGrants.ScopeGrants.postgres.createTable)
+  for (const ddl of ScopeGrants.ScopeGrants.postgres.createIndexes) yield* sql.unsafe(ddl)
+  yield* sql`SELECT set_config('search_path', ${search_path}, true)`
+  // Engine-side constraints the SyncTable cannot express: grants die with their scope, and a
+  // role outside the Role literals (from a script that bypasses the store) cannot be stored.
   yield* sql`
-    CREATE TABLE echo_sync.scope_grants (
-      id text PRIMARY KEY,
-      access_scope_id text NOT NULL REFERENCES echo_sync.access_scopes (id) ON DELETE CASCADE,
-      principal_id text NOT NULL,
-      role text NOT NULL CHECK (role IN ('reader', 'writer', 'owner')),
-      granted_at timestamptz NOT NULL DEFAULT now(),
-      UNIQUE (access_scope_id, principal_id)
-    )`
+    ALTER TABLE echo_sync.scope_grants
+      ADD FOREIGN KEY (access_scope_id) REFERENCES echo_sync.access_scopes (id) ON DELETE CASCADE,
+      ADD CHECK (role IN ('reader', 'writer', 'owner'))`
   yield* sql`CREATE INDEX scope_grants_principal ON echo_sync.scope_grants (principal_id)`
 
   yield* sql`

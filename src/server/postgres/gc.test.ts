@@ -5,7 +5,7 @@ import { TestClock } from "effect/testing"
 import { collectGarbage } from "./gc.ts"
 import { runMutation } from "./ledger.ts"
 import { pull } from "./pull.ts"
-import { grant, pgAvailable, Replica, serverView, TestDatabase } from "./test-support.ts"
+import { grant, pgAvailable, Replica, serverView, TestDatabase, registry } from "./test-support.ts"
 
 const insert = (id: string) =>
   Effect.gen(function* () {
@@ -137,7 +137,7 @@ const forge = (cursor: bigint | null, position: string) =>
 const expectStale = (cursor: bigint | null, position: string) =>
   Effect.gen(function* () {
     const failure = yield* Effect.flip(
-      pull({ principalId: "p", clientId: "d", cursor, continuation: forge(cursor, position), limit: 10 })
+      pull(registry, { principalId: "p", clientId: "d", cursor, continuation: forge(cursor, position), limit: 10 })
     )
     assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "staleContinuation")
   })
@@ -148,7 +148,13 @@ describe.skipIf(!pgAvailable)("pull continuation (§8)", () => {
       yield* grant("p", "s1")
       yield* grant("q", "s1")
       for (const id of ["a", "b", "c"]) yield* insert(id)
-      const page = yield* pull({ principalId: "p", clientId: "d", cursor: null, continuation: Option.none(), limit: 1 })
+      const page = yield* pull(registry, {
+        principalId: "p",
+        clientId: "d",
+        cursor: null,
+        continuation: Option.none(),
+        limit: 1
+      })
       if (page._tag !== "PullPage") return assert.fail("expected a PullPage")
       const continuation = Option.some(page.continuation)
       const replays = [
@@ -157,14 +163,20 @@ describe.skipIf(!pgAvailable)("pull continuation (§8)", () => {
         { principalId: "p", clientId: "d", cursor: 0n }
       ]
       for (const replay of replays) {
-        const failure = yield* Effect.flip(pull({ ...replay, continuation, limit: 10 }))
+        const failure = yield* Effect.flip(pull(registry, { ...replay, continuation, limit: 10 }))
         assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "staleContinuation")
       }
       const tampered = page.continuation.replace(/"position":"\d+"/, '"position":"x"')
       assert.notStrictEqual(tampered, page.continuation)
       for (const garbled of ["", "not json", tampered]) {
         const failure = yield* Effect.flip(
-          pull({ principalId: "p", clientId: "d", cursor: null, continuation: Option.some(garbled), limit: 10 })
+          pull(registry, {
+            principalId: "p",
+            clientId: "d",
+            cursor: null,
+            continuation: Option.some(garbled),
+            limit: 10
+          })
         )
         assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "staleContinuation")
       }
@@ -205,8 +217,8 @@ describe.skipIf(!pgAvailable)("pull continuation (§8)", () => {
       const received = replica.received.length
       yield* replica.sync()
       assert.deepStrictEqual(
-        replica.received.slice(received).filter((c) => c._tag === "ScopePurged"),
-        [{ _tag: "ScopePurged", scopeId: "B" }]
+        replica.received.slice(received).filter((c) => c._tag === "scopePurged"),
+        [{ _tag: "scopePurged", scopeId: "B" }]
       )
       assert.deepStrictEqual(replica.view(), yield* serverView("p"))
     }).pipe(Effect.provide(TestDatabase))
@@ -219,7 +231,9 @@ describe.skipIf(!pgAvailable)("pull continuation (§8)", () => {
       const continuation = Option.some(
         JSON.stringify({ clientId: "d", principalId: "p", cursor: "1", position: "1", scopes: ["s1"], walking: [] })
       )
-      const failure = yield* Effect.flip(pull({ principalId: "p", clientId: "d", cursor: 1n, continuation, limit: 10 }))
+      const failure = yield* Effect.flip(
+        pull(registry, { principalId: "p", clientId: "d", cursor: 1n, continuation, limit: 10 })
+      )
       assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "unknownCursor")
     }).pipe(Effect.provide(TestDatabase))
   )
@@ -229,7 +243,7 @@ describe.skipIf(!pgAvailable)("pull continuation (§8)", () => {
       yield* grant("p", "s1")
       yield* insert("a")
       const failure = yield* Effect.flip(
-        pull({ principalId: "p", clientId: "d", cursor: 1n, continuation: Option.none(), limit: 10 })
+        pull(registry, { principalId: "p", clientId: "d", cursor: 1n, continuation: Option.none(), limit: 10 })
       )
       assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "unknownCursor")
     }).pipe(Effect.provide(TestDatabase))
@@ -244,7 +258,7 @@ describe.skipIf(!pgAvailable)("pull continuation (§8)", () => {
       const cursor = replica.cursor
       yield* insert("b")
       // This response is lost: the client never applies it, then the next one also completes.
-      yield* pull({ principalId: "p", clientId: "d", cursor, continuation: Option.none(), limit: 10 })
+      yield* pull(registry, { principalId: "p", clientId: "d", cursor, continuation: Option.none(), limit: 10 })
       yield* insert("c")
       yield* replica.sync()
       assert.deepStrictEqual(replica.view(), yield* serverView("p"))

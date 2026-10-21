@@ -39,7 +39,7 @@ const writersRaceAPullingReader = Effect.gen(function* () {
   // position the cursor already passed never will.
   yield* replica.sync()
 
-  const received = new Set(replica.received.flatMap((c) => (c._tag === "Upsert" ? [c.rowId] : [])))
+  const received = new Set(replica.received.flatMap((c) => (c._tag === "upsert" ? [String(c.row["id"])] : [])))
   return Array.from({ length: writers }, (_, i) => `w${i}`).filter((id) => !received.has(id))
 })
 

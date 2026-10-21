@@ -2,16 +2,25 @@ export { collectGarbage } from "./gc.ts"
 export {
   type BatchItem,
   type BatchResult,
+  type BodyError,
   ClientForbidden,
   type Envelope,
   type LedgerOptions,
-  MalformedEnvelope,
-  MutationOutcome,
-  MutationRejected,
   MutationTransient,
+  type Processed,
   registerClient,
   runBatch,
   runMutation
 } from "./ledger.ts"
-export { type Ack, type Change, pull, type PullRequest, type PullResponse, ResnapshotRequired } from "./pull.ts"
-export { attach, migrate, migrationsTable, type SyncedTable, syncedTables, TableNameConflict } from "./schema.ts"
+export { pull, type PullRequest } from "./pull.ts"
+export * as RowStore from "./rowStore.ts"
+export {
+  attach,
+  migrate,
+  migrationsTable,
+  type Resolved,
+  resolveTables,
+  type SyncedTable,
+  syncedTables,
+  TableNameConflict
+} from "./schema.ts"
