@@ -250,7 +250,10 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
       if (prior.kind !== c.kind) {
         todo(
           `${key} changes kind ${prior.kind} → ${c.kind}. Type changes are never generated (they can lose data):`,
-          `  add a new column, backfill it, switch readers and writers, then drop the old one, by hand.`
+          `  add a new column, backfill it, switch readers and writers, then drop the old one, by hand.`,
+          `  Dropping the old column also drops every index and unique constraint on it. The sequence`,
+          `  must restore each declared one the drop removed, under its declared name, even where the`,
+          `  declaration itself did not change; the startup verifier reports them as drift until then.`
         )
         continue
       }
