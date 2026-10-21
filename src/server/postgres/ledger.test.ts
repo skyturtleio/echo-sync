@@ -271,4 +271,29 @@ describe.skipIf(!pgAvailable)("mutation ledger (§6)", () => {
       assert.strictEqual(yield* counterBody, "a")
     }).pipe(Effect.provide(TestDatabase))
   )
+
+  it.live(
+    "a conflict combined with a rejection is not retried and not ledgered (retry must not pick one failure)",
+    () =>
+      Effect.gen(function* () {
+        let attempts = 0
+        // First attempt: a real SQLSTATE 40001 and a MutationRejected in one cause. Second would succeed.
+        const body = Effect.gen(function* () {
+          attempts++
+          if (attempts > 1) return yield* appendEffect("x")
+          const conflict = yield* Effect.orDie(Effect.flip(serializationFailure))
+          return yield* Effect.failCause(
+            Cause.fromReasons<SqlError | MutationRejected>([
+              Cause.makeFailReason(conflict),
+              Cause.makeFailReason(new MutationRejected({ reason: "domain", message: "no" }))
+            ])
+          )
+        })
+        const exit = yield* Effect.exit(runMutation(env("m", 1n), body, fastRetry))
+        assert.strictEqual(attempts, 1)
+        assert.isTrue(Exit.isFailure(exit) && Cause.hasDies(exit.cause) && !exit.cause.reasons.some(Cause.isFailReason))
+        assert.deepStrictEqual(yield* ledgerIds, [])
+        assert.strictEqual(yield* counterBody, "")
+      }).pipe(Effect.provide(TestDatabase))
+  )
 })

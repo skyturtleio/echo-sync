@@ -88,8 +88,30 @@ const transient = (envelope: Envelope, error: SqlError) =>
     message: `${error.reason._tag}: ${error.message}`
   })
 
-const isConflict = (error: SqlError | ClientForbidden | MutationRejected) =>
-  error._tag === "SqlError" && (error.reason._tag === "SerializationError" || error.reason._tag === "DeadlockError")
+type AttemptError = SqlError | ClientForbidden | MutationRejected
+
+const isConflict = (error: unknown) =>
+  isSqlError(error) && (error.reason._tag === "SerializationError" || error.reason._tag === "DeadlockError")
+
+/**
+ * A failed attempt that must not be retried, carrying its whole cause. `Effect.retry` looks only
+ * at the first typed failure, so a compound cause (a conflict plus anything else) is wrapped
+ * here before retry sees it, and classified afterwards as a whole.
+ */
+class Settled {
+  readonly attempt: Cause.Cause<AttemptError>
+  constructor(attempt: Cause.Cause<AttemptError>) {
+    this.attempt = attempt
+  }
+}
+
+/** Only a cause made solely of conflict failures stays retryable. */
+const gateRetry = <A, R>(attempt: Effect.Effect<A, AttemptError, R>): Effect.Effect<A, AttemptError | Settled, R> =>
+  Effect.catchCause(attempt, (cause): Effect.Effect<never, AttemptError | Settled> =>
+    cause.reasons.length > 0 && cause.reasons.every((r) => Cause.isFailReason(r) && isConflict(r.error))
+      ? Effect.failCause(cause)
+      : Effect.fail(new Settled(cause))
+  )
 
 /** The body failed with only `MutationRejected`: a permanent, recordable outcome. */
 const asRejection = (cause: Cause.Cause<MutationRejected | SqlError>): MutationOutcome | undefined => {
@@ -212,8 +234,12 @@ export const runMutation = <R>(
       })
     )
 
-    return yield* execute.pipe(
-      Effect.retry({ schedule: options?.conflictRetry ?? defaultConflictRetry, while: isConflict }),
+    return yield* gateRetry(execute).pipe(
+      Effect.retry({ schedule: options?.conflictRetry ?? defaultConflictRetry, while: (e) => !(e instanceof Settled) }),
+      // Unwrap: a settled attempt keeps its whole cause; otherwise the conflicts ran out.
+      Effect.catch((error): Effect.Effect<never, AttemptError> =>
+        error instanceof Settled ? Effect.failCause(error.attempt) : Effect.fail(error)
+      ),
       Effect.catchCause((cause) => classify(envelope, cause))
     )
   })

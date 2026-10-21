@@ -83,6 +83,12 @@ Failures are classified over the whole `Cause`, never by its first reason:
 
 Both orderings of SQL defect and programmer defect are tested.
 
+Retry eligibility is decided over the whole cause too, before `Effect.retry` sees it.
+`Effect.retry` looks only at the first typed failure, so a cause made of a conflict plus a
+rejection would otherwise be retried. Only a cause consisting solely of conflict failures
+(`40001`, deadlock) is retried; anything else is classified once, unretried (tested with a real
+`40001` combined with `MutationRejected`).
+
 `40001` and deadlocks are retried with a `Schedule` (default: 4 retries, exponential from
 10 ms). Anything else becomes `MutationTransient`, which means *outcome unknown*, not "not
 recorded". That covers any other `SqlError`, a conflict still failing after the retries, and
@@ -263,3 +269,4 @@ done by hand while building this:
 | outer `catchTag` + `catchDefect` instead of whole-cause classification | compound-cause test |
 | `catchTag("MutationRejected")` on the body | rejection-plus-defect test |
 | no `seq ≥ 1` guard | malformed-envelope test |
+| retry before whole-cause gating | conflict-plus-rejection test |
