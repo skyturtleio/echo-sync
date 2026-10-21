@@ -49,6 +49,17 @@ while a stream is open is therefore not detected until that stream reconnects; t
 an expired token is honoured on a live one. The client evaluates `syncHeaders` per request (DESIGN
 §9.1 Credentials), so a reconnect carries the renewed credential. `ClientForbidden` becomes `Unauthorized`.
 
+Composing a transport: `handlers` is three exported seams in order, and another transport (or a
+test) composes the same ones without the RPC layer. Authorize with `principalFor(headers)`
+(fails `Unauthorized`). Push is then `executeBatch(options, actor, request)`, failing only
+`Unauthorized | MalformedEnvelope` and never with infrastructure (a SQL failure is a short
+results list). Pull is `pull(registry, { principalId, clientId, cursor, continuation, limit })`
+piped through `serverFailures`, which maps the whole cause: any `SqlError` becomes
+`ServerUnavailable`, `ClientForbidden` becomes `Unauthorized`, `ResnapshotRequired` and
+interrupts pass through, and a non-SQL defect stays a defect. Pokes wraps its stream the same
+way (`Stream.catchCause` into `serverFailures(Effect.failCause(cause))`). All three require
+`SqlClient`.
+
 - push: one SERIALIZABLE ledger transaction per mutation (read-modify-write handlers would lose
   updates under READ COMMITTED; `40001` retries the whole attempt), `roleFor` read from `scope_grants` (own grant or
   `*`) inside it, `now` from the Clock, `random` = `seededRandom(clientId, mutationId)`. Every
