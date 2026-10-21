@@ -506,7 +506,10 @@ const todosByProject = Query.make("todos.byProject", {
     (either of capture / truncate guard absent, disabled, or with the wrong timing, events,
     `WHEN` clause or column list — check `tgenabled`, `tgtype`, `tgqual`, `tgattr` on every
     relation carrying the function, not the first), or a registry table that is not attached,
-    is drift. A declared index or unique set is compared against a **valid, ready, live**
+    is drift. **More than one relation carrying the capture trigger for one sync table name is
+    drift by itself**, however clean each relation is: the name is the unqualified sync identity
+    (§3) and `attach` refuses that state, so the verifier reports it rather than checking each
+    relation and passing. A declared index or unique set is compared against a **valid, ready, live**
     index (`indisvalid`, `indisready`, `indislive`) whose **key** columns (`indnkeyatts`, not
     `INCLUDE` payload) match in order, collation and `NULLS` placement; a unique set's expected
     shape is the one `SyncTable`'s DDL generates (`NULLS DISTINCT`, default placement), which
@@ -521,6 +524,15 @@ const todosByProject = Query.make("todos.byProject", {
     executable DDL against a relation the module cannot assume exists. The generator resolves
     the previous manifest through table renames before diffing columns, so a combined
     table-and-column rename produces one table TODO and one column TODO, not an intent error.
+    A changed index is **one step** (`DROP INDEX` then `CREATE INDEX` of the same name): if
+    either half references a blocked table or column, both halves are the same TODO, never an
+    executable `CREATE` whose `DROP` was deferred (the name is still taken; `42P07`). After a
+    table-rename TODO, every later step for that table addresses the table and its indexes by
+    their **new** names, because the rename TODO itself instructs renaming each
+    `old__<index>` to `new__<index>` (the verifier finds declared indexes by name) and the
+    later steps run by hand after it. An index whose column is dropped is dropped with the
+    column by PostgreSQL: the generator notes that on the drop TODO and emits no separate
+    `DROP INDEX` for it; only a replacement `CREATE`, as a TODO after the drop.
 - **Additive column evolution (observed on pinned Effect 4.0.5 `Schema.Struct`):** wire and
   storage row codecs **drop excess keys on decode** and **fail on a missing key**. Never set
   `onExcessProperty: "error"` on row codecs. Consequences, which are the v1 rule: (1) a new
