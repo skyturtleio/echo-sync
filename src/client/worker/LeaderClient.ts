@@ -109,7 +109,7 @@ export class LeaderClient extends Context.Service<
       query: LiveQuery
     ) => Stream.Stream<QueryResult, SqlFailure | RawExecDisabled | LeaderUnavailable>
     readonly leaderInfo: Effect.Effect<LeaderInfo, LeaderUnavailable>
-    /** The leader's sync status; ends with `LeaderLost` on handover (re-subscribe, like `subscribe`). */
+    /** The leader's sync status; ends with `LeaderLost` on handover (re-subscribe, like `subscribeRaw`). */
     readonly syncStatus: Stream.Stream<SyncStatus, SyncDisabled | LeaderUnavailable>
     /** Retained notices, current list then every change; survives handover. */
     readonly notices: Stream.Stream<ReadonlyArray<StoredNotice>, SqlFailure | LeaderUnavailable>
