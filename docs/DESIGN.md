@@ -275,7 +275,10 @@ without any element, from the shared listener's clock. The client treats every e
 of liveness, wakes the loop only on `Poke` (a heartbeat must never trigger a pull), and ends the
 stream itself when `idleTimeout` (client option, default 45 s, must exceed the server interval)
 passes with no element; the normal reconnect-with-backoff then applies, and the new stream's
-initial poke covers anything missed. Nothing else changes: pokes stay hints, no resync timer. A change committed between the
+initial poke covers anything missed. The `idleTimeout` clock starts when the HTTP request is
+sent and bounds the wait for the first element as well as the gaps between elements; local
+preparation of a (re)connect (notably `syncHeaders`, §9.1 Credentials) runs before the clock
+starts, stays interruptible, and is never counted as stream silence. Nothing else changes: pokes stay hints, no resync timer. A change committed between the
 client's last pull and the `LISTEN` is therefore covered by the pull that initial poke triggers,
 and a change committed after it produces a notification. The client must not rely on a pull
 issued *before* the stream is established to close a reconnect gap, and v1 adds no periodic
@@ -576,6 +579,14 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
   caches headers across requests, so a renewed token takes effect on the next request without a
   leader restart. `Unauthorized` stays retried and never fatal; the app observes a persistent
   `Unauthorized` through `syncStatus` and decides on sign-out itself.
+  Failure classification (coordinator ruling, ws/credential-refresh review): `syncHeaders` runs
+  before the request leaves the leader, so anything it raises (a defect, since its error channel
+  is `never`) is a local acquisition failure, classified like a network failure: the request is
+  not sent, the loop retries with the ordinary backoff, and `syncStatus` reports it as a
+  transient error. It is never a server defect, never `PushIntegrityError`, and never halts the
+  push for the leader's lifetime; interruption passes through unchanged. Server-side defect
+  fatality applies only to responses the server actually produced. For streams, the
+  `idleTimeout` clock starts after `syncHeaders` has produced the headers (§6 Liveness).
 
 ## 10. Queries (client read API)
 
