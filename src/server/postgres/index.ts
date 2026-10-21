@@ -14,7 +14,7 @@ export {
 } from "./ledger.ts"
 export { pull, type PullRequest } from "./pull.ts"
 export * as RowStore from "./rowStore.ts"
-export { handlers, layerHttp, pokeChannel, type SyncServerOptions } from "./rpc.ts"
+export { handlers, layerHttp, pokeChannel, presenceHandlers, type SyncServerOptions } from "./rpc.ts"
 export {
   attach,
   migrate,

@@ -39,7 +39,8 @@ the registry is skipped; its log entries arrive as tombstones, never as payloads
 ## RPC adapter
 
 `layerHttp({ registry, mutations, principalFor, path = "/sync" })` mounts `Protocol.SyncRpcs`
-with `RpcServer.layerHttp({ protocol: "http" })` and `RpcSerialization.layerNdjson`, the
+and `Protocol.PresenceRpcs` (one merged group, one path, each group's handlers provided with
+`Layer.provide`) with `RpcServer.layerHttp({ protocol: "http" })` and `RpcSerialization.layerNdjson`, the
 transport the browser speaks. `principalFor(headers)` is the app's authentication; the principal
 is never read from the payload. `ClientForbidden` becomes `Unauthorized`.
 
@@ -77,6 +78,21 @@ is never read from the payload. `ClientForbidden` becomes `Unauthorized`.
   are a fixed cadence, not "after an interval without a poke": a busy stream also gets them, which
   costs one small frame per interval. The client wakes only on `poke` and ends a stream that
   delivers nothing for `idleTimeout` (`LeaderOptions`, default 45 s).
+- presence (DESIGN §12, `presence.ts` plus `presenceHandlers` in rpc.ts): process-local, no
+  tables. A `Ref` of rooms, each a map of entries plus a sliding `PubSub<void>` of capacity 1;
+  a room exists while it has an entry. `room` checks `roleFor` (any role, the principal's or
+  `*`, as for reads) before joining, so an unauthorized caller fails `Unauthorized` and never
+  enters. The entry is added with `acquireRelease` in the stream's scope and removed when the
+  stream ends for any reason; on HTTP that includes the client aborting its request. A stream
+  subscribes before announcing its join, and each tick is turned into a fresh `RoomSnapshot`
+  (entries ordered by principal, client, tab), so snapshots coalesce under load and never miss
+  the latest state. As DESIGN §12 states: the payload carries `clientId` (the entry key needs it);
+  the key also includes the principal, so naming another principal's client id cannot replace
+  or end its entry; a rejoin with the same key replaces the entry, and the older stream's end
+  does not remove the newer one (a per-join token). `track` needs no grant lookup: it only
+  changes an entry the same principal holds. Not handled in v1: a grant revoked while a `room`
+  stream is open leaves the entry until the stream ends, and presence streams carry no
+  heartbeat (DESIGN §16 item 13).
 
 ## Engine state
 

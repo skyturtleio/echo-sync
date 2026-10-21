@@ -7,6 +7,7 @@ import { SqlClient } from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
 import { AccessScope, Ids, Mutation, Protocol, type Registry, Store } from "echo-sync"
 import { type ClientForbidden, type LedgerOptions, registerClient, runBatch } from "./ledger.ts"
+import * as Presence from "./presence.ts"
 import { pull } from "./pull.ts"
 import * as RowStore from "./rowStore.ts"
 import { resolveTables } from "./schema.ts"
@@ -312,10 +313,52 @@ export const handlers = (options: SyncServerOptions) =>
   )
 
 /**
- * Mounts `Protocol.SyncRpcs` on `path` of the app's `HttpRouter`, HTTP POST with NDJSON framing,
- * which is what the browser's transport speaks (DESIGN §6).
+ * Handlers for `Protocol.PresenceRpcs` (DESIGN §12): process-local presence, authorized like
+ * reads. `room` requires a grant of any role in the room's scope (the principal's or `*`), checked
+ * on join; an entry, once joined, stays until its stream ends, and `track` only changes an entry
+ * the same principal holds, so it needs no grant lookup of its own.
+ */
+export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor">) =>
+  Protocol.PresenceRpcs.toLayer(
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      const presence = yield* Presence.make
+      return Protocol.PresenceRpcs.of({
+        room: (payload, { headers }) =>
+          Stream.unwrap(
+            Effect.gen(function* () {
+              const principalId = yield* options.principalFor(headers)
+              const role = yield* roleFor(
+                sql,
+                principalId
+              )(payload.room).pipe(
+                Effect.catchTag("StoreUnavailable", (e) =>
+                  Effect.fail(new Protocol.ServerUnavailable({ message: e.message }))
+                )
+              )
+              if (Option.isNone(role)) {
+                return yield* new Protocol.Unauthorized({ message: `no grant in scope ${payload.room}` })
+              }
+              return presence.join({ principalId, ...payload })
+            })
+          ),
+        track: (payload, { headers }) =>
+          Effect.gen(function* () {
+            const principalId = yield* options.principalFor(headers)
+            yield* presence.track({ principalId, ...payload })
+          })
+      })
+    })
+  )
+
+/**
+ * Mounts `Protocol.SyncRpcs` and `Protocol.PresenceRpcs` on `path` of the app's `HttpRouter`,
+ * HTTP POST with NDJSON framing, which is what the browser's transport speaks (DESIGN §6, §12).
+ * Each group's handlers are provided, not merged, so neither leaks into the app's context.
  */
 export const layerHttp = (options: SyncServerOptions & { readonly path?: HttpRouter.PathInput | undefined }) =>
-  RpcServer.layerHttp({ group: Protocol.SyncRpcs, path: options.path ?? "/sync", protocol: "http" }).pipe(
-    Layer.provide([handlers(options), RpcSerialization.layerNdjson])
-  )
+  RpcServer.layerHttp({
+    group: Protocol.SyncRpcs.merge(Protocol.PresenceRpcs),
+    path: options.path ?? "/sync",
+    protocol: "http"
+  }).pipe(Layer.provide([handlers(options), presenceHandlers(options), RpcSerialization.layerNdjson]))

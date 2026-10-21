@@ -1,6 +1,6 @@
 import { Schema } from "effect"
 import { Rpc, RpcGroup } from "effect/rpc"
-import { AccessScopeId } from "./AccessScope.ts"
+import { AccessScopeId, PrincipalId } from "./AccessScope.ts"
 import { ClientId, Cursor, MutationId, Position, Seq, SeqFloor } from "./Ids.ts"
 import { MutationOutcome } from "./Mutation.ts"
 import { EncodedRow } from "./SyncTable.ts"
@@ -138,5 +138,51 @@ export const SyncRpcs = RpcGroup.make(
     success: PokesElement,
     error: Schema.Union([ServerUnavailable, Unauthorized]),
     stream: true
+  })
+)
+
+// ---------------------------------------------------------------------------------------------
+// Presence (DESIGN §12): in-memory, connection-scoped, never on the durable path
+// ---------------------------------------------------------------------------------------------
+
+/** One tab of a client. A presence entry is keyed by `(clientId, tabId)`. */
+export const TabId = Schema.String.check(Schema.isNonEmpty()).pipe(Schema.brand("echo-sync/TabId"))
+export type TabId = typeof TabId.Type
+
+export const PresenceEntry = Schema.Struct({
+  principalId: PrincipalId,
+  clientId: ClientId,
+  tabId: TabId,
+  state: Schema.Json
+})
+export type PresenceEntry = typeof PresenceEntry.Type
+
+/** Every entry of a room, ordered by `(principalId, clientId, tabId)`. */
+export const RoomSnapshot = Schema.Struct({ room: AccessScopeId, entries: Schema.Array(PresenceEntry) })
+export type RoomSnapshot = typeof RoomSnapshot.Type
+
+/** The entry's identity and state. `room` is an access scope the principal must be able to read. */
+export const PresencePayload = Schema.Struct({
+  clientId: ClientId,
+  room: AccessScopeId,
+  tabId: TabId,
+  state: Schema.Json
+})
+
+export const PresenceRpcs = RpcGroup.make(
+  /**
+   * Joins `room` with `state` and observes it: a `RoomSnapshot` on join and after every change
+   * (coalescing allowed). The entry lives exactly while this stream is open.
+   */
+  Rpc.make("room", {
+    payload: PresencePayload,
+    success: RoomSnapshot,
+    error: Schema.Union([ServerUnavailable, Unauthorized]),
+    stream: true
+  }),
+  /** Replaces the state of this `(clientId, tabId)` entry in `room`; a no-op without one. */
+  Rpc.make("track", {
+    payload: PresencePayload,
+    error: Schema.Union([ServerUnavailable, Unauthorized])
   })
 )
