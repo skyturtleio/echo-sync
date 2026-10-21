@@ -34,6 +34,7 @@ import {
   type LiveQuery,
   type OutboxEnvelope,
   type QueryResult,
+  type RawExecDisabled,
   type Rows,
   type SqlFailure,
   type SqlParams
@@ -71,7 +72,11 @@ export interface Status {
 export class LeaderClient extends Context.Service<
   LeaderClient,
   {
-    readonly exec: (sql: string, params?: SqlParams) => Effect.Effect<Rows, SqlFailure | LeaderUnavailable>
+    /** Raw SQL for the dev harness; `RawExecDisabled` unless the leader was started with `allowRawExec`. */
+    readonly exec: (
+      sql: string,
+      params?: SqlParams
+    ) => Effect.Effect<Rows, SqlFailure | RawExecDisabled | LeaderUnavailable>
     /** Runs the mutation optimistically; resolves only after the outbox entry is committed in SQLite. */
     readonly enqueue: (
       envelope: OutboxEnvelope
@@ -172,7 +177,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
       exec: (sql, params = []) => withLeader((client) => client.exec({ sql, params })),
       enqueue: (envelope) => withLeader((client) => client.enqueue({ envelope })),
       leaderInfo: withLeader((client) => client.leaderInfo()),
-      subscribe: (query) => streamWithLeader((client) => client.subscribe({ query })),
+      subscribe: (query) => streamWithLeader((client) => client.subscribeRaw({ query })),
       syncStatus: streamWithLeader((client) => client.syncStatus()),
       notices: withLeader((client) => client.notices()),
       exportPending: withLeader((client) => client.exportPending()),

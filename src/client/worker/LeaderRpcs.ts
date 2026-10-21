@@ -5,7 +5,7 @@
  */
 import * as Schema from "effect/Schema"
 import { Rpc, RpcGroup } from "effect/rpc"
-import { Ids, Mutation } from "echo-sync"
+import { Errors, Ids, Mutation, Query } from "echo-sync"
 import { LocallyRejected } from "../sync/Engine.ts"
 import { Notice } from "../sync/SqliteSyncStorage.ts"
 import { SyncStatus } from "../sync/SyncLoop.ts"
@@ -30,6 +30,12 @@ export type SqlParams = typeof SqlParams.Type
 
 export const Rows = Schema.Array(Schema.Record(Schema.String, Schema.Unknown))
 export type Rows = typeof Rows.Type
+
+/**
+ * `exec` on a leader started without `allowRawExec` (DESIGN §10.1): raw writes bypass the outbox and
+ * break the replica invariant, so only the dev harness enables it.
+ */
+export class RawExecDisabled extends Schema.TaggedError<RawExecDisabled>()("RawExecDisabled", {}) {}
 
 /** This leader was started without a `syncUrl`: a local-only replica, nothing syncs. */
 export class SyncDisabled extends Schema.TaggedError<SyncDisabled>()("SyncDisabled", {}) {}
@@ -57,8 +63,9 @@ export const Statement = Schema.Struct({ sql: Schema.String, params: SqlParams }
 export type Statement = typeof Statement.Type
 
 /**
- * A live query: a fixed list of read statements plus the tables they depend on (table-level
- * dependencies, DESIGN §10). Typed `Query.make` handlers will compile down to this shape.
+ * A raw live query (DESIGN §10's escape hatch): a fixed list of read statements plus the tables they
+ * depend on (table-level dependencies). The leader runs it with `PRAGMA query_only` on, so a statement
+ * that writes fails and nothing commits. Registered queries (`subscribe`) are the normal read path.
  */
 export const LiveQuery = Schema.Struct({
   statements: Schema.Array(Statement),
@@ -88,10 +95,11 @@ export type LeaderInfo = typeof LeaderInfo.Type
 
 export class LeaderRpcs extends RpcGroup.make(
   /** Raw statement execution for the dev harness and diagnostics. */
+  /** Raw statement execution for the dev harness; `RawExecDisabled` unless the leader allows it. */
   Rpc.make("exec", {
     payload: { sql: Schema.String, params: SqlParams },
     success: Rows,
-    error: SqlFailure
+    error: Schema.Union([SqlFailure, RawExecDisabled])
   }),
   /**
    * Run a mutation optimistically and durably append it to the outbox, in one SQLite transaction
@@ -104,8 +112,26 @@ export class LeaderRpcs extends RpcGroup.make(
     success: Enqueued,
     error: Schema.Union([SqlFailure, LocallyRejected])
   }),
-  /** Live query: emits the current result, then a fresh result after every write to `tables`. */
+  /**
+   * A registered query (DESIGN §10.1), by name with its encoded args. Emits the encoded result of a run,
+   * then of a fresh run after every write to a table the latest run read. Each run, and the dependency
+   * set derived from it, comes from one read transaction.
+   */
   Rpc.make("subscribe", {
+    payload: { name: Schema.String, args: Schema.Json },
+    success: Schema.Json,
+    error: Schema.Union([
+      SqlFailure,
+      Query.UnknownQuery,
+      Query.QueryArgsDecodeFailed,
+      Errors.RowNotFound,
+      Errors.ScopeForbidden,
+      Errors.InvalidRow
+    ]),
+    stream: true
+  }),
+  /** Raw live query: emits the current result, then a fresh result after every write to `tables`. */
+  Rpc.make("subscribeRaw", {
     payload: { query: LiveQuery },
     success: QueryResult,
     error: SqlFailure,

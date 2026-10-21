@@ -2,13 +2,16 @@
 import "../testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { expect, it } from "@effect/vitest"
-import { Deferred, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Schema, Stream } from "effect"
+import * as Reactivity from "effect/reactivity/Reactivity"
+import { RpcTest } from "effect/rpc"
 import * as SqlClient from "effect/sql/SqlClient"
-import { AccessScope, Ids, Mutation, Protocol, Registry, SyncTable } from "echo-sync"
+import { AccessScope, Ids, Mutation, Protocol, Query, Registry, ScopeGrants, type Store, SyncTable } from "echo-sync"
 import * as Engine from "../sync/Engine.ts"
 import * as SqliteSyncStorage from "../sync/SqliteSyncStorage.ts"
 import * as SyncLoop from "../sync/SyncLoop.ts"
-import { enqueueAndWake } from "./Leader.ts"
+import { enqueueAndWake, makeHandlers } from "./Leader.ts"
+import { LeaderRpcs } from "./LeaderRpcs.ts"
 
 const T = SyncTable.make("t", { id: Schema.String.pipe(Schema.brand("TId")), accessScopeId: AccessScope.AccessScopeId })
 const registry = Registry.make([T])
@@ -91,4 +94,189 @@ it.live("an enqueue cancelled while its COMMIT runs still wakes the loop: the en
     expect(pushed).toEqual(["m"])
     expect((yield* loop.status).lastError).toBeNull()
   }).pipe(Effect.provide(Db))
+)
+
+// ---------------------------------------------------------------------------------------------
+// Registered queries, raw live queries and raw exec over the leader's RPC handlers (DESIGN §10.1)
+// ---------------------------------------------------------------------------------------------
+
+const RowId = Schema.String.pipe(Schema.brand("RowId"))
+const rowFields = { id: RowId, accessScopeId: AccessScope.AccessScopeId, body: Schema.String }
+const Flags = SyncTable.make("flags", { ...rowFields })
+const B = SyncTable.make("b", { ...rowFields })
+const C = SyncTable.make("c", { ...rowFields })
+const L = SyncTable.make("l", { ...rowFields })
+const R = SyncTable.make("r", { ...rowFields })
+const Raw = SyncTable.make("raw", { ...rowFields })
+const queryRegistry = Registry.make([Flags, B, C, L, R, Raw])
+const scope = AccessScope.AccessScopeId.make("s")
+const me = AccessScope.PrincipalId.make("me")
+
+/** Reads `flags`, then only the table the flag names: its dependency set changes with the data. */
+const pick = Query.make("pick", {
+  args: Schema.Struct({}),
+  success: Schema.Struct({ target: Schema.String, n: Schema.Number }),
+  handler: (db) =>
+    Effect.gen(function* () {
+      const flag = yield* db.get(Flags, RowId.make("f"))
+      const rows = yield* db.scan(flag.body === "b" ? B : C)
+      return { target: flag.body, n: rows.length }
+    })
+})
+/** Two reads that a writer always changes together, in one transaction. */
+const pair = Query.make("pair", {
+  args: Schema.Struct({}),
+  success: Schema.Struct({ l: Schema.Number, r: Schema.Number }),
+  handler: (db) =>
+    Effect.gen(function* () {
+      const l = yield* db.scan(L)
+      // A slow run: a write that could land between the two reads gets the time to do so.
+      yield* Effect.sleep("3 millis")
+      const r = yield* db.scan(R)
+      return { l: l.length, r: r.length }
+    })
+})
+
+const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
+  Effect.gen(function* () {
+    const reactivity = yield* Reactivity.make
+    const sql = yield* SqliteClient.makeMemory({ installReactivityHooks: true }).pipe(
+      Effect.provideService(Reactivity.Reactivity, reactivity)
+    )
+    yield* SqliteSyncStorage.migrate(queryRegistry).pipe(Effect.provideService(SqlClient.SqlClient, sql))
+    const storage = SqliteSyncStorage.make(sql, queryRegistry)
+    const put = <T extends SyncTable.AnySyncTable>(table: T, row: Store.RowOf<T>) =>
+      storage.rows.write(table, row.id, Option.some(Schema.encodeUnknownSync(table.wire)(row)))
+    const write = <T extends SyncTable.AnySyncTable>(table: T, row: Store.RowOf<T>) =>
+      storage.transaction(put(table, row))
+    yield* write(ScopeGrants.ScopeGrants, {
+      id: ScopeGrants.grantId(scope, me),
+      accessScopeId: scope,
+      principalId: me,
+      role: "owner",
+      grantedAt: DateTime.makeUnsafe(0)
+    })
+    const engine = yield* Engine.make({
+      clientId: Ids.ClientId.make("c"),
+      actor: me,
+      storage,
+      registry: queryRegistry,
+      mutations: Mutation.makeRegistry([]),
+      transport: {
+        push: () => Effect.die(new Error("no transport")),
+        pull: () => Effect.die(new Error("no transport"))
+      }
+    })
+    const handlers = yield* makeHandlers({
+      sql,
+      reactivity,
+      storage,
+      engine,
+      loop: undefined,
+      actor: me,
+      queries: Query.makeRegistry([pick, pair]),
+      allowRawExec: options.allowRawExec,
+      info: { leaderId: "l", clientId: "c", dbName: "test", syncing: false }
+    })
+    const client = yield* RpcTest.makeClient(LeaderRpcs).pipe(Effect.provide(handlers))
+    const row = (id: string, body = "x") => ({ id: RowId.make(id), accessScopeId: scope, body })
+    const count = (table: string) =>
+      Effect.map(sql.unsafe<{ readonly n: number }>(`SELECT count(*) AS n FROM ${table}`), (rs) => rs[0]?.n)
+    return { client, storage, put, write, row, count }
+  })
+
+/** Collect a stream's emissions into a queue in the background. */
+const collect = <A, E>(stream: Stream.Stream<A, E>) =>
+  Effect.gen(function* () {
+    const emissions = yield* Queue.unbounded<A>()
+    yield* Effect.forkScoped(Stream.runForEach(stream, (a) => Queue.offer(emissions, a)))
+    const next = Queue.take(emissions).pipe(Effect.timeout("5 seconds"))
+    return { emissions, next }
+  })
+
+it.live(
+  "a query re-emits after a write to a table only its latest run read, and not after one it stopped reading",
+  () =>
+    Effect.gen(function* () {
+      const { client, write, row } = yield* leaderRpc({ allowRawExec: false })
+      yield* write(Flags, row("f", "c"))
+      const { emissions, next } = yield* collect(client.subscribe({ name: "pick", args: {} }))
+      expect(yield* next).toEqual({ target: "c", n: 0 })
+      // `b` was not read by the first run, but `flags` was: the switch re-runs, and that run reads `b`.
+      yield* write(Flags, row("f", "b"))
+      expect(yield* next).toEqual({ target: "b", n: 0 })
+      // Fails if `b` were not picked up from the latest run (dependencies fixed at the first run).
+      yield* write(B, row("b1"))
+      expect(yield* next).toEqual({ target: "b", n: 1 })
+      // Fails if `c`, read only by the first run, were still watched: that re-run would emit {b, 1} here.
+      yield* write(C, row("c1"))
+      yield* Effect.sleep("300 millis")
+      expect(yield* Queue.size(emissions)).toBe(0)
+      yield* write(B, row("b2"))
+      expect(yield* next).toEqual({ target: "b", n: 2 })
+    }).pipe(Effect.scoped)
+)
+
+it.live("every emission of a query is one snapshot: two tables written together never disagree", () =>
+  Effect.gen(function* () {
+    const { client, storage, put, row } = yield* leaderRpc({ allowRawExec: false })
+    const { emissions, next } = yield* collect(
+      client
+        .subscribe({ name: "pair", args: {} })
+        .pipe(Stream.mapEffect((u) => Schema.decodeUnknownEffect(pair.success)(u)))
+    )
+    expect(yield* next).toEqual({ l: 0, r: 0 })
+    const n = 40
+    // One transaction writes both tables; a run that read them outside one transaction could see l = r + 1.
+    yield* Effect.forkScoped(
+      Effect.forEach(
+        Array.from({ length: n }, (_, i) => i + 1),
+        (i) =>
+          storage
+            .transaction(Effect.andThen(put(L, row(`l${i}`)), put(R, row(`r${i}`))))
+            .pipe(Effect.andThen(Effect.sleep("1 millis")))
+      )
+    )
+    const seen: Array<{ readonly l: number; readonly r: number }> = []
+    let last = { l: 0, r: 0 }
+    while (last.l < n || last.r < n) {
+      last = yield* next
+      seen.push(last)
+    }
+    seen.push(...(yield* Queue.clear(emissions)))
+    expect(seen.filter((e) => e.l !== e.r)).toEqual([])
+  }).pipe(Effect.scoped)
+)
+
+it.live("a raw live query whose statement writes fails and commits nothing", () =>
+  Effect.gen(function* () {
+    const { client, count } = yield* leaderRpc({ allowRawExec: true })
+    const result = yield* Stream.runHead(
+      client.subscribeRaw({
+        query: {
+          statements: [
+            { sql: "SELECT count(*) AS n FROM raw", params: [] },
+            { sql: "INSERT INTO raw (id, access_scope_id, body) VALUES ('w', 's', 'x')", params: [] }
+          ],
+          tables: ["raw"]
+        }
+      })
+    ).pipe(Effect.exit)
+    expect(Exit.isFailure(result) ? String(Cause.squash(result.cause)) : "emitted").toContain("SqlFailure")
+    expect(yield* count("raw")).toBe(0)
+    // `query_only` is off again after the raw query: an allowed write still works.
+    yield* client.exec({ sql: "INSERT INTO raw (id, access_scope_id, body) VALUES ('e', 's', 'x')", params: [] })
+    expect(yield* count("raw")).toBe(1)
+  }).pipe(Effect.scoped)
+)
+
+it.live("raw exec is refused, and writes nothing, on a leader started without allowRawExec", () =>
+  Effect.gen(function* () {
+    const { client, count } = yield* leaderRpc({ allowRawExec: false })
+    const result = yield* client
+      .exec({ sql: "INSERT INTO raw (id, access_scope_id, body) VALUES ('e', 's', 'x')", params: [] })
+      .pipe(Effect.flip)
+    expect(result._tag).toBe("RawExecDisabled")
+    expect(yield* count("raw")).toBe(0)
+  }).pipe(Effect.scoped)
 )

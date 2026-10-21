@@ -17,23 +17,25 @@
  */
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner"
-import * as Context from "effect/Context"
+import type * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
+import * as Reactivity from "effect/reactivity/Reactivity"
+import * as Scope from "effect/Scope"
 import * as SqlClient from "effect/sql/SqlClient"
 import type { Row } from "effect/sql/SqlConnection"
 import type { SqlError } from "effect/sql/SqlError"
 import { type Rpc, type RpcGroup, RpcServer } from "effect/rpc"
-import { AccessScope, type Errors, Ids, type Mutation, type Registry } from "echo-sync"
+import { AccessScope, type Errors, Ids, type Mutation, Query, type Registry, Store } from "echo-sync"
 import * as Outbox from "../Outbox.ts"
 import * as Engine from "../sync/Engine.ts"
 import * as SqliteSyncStorage from "../sync/SqliteSyncStorage.ts"
 import * as SyncLoop from "../sync/SyncLoop.ts"
 import * as Transport from "../sync/Transport.ts"
-import { LeaderRpcs, SqlFailure, SyncDisabled } from "./LeaderRpcs.ts"
+import { LeaderRpcs, RawExecDisabled, SqlFailure, SyncDisabled } from "./LeaderRpcs.ts"
 import { type Endpoint, type FromLeader, isToLeader, type ToLeader } from "./messages.ts"
 import * as OpfsSqlite from "./OpfsSqlite.ts"
 import * as Platform from "./platform.ts"
@@ -62,15 +64,17 @@ const openDatabase = (identity: Platform.ReplicaIdentity, registry: Registry.Syn
     const serve = yield* OpfsSqlite.open({ poolDirectory, dbName: Platform.dbName(identity) })
     const channel = new MessageChannel()
     yield* Effect.forkScoped(serve(channel.port1))
-    const context = yield* Layer.build(
-      SqliteClient.layer({ worker: Effect.succeed(channel.port2), installReactivityHooks: true })
-    )
-    const sql = Context.get(context, SqlClient.SqlClient)
+    // Our own `Reactivity`, so registered queries can re-register their keys per run (the layer hides its own).
+    const reactivity = yield* Reactivity.make
+    const sql: SqlClient.SqlClient = yield* SqliteClient.make({
+      worker: Effect.succeed(channel.port2),
+      installReactivityHooks: true
+    }).pipe(Effect.provideService(Reactivity.Reactivity, reactivity))
     // Engine tables and the replica schema in one transaction (a manifest change rebuilds the replica).
     yield* Effect.andThen(SqliteSyncStorage.migrate(registry), Outbox.pruneReleased()).pipe(
       Effect.provideService(SqlClient.SqlClient, sql)
     )
-    return sql
+    return { sql, reactivity }
   })
 
 /** A replica without `syncUrl`: the engine never calls its transport, because no loop runs. */
@@ -90,29 +94,102 @@ export const enqueueAndWake =
   (mutationId: Ids.MutationId, name: string, args: Schema.Json) =>
     engine.mutate(mutationId, name, args).pipe(Effect.ensuring(wake))
 
-const makeHandlers = (
-  sql: SqlClient.SqlClient,
-  storage: SqliteSyncStorage.SqliteSyncStorage,
-  engine: Engine.Engine<unknown>,
-  loop: SyncLoop.SyncLoop | undefined,
-  info: { leaderId: string; clientId: string; dbName: string; syncing: boolean }
-) =>
+/**
+ * A stream of `run`'s results that re-runs after every invalidation of the keys its latest run passed to
+ * `watch` (DESIGN §10.1). `run` must call `watch` while it still holds the storage permit: writes are
+ * admitted through the same permit and invalidate as they execute, so none can fall between the read and
+ * the registration. A failed run ends the stream.
+ */
+export const liveRuns = <A, E, R>(
+  reactivity: Reactivity.Reactivity,
+  run: (watch: (keys: ReadonlyArray<string>) => Effect.Effect<void>) => Effect.Effect<A, E, R>
+): Stream.Stream<A, E, R> =>
+  Stream.unwrap(
+    Effect.gen(function* () {
+      // Capacity 1, sliding: any number of invalidations during a run coalesce into one re-run.
+      const dirty = yield* Queue.sliding<void>(1)
+      Queue.offerUnsafe(dirty, undefined)
+      let cancel: (() => void) | undefined
+      yield* Scope.addFinalizer(
+        yield* Effect.scope,
+        Effect.sync(() => cancel?.())
+      )
+      const watch = (keys: ReadonlyArray<string>) =>
+        Effect.sync(() => {
+          cancel?.()
+          cancel = reactivity.registerUnsafe(keys, () => void Queue.offerUnsafe(dirty, undefined))
+        })
+      return Stream.fromEffectRepeat(Effect.andThen(Queue.take(dirty), run(watch)))
+    })
+  )
+
+export interface HandlerOptions {
+  readonly sql: SqlClient.SqlClient
+  readonly reactivity: Reactivity.Reactivity
+  readonly storage: SqliteSyncStorage.SqliteSyncStorage
+  readonly engine: Engine.Engine<unknown>
+  readonly loop: SyncLoop.SyncLoop | undefined
+  readonly actor: AccessScope.PrincipalId
+  readonly queries: Query.QueryRegistry
+  readonly allowRawExec: boolean
+  readonly info: { leaderId: string; clientId: string; dbName: string; syncing: boolean }
+}
+
+/** The leader's `LeaderRpcs` handlers. Exported for tests, which serve them without a worker. */
+export const makeHandlers = ({
+  sql,
+  reactivity,
+  storage,
+  engine,
+  loop,
+  actor,
+  queries,
+  allowRawExec,
+  info
+}: HandlerOptions) =>
   LeaderRpcs.toHandlers({
     // Every RPC takes the storage permit, so one queued behind a long install is cancellable while it waits.
-    exec: ({ sql: text, params }) => storage.admit(sql.unsafe<Row>(text, params).pipe(Effect.mapError(toFailure))),
+    exec: ({ sql: text, params }) =>
+      allowRawExec
+        ? storage.admit(sql.unsafe<Row>(text, params).pipe(Effect.mapError(toFailure)))
+        : Effect.fail(new RawExecDisabled()),
     enqueue: ({ envelope }) =>
       enqueueAndWake(engine, loop?.wake ?? Effect.void)(envelope.mutationId, envelope.name, envelope.args).pipe(
         Effect.map(({ clientId, mutationId, seq }) => ({ clientId, mutationId, seq })),
         Effect.catchTag("StoreUnavailable", (error) => Effect.fail(unavailable(error)))
       ),
-    subscribe: ({ query }) =>
+    subscribe: ({ name, args }) =>
+      liveRuns(reactivity, (watch) =>
+        // One read transaction per run: the result and the tables it read are one replica version, and
+        // the new dependency set is registered before any later write is admitted (DESIGN §10.1).
+        storage
+          .transaction(
+            Effect.gen(function* () {
+              const rows = storage.rows
+              const instance = Store.make(rows, { roleFor: Engine.roleFromGrants(rows, actor) })
+              const result = yield* Query.run(queries, name, args, instance.store).pipe(
+                // A failed run still read tables; the stream ends with its error either way.
+                Effect.ensuring(Effect.flatMap(instance.reads, (tables) => watch([...tables])))
+              )
+              return result
+            })
+          )
+          .pipe(Effect.catchTag("StoreUnavailable", (error) => Effect.fail(unavailable(error))))
+      ),
+    subscribeRaw: ({ query }) =>
       sql
         .reactive(
           query.tables,
           // One read transaction per emission, so a batch never mixes replica versions (DESIGN §10).
+          // `query_only` makes a writing statement fail inside the transaction, which then rolls back;
+          // it is switched off again before COMMIT/ROLLBACK, still inside the permit (DESIGN §10.1).
           storage
             .transaction(
-              Effect.forEach(query.statements, (s) => sql.unsafe<Row>(s.sql, s.params)).pipe(Effect.mapError(toFailure))
+              sql`PRAGMA query_only = ON`.pipe(
+                Effect.andThen(Effect.forEach(query.statements, (s) => sql.unsafe<Row>(s.sql, s.params))),
+                Effect.ensuring(Effect.orDie(sql`PRAGMA query_only = OFF`)),
+                Effect.mapError(toFailure)
+              )
             )
             .pipe(Effect.catchTag("StoreUnavailable", (error) => Effect.fail(unavailable(error))))
         )
@@ -153,6 +230,13 @@ export interface LeaderOptions {
   readonly registry: Registry.SyncRegistry
   /** The app's mutations; `enqueue` runs them optimistically. */
   readonly mutations: Mutation.MutationRegistry
+  /** The app's registered queries (DESIGN §10.1); `subscribe` runs them by name. Defaults to none. */
+  readonly queries?: Query.QueryRegistry
+  /**
+   * Serve the raw `exec` RPC (writes outside the outbox, DESIGN §10.1). Dev harnesses and diagnostics
+   * only; apps never set it. Without it `exec` fails with `RawExecDisabled`.
+   */
+  readonly allowRawExec?: boolean
   /**
    * Where `Protocol.SyncRpcs` is mounted (HTTP, NDJSON). Omit for a local-only replica: `enqueue`
    * still applies and persists, nothing is pushed or pulled.
@@ -185,7 +269,7 @@ const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: L
     yield* Platform.holdLock(Platform.leaderEpochLockName(identity, leaderId))
     const dbName = Platform.dbName(identity)
     const { registry, mutations, syncUrl } = options
-    const sql = yield* openDatabase(identity, registry)
+    const { sql, reactivity } = yield* openDatabase(identity, registry)
     const clientId = yield* Outbox.clientId.pipe(
       Effect.provideService(SqlClient.SqlClient, sql),
       Effect.flatMap(Schema.decodeUnknownEffect(Ids.ClientId))
@@ -206,11 +290,16 @@ const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: L
       yield* sync.wake
       loop = sync
     }
-    const handlers = yield* makeHandlers(sql, storage, engine, loop, {
-      leaderId,
-      clientId,
-      dbName,
-      syncing: loop !== undefined
+    const handlers = yield* makeHandlers({
+      sql,
+      reactivity,
+      storage,
+      engine,
+      loop,
+      actor,
+      queries: options.queries ?? Query.makeRegistry([]),
+      allowRawExec: options.allowRawExec ?? false,
+      info: { leaderId, clientId, dbName, syncing: loop !== undefined }
     })
     send(endpoint, { _tag: "Elected", leaderId })
 

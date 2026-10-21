@@ -40,5 +40,7 @@ const syncUrl = flags.get("syncUrl")
 runLeaderWorker(self, {
   registry,
   mutations: clientMutations,
+  // The harness's scenarios use raw `exec`; apps never set this (DESIGN §10.1).
+  allowRawExec: true,
   ...(syncUrl === null ? {} : { syncUrl, syncHeaders: (principal) => ({ [principalHeader]: principal }) })
 })
