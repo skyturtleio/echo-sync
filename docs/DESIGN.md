@@ -213,6 +213,21 @@ a ledgered `Rejected{…}` so the batch continues and the outbox drains. The cli
 `MalformedEnvelope`, and a push payload decode failure, as a fatal integrity error: it stops
 pushing, surfaces the error, and offers export of pending mutations (§9). It never releases the
 entry (that would open a `seq` gap, which §16.5 forbids) and never retries automatically.
+On the wire a payload decode failure has no failure tag: the pinned `RpcServer` answers it with
+a defect, exactly as it answers a handler defect (which this section says is never retried or
+ledgered). So the client rule is: **any defect in a push response is fatal** for the leader's
+lifetime; a halt is in-memory, so a reload or leader handover pushes once more and either
+succeeds (server fixed) or halts again. A batch that fails the client-side `PushRequest` check
+before sending is fatal the same way, and nothing is sent. Corollary for the server: every
+infrastructure failure (connection, pool, `40001` after retries) must surface as a transient
+*failure*, never leak as a defect, or clients halt until reload. Transient push failures
+(`RpcClientError`, `Unauthorized`, interruption) and every pull failure (including a pull defect
+or an undecodable page, mapped to a transient pull error) are retried with backoff. v1 uses one
+backoff per sync cycle (push then pull), not one per operation: a transient push failure also
+delays the next pull. A halted push does not count as a failure and does not delay pull.
+Transport: `SyncRpcs` over HTTP POST with NDJSON (`RpcServer.layerHttp({ protocol: "http" })`
++ `RpcSerialization.layerNdjson` on the server; `RpcClient` over the platform fetch on the
+client).
 
 ## 7. Log ordering invariant
 
@@ -347,7 +362,8 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   are dropped and surfaced as typed notices (retained for inspection, not silently erased).
   The re-run is unconditional and belongs to the install path (engine `rebase`), including after
   a schema rebuild (§11 `dataHash` change): the rebuild empties the replica, nulls the cursor and
-  empties each pending entry's undo, so until the null-cursor set installs, pending effects are
+  empties each pending entry's undo (it keeps the outbox, released marks, `pushedThrough` and
+  notices: those describe the outbox, not the replica), so until the null-cursor set installs, pending effects are
   deliberately invisible (replaying onto an empty replica would run handlers against missing
   rows and the install discards the result anyway). On that install, `rebase` restores nothing
   (undo is empty), installs the set, then replays every pending entry the set does not settle in
