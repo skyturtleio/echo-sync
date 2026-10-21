@@ -466,9 +466,31 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
   erased" (§9) means exactly: the engine never removes a notice on its own, there is no cap,
   and only an explicit dismissal deletes one. A notice carries the full envelope, so an
   undismissed `Rejected`/`OutcomeUnknown` is also the user's recovery record for that intent.
-- **`status`** is a `Stream` (mode, `isLeaderTab`, `leaderId`), current value then changes;
-  `syncStatus` stays as is. `mode: "unsupported"` and `SecondaryTabWithoutRouter` are states the
-  adapter must render, not errors it may swallow.
+- **`status`** is a `Stream` (mode, `isLeaderTab`, `leaderId`), current value then changes.
+  `mode: "unsupported"` and `SecondaryTabWithoutRouter` are states the adapter must render, not
+  errors it may swallow.
+- **`syncStatus`** (ruling from the HeyBabe consumer trial) is a `Stream` of
+  `{ push, lastError, pendingMutations, lastSyncedAt, phase, nextRetryAt }`, current value then
+  every change, and it **survives handover like `subscribe`**: on `LeaderLost` it re-subscribes
+  to the new leader and keeps the last emission until the first fresh one. `pendingMutations` is
+  the number of unreleased outbox entries (pushed-but-not-installed included) and changes on
+  every local append and release, not only on network cycles; a consumer must never need
+  `exportPending` just to count. `lastSyncedAt` is epoch ms of the last cycle whose push and
+  `PullDone` install both completed, `null` until the first such cycle in this leader (not
+  persisted; a fresh leader starts at `null`). `phase` is
+  `"idle" | "pushing" | "pulling" | "backoff"`; `nextRetryAt` is epoch ms while
+  `phase === "backoff"`, otherwise `null`. There is no `connected` boolean: a completed cycle
+  proves nothing about current connectivity, and v1 adds none (see §16 item 9).
+- **`requestSync`**: `Effect<void, SyncDisabled | LeaderUnavailable>` on the tab client. It
+  wakes the sync loop (coalesced with the existing wake queue) and completes once the wake is
+  accepted. It never implies network success, never clears `Halted`, and retries `LeaderLost`
+  like `mutate`. Its outcome is observable only through `syncStatus`.
+- **Closing the tab client's scope** terminates a locally owned leader worker and nothing else.
+  The outbox is durable (§9), so a push in flight at that moment resolves on the next leader
+  through the §9 idempotency rule and the §8 backstop; the engine neither drains nor freezes.
+  An app that wants a "pending writes" exit gate builds it from `pendingMutations` /
+  `exportPending` and its own approval UI; there is no global freeze primitive.
+- **Replica reset / sign-out purge** of an identity's local data: open, §16 item 11.
 - **Credentials**: `syncHeaders` is evaluated once per leader (§6: `Unauthorized` is retried,
   so a renewed credential needs a new leader today). Refresh without a leader restart is §16
   item 10.
@@ -737,3 +759,4 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
 8. Query `limit` pushdown through the scope filter — **resolved** (main 41b878a): `IndexRangePlan` carries `readableBy` (principals) and `limit`; every `RowStore` applies readability as a `scope_grants` semi-join on `(access_scope_id, principal_id)` and stops after `limit` readable rows; `Store.planResult` is the shared reference. Covered by the `Conformance.rowStore` invariant run by Memory, SQLite and PG. Integration rule still owed by `ws/query` at landing: a registered-query run must record `scope_grants` as read whenever the plan carries `readableBy`, so a revoke re-runs the query.
 9. Pokes liveness. An idle client's only wake source is the `pokes` stream (§6: no resync timer, client pulls on every poke), and the HTTP RPC transport has no heartbeat, so an intermediary that holds a dead response open (observed with Vite's dev proxy, `docs/vertical-slice.md`) leaves the client deaf until a local enqueue. **User decision**, since it touches `Protocol`: (a) server heartbeat element on `pokes` distinguishable from a poke, plus a client idle timeout that reconnects; (b) a capped `pokes` connection lifetime with reconnect, no heartbeat; (c) accept for v1 and document. Until ruled, the vertical slice breaks the proxied response in the harness only.
 10. Credential refresh. `LeaderOptions.syncHeaders(principal)` is evaluated once per leader, so a renewed token takes effect only after a leader restart, while `Unauthorized` is retried (§6) and never fatal — a client with an expired token retries forever until the tab is reloaded. Lean: make `syncHeaders` an Effect evaluated per outgoing request (push, pull, pokes reconnect), with the app owning the refresh. Not scheduled; raise before any app relies on short-lived tokens.
+11. Replica reset on sign-out (HeyBabe trial). The public client has no way to delete an identity's local data (`echo-sync/<appId>/<profile>` on OPFS, replica + outbox + notices) after the app has signed the account out across tabs. **User decision**: (a) engine-owned `resetReplica` that acquires the identity's leader lock, refuses while a leader or tab client is alive (`ReplicaInUse`), deletes only that identity's directory, and drops the outbox only under an explicit flag; (b) engine-owned purge that deletes the whole identity directory when no leader exists, with the app responsible for warning on pending writes first; (c) no engine API in v1, the directory layout is documented and the app deletes it.
