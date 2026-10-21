@@ -519,11 +519,19 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
   for closing its tab clients first (its own cross-tab sign-out tombstone). Under the lock it
   opens the outbox through the same worker-hosted VFS path the leader uses (reuse the leader
   worker startup in a reset mode; no second OPFS host), counts unreleased entries, and fails
-  `PendingWrites { count }` unless `options.discardPending === true`; then it closes the
-  database and pool and removes the OPFS directory `echo-sync/<appId>/<profile>` recursively,
-  releasing the lock last. A candidate that becomes leader afterwards finds no pool and creates
-  a fresh, empty replica, which is the correct state for a signed-out identity. Notices are part
-  of the replica and go with it; the outbox is the only guarded content.
+  `PendingWrites { count }` on any unreleased entry; an outbox that cannot be read (the database
+  does not open, is corrupt, or has a schema this build cannot read) fails closed with
+  `ResetFailed`. With `options.discardPending === true` the reset never opens the database: it
+  skips the count entirely, so a corrupt replica or a partially removed one can still be reset
+  (coordinator ruling, ws/reset-replica review). Both paths keep identity validation, the leader
+  lock, success on an absent directory, waiting for the pool's access handles to be free as the
+  leader does, and removal of only this profile's directory. Then it closes whatever it opened
+  and removes the OPFS directory `echo-sync/<appId>/<profile>` recursively, releasing the lock
+  last. A candidate that becomes leader afterwards finds no pool and creates a fresh, empty
+  replica, which is the correct state for a signed-out identity. Notices are part of the replica
+  and go with it; the outbox is the only guarded content. The config carries the app's
+  `spawnLeader` factory (the same one passed to the tab client), since the reset must start the
+  app's own leader worker entry.
 - **Presence** (user ruling, §16 item 12a): `presence(room, state)` is a `Stream<RoomSnapshot>`
   on the tab client; this tab's entry exists exactly while the stream is open, and it survives
   handover like `subscribe` (re-joined on the new leader). `track(room, state)` replaces this
