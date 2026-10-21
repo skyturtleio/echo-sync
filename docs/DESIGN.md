@@ -549,9 +549,15 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
   different mutation name, a `DomainError` naming another mutation, or any decode failure is a
   typed `NoticeMismatch`, never a defect. Pure (no services), core-only, usable on the tab and
   the server. (Corrected from an earlier `{ envelope, outcome }` shape that no consumer holds.)
-- **Credentials**: `syncHeaders` is evaluated once per leader (§6: `Unauthorized` is retried,
-  so a renewed credential needs a new leader today). Refresh without a leader restart is §16
-  item 10.
+- **Credentials** (coordinator ruling, §16 item 10): `LeaderOptions.syncHeaders` is
+  `(principal) => Effect<Readonly<Record<string, string>>>` (error channel `never`), evaluated
+  by the transport for every outgoing request: each push, each pull, and each (re)connect of a
+  stream (`pokes`, and `room` once the presence client exists). The app owns refresh: it returns
+  the credential it wants on the wire now, caching and renewing as it sees fit; if a renewal
+  fails it returns what it has and the §6 `Unauthorized` retry path applies. The engine never
+  caches headers across requests, so a renewed token takes effect on the next request without a
+  leader restart. `Unauthorized` stays retried and never fatal; the app observes a persistent
+  `Unauthorized` through `syncStatus` and decides on sign-out itself.
 
 ## 10. Queries (client read API)
 
@@ -842,7 +848,7 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
 7. Additive schema evolution across a deploy — **resolved in §11** (codecs drop excess keys, fail on missing; new columns nullable/defaulted; deploy server first). Remaining: a wire manifest/version gate so a newer client against an older server degrades cleanly instead of failing row decode; needed before clients can ship ahead of the server.
 8. Query `limit` pushdown through the scope filter — **resolved** (main 41b878a): `IndexRangePlan` carries `readableBy` (principals) and `limit`; every `RowStore` applies readability as a `scope_grants` semi-join on `(access_scope_id, principal_id)` and stops after `limit` readable rows; `Store.planResult` is the shared reference. Covered by the `Conformance.rowStore` invariant run by Memory, SQLite and PG. Integration rule still owed by `ws/query` at landing: a registered-query run must record `scope_grants` as read whenever the plan carries `readableBy`, so a revoke re-runs the query.
 9. Pokes liveness — **resolved (user: a)**, see §6 Liveness: `Poke | Heartbeat` stream element, server `heartbeatInterval` (default 15 s), client `idleTimeout` (default 45 s) that ends and reconnects the stream; heartbeats never wake the loop. The harness-only proxy workaround goes away once the client timeout exists.
-10. Credential refresh. `LeaderOptions.syncHeaders(principal)` is evaluated once per leader, so a renewed token takes effect only after a leader restart, while `Unauthorized` is retried (§6) and never fatal — a client with an expired token retries forever until the tab is reloaded. Lean: make `syncHeaders` an Effect evaluated per outgoing request (push, pull, pokes reconnect), with the app owning the refresh. Not scheduled; raise before any app relies on short-lived tokens.
+10. Credential refresh — **resolved (user: a)**, see §9.1 Credentials: `syncHeaders` returns an Effect and is evaluated per outgoing request (push, pull, every stream (re)connect); the app owns refresh; `Unauthorized` stays retried and never fatal. Scheduled (ws/credential-refresh).
 11. Replica reset on sign-out — **resolved (user: a)**, see §9.1 `resetReplica`: engine-owned, guarded by the leader lock (`ReplicaInUse`) and by the outbox (`PendingWrites { count }` unless `discardPending`), deletes only the identity's OPFS directory.
 12. Presence — **resolved (user: a)**, implement as designed: §12 `PresenceRpcs` (`room` stream joins and observes, `track` updates, entries keyed by `(clientId, tabId)`, scope-grant authorization, process-local in-memory state) and §9.1 `presence` / `track` on the tab client, leader-owned and handover-surviving. Multi-instance presence is a later item.
 13. Presence liveness and revocation (v1 gaps declared by ws/presence-server). **Liveness resolved (coordinator ruling, before the tab client exists so the wire never changes):** the `room` stream element becomes `RoomSnapshot | Heartbeat` (the same `Heartbeat` tagged struct as `pokes`), the server emits a heartbeat every `heartbeatInterval` on every open `room` stream, and the tab client's `presence` applies the same `idleTimeout` as `followPokes` (end and rejoin a silent stream; a rejoin re-sends the latest desired state since `track`'s ack cannot confirm application). A heartbeat is never a snapshot and never changes room state. Revocation stays open: a grant revoked while a `room` stream is open leaves the entry until that stream ends; re-check the grant on each snapshot only if an app needs it. Not scheduled.
