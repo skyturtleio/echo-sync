@@ -8,7 +8,11 @@ export default defineConfig({
     port: 5199,
     strictPort: true,
     host: "127.0.0.1",
-    fs: { allow: [fileURLToPath(new URL("../..", import.meta.url))] }
+    fs: { allow: [fileURLToPath(new URL("../..", import.meta.url))] },
+    // The vertical-slice server (examples/server/main.ts): the real SyncRpcs at /sync, scenario hooks at /admin.
+    proxy: Object.fromEntries(
+      ["/sync", "/admin"].map((path) => [path, process.env["ECHO_SLICE_SERVER"] ?? "http://127.0.0.1:5200"])
+    )
   },
   // wa-sqlite resolves its .wasm relative to its own module URL; pre-bundling would break that.
   // Scan the workers too: otherwise deps first seen when a worker loads trigger a mid-run full page reload.

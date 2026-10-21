@@ -1,6 +1,5 @@
-import { Effect, Schema } from "effect"
-import { Mutation, Registry } from "echo-sync"
 import { runLeaderWorker } from "../../src/client/worker/index.ts"
+import { clientMutations, principalHeader, registry } from "./app.ts"
 
 // Harness-only fault injection, enabled per tab through the worker URL (see main.ts / scenarios.sh).
 const flags = new URLSearchParams(self.location.search)
@@ -35,12 +34,11 @@ if (flags.has("failOpen")) {
   })
 }
 
-// The harness syncs no tables and has one mutation, "t", that writes nothing: the scenarios exercise the
-// outbox, ownership and handover, not reconciliation. `?syncUrl=` turns the sync loop on.
-const t = Mutation.make("t", { args: Schema.Json, handler: () => Effect.void })
+// The harness app (app.ts): the `todos` table and its mutations. `?syncUrl=` turns the sync loop on; the
+// tab's principal goes to the server in the dev-only principal header.
 const syncUrl = flags.get("syncUrl")
 runLeaderWorker(self, {
-  registry: Registry.make([]),
-  mutations: Mutation.makeRegistry([t]),
-  ...(syncUrl === null ? {} : { syncUrl })
+  registry,
+  mutations: clientMutations,
+  ...(syncUrl === null ? {} : { syncUrl, syncHeaders: (principal) => ({ [principalHeader]: principal }) })
 })
