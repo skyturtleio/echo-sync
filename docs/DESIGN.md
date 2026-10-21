@@ -181,6 +181,16 @@ return the recorded outcome without re-executing. Every push outcome carries the
 `position` it was recorded at, so the client can tell whether its installed replica already
 covers it (§8).
 
+**Request-level push errors are reserved for input an honest client cannot produce.** Push
+fails as a whole, with nothing executed or ledgered, only on `Unauthorized` and
+`MalformedEnvelope` (e.g. `seq < 1`; the `Seq` schema already refuses this at RPC decode, so
+the server guard is defense in depth against corrupt or forged input). Any per-envelope check
+an honest client *could* fail (args decode, authorization, domain error, size) must instead be
+a ledgered `Rejected{…}` so the batch continues and the outbox drains. The client treats
+`MalformedEnvelope`, and a push payload decode failure, as a fatal integrity error: it stops
+pushing, surfaces the error, and offers export of pending mutations (§9). It never releases the
+entry (that would open a `seq` gap, which §16.5 forbids) and never retries automatically.
+
 ## 7. Log ordering invariant
 
 Postgres sequences are not commit-ordered. Position 41 may commit after a client has already
@@ -380,6 +390,17 @@ const todosByProject = Query.make("todos.byProject", {
   safe plus a commented TODO for manual steps. NOT NULL evolution: expand → compatible writers →
   chunked idempotent backfill (outside Migrator's transaction) → validate → enforce.
 - Adding an index must not force a replica re-download.
+- **Additive column evolution (observed on pinned Effect 4.0.5 `Schema.Struct`):** wire and
+  storage row codecs **drop excess keys on decode** and **fail on a missing key**. Never set
+  `onExcessProperty: "error"` on row codecs. Consequences, which are the v1 rule: (1) a new
+  column must be nullable or server-defaulted; (2) an older client keeps syncing a known table
+  at the newer server schema (it decodes the fields it knows; its optimistic `patch` re-encodes
+  a row without the new column into its *own* replica only, and the next pull overwrites it —
+  the server is authoritative and always runs the newest schema, and mutations carry args, not
+  rows); (3) a newer client against an older server is a decode failure the §9 rebuild cannot
+  repair, so **deploy order is server first, then clients**; the startup verifier (above) makes
+  the server refuse to serve a mismatched database, never a stale client. A manifest/version
+  gate on the wire is the later fix for (3).
 
 ## 12. Transport
 
@@ -448,5 +469,5 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
    - `Rejected{ClientExpired}` still carries a ledger `position` (§6 says every outcome does): the server records, next to the floor, the position of the highest expired ledger row and returns that. The client reports it as an `OutcomeUnknown` notice.
    - **Expiry depends on §9's outbox rule (1).** The §8 push-position backstop (rule 2) does not survive expiry: a duplicate enqueued after its original was released gets a fresh `seq` above the floor, and once the original's ledger row is gone the server cannot recognise it and executes it again (shown by the reconcile simulation). Only a released-row memory in the outbox rules such a duplicate out. Any expiry policy must therefore expire a client's ledger rows only after the released-row retention window (§9, default 24 h) has passed since those rows were acked, and never rows newer than the client's last presented cursor. When to raise the floor beyond that is the remaining open question.
 6. Local full-text search: the pinned wa-sqlite build lacks FTS5 (§10); decide custom build vs. non-FTS search when the search primitive is scheduled.
-7. Additive schema evolution across a deploy: a running client with an older registry receives rows of a *known* table at the newer server schema (added column, widened union). §8 settles unknown tables (skipped). For known tables the wire codec must either tolerate extra fields and decode missing-on-client fields as absent, or the protocol needs a manifest/version gate that forces a replica rebuild. Decide before the first schema migration ships; foundation to report what `SyncTable.wire` does with excess properties today.
+7. Additive schema evolution across a deploy — **resolved in §11** (codecs drop excess keys, fail on missing; new columns nullable/defaulted; deploy server first). Remaining: a wire manifest/version gate so a newer client against an older server degrades cleanly instead of failing row decode; needed before clients can ship ahead of the server.
 8. Query `limit` is applied after the scope filter in `Store.make` (v1), so `take(n)` is not pushed down to `RowStore.range` and a query over a large table with many unreadable rows scans past them. Fix by pushing the scope predicate into the range plan when queries are built.
