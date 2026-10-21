@@ -2,9 +2,10 @@
 import "../testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { expect, it } from "@effect/vitest"
-import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Schema, Stream } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Schema, Scope, Stream } from "effect"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import { RpcTest } from "effect/rpc"
+import * as Schedule from "effect/Schedule"
 import * as SqlClient from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation, Protocol, Query, Registry, ScopeGrants, type Store, SyncTable } from "echo-sync"
 import * as Engine from "../sync/Engine.ts"
@@ -375,7 +376,9 @@ const passThrough = (client: Effect.Success<ReturnType<typeof leaderRpc>>["clien
   enqueue: (envelope) => client.enqueue({ envelope }),
   subscribe: (name, args) => client.subscribe({ name, args }),
   notices: client.notices(),
-  dismissNotices: (ids) => client.dismissNotices({ ids })
+  dismissNotices: (ids) => client.dismissNotices({ ids }),
+  syncStatus: client.syncStatus(),
+  requestSync: client.requestSync()
 })
 
 it.live("mutate retried across LeaderLost after the lost leader committed leaves exactly one outbox row", () =>
@@ -471,5 +474,215 @@ it.live("a dismissed notice is gone from the notices stream, and an undismissed 
     yield* engine.pull
     const afterPull = yield* Stream.runHead(client.notices())
     expect(Option.map(afterPull, ids)).toEqual(Option.some(["m2"]))
+  }).pipe(Effect.scoped)
+)
+
+// ---------------------------------------------------------------------------------------------
+// syncStatus and requestSync (DESIGN §9.1) over leaders wired as `program` wires them
+// ---------------------------------------------------------------------------------------------
+
+class Integrity extends Schema.TaggedError<Integrity>()("Integrity", {}) {}
+class Offline extends Schema.TaggedError<Offline>()("Offline", {}) {}
+const decodePush = Schema.decodeUnknownSync(Protocol.PushResponse)
+
+/** One replica database, shared by the successive leaders of a test (a handover keeps the file). */
+const replicaDb = Effect.gen(function* () {
+  const reactivity = yield* Reactivity.make
+  const sql = yield* SqliteClient.makeMemory({ installReactivityHooks: true }).pipe(
+    Effect.provideService(Reactivity.Reactivity, reactivity)
+  )
+  yield* SqliteSyncStorage.migrate(queryRegistry).pipe(Effect.provideService(SqlClient.SqlClient, sql))
+  const storage = SqliteSyncStorage.make(sql, queryRegistry)
+  const grant = {
+    id: ScopeGrants.grantId(scope, me),
+    accessScopeId: scope,
+    principalId: me,
+    role: "owner" as const,
+    grantedAt: DateTime.makeUnsafe(0)
+  }
+  // A replica that already installed a snapshot (cursor 1), so a pull is incremental and keeps the grant.
+  yield* storage.transaction(
+    Effect.andThen(
+      storage.rows.write(
+        ScopeGrants.ScopeGrants,
+        grant.id,
+        Option.some(Schema.encodeUnknownSync(ScopeGrants.ScopeGrants.wire)(grant))
+      ),
+      storage.setMeta({ cursor: position, pushedThrough: 0, resnapshot: false })
+    )
+  )
+  return { sql, reactivity }
+})
+
+/** A leader over `db` with a running sync loop and the reactive pending count, as `program` builds it. */
+const syncLeader = (
+  db: Effect.Success<typeof replicaDb>,
+  transport: Engine.Transport<Integrity | Offline>,
+  retryDelay: "1 second" | "1 hour" = "1 second"
+) =>
+  Effect.gen(function* () {
+    const storage = SqliteSyncStorage.make(db.sql, queryRegistry)
+    const engine = yield* Engine.make({
+      clientId: Ids.ClientId.make("c"),
+      actor: me,
+      storage,
+      registry: queryRegistry,
+      mutations: Mutation.makeRegistry([addRaw]),
+      transport
+    })
+    const loop = yield* SyncLoop.make({
+      engine,
+      isFatalPush: (e) => e instanceof Integrity,
+      pendingMutations: storage.pendingCount,
+      retryDelay,
+      maxRetryDelay: "1 hour"
+    })
+    yield* Effect.forkScoped(loop.run)
+    const handlers = yield* makeHandlers({
+      sql: db.sql,
+      reactivity: db.reactivity,
+      storage,
+      engine,
+      loop,
+      actor: me,
+      queries: Query.makeRegistry([]),
+      allowRawExec: false,
+      info: { leaderId: "l", clientId: "c", dbName: "test", syncing: true }
+    })
+    return yield* RpcTest.makeClient(LeaderRpcs).pipe(Effect.provide(handlers))
+  })
+
+/** Take emissions until one satisfies `p` (5 s budget); returns it. */
+const awaitStatus = (
+  emissions: Queue.Queue<SyncLoop.SyncStatus>,
+  p: (s: SyncLoop.SyncStatus) => boolean
+): Effect.Effect<SyncLoop.SyncStatus, unknown> =>
+  Queue.take(emissions).pipe(
+    Effect.repeat({ until: p }),
+    Effect.timeoutOrElse({
+      duration: "5 seconds",
+      orElse: () => Effect.fail(new Error("no matching syncStatus emission within 5 s"))
+    })
+  )
+
+it.live(
+  "pendingMutations follows every append and release (not only cycle ends), and a new leader starts from the durable outbox",
+  () =>
+    Effect.gen(function* () {
+      const db = yield* replicaDb
+      // Pull answers only when the test offers it the acks to deliver; push applies at fresh positions.
+      const pulls = yield* Queue.unbounded<ReadonlyArray<string>>()
+      const positions = new Map<string, number>()
+      let next = 100
+      let cursor = 1
+      const transport: Engine.Transport<Integrity | Offline> = {
+        push: (request) =>
+          Effect.sync(() =>
+            decodePush({
+              results: request.mutations.map((m) => {
+                positions.set(m.mutationId, ++next)
+                return { mutationId: m.mutationId, position: String(next), outcome: { _tag: "Applied" } }
+              })
+            })
+          ),
+        pull: () =>
+          Effect.map(Queue.take(pulls), (acked) => {
+            const acks = acked.map((id) => ({
+              mutationId: id,
+              position: String(positions.get(id) ?? 0),
+              outcome: { _tag: "Applied" }
+            }))
+            cursor = Math.max(cursor, ...acked.map((id) => positions.get(id) ?? 0))
+            return decodeDone({ _tag: "PullDone", changes: [], acks, nextCursor: String(cursor), expiredThrough: 0 })
+          })
+      }
+      const first = yield* Scope.make()
+      const leader1 = yield* syncLeader(db, transport).pipe(Scope.provide(first))
+      const lost = yield* Deferred.make<void>()
+      let opens = 0
+      const leader2 = yield* Deferred.make<typeof leader1>()
+      const api = tabApi({
+        ...passThrough(leader1),
+        syncStatus: Stream.suspend(() =>
+          ++opens === 1
+            ? leader1
+                .syncStatus()
+                .pipe(Stream.interruptWhen(Effect.andThen(Deferred.await(lost), Effect.fail(leaderLost))))
+            : Stream.unwrap(Effect.map(Deferred.await(leader2), (c) => c.syncStatus()))
+        )
+      })
+      const emissions = yield* Queue.unbounded<SyncLoop.SyncStatus>()
+      const ended = yield* Deferred.make<void>()
+      yield* Effect.forkScoped(
+        Stream.runForEach(api.syncStatus, (s) => Queue.offer(emissions, s)).pipe(
+          Effect.ensuring(Deferred.succeed(ended, undefined))
+        )
+      )
+      const enqueue = (id: string) =>
+        leader1.enqueue({
+          envelope: { mutationId: Ids.MutationId.make(id), name: "raw.add", args: { id } }
+        })
+
+      // The first cycle is parked in pull. An enqueue is counted at once, while that cycle still runs.
+      yield* awaitStatus(emissions, (s) => s.phase === "pulling")
+      yield* enqueue("m1")
+      const appended = yield* awaitStatus(emissions, (s) => s.pendingMutations === 1)
+      expect([appended.phase, appended.lastSyncedAt]).toEqual(["pulling", null])
+
+      // Cycle 1 ends; cycle 2 pushes m1 (Applied above the cursor: pushed, not installed) and parks in pull.
+      yield* Queue.offer(pulls, [])
+      const pushed = yield* awaitStatus(emissions, (s) => s.phase === "pulling" && s.lastSyncedAt !== null)
+      expect(pushed.pendingMutations).toBe(1)
+      expect(positions.has("m1")).toBe(true)
+
+      // The install that carries m1's ack releases it.
+      yield* Queue.offer(pulls, ["m1"])
+      yield* awaitStatus(emissions, (s) => s.pendingMutations === 0)
+
+      // m2 is appended; then the leader goes away and a new one opens the same database.
+      yield* enqueue("m2")
+      yield* awaitStatus(emissions, (s) => s.pendingMutations === 1)
+      // The tab sees the loss first (as LeaderClient's epoch watch reports it), then the leader's scope ends.
+      yield* Deferred.succeed(lost, undefined)
+      yield* Scope.close(first, Exit.void)
+      yield* Deferred.succeed(leader2, yield* syncLeader(db, transport))
+      // The new leader's first status (lastSyncedAt null: nothing synced in this leader) counts m2.
+      const fresh = yield* awaitStatus(emissions, (s) => s.lastSyncedAt === null)
+      expect(fresh.pendingMutations).toBe(1)
+      expect(opens).toBe(2)
+      expect(yield* Deferred.isDone(ended)).toBe(false)
+    }).pipe(Effect.scoped)
+)
+
+it.live("requestSync during backoff runs the next cycle at once and leaves a halted push halted", () =>
+  Effect.gen(function* () {
+    const db = yield* replicaDb
+    const calls = { push: 0, pull: 0 }
+    const transport: Engine.Transport<Integrity | Offline> = {
+      push: () => Effect.suspend(() => (calls.push++, Effect.fail(new Integrity()))),
+      pull: () => Effect.suspend(() => (calls.pull++, Effect.fail(new Offline())))
+    }
+    // An hour of backoff: only a wake can bring the next cycle within the test's budget.
+    const client = yield* syncLeader(db, transport, "1 hour")
+    const api = tabApi(passThrough(client))
+    const emissions = yield* Queue.unbounded<SyncLoop.SyncStatus>()
+    yield* Effect.forkScoped(Stream.runForEach(api.syncStatus, (s) => Queue.offer(emissions, s)))
+    yield* client.enqueue({
+      envelope: { mutationId: Ids.MutationId.make("m1"), name: "raw.add", args: { id: "m1" } }
+    })
+    const halted = yield* awaitStatus(emissions, (s) => s.push._tag === "Halted" && s.phase === "backoff")
+    const pullsBefore = calls.pull
+    expect(halted.nextRetryAt ?? 0).toBeGreaterThan(Date.now() + 30 * 60_000)
+    expect(halted.lastSyncedAt).toBeNull()
+
+    yield* api.requestSync
+    const woken = yield* Effect.repeat(
+      Effect.sync(() => calls.pull),
+      { until: (n) => n > pullsBefore, schedule: Schedule.spaced("10 millis") }
+    ).pipe(Effect.timeoutOption("3 seconds"))
+    expect(Option.isSome(woken) ? "next cycle ran" : "still waiting out the backoff").toBe("next cycle ran")
+    const after = yield* awaitStatus(emissions, (s) => s.phase === "backoff" && calls.pull > pullsBefore)
+    expect(after.push._tag).toBe("Halted")
+    expect(calls.push).toBe(1)
   }).pipe(Effect.scoped)
 )

@@ -89,16 +89,41 @@ is still the active connection, and a displaced connection completes its `lost` 
 | `enqueue` retry after `LeaderLost` | Safe: idempotent on `mutationId`, pending or released (returns the existing `seq`, allocates none) | Verified across a real handover and at the commit-before-lost-response crash point, with two tabs retrying the same id at once. |
 | `exec` retry | Only if the statement is idempotent | Raw SQL, harness/diagnostics only. |
 | Request issued while no leader is connected | Waits for the next leader | Leadership gaps are short (lock queue). |
-| Open `subscribe` (registered query) or `notices` stream | **Resumes** on the next leader; nothing is emitted in between, so the consumer keeps the last emission until the fresh first one | DESIGN §9.1; see below. |
-| Open `subscribeRaw` or `syncStatus` stream | **Terminates** with `LeaderUnavailable{LeaderLost}`; the caller re-subscribes | See below. |
+| Open `subscribe` (registered query), `notices` or `syncStatus` stream | **Resumes** on the next leader; nothing is emitted in between, so the consumer keeps the last emission until the fresh first one | DESIGN §9.1; see below. |
+| `requestSync` after `LeaderLost` | Retried like `mutate`; a wake is idempotent (coalesced into the sliding wake queue) | DESIGN §9.1. |
+| Open `subscribeRaw` stream | **Terminates** with `LeaderUnavailable{LeaderLost}`; the caller re-subscribes | See below. |
 | Replica / outbox | Persist (same OPFS file; the new leader reopens it) | Verified. |
 
 The server side of a stream (its `Reactivity` registration) dies with the old leader, and the new leader
 cannot know which result version the subscriber last saw. A resumed stream therefore never tries to
 continue: the tab re-subscribes and the new leader sends a fresh, complete first result, which may repeat
-the last value (never skip a change). `subscribe` and `notices` do this inside `LeaderClient` (their
-results are whole values, so a repeat is harmless); the raw `subscribeRaw` and `syncStatus` streams still
-end with `LeaderLost` and leave it to the caller (the harness scenarios assert that end).
+the last value (never skip a change). `subscribe`, `notices` and `syncStatus` do this inside `LeaderClient`
+(their results are whole values, so a repeat is harmless); the raw `subscribeRaw` stream still ends with
+`LeaderLost` and leaves it to the caller (the harness scenarios assert that end).
+
+### Closing the tab client's scope (DESIGN §9.1)
+
+`LeaderClient.make`'s only finalizer for the leader is `worker.terminate()` on this tab's own leader
+candidate (the harness closes the scope on `pagehide`). `terminate()` stops the worker's event loop at
+once: no Effect finalizer in the worker runs, so nothing drains, flushes or freezes. What that means for a
+push in flight at that moment:
+
+- The outbox entry was committed before `enqueue` resolved, so it is still pending in OPFS. The browser
+  releases the dead worker's Web Locks and access handles, the next queued candidate becomes leader and
+  reopens the same file.
+- The worker's HTTP push request is abandoned with it. The server may have committed it (ledger row, no
+  ack delivered) or not (its transaction rolls back with the dropped connection, or never started).
+- The next leader pushes every unreleased entry. If the first push committed, the ledger answers the
+  repeat with the recorded outcome (§9 idempotency); otherwise it applies now. Either way the entry is
+  acked exactly once and released by the pull that carries the ack (§8 backstop).
+
+Evidence: slice scenario S5 (`slice.sh`, "leader closed while its push is held on the server") closes the
+owning tab while its push is parked at a server gate inside the ledger transaction. The successor sends
+its own push while the entry is still pending, and after the gate opens Postgres holds exactly one ledger
+row and the entry is released. Closing the tab ends the worker the same way the scope finalizer does (a
+dedicated worker does not outlive its document), so no separate scope-close scenario was added. A worker
+that ends itself after a commit is covered too: "crash after commit" and "worker-only crash" in
+`scenarios.sh`.
 
 ## Fallback without SharedWorker
 
@@ -189,7 +214,15 @@ tables and replica schema, one transaction) and builds `Engine.make` over the SQ
   A new leader starts a fresh loop, so a halt re-trips on its first push (DESIGN §6).
 - Without `syncUrl` the replica is local-only: enqueue still applies and persists; `syncStatus` fails
   with `SyncDisabled`.
-- `syncStatus` (stream, ends with `LeaderLost` on handover like `subscribeRaw`), `notices` (stream) and
+- `syncStatus` is `{ push, lastError, pendingMutations, lastSyncedAt, phase, nextRetryAt }` (DESIGN §9.1).
+  `pendingMutations` is a recount of unreleased `echo_outbox` rows taken under the storage permit after
+  every write to that table (`SqliteSyncStorage.pendingCount`, reactive on the connection's update hook),
+  so it follows each enqueue and release, not only cycle ends, and cannot drift. `lastSyncedAt` is set by a
+  cycle whose push finished cleanly and whose pull installed a `PullDone`; it is in memory, so a new leader
+  starts at `null`. `phase` is set by the loop (`pushing`, `pulling`, `backoff` with `nextRetryAt`, `idle`).
+  `requestSync` offers to the loop's sliding wake queue: during backoff it cuts the wait short, and it
+  never touches a `Halted` push.
+- `syncStatus` (stream, resumes on handover like `subscribe`), `requestSync`, `notices` (stream) and
   `exportPending` (pending outbox in seq order; reads storage only, so it is available while push is
   halted) are RPCs on `LeaderRpcs`.
 - `RpcClient.layerProtocolHttp({ url })` posts to `<url>/` (trailing slash): the server route must accept

@@ -144,7 +144,7 @@ worker_crash() { # $1 = label, $2 = extra page flags
   F=$(open_tab "$BASE/?app=$APP")
   ev <<<"$SERVED" >/dev/null
   ab tab "$L" >/dev/null
-  ev <<<"echo.watchStatus(); await echo.enqueue({ mutationId: 'crash-after-commit-worker-only', name: 't', args: {} }); return true" >/dev/null
+  ev <<<"echo.watchStatus(); echo.watchSyncStatus(); await echo.until(() => echo.syncStatusLog.length > 0); await echo.enqueue({ mutationId: 'crash-after-commit-worker-only', name: 't', args: {} }); return true" >/dev/null
   ab tab "$F" >/dev/null
   f=$(ev <<<"return await echo.until(async () => { const s = await echo.status(); return s.isLeaderTab && s.leaderId !== undefined ? s : undefined }, 15000) ?? null")
   ab tab "$L" >/dev/null
@@ -152,11 +152,18 @@ worker_crash() { # $1 = label, $2 = extra page flags
   connected=$(ev <<<"return (await echo.until(() => echo.statusLog.some((s) => s.leaderId === '$(jq -r .leaderId <<<"$f")'), 15000)) === true")
   ev <<<"echo.releaseEpochWatch(); await new Promise((r) => setTimeout(r, 300)); return true" >/dev/null
   log=$(ev <<<"return echo.statusLog")
-  check "worker-only crash ($1): every status emission naming another epoch has isLeaderTab false, and the tab follows the new leader" "$(jq -c --argjson l "$l" --argjson f "$f" --argjson c "$connected" --argjson log "$log" '
+  # syncStatus (DESIGN §9.1): the stream never ends, and it emits again once the tab follows F's leader.
+  sync=$(ev <<<"const f = echo.statusLog.findIndex((s) => s.leaderId === '$(jq -r '.leaderId // empty' <<<"$f")')
+await echo.until(() => echo.syncStatusLog.some((e) => e.afterStatus > f), 15000)
+return { firstOnNew: f, entries: echo.syncStatusLog.map((e) => ({ after: e.afterStatus, pending: e.value.pendingMutations, phase: e.value.phase, synced: e.value.lastSyncedAt !== null })), ended: echo.syncWatch.ended ?? null }")
+  check "worker-only crash ($1): every status emission naming another epoch has isLeaderTab false, the tab follows the new leader, and syncStatus survives into it" "$(jq -c --argjson l "$l" --argjson f "$f" --argjson c "$connected" --argjson log "$log" --argjson sync "$sync" '
     ($log | map(select(.leaderId != null and .leaderId != $l.leaderId))) as $others |
     { pass: ($l.isLeaderTab and $f != null and $f.isLeaderTab and $c and ($log | any(.isLeaderTab))
             and ($others | length) > 0 and ($others | all(.isLeaderTab | not))
-            and ($log[-1].leaderId == $f.leaderId) and ($log[-1].isLeaderTab | not)),
+            and ($log[-1].leaderId == $f.leaderId) and ($log[-1].isLeaderTab | not)
+            and $sync.ended == null and $sync.firstOnNew >= 0
+            and ($sync.entries | any(.after <= $sync.firstOnNew)) and ($sync.entries | any(.after > $sync.firstOnNew))),
+      sync: $sync,
       log: ($log | map({ isLeaderTab, leader: (.leaderId // "-")[0:8] })), old: $l.leaderId[0:8], new: ($f.leaderId // "-")[0:8] }' <<<"{}")"
   for t in "$L" "$F"; do ab tab close "$t" >/dev/null; done
 }

@@ -9,7 +9,7 @@
  * exportable. The engine writes nothing durable when its transport fails, so classifying in the caller
  * (who owns the transport's error union) loses nothing.
  */
-import { Cause, Duration, Effect, Exit, Option, Queue, Schema, Stream, SubscriptionRef } from "effect"
+import { Cause, Clock, Duration, Effect, Exit, Option, Queue, Schema, Stream, SubscriptionRef } from "effect"
 import type { Errors } from "echo-sync"
 import type * as Engine from "./Engine.ts"
 
@@ -20,15 +20,29 @@ export const PushState = Schema.Union([
 ])
 export type PushState = typeof PushState.Type
 
+export const SyncPhase = Schema.Literals(["idle", "pushing", "pulling", "backoff"])
+export type SyncPhase = typeof SyncPhase.Type
+
+/** The leader's sync state (DESIGN §9.1). No `connected` flag: a finished cycle proves nothing about now. */
 export const SyncStatus = Schema.Struct({
   push: PushState,
   /** Last transient failure, cleared by the next cycle that completes cleanly. */
-  lastError: Schema.NullOr(Schema.String)
+  lastError: Schema.NullOr(Schema.String),
+  /** Unreleased outbox entries (pushed-but-not-installed included); follows every append and release. */
+  pendingMutations: Schema.Int,
+  /** Epoch ms of the last cycle whose push and `PullDone` install both completed; `null` until one in this leader. */
+  lastSyncedAt: Schema.NullOr(Schema.Number),
+  phase: SyncPhase,
+  /** Epoch ms of the next retry while `phase === "backoff"`, otherwise `null`. */
+  nextRetryAt: Schema.NullOr(Schema.Number)
 })
 export type SyncStatus = typeof SyncStatus.Type
 
 export interface SyncLoop {
-  /** Request a cycle soon (coalesced: many wakes while one is queued run one cycle). */
+  /**
+   * Request a cycle soon (coalesced: many wakes while one is queued run one cycle). During backoff it
+   * cuts the wait short; it never clears a `Halted` push.
+   */
   readonly wake: Effect.Effect<void>
   readonly status: Effect.Effect<SyncStatus>
   readonly changes: Stream.Stream<SyncStatus>
@@ -61,18 +75,36 @@ export const make = <TE>(options: {
   /** First retry delay after a transient failure; doubles up to `maxRetryDelay`. */
   readonly retryDelay?: Duration.Input
   readonly maxRetryDelay?: Duration.Input
+  /**
+   * The current count of unreleased outbox entries, then the count after every outbox write (the leader
+   * passes a reactive count over `echo_outbox`). Followed while `run` runs; a failure restarts it after
+   * a second. Without it `pendingMutations` stays 0.
+   */
+  readonly pendingMutations?: Stream.Stream<number, Errors.StoreUnavailable>
 }): Effect.Effect<SyncLoop> =>
   Effect.gen(function* () {
     const { engine } = options
     const base = Duration.toMillis(Duration.fromInputUnsafe(options.retryDelay ?? "1 second"))
     const cap = Duration.toMillis(Duration.fromInputUnsafe(options.maxRetryDelay ?? "30 seconds"))
-    const status = yield* SubscriptionRef.make<SyncStatus>({ push: { _tag: "Active" }, lastError: null })
+    const status = yield* SubscriptionRef.make<SyncStatus>({
+      push: { _tag: "Active" },
+      lastError: null,
+      pendingMutations: 0,
+      lastSyncedAt: null,
+      phase: "idle",
+      nextRetryAt: null
+    })
+    const setPhase = (phase: SyncPhase, nextRetryAt: number | null = null) =>
+      SubscriptionRef.update(status, (s) => ({ ...s, phase, nextRetryAt }))
     const wakes = yield* Queue.sliding<void>(1)
 
     /** One push+pull cycle; returns whether it hit a transient failure. */
     const cycle = Effect.gen(function* () {
       let transient = Option.none<string>()
+      // A cycle whose push did not run (halted) or did not finish cleanly is not a completed sync.
+      let pushedCleanly = false
       if ((yield* SubscriptionRef.get(status)).push._tag === "Active") {
+        yield* setPhase("pushing")
         const pushed = yield* Effect.exit(engine.push)
         if (Exit.isFailure(pushed)) {
           const { halts, message } = yield* classify(pushed.cause, options.isFatalPush)
@@ -85,28 +117,51 @@ export const make = <TE>(options: {
           }
         } else if (pushed.value.stopped) {
           transient = Option.some("server stopped the push batch at a transient failure")
+        } else {
+          pushedCleanly = true
         }
       }
+      yield* setPhase("pulling")
       // Every pull failure, a defect included, is transient (§6): nothing was installed.
       const pulled = yield* Effect.exit(engine.pull)
       if (Exit.isFailure(pulled)) {
         const { message } = yield* classify(pulled.cause, undefined)
         if (Option.isNone(transient)) transient = Option.some(message)
       }
-      yield* SubscriptionRef.update(status, (s) => ({ ...s, lastError: Option.getOrNull(transient) }))
+      // `engine.pull` succeeds only once a `PullDone` set is installed.
+      const syncedAt = pushedCleanly && Exit.isSuccess(pulled) ? yield* Clock.currentTimeMillis : undefined
+      yield* SubscriptionRef.update(status, (s) => ({
+        ...s,
+        lastError: Option.getOrNull(transient),
+        lastSyncedAt: syncedAt ?? s.lastSyncedAt
+      }))
       return Option.isSome(transient)
     })
 
+    const followPending =
+      options.pendingMutations === undefined
+        ? Effect.void
+        : Stream.runForEach(options.pendingMutations, (n) =>
+            SubscriptionRef.update(status, (s) => ({ ...s, pendingMutations: n }))
+          ).pipe(
+            Effect.catchCause((cause) => Effect.logWarning("echo-sync: pending count failed; restarting", cause)),
+            Effect.andThen(Effect.sleep("1 second")),
+            Effect.forever
+          )
+
     const run = Effect.gen(function* () {
+      yield* Effect.forkChild(followPending)
       let delay = base
       while (true) {
         const failed = yield* cycle
         if (failed) {
           // Retry after the backoff unless something wakes the loop first.
+          yield* setPhase("backoff", (yield* Clock.currentTimeMillis) + delay)
           yield* Effect.raceFirst(Queue.take(wakes), Effect.sleep(Duration.millis(delay)))
           delay = Math.min(delay * 2, cap)
         } else {
           delay = base
+          yield* setPhase("idle")
           yield* Queue.take(wakes)
         }
       }

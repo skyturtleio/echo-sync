@@ -82,7 +82,27 @@ it.effect("a transient push failure is retried with backoff and clears once a cy
     yield* TestClock.adjust("1 millis")
     yield* settle
     expect(calls.push).toBe(3)
-    expect(yield* loop.status).toEqual({ push: { _tag: "Active" }, lastError: null })
+    expect(yield* loop.status).toMatchObject({ push: { _tag: "Active" }, lastError: null })
+  })
+)
+
+it.effect("lastSyncedAt stays null after a cycle whose pull failed, and is set by the first cycle that installs", () =>
+  Effect.gen(function* () {
+    const calls = { pull: 0 }
+    const engine: Engine.Engine<Offline> = {
+      mutate: () => Effect.die("unused"),
+      push: Effect.succeed({ processed: 1, stopped: false }),
+      pull: Effect.suspend(() => (++calls.pull === 1 ? Effect.fail(new Offline()) : Effect.void))
+    }
+    yield* TestClock.adjust("5 seconds")
+    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush })
+    yield* Effect.forkChild(loop.run)
+    yield* settle
+    // The push completed but nothing was installed: not a sync.
+    expect(yield* loop.status).toMatchObject({ lastSyncedAt: null, phase: "backoff", nextRetryAt: 6000 })
+    yield* TestClock.adjust("1 second")
+    yield* settle
+    expect(yield* loop.status).toMatchObject({ lastSyncedAt: 6000, phase: "idle", nextRetryAt: null })
   })
 )
 
@@ -172,7 +192,7 @@ it.effect("a pull that fails with MalformedChange is retried with backoff and ne
     yield* TestClock.adjust("1 millis")
     yield* settle
     expect(calls).toEqual({ push: 2, pull: 2 })
-    expect(yield* loop.status).toEqual({ push: { _tag: "Active" }, lastError: null })
+    expect(yield* loop.status).toMatchObject({ push: { _tag: "Active" }, lastError: null })
   })
 )
 

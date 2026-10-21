@@ -11,6 +11,7 @@ import * as Stream from "effect/Stream"
 import * as LeaderClientModule from "../../src/client/worker/LeaderClient.ts"
 import type { OutboxEnvelope, QueryResult, SqlParams } from "../../src/client/worker/LeaderRpcs.ts"
 import type { ToRouter } from "../../src/client/worker/messages.ts"
+import type { SyncStatus } from "../../src/client/sync/SyncLoop.ts"
 
 const params = new URLSearchParams(location.search)
 const appId = params.get("app") ?? "spike"
@@ -95,6 +96,12 @@ const currentStatus = Stream.runHead(client.status).pipe(
 
 /** Every `status` emission since `watchStatus()`, in order (the stream is continuous, not polled). */
 const statusLog: Array<LeaderClientModule.Status> = []
+/**
+ * Every `syncStatus` emission since `watchSyncStatus()`, each with the `statusLog` length when it arrived
+ * (to order it against leader changes); `syncStatusEnded` is how the stream ended, if it did.
+ */
+const syncStatusLog: Array<{ readonly afterStatus: number; readonly value: SyncStatus }> = []
+const syncWatch: { ended: unknown } = { ended: undefined }
 
 const echo = {
   statusLog,
@@ -103,6 +110,22 @@ const echo = {
     releaseEpochWatch()
     return true
   },
+  syncStatusLog,
+  syncWatch,
+  watchSyncStatus: () => {
+    Effect.runFork(
+      Stream.runForEach(client.syncStatus, (value) =>
+        Effect.sync(() => void syncStatusLog.push({ afterStatus: statusLog.length, value }))
+      ).pipe(
+        Effect.exit,
+        Effect.map((exit) => {
+          syncWatch.ended = Exit.isFailure(exit) ? JSON.parse(JSON.stringify(exit.cause)) : "completed"
+        })
+      )
+    )
+    return true
+  },
+  requestSync: () => run(client.requestSync),
   watchStatus: () => {
     Effect.runFork(Stream.runForEach(client.status, (s) => Effect.sync(() => void statusLog.push(s))))
     return true

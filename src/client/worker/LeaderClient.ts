@@ -11,7 +11,8 @@
  *   mutation that committed on the lost leader lands on the §9 idempotency rule: one outbox row.
  * - `subscribe` (registered queries) and `notices` re-subscribe to the next leader on `LeaderLost`; the
  *   stream emits nothing in between, so a consumer keeps the last emission until a fresh one arrives.
- * - Raw `subscribeRaw` streams and `syncStatus` terminate with `LeaderUnavailable { reason: "LeaderLost" }`;
+ * - `syncStatus` also re-subscribes on `LeaderLost` (DESIGN §9.1); `requestSync` retries it like `mutate`.
+ * - Raw `subscribeRaw` streams terminate with `LeaderUnavailable { reason: "LeaderLost" }`;
  *   the caller re-subscribes and receives a fresh full result from the new leader.
  */
 import * as BrowserWorker from "@effect/platform-browser/BrowserWorker"
@@ -109,8 +110,16 @@ export class LeaderClient extends Context.Service<
       query: LiveQuery
     ) => Stream.Stream<QueryResult, SqlFailure | RawExecDisabled | LeaderUnavailable>
     readonly leaderInfo: Effect.Effect<LeaderInfo, LeaderUnavailable>
-    /** The leader's sync status; ends with `LeaderLost` on handover (re-subscribe, like `subscribeRaw`). */
+    /**
+     * The leader's sync status, current value then every change; survives handover like `subscribe` (the
+     * last emission stands until the new leader's first). `SyncDisabled` on a local-only replica.
+     */
     readonly syncStatus: Stream.Stream<SyncStatus, SyncDisabled | LeaderUnavailable>
+    /**
+     * Wake the leader's sync loop (coalesced) and complete once the wake is accepted (DESIGN §9.1). Implies
+     * no network success and never clears a halted push; retried across `LeaderLost`.
+     */
+    readonly requestSync: Effect.Effect<void, SyncDisabled | LeaderUnavailable>
     /** Retained notices, current list then every change; survives handover. */
     readonly notices: Stream.Stream<ReadonlyArray<StoredNotice>, SqlFailure | LeaderUnavailable>
     /** The only way a notice is removed (DESIGN §9.1). Idempotent, so retried across `LeaderLost`. */
@@ -173,6 +182,8 @@ export interface LeaderCalls {
   readonly subscribe: (name: string, args: Schema.Json) => Stream.Stream<Schema.Json, SubscribeError>
   readonly notices: Stream.Stream<ReadonlyArray<StoredNotice>, SqlFailure | LeaderUnavailable>
   readonly dismissNotices: (ids: ReadonlyArray<number>) => Effect.Effect<void, SqlFailure | LeaderUnavailable>
+  readonly syncStatus: Stream.Stream<SyncStatus, SyncDisabled | LeaderUnavailable>
+  readonly requestSync: Effect.Effect<void, SyncDisabled | LeaderUnavailable>
 }
 
 /**
@@ -209,6 +220,8 @@ export const tabApi = (calls: LeaderCalls) => {
     mutate,
     subscribe,
     notices: resubscribing(calls.notices),
+    syncStatus: resubscribing(calls.syncStatus),
+    requestSync: calls.requestSync.pipe(Effect.retry({ while: isLeaderLost, schedule: lostBackoff })),
     dismissNotices: (ids: ReadonlyArray<number>) =>
       calls.dismissNotices(ids).pipe(Effect.retry({ while: isLeaderLost, schedule: lostBackoff }))
   }
@@ -324,11 +337,12 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
         enqueue,
         subscribe: (name, args) => streamWithLeader((client) => client.subscribe({ name, args })),
         notices: streamWithLeader((client) => client.notices()),
-        dismissNotices: (ids) => withLeader((client) => client.dismissNotices({ ids }))
+        dismissNotices: (ids) => withLeader((client) => client.dismissNotices({ ids })),
+        syncStatus: streamWithLeader((client) => client.syncStatus()),
+        requestSync: withLeader((client) => client.requestSync())
       }),
       leaderInfo: withLeader((client) => client.leaderInfo()),
       subscribeRaw: (query) => streamWithLeader((client) => client.subscribeRaw({ query })),
-      syncStatus: streamWithLeader((client) => client.syncStatus()),
       exportPending: withLeader((client) => client.exportPending()),
       status: SubscriptionRef.changes(status)
     })

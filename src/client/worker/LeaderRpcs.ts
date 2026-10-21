@@ -145,6 +145,8 @@ export class LeaderRpcs extends RpcGroup.make(
   Rpc.make("leaderInfo", { success: LeaderInfo }),
   /** The sync loop's status: the current value, then every change (push halted, last transient error). */
   Rpc.make("syncStatus", { success: SyncStatus, error: SyncDisabled, stream: true }),
+  /** Wake the sync loop (coalesced); completes once the wake is queued, never clears a halted push. */
+  Rpc.make("requestSync", { error: SyncDisabled }),
   /**
    * Retained notices (rejected / outcome-unknown mutations), oldest first: the current list, then the
    * list after every change to `echo_notices`. The engine never removes one; only `dismissNotices` does.

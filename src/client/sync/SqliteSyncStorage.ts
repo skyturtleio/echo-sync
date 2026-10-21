@@ -13,7 +13,7 @@
  * `Mutation.MutationRejection`, and undo images store their table by sync name, resolved through the
  * registry when read (a rebuild empties them, so a name is always registered).
  */
-import { Effect, Option, Schema, Semaphore } from "effect"
+import { Effect, Option, Schema, Semaphore, type Stream } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
 import { type Errors, Ids, Mutation, Protocol, type Registry, type Store, SyncTable } from "echo-sync"
@@ -166,6 +166,12 @@ export interface SqliteSyncStorage extends Engine.SyncStorage {
    * so SQL outside the engine (the tab `exec`/`subscribe` RPCs) waits as cancellably as `transaction`.
    */
   readonly admit: <A, E, R>(self: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
+  /**
+   * The number of unreleased outbox entries, then the number after every write to `echo_outbox` (an
+   * append or a release, through the connection's reactivity hook). Each count is read under the permit,
+   * so it sees committed state only: a recount, never bookkeeping that can drift (DESIGN §9.1).
+   */
+  readonly pendingCount: Stream.Stream<number, Errors.StoreUnavailable>
 }
 
 export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry): SqliteSyncStorage => {
@@ -201,6 +207,15 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
 
   return {
     admit: (self) => permit.withPermit(self),
+    pendingCount: sql.reactive(
+      ["echo_outbox"],
+      permit.withPermit(
+        Effect.map(
+          run(sql<{ readonly n: number }>`SELECT count(*) AS n FROM echo_outbox WHERE released_at IS NULL`),
+          (counted) => counted[0]?.n ?? 0
+        )
+      )
+    ),
     // BEGIN/COMMIT failures map like any statement's; the body's own errors pass through unchanged.
     // `withTransaction` waits for the connection lease uninterruptibly; waiting for `permit` first makes
     // a transaction queued behind a long one (e.g. a pull install) cancellable while it waits. Admission

@@ -222,6 +222,7 @@ export const makeHandlers = ({
     },
     leaderInfo: () => Effect.succeed(info),
     syncStatus: () => (loop === undefined ? Stream.fail(new SyncDisabled()) : loop.changes),
+    requestSync: () => (loop === undefined ? Effect.fail(new SyncDisabled()) : loop.wake),
     notices: () =>
       sql.reactive(["echo_notices"], storage.admit(SqliteSyncStorage.notices(sql)).pipe(Effect.mapError(unavailable))),
     dismissNotices: ({ ids }) =>
@@ -320,7 +321,11 @@ const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: L
       const protocol = yield* Layer.build(Transport.layerProtocolHttp(syncUrl, options.syncHeaders?.(actor)))
       const transport = yield* Transport.make.pipe(Effect.provide(protocol))
       engine = yield* Engine.make({ clientId, actor, storage, registry, mutations, transport })
-      const sync = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush })
+      const sync = yield* SyncLoop.make({
+        engine,
+        isFatalPush: Transport.isFatalPush,
+        pendingMutations: storage.pendingCount
+      })
       yield* Effect.forkScoped(sync.run)
       yield* Effect.forkScoped(
         SyncLoop.followPokes({ connect: transport.pokes(clientId), wake: sync.wake, idleTimeout: options.idleTimeout })
