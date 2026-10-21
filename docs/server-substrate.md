@@ -39,14 +39,20 @@ with `RpcServer.layerHttp({ protocol: "http" })` and `RpcSerialization.layerNdjs
 transport the browser speaks. `principalFor(headers)` is the app's authentication; the principal
 is never read from the payload. `ClientForbidden` becomes `Unauthorized`.
 
-- push: one ledger transaction per mutation, `roleFor` read from `scope_grants` (own grant or
+- push: one SERIALIZABLE ledger transaction per mutation (read-modify-write handlers would lose
+  updates under READ COMMITTED; `40001` retries the whole attempt), `roleFor` read from `scope_grants` (own grant or
   `*`) inside it, `now` from the Clock, `random` = `seededRandom(clientId, mutationId)`. Every
   infrastructure failure (connection, pool, `40001` after the bounded retry, the catalog read
   before the batch) is a short results list, never a defect: the client halts push on any
   defect (§6). Tested with a real connection kill mid-batch over HTTP.
-- pull: an infrastructure failure (`SqlError`) is `Protocol.ServerUnavailable`, a typed
-  transient, so a defect from the server always means a bug (§6). Tested by injecting a SqlError
-  under pull over HTTP; the old `die` mapping fails the test.
+- pull and pokes classify a failure over its whole `Cause` (§6): any non-SQL defect keeps the
+  whole cause as defects; otherwise a `SqlError` anywhere, as a failure or as the defect the
+  pinned client's `orDie` ROLLBACK raises on a dead connection, becomes
+  `Protocol.ServerUnavailable`; otherwise typed failures and interrupts pass through. A defect
+  from the server therefore always means a bug. Push applies the same classification to the
+  catalog read before the batch (a SQL-only cause is an empty result list). Tested over HTTP: an
+  injected SqlError, a backend killed before ROLLBACK of a failed pull, and Fail(SqlError) plus a
+  programmer defect (must stay a defect).
 - pokes: `LISTEN echo_sync`. `next_position()` runs `pg_notify('echo_sync', '')`, which Postgres
   delivers at commit and coalesces per transaction. The stream carries no data. A lost LISTEN
   connection ends it with `ServerUnavailable` (tested by terminating the listener's backend); the
@@ -319,4 +325,8 @@ done by hand while building this:
 | `SELECT t.*` / undecoded payloads | wire-form test, every scope test |
 | `ASC NULLS LAST`, or jsonb not bound as jsonb | RowStore range test |
 | a transient stop turned into a die | connection-lost-mid-batch RPC test |
+| mutation transaction at READ COMMITTED | two-client increment and same-id insert tests |
+| RowStore defaulting an unmapped table to `public` | unattached-table test |
+| unquoted regclass lookup in `attach` | `"Public"` schema attach test |
+| tag-only `SqlError` mapping on pull | rollback-connection-loss and SQL-plus-defect RPC tests |
 | SqlError cleanup defects treated as defects | connection-lost-mid-batch RPC test |
