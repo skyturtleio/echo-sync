@@ -6,7 +6,7 @@ import { ResnapshotRequired } from "../../client/sync/Wire.ts"
 import * as MemoryStore from "./MemoryStore.ts"
 import * as MemorySyncStorage from "./MemorySyncStorage.ts"
 import * as RefServer from "./RefServer.ts"
-import { COUNTERS, GRANTS, grantRow, runMutation } from "./SimApp.ts"
+import { COUNTERS, GRANTS, grantRow, knownTable, runMutation } from "./SimApp.ts"
 import * as Simulation from "./Simulation.ts"
 
 // Reproduce a failure with SIM_SEED=<seed>; widen the sweep with SIM_SEEDS=<n>.
@@ -37,13 +37,22 @@ describe("reconciliation simulation", () => {
     "random schedules keep every client = replay(pending, server@cursor) and lose/duplicate no intent",
     () =>
       Effect.gen(function* () {
-        const reached = { reloadsMidSet: 0, resnapshots: 0, lateRetries: 0, markerHits: 0, crashes: 0, interleaved: 0 }
+        const reached = {
+          reloadsMidSet: 0,
+          resnapshots: 0,
+          lateRetries: 0,
+          markerHits: 0,
+          unknownTableWrites: 0,
+          crashes: 0,
+          interleaved: 0
+        }
         for (const seed of seeds) {
           const stats = yield* Simulation.run({ seed, steps: 400 })
           reached.reloadsMidSet += stats.reloadsMidSet
           reached.resnapshots += stats.resnapshots
           reached.lateRetries += stats.lateRetries
           reached.markerHits += stats.markerHits
+          reached.unknownTableWrites += stats.unknownTableWrites
           reached.crashes += stats.crashes
           reached.interleaved += stats.interleaved
         }
@@ -94,6 +103,7 @@ describe("reconciliation simulation", () => {
       let pulls = 0
       const engine = yield* Engine.make({
         clientId: "c",
+        knownTable,
         storage: MemorySyncStorage.make(disk),
         executor: executorFor(disk),
         transport: {
@@ -141,6 +151,7 @@ describe("reconciliation simulation", () => {
       const disk = MemorySyncStorage.makeDisk()
       const options = {
         clientId: "c",
+        knownTable,
         storage: MemorySyncStorage.make(disk),
         executor: executorFor(disk),
         transport: {
@@ -224,6 +235,7 @@ describe("reconciliation simulation", () => {
       ]
       const engine = yield* Engine.make({
         clientId: "c",
+        knownTable,
         storage: MemorySyncStorage.make(disk),
         executor: executorFor(disk),
         transport: {

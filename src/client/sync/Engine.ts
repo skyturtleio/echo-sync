@@ -188,11 +188,15 @@ const rebase = <E>(
  * inside one storage transaction. A set that started from cursor `null` is a snapshot of every
  * readable scope, so it replaces the replica instead of patching it (rows of scopes revoked
  * while the client could not see the log would otherwise survive a resnapshot).
+ * Changes for a table the client's registry does not know are skipped with a log line (DESIGN
+ * §8): during a deploy that adds a synced table, clients on the old registry receive its rows;
+ * they arrive with the next app version, whose manifest change rebuilds the replica from null.
  * Exported so tests can build a deliberately wrong page-at-a-time client.
  */
 export const applyPageSet = <E>(
   storage: SyncStorage<E>,
   executor: Executor<E>,
+  knownTable: (name: string) => boolean,
   pages: ReadonlyArray<PullPage>,
   done: PullDone
 ) =>
@@ -203,6 +207,10 @@ export const applyPageSet = <E>(
       if (pullFrom(meta) === null) yield* storage.rows.clearAll
       for (const page of set) {
         for (const change of page.changes) {
+          if (change._tag !== "scopePurged" && !knownTable(change.table)) {
+            yield* Effect.logWarning(`echo-sync: skipping ${change._tag} for unknown table ${change.table}`)
+            continue
+          }
           switch (change._tag) {
             case "upsert":
               yield* storage.rows.write(change.table, change.row.id, Option.some(change.row))
@@ -263,6 +271,8 @@ export const make = <E, TE>(options: {
   readonly storage: SyncStorage<E>
   readonly executor: Executor<E>
   readonly transport: Transport<TE>
+  /** Whether the client's registry has a table of this sync name (core: `Registry.get`). */
+  readonly knownTable: (name: string) => boolean
   readonly pushBatchSize?: number
 }): Effect.Effect<Engine<E, TE>> =>
   Effect.gen(function* () {
@@ -377,7 +387,7 @@ export const make = <E, TE>(options: {
           return yield* storage.transaction(
             Effect.gen(function* () {
               const set = yield* storage.staged
-              yield* applyPageSet(storage, executor, set, response)
+              yield* applyPageSet(storage, executor, options.knownTable, set, response)
             })
           )
         }

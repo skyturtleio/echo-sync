@@ -29,7 +29,18 @@ import type { EncodedRow, MutationEnvelope, PullDone, PullResponse } from "../..
 import * as MemoryStore from "./MemoryStore.ts"
 import * as MemorySyncStorage from "./MemorySyncStorage.ts"
 import * as RefServer from "./RefServer.ts"
-import { ANYONE, COUNTERS, GRANTS, grantId, grantRow, restore, roleOf, runMutation } from "./SimApp.ts"
+import {
+  ANYONE,
+  COUNTERS,
+  GRANTS,
+  NOTES,
+  grantId,
+  knownTable,
+  grantRow,
+  restore,
+  roleOf,
+  runMutation
+} from "./SimApp.ts"
 import type { Role } from "./SimApp.ts"
 
 export class TransportFailed extends Schema.TaggedError<TransportFailed>()("TransportFailed", {
@@ -69,6 +80,8 @@ export interface Stats {
   readonly lateRetries: number
   /** Enqueue retries after release answered by the released-row marker (no new intent). */
   readonly markerHits: number
+  /** Server writes to a table absent from the clients' registry. */
+  readonly unknownTableWrites: number
   /** Crashes injected in the middle of a storage transaction. */
   readonly crashes: number
   /** Local mutations/pushes run while a pull was suspended on the network. */
@@ -113,12 +126,16 @@ const diff = (actual: string, expected: string) => {
   return `replica has [${extra.join("; ")}] but should have [${missing.join("; ")}]`
 }
 
-/** Rows of `tables` in scopes `principal` can read, judged by the grant rows in `tables`. */
+/**
+ * Rows of `tables` the client should hold: known tables only (DESIGN §8 skips the rest), in
+ * scopes `principal` can read, judged by the grant rows in `tables`.
+ */
 const view = (tables: MemoryStore.Tables, principal: string) =>
   Effect.gen(function* () {
     const source = MemoryStore.make(tables)
     const out: MemoryStore.Tables = new Map()
     for (const [table, rows] of tables) {
+      if (!knownTable(table)) continue
       const kept = new Map<string, EncodedRow>()
       for (const [id, row] of rows) {
         if (Option.isSome(yield* roleOf(source, principal, row.access_scope_id))) kept.set(id, row)
@@ -164,6 +181,7 @@ export const run = (options: Options) =>
       expired: 0,
       lateRetries: 0,
       markerHits: 0,
+      unknownTableWrites: 0,
       crashes: 0,
       interleaved: 0
     }
@@ -242,7 +260,7 @@ export const run = (options: Options) =>
           transport,
           online: true,
           skew: 0,
-          engine: yield* Engine.make({ clientId, storage, executor, transport, pushBatchSize: 4 })
+          engine: yield* Engine.make({ clientId, storage, executor, transport, knownTable, pushBatchSize: 4 })
         }
         return client
       })
@@ -275,7 +293,9 @@ export const run = (options: Options) =>
               continue
             }
             const done: PullDone = page
-            return yield* storage.transaction(Engine.applyPageSet(storage, executor, client.disk.staged, done))
+            return yield* storage.transaction(
+              Engine.applyPageSet(storage, executor, knownTable, client.disk.staged, done)
+            )
           }
           const early: PullDone = {
             _tag: "PullDone",
@@ -286,7 +306,7 @@ export const run = (options: Options) =>
           }
           yield* storage.transaction(
             Effect.gen(function* () {
-              yield* Engine.applyPageSet(storage, executor, [], early)
+              yield* Engine.applyPageSet(storage, executor, knownTable, [], early)
               yield* storage.stage({ ...page, changes: [], acks: [] })
             })
           )
@@ -380,7 +400,20 @@ export const run = (options: Options) =>
     const serverWrite = Effect.gen(function* () {
       const scope = Option.getOrElse(rng.pick(SCOPES), () => "s0")
       const principal = Option.getOrElse(rng.pick([...PRINCIPALS, ANYONE]), () => ANYONE)
-      const kind = rng.int(4)
+      const kind = rng.int(5)
+      if (kind === 4) {
+        // A table added by a newer server deploy: clients must skip it and keep syncing.
+        stats.unknownTableWrites++
+        const id = `n${rng.int(8)}`
+        note(`server: write ${NOTES}/${id} in ${scope} (unknown to clients)`)
+        return yield* server.writeDirect([
+          {
+            table: NOTES,
+            id,
+            row: rng.chance(0.8) ? Option.some({ id, access_scope_id: scope, body: `b${step}` }) : Option.none()
+          }
+        ])
+      }
       if (kind === 0) {
         const role = Option.getOrElse(rng.pick(ROLES), (): Role => "reader")
         note(`server: grant ${principal} ${role} on ${scope}`)
@@ -420,6 +453,7 @@ export const run = (options: Options) =>
           storage: client.storage,
           executor: client.executor,
           transport: client.transport,
+          knownTable,
           pushBatchSize: 4
         })
       })

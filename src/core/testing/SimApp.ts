@@ -15,6 +15,10 @@ import type { MemoryStore } from "./MemoryStore.ts"
 export const COUNTERS = "counters"
 export const GRANTS = "scope_grants"
 export const ANYONE = "*"
+/** A table the server syncs but the clients' registry does not have (an older app version). */
+export const NOTES = "notes"
+/** The clients' registry. */
+export const knownTable = (name: string) => name === COUNTERS || name === GRANTS
 
 export type Role = "reader" | "writer" | "owner"
 
