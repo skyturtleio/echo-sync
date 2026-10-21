@@ -500,6 +500,8 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
               readableBy: Option.some([options.actor, Everyone]),
               limit
             }
+            // The semi-join reads `scope_grants`: a grant change can change this result (DESIGN §10.1).
+            if (Option.isSome(plan.readableBy)) yield* read(ScopeGrants)
             return yield* Effect.forEach(yield* rows.range(table, plan), (row) => decode(table, row))
           })
         const ordered = (order: "asc" | "desc"): OrderedQuery<RowOf<T>, InvalidRow | StoreUnavailable> => ({

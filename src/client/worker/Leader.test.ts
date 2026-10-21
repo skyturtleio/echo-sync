@@ -108,7 +108,8 @@ const C = SyncTable.make("c", { ...rowFields })
 const L = SyncTable.make("l", { ...rowFields })
 const R = SyncTable.make("r", { ...rowFields })
 const Raw = SyncTable.make("raw", { ...rowFields })
-const queryRegistry = Registry.make([Flags, B, C, L, R, Raw])
+const Docs = SyncTable.make("docs", { ...rowFields }, { indexes: { by_body: ["body"] } })
+const queryRegistry = Registry.make([Flags, B, C, L, R, Raw, Docs])
 const scope = AccessScope.AccessScopeId.make("s")
 const me = AccessScope.PrincipalId.make("me")
 
@@ -160,6 +161,13 @@ const flip = Query.make("flip", {
     })
 })
 
+/** Only `db.query`: readability comes from the plan's scope_grants semi-join, never from `roleFor`. */
+const docs = Query.make("docs", {
+  args: Schema.Struct({}),
+  success: Schema.Number,
+  handler: (db) => Effect.map(db.query(Docs).withIndex("by_body").collect, (rows) => rows.length)
+})
+
 const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
   Effect.gen(function* () {
     const reactivity = yield* Reactivity.make
@@ -197,7 +205,7 @@ const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
       engine,
       loop: undefined,
       actor: me,
-      queries: Query.makeRegistry([pick, pair, flip]),
+      queries: Query.makeRegistry([pick, pair, flip, docs]),
       allowRawExec: options.allowRawExec,
       info: { leaderId: "l", clientId: "c", dbName: "test", syncing: false }
     })
@@ -337,5 +345,19 @@ it.live("a registered query that writes fails, commits nothing, and leaves the n
     expect(yield* flagBody).toBe("c")
     yield* engine.mutate(Ids.MutationId.make("m1"), "raw.add", { id: "r1" })
     expect(yield* count("raw")).toBe(1)
+  }).pipe(Effect.scoped)
+)
+
+it.live("revoking a grant re-emits a live query whose handler only used db.query", () =>
+  Effect.gen(function* () {
+    const { client, storage, write, row } = yield* leaderRpc({ allowRawExec: false })
+    yield* write(Docs, row("d1"))
+    const { next } = yield* collect(client.subscribe({ name: "docs", args: {} }))
+    expect(yield* next).toEqual(1)
+    // Fails if scope_grants were not recorded as read: nothing would invalidate, and `next` times out.
+    yield* storage.transaction(
+      storage.rows.write(ScopeGrants.ScopeGrants, ScopeGrants.grantId(scope, me), Option.none())
+    )
+    expect(yield* next).toEqual(0)
   }).pipe(Effect.scoped)
 )

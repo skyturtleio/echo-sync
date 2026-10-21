@@ -178,7 +178,7 @@ export const makeHandlers = ({
             readOnly(
               Effect.gen(function* () {
                 const rows = storage.rows
-                const instance = Store.make(rows, { roleFor: Engine.roleFromGrants(rows, actor) })
+                const instance = Store.make(rows, { actor, roleFor: Engine.roleFromGrants(rows, actor) })
                 const result = yield* Query.run(queries, name, args, instance.store).pipe(
                   // A failed run still read tables; the stream ends with its error either way.
                   Effect.ensuring(Effect.flatMap(instance.reads, (tables) => watch([...tables])))
