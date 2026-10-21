@@ -286,6 +286,20 @@ export const verify = (registry: Registry.SyncRegistry) =>
           problem: `captured in ${attached.length} schemas (${attached.map((r) => r.schema).join(", ")}); the log names tables unqualified, so exactly one may be attached`
         })
       }
+      if (attached.length > 0) {
+        // DESIGN §11: the relation the unqualified name resolves to through search_path must be a
+        // captured one, or app SQL writes a relation sync never sees.
+        const [resolved] = yield* sql<Relation>`
+          SELECT c.oid::int AS oid, n.nspname AS schema FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.oid = to_regclass(quote_ident(${table.name}))`
+        if (resolved !== undefined && !attached.some((r) => r.oid === resolved.oid)) {
+          mismatches.push({
+            table: table.name,
+            problem: `the unqualified name resolves through search_path to ${resolved.schema}.${table.name}, but the captured relation is in ${attached.map((r) => r.schema).join(", ")}; fix search_path or attach with an explicit schema`
+          })
+        }
+      }
       if (attached.length === 0) {
         mismatches.push({
           table: table.name,

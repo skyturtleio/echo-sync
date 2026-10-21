@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
-import type * as PgClient from "@effect/sql-pg/PgClient"
-import { Effect, Exit, Layer, Option } from "effect"
+import * as PgClient from "@effect/sql-pg/PgClient"
+import { Effect, Exit, Layer, Option, Redacted } from "effect"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
 import { RpcClient, RpcSerialization } from "effect/rpc"
@@ -166,6 +166,39 @@ describe.skipIf(!pgAvailable)("server startup (§11)", () => {
       )
       assert.isTrue(
         error.mismatches.some((m) => m.table === "notes" && m.problem.includes("body")),
+        JSON.stringify(error.mismatches)
+      )
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("a search_path that resolves the table name to an uncaptured relation fails startup with a Drift", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      // public.items is attached; zz.items is an uncaptured twin that search_path now prefers.
+      yield* sql`CREATE SCHEMA zz`
+      yield* sql`CREATE TABLE zz.items (LIKE public.items INCLUDING ALL)`
+      const [row] = yield* sql<{ db: string }>`SELECT current_database() AS db`
+      if (row === undefined) return assert.fail("no database name")
+      yield* sql`ALTER DATABASE ${sql(row.db)} SET search_path = zz, public`
+      // Pooled connections keep their session settings, so start a client the setting applies to.
+      const url = new URL(process.env["ECHO_PG_URL"] ?? "")
+      url.pathname = `/${row.db}`
+      const exit = yield* Effect.exit(Startup.prepare(options)).pipe(
+        Effect.provide(PgClient.layer({ url: Redacted.make(url.toString()), maxConnections: 4 }))
+      )
+      if (Exit.isSuccess(exit)) return assert.fail("startup served while app SQL resolves to an uncaptured relation")
+      const [reason] = exit.cause.reasons
+      const error = reason !== undefined && reason._tag === "Fail" ? reason.error : undefined
+      if (error === undefined || !("_tag" in error) || error._tag !== "Drift") {
+        return assert.fail(`expected Drift, got ${String(exit.cause)}`)
+      }
+      assert.isTrue(
+        error.mismatches.some(
+          (m) =>
+            m.table === "items" &&
+            m.problem.includes("zz.items") &&
+            m.problem.includes("captured relation is in public")
+        ),
         JSON.stringify(error.mismatches)
       )
     }).pipe(Effect.provide(TestDatabase))
