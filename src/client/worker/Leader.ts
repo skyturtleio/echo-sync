@@ -17,6 +17,7 @@
  */
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner"
+import * as Cause from "effect/Cause"
 import type * as Context from "effect/Context"
 import * as DateTime from "effect/DateTime"
 import type * as Duration from "effect/Duration"
@@ -38,7 +39,7 @@ import * as SqliteSyncStorage from "../sync/SqliteSyncStorage.ts"
 import * as SyncLoop from "../sync/SyncLoop.ts"
 import * as Transport from "../sync/Transport.ts"
 import { LeaderRpcs, RawExecDisabled, SqlFailure, SyncDisabled } from "./LeaderRpcs.ts"
-import { type Endpoint, type FromLeader, isToLeader, type ToLeader } from "./messages.ts"
+import { type Endpoint, type FromLeader, isToLeader, type ResetOutcome, type ToLeader } from "./messages.ts"
 import * as OpfsSqlite from "./OpfsSqlite.ts"
 import * as Platform from "./platform.ts"
 
@@ -57,8 +58,11 @@ const unavailable = (error: Errors.StoreUnavailable) => new SqlFailure({ message
 
 const send = (endpoint: Endpoint, message: FromLeader) => endpoint.postMessage(message, { transfer: [] })
 
-/** Open the database: the OPFS host on one end of a channel, the Effect SQL client on the other. */
-const openDatabase = (identity: Platform.ReplicaIdentity, registry: Registry.SyncRegistry) =>
+/**
+ * Open the database without migrating it: the OPFS host on one end of a channel, the Effect SQL client on
+ * the other. The leader and `Reset` both open through here, so there is one OPFS host path.
+ */
+const openConnection = (identity: Platform.ReplicaIdentity) =>
   Effect.gen(function* () {
     const poolDirectory = Platform.poolDirectory(identity)
     yield* Platform.awaitOpfsPoolFree(poolDirectory)
@@ -72,6 +76,13 @@ const openDatabase = (identity: Platform.ReplicaIdentity, registry: Registry.Syn
       worker: Effect.succeed(channel.port2),
       installReactivityHooks: true
     }).pipe(Effect.provideService(Reactivity.Reactivity, reactivity))
+    return { sql, reactivity }
+  })
+
+/** The leader's database: `openConnection`, then the engine tables and the replica schema. */
+const openDatabase = (identity: Platform.ReplicaIdentity, registry: Registry.SyncRegistry) =>
+  Effect.gen(function* () {
+    const { sql, reactivity } = yield* openConnection(identity)
     // Engine tables and the replica schema in one transaction (a manifest change rebuilds the replica).
     yield* Effect.andThen(SqliteSyncStorage.migrate(registry), Outbox.pruneReleased()).pipe(
       Effect.provideService(SqlClient.SqlClient, sql)
@@ -288,10 +299,77 @@ export interface LeaderOptions {
   readonly idleTimeout?: Duration.Input
 }
 
-const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: LeaderOptions) =>
+type Init = Extract<ToLeader, { readonly _tag: "Init" }>
+type Reset = Extract<ToLeader, { readonly _tag: "Reset" }>
+
+/** The OPFS directory for `path`, or `undefined` if some part of it does not exist. */
+const opfsDirectory = (path: string) =>
+  Effect.tryPromise({
+    try: async () => {
+      let dir = await navigator.storage.getDirectory()
+      for (const part of path.split("/")) {
+        try {
+          dir = await dir.getDirectoryHandle(part)
+        } catch (cause) {
+          if (cause instanceof DOMException && cause.name === "NotFoundError") return undefined
+          throw cause
+        }
+      }
+      return dir
+    },
+    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause)))
+  })
+
+/** Unreleased outbox entries; a database without an outbox (never migrated) has none. */
+const countUnreleased = (sql: SqlClient.SqlClient) =>
   Effect.gen(function* () {
-    let init = yield* Queue.take(inbox)
-    while (init._tag !== "Init") init = yield* Queue.take(inbox)
+    const table = yield* sql<{ readonly n: number }>`
+      SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'echo_outbox'`
+    if ((table[0]?.n ?? 0) === 0) return 0
+    const pending = yield* sql<{ readonly n: number }>`SELECT count(*) AS n FROM echo_outbox WHERE released_at IS NULL`
+    return pending[0]?.n ?? 0
+  })
+
+/**
+ * `resetReplica`'s worker half (DESIGN §9.1). Takes the leader lock only if it is free, so it never queues
+ * ahead of or behind a leader; under it, opens the database through the leader's own OPFS host (no
+ * migration: a replica this build cannot migrate can still be reset), counts the outbox, closes the
+ * database and the pool, removes `echo-sync/<appId>/<profile>`, and releases the lock last. A candidate
+ * queued meanwhile is elected only after the directory is gone, so it creates a fresh replica.
+ */
+const reset = (message: Reset): Effect.Effect<ResetOutcome> =>
+  Effect.gen(function* () {
+    const identity: Platform.ReplicaIdentity = { appId: message.appId, profile: message.profile }
+    const invalid = Platform.validateIdentity(identity) ?? Platform.leaderHostCapability()
+    if (invalid !== undefined) return { _tag: "ResetFailed", message: invalid } satisfies ResetOutcome
+    const poolDirectory = Platform.poolDirectory(identity)
+    return yield* Effect.scoped(
+      Effect.gen(function* () {
+        if (!(yield* Platform.tryHoldLock(Platform.leaderLockName(identity)))) {
+          return { _tag: "ReplicaInUse" } satisfies ResetOutcome
+        }
+        if ((yield* opfsDirectory(poolDirectory)) === undefined) return { _tag: "Done" } satisfies ResetOutcome
+        // The inner scope closes the database and the pool (its access handles) before anything is removed.
+        const count = yield* Effect.scoped(Effect.flatMap(openConnection(identity), ({ sql }) => countUnreleased(sql)))
+        if (count > 0 && !message.discardPending) return { _tag: "PendingWrites", count } satisfies ResetOutcome
+        const parent = yield* opfsDirectory(`echo-sync/${identity.appId}`)
+        if (parent !== undefined) {
+          yield* Effect.tryPromise({
+            try: () => parent.removeEntry(identity.profile, { recursive: true }),
+            catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause)))
+          })
+        }
+        return { _tag: "Done" } satisfies ResetOutcome
+      })
+    )
+  }).pipe(
+    Effect.catchCause((cause) =>
+      Effect.succeed({ _tag: "ResetFailed", message: Cause.pretty(cause) } satisfies ResetOutcome)
+    )
+  )
+
+const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: LeaderOptions, init: Init) =>
+  Effect.gen(function* () {
     const identity: Platform.ReplicaIdentity = { appId: init.appId, profile: init.profile }
     const invalid = Platform.validateIdentity(identity) ?? Platform.leaderHostCapability()
     if (invalid !== undefined) return yield* Effect.fail(new Error(invalid))
@@ -391,5 +469,14 @@ const listen = (
 export const runLeaderWorker = (self: WorkerScope, options: LeaderOptions): void => {
   const inbox = Effect.runSync(Queue.unbounded<ToLeader>())
   listen(self, inbox)
-  Effect.runFork(program(self, inbox, options))
+  Effect.runFork(
+    Effect.gen(function* () {
+      let first = yield* Queue.take(inbox)
+      while (first._tag !== "Init" && first._tag !== "Reset") first = yield* Queue.take(inbox)
+      if (first._tag === "Init") return yield* program(self, inbox, options, first)
+      const outcome = yield* reset(first)
+      // Every lock and handle is released by now (the reset's scope closed); the tab ends this worker.
+      send(self, { _tag: "ResetOutcome", outcome })
+    })
+  )
 }

@@ -361,6 +361,50 @@ check "the longest database path the pool holds opens and round-trips; one chara
     longest: $l, over: $o }')"
 ab tab close "$T" >/dev/null
 
+# ── resetReplica (DESIGN §9.1): guarded by the leader lock and the outbox, deletes only its identity ──
+# Profile "a" syncs with the fake server, whose push always halts, so its entry stays pending. Profile "b"
+# is a sibling identity of the same app. The resets run from a tab of an unrelated app (no client for "a").
+APP="reset-$RUN"
+A=$(open_tab "$BASE/?app=$APP&profile=a&syncUrl=$BASE/fake-sync/rpc")
+a0=$(ev <<<'await echo.ready(); const e = await echo.enqueue({ mutationId: "pending-a", name: "t", args: {} }); const i = await echo.info(); return { ok: e.ok, clientId: i.ok ? i.value.clientId : null }')
+B=$(open_tab "$BASE/?app=$APP&profile=b&syncUrl=$BASE/fake-sync/rpc")
+b0=$(ev <<<'await echo.ready(); await echo.exec("CREATE TABLE keep (v TEXT)"); await echo.exec("INSERT INTO keep VALUES (?)", ["b-row"]); const i = await echo.info(); return { clientId: i.ok ? i.value.clientId : null }')
+ab tab close "$B" >/dev/null
+R=$(open_tab "$BASE/?app=resetter-$RUN")
+ev <<<'await echo.ready(); return true' >/dev/null
+TARGET="{ appId: '$APP', profile: 'a' }"
+# Retries only ReplicaInUse, for the moment between a closed tab and the browser releasing its worker's lock.
+RESET="const reset = async (discard) => { let r; for (let i = 0; i < 100; i++) { r = await echo.resetReplica($TARGET, discard); if (r.ok || r.error._tag !== 'ReplicaInUse') return r; await new Promise((res) => setTimeout(res, 50)) } return r }"
+check "reset while a leader is live fails ReplicaInUse and deletes nothing" "$(ev <<<"const before = await echo.opfsList('echo-sync/$APP/a')
+const r = await echo.resetReplica($TARGET)
+const after = await echo.opfsList('echo-sync/$APP/a')
+return { pass: !r.ok && r.error._tag === 'ReplicaInUse' && before !== null && before.length > 0 && JSON.stringify(after) === JSON.stringify(before), r, before, after }")"
+ab tab "$A" >/dev/null
+alive=$(ev <<<'const r = await echo.exec("SELECT mutation_id FROM echo_outbox WHERE released_at IS NULL"); return r.ok && r.value.length === 1')
+ab tab close "$A" >/dev/null
+ab tab "$R" >/dev/null
+check "reset with one pending write fails PendingWrites{1} and deletes nothing" "$(ev <<<"$RESET
+const before = await echo.opfsList('echo-sync/$APP/a')
+const r = await reset(false)
+const after = await echo.opfsList('echo-sync/$APP/a')
+return { pass: $alive && $(jq '.ok' <<<"$a0") && !r.ok && r.error._tag === 'PendingWrites' && r.error.count === 1 && before !== null && JSON.stringify(after) === JSON.stringify(before), r, before, after }")"
+check "reset with discardPending removes echo-sync/<appId>/a and leaves sibling profile b intact" "$(ev <<<"$RESET
+const r = await reset(true)
+const app = await echo.opfsList('echo-sync/$APP')
+const b = await echo.opfsList('echo-sync/$APP/b')
+return { pass: r.ok && app !== null && !app.includes('a') && app.includes('b') && b !== null && b.length > 0, r, app, b }")"
+ab tab close "$R" >/dev/null
+A=$(open_tab "$BASE/?app=$APP&profile=a&syncUrl=$BASE/fake-sync/rpc")
+check "a leader started after the reset has an empty replica and a fresh clientId" "$(ev <<<"await echo.ready()
+const i = await echo.info(); const ob = await echo.exec('SELECT count(*) AS n FROM echo_outbox')
+return { pass: i.ok && i.value.clientId !== $(jq '.clientId' <<<"$a0") && ob.ok && ob.value[0].n === 0, clientId: i.ok ? i.value.clientId : i, before: $(jq '.clientId' <<<"$a0"), ob }")"
+ab tab close "$A" >/dev/null
+B=$(open_tab "$BASE/?app=$APP&profile=b&syncUrl=$BASE/fake-sync/rpc")
+check "the sibling identity keeps its rows and clientId through the reset" "$(ev <<<"await echo.ready()
+const i = await echo.info(); const k = await echo.exec('SELECT v FROM keep')
+return { pass: i.ok && i.value.clientId === $(jq '.clientId' <<<"$b0") && k.ok && k.value[0]?.v === 'b-row', i, k }")"
+ab tab close "$B" >/dev/null
+
 # ── identities that would escape the storage namespace are refused up front ──────────────────────────
 D=$(open_tab "$BASE/?app=.")
 check "identity '.' is refused with LeaderUnavailable{Unsupported}, nothing is opened" "$(ev <<<'const r = await echo.info(); const s = await echo.status()

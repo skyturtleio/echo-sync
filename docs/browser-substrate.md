@@ -129,6 +129,34 @@ dedicated worker does not outlive its document), so no separate scope-close scen
 that ends itself after a commit is covered too: "crash after commit" and "worker-only crash" in
 `scenarios.sh`.
 
+### Resetting a replica (`resetReplica`, DESIGN §9.1)
+
+`ResetReplica.resetReplica({ appId, profile, spawnLeader }, { discardPending? })` deletes one identity's
+replica, for example on sign-out. It is a static function (exported from `echo-sync/client`), so it runs
+while no tab client for that identity is alive. Closing the tab clients first is the app's job, through its
+own cross-tab sign-out signal.
+
+- It spawns the app's leader worker (`spawnLeader`, the same factory `LeaderClient.make` takes) and sends it
+  `Reset` instead of `Init`. That worker never becomes leader: it opens the pool through the leader's own
+  OPFS host (`openConnection` in `Leader.ts`), so there is no second OPFS host path. It does not migrate.
+- It takes the identity's leader lock with `ifAvailable`. If the lock is held, it fails `ReplicaInUse` and
+  touches nothing. It never queues, so it cannot be granted ahead of or behind a waiting candidate.
+- Under the lock it counts unreleased `echo_outbox` rows. Unless `discardPending` is set, a count above 0
+  fails `PendingWrites { count }` and deletes nothing.
+- Otherwise it closes the database and the pool (releasing the access handles), removes the directory
+  `echo-sync/<appId>/<profile>` recursively, and releases the lock last. A candidate queued meanwhile is
+  elected only after the directory is gone, so it creates a fresh replica with a new `clientId`.
+- Sibling identities (`echo-sync/<appId>/<other profile>`) are untouched. A replica that never existed
+  resets successfully.
+- Notices belong to the replica and go with it. The outbox is the only guarded content.
+- Any other failure (unsupported browser, invalid identity, an OPFS error) is `ResetFailed { message }`.
+  Interrupting the reset terminates its worker. The browser then releases the lock and handles; a removal
+  that had already begun may be partial, so retry the reset in that case.
+
+Evidence: `scenarios.sh` "reset …" checks (live leader → `ReplicaInUse` with the directory listing
+unchanged; one pending write → `PendingWrites{1}` unchanged; `discardPending` removes `a` and keeps `b`; the
+next leader for `a` has an empty outbox and a new `clientId`; `b` keeps its rows and `clientId`).
+
 ## Fallback without SharedWorker
 
 Capability-tested in the tab (`typeof SharedWorker === "function"`). Without it, mode is `single-tab`:

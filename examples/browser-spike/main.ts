@@ -12,6 +12,7 @@ import * as LeaderClientModule from "../../src/client/worker/LeaderClient.ts"
 import type { OutboxEnvelope, QueryResult, SqlParams } from "../../src/client/worker/LeaderRpcs.ts"
 import type { ToRouter } from "../../src/client/worker/messages.ts"
 import type { SyncStatus } from "../../src/client/sync/SyncLoop.ts"
+import { resetReplica } from "../../src/client/worker/ResetReplica.ts"
 
 const params = new URLSearchParams(location.search)
 const appId = params.get("app") ?? "spike"
@@ -52,20 +53,22 @@ const log = (line: string) => {
 const spawnRouter = (name: string) =>
   new SharedWorker(new URL("./router.worker.ts", import.meta.url), { type: "module", name })
 
+// Fault-injection flags (`crashAfterCommit`, `failOpen`) are forwarded to this tab's leader candidate only.
+const spawnLeader = (name: string) => {
+  const url = new URL("./leader.worker.ts", import.meta.url)
+  for (const flag of ["crashAfterCommit", "failOpen"]) if (params.has(flag)) url.searchParams.set(flag, "")
+  const syncUrl = params.get("syncUrl")
+  if (syncUrl !== null) url.searchParams.set("syncUrl", syncUrl)
+  return new Worker(url, { type: "module", name })
+}
+
 const scope = Effect.runSync(Scope.make())
 const client = await Effect.runPromise(
   LeaderClientModule.make({
     appId,
     profile,
     principal: params.get("principal") ?? "spike-user",
-    // Fault-injection flags (`crashAfterCommit`, `failOpen`) are forwarded to this tab's leader candidate only.
-    spawnLeader: (name) => {
-      const url = new URL("./leader.worker.ts", import.meta.url)
-      for (const flag of ["crashAfterCommit", "failOpen"]) if (params.has(flag)) url.searchParams.set(flag, "")
-      const syncUrl = params.get("syncUrl")
-      if (syncUrl !== null) url.searchParams.set("syncUrl", syncUrl)
-      return new Worker(url, { type: "module", name })
-    },
+    spawnLeader,
     spawnRouter
   }).pipe(Scope.provide(scope))
 )
@@ -126,6 +129,24 @@ const echo = {
     return true
   },
   requestSync: () => run(client.requestSync),
+  /** `resetReplica` for another identity (this tab's own client must not be for it). */
+  resetReplica: (target: { readonly appId: string; readonly profile: string }, discardPending = false) =>
+    run(resetReplica({ ...target, spawnLeader }, discardPending ? { discardPending: true } : {})),
+  /** Entry names in an OPFS directory (`a/b/c`), or `null` if it does not exist. */
+  opfsList: async (path: string): Promise<Array<string> | null> => {
+    let dir = await navigator.storage.getDirectory()
+    for (const part of path.split("/")) {
+      const next = await dir.getDirectoryHandle(part).catch(() => undefined)
+      if (next === undefined) return null
+      dir = next
+    }
+    const names: Array<string> = []
+    // `values()` is in the WHATWG spec and every engine with OPFS, but not in TS's DOM lib yet.
+    // oxlint-disable-next-line typescript/consistent-type-assertions -- platform edge, see above
+    const iterable = dir as unknown as { values(): AsyncIterable<FileSystemHandle> }
+    for await (const handle of iterable.values()) names.push(handle.name)
+    return names.toSorted()
+  },
   watchStatus: () => {
     Effect.runFork(Stream.runForEach(client.status, (s) => Effect.sync(() => void statusLog.push(s))))
     return true

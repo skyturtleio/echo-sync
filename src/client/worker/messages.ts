@@ -14,10 +14,26 @@ export const ToLeader = Schema.Union([
   /** Serve LeaderRpcs to `tabId` on `port` until that tab's lock is released. */
   Schema.TaggedStruct("Connect", { tabId: Schema.String, port: Port }),
   /** A port to the router; the router sends `Connect` messages on it. */
-  Schema.TaggedStruct("RouterPort", { port: Port })
+  Schema.TaggedStruct("RouterPort", { port: Port }),
+  /**
+   * Instead of `Init`: reset this identity's replica (DESIGN §9.1 `resetReplica`) and answer with one
+   * `ResetOutcome`. The worker never becomes leader.
+   */
+  Schema.TaggedStruct("Reset", { appId: Schema.String, profile: Schema.String, discardPending: Schema.Boolean })
 ])
 export type ToLeader = typeof ToLeader.Type
 export const isToLeader = Schema.is(ToLeader)
+
+export const ResetOutcome = Schema.Union([
+  /** The pool directory is gone (or never existed). */
+  Schema.TaggedStruct("Done", {}),
+  /** A leader holds the identity's leader lock; nothing was touched. */
+  Schema.TaggedStruct("ReplicaInUse", {}),
+  /** The outbox has unreleased entries and `discardPending` was not set; nothing was deleted. */
+  Schema.TaggedStruct("PendingWrites", { count: Schema.Int }),
+  Schema.TaggedStruct("ResetFailed", { message: Schema.String })
+])
+export type ResetOutcome = typeof ResetOutcome.Type
 
 /** leader-candidate worker → its tab */
 export const FromLeader = Schema.Union([
@@ -26,7 +42,9 @@ export const FromLeader = Schema.Union([
   /** This worker holds the leader lock and has opened the database. */
   Schema.TaggedStruct("Elected", { leaderId: Schema.String }),
   /** This worker won the election but could not open the database; it released the lock. */
-  Schema.TaggedStruct("Failed", { message: Schema.String })
+  Schema.TaggedStruct("Failed", { message: Schema.String }),
+  /** The answer to `Reset`; the worker has released every lock and closed the pool before sending it. */
+  Schema.TaggedStruct("ResetOutcome", { outcome: ResetOutcome })
 ])
 export type FromLeader = typeof FromLeader.Type
 export const isFromLeader = Schema.is(FromLeader)
