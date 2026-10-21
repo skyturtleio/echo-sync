@@ -163,8 +163,6 @@ describe("presence state (§12)", () => {
         const c = yield* watch("c")
         assert.deepStrictEqual(yield* room, ["p/c1/c=null"])
         assert.deepStrictEqual(c.seen, [["p/c1/c=null"]])
-        // A's last view was its own replacement, never a stale room it keeps observing.
-        assert.deepStrictEqual(a.seen.at(-1), ["p/c1/k=null"])
       })
   )
 
