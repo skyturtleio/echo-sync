@@ -22,7 +22,10 @@ const makeBarrier = (n: number) =>
     })
   })
 
-const asOwner = { roleFor: () => Effect.succeed(Option.some<AccessScope.Role>("owner")) }
+const asOwner = {
+  actor: AccessScope.PrincipalId.make("owner"),
+  roleFor: () => Effect.succeed(Option.some<AccessScope.Role>("owner"))
+}
 const attachedRowStore = (registry: Registry.SyncRegistry) =>
   Effect.flatMap(resolveTables(registry), (tables) =>
     RowStore.make(new Map(tables.map((t) => [t.table.name, t.schema])))

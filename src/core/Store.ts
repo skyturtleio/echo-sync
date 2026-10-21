@@ -2,6 +2,8 @@ import { Effect, Option, Schema } from "effect"
 import {
   type AccessScopeId,
   AccessScopeId as AccessScopeIdSchema,
+  Everyone,
+  type PrincipalId,
   PrincipalId as PrincipalIdSchema,
   type Role,
   satisfies
@@ -72,6 +74,14 @@ export interface Bound {
  * `eq` and bound values are wire values; a SQL RowStore binds each through its key column's
  * dialect codec (`column.sqlite` / `column.postgres`), e.g. a timestamp bound is epoch ms on
  * the wire and a `Date` for Postgres.
+ *
+ * Scope and limit are part of the plan so the store stops after `limit` readable rows instead of
+ * scanning past unreadable ones (DESIGN open item 8):
+ * - `readableBy` (`Some(principals)`): only rows whose `access_scope_id` has a `scope_grants` row
+ *   for one of `principals` (every role satisfies `reader`, so any grant makes a scope readable),
+ *   read in the same transaction as the rows; `None` = no scope constraint;
+ * - `limit` (`Some(n)`, a non-negative integer): the first `n` rows, in plan order, of those that
+ *   match everything else; `None` = all.
  */
 export interface IndexRangePlan {
   readonly index: Index
@@ -79,6 +89,8 @@ export interface IndexRangePlan {
   readonly lower: Option.Option<Bound>
   readonly upper: Option.Option<Bound>
   readonly order: "asc" | "desc"
+  readonly readableBy: Option.Option<ReadonlyArray<PrincipalId>>
+  readonly limit: Option.Option<number>
 }
 
 /** Reference predicate for `plan` (MemoryStore uses it; SQL stores must agree). */
@@ -108,6 +120,27 @@ export const planOrder = (plan: IndexRangePlan): ((a: EncodedRow, b: EncodedRow)
   return plan.order === "asc" ? asc : (a, b) => asc(b, a)
 }
 
+/**
+ * Reference result of `plan` over `rows` (a table's rows) given `grants` (the `scope_grants`
+ * table's rows): match, scope, order, then limit. MemoryStore uses it; SQL stores must agree.
+ */
+export const planResult = (
+  plan: IndexRangePlan,
+  rows: Iterable<EncodedRow>,
+  grants: (id: string) => boolean
+): ReadonlyArray<EncodedRow> => {
+  const readable = (row: EncodedRow) =>
+    Option.match(plan.readableBy, {
+      onNone: () => true,
+      onSome: (principals) => {
+        const scope = row["access_scope_id"]
+        return typeof scope === "string" && principals.some((p) => grants(grantId(AccessScopeIdSchema.make(scope), p)))
+      }
+    })
+  const ordered = [...rows].filter((row) => planMatches(plan, row) && readable(row)).toSorted(planOrder(plan))
+  return Option.match(plan.limit, { onNone: () => ordered, onSome: (n) => ordered.slice(0, n) })
+}
+
 // ---------------------------------------------------------------------------------------------
 // RowStore ports (implemented per dialect)
 // ---------------------------------------------------------------------------------------------
@@ -127,7 +160,7 @@ export interface RowStore {
     id: string,
     row: Option.Option<EncodedRow>
   ) => Effect.Effect<void, StoreUnavailable>
-  /** Rows matching `plan`, in plan order (see `planMatches` / `planOrder`). */
+  /** Rows matching `plan`: `planResult` (match, readable scope, plan order, limit). */
   readonly range: (
     table: AnySyncTable,
     plan: IndexRangePlan
@@ -254,7 +287,12 @@ export interface UndoImage {
 }
 
 export interface StoreOptions {
-  /** The actor's effective role on a scope (own grant or `*`), if any. */
+  /** The actor whose grants (own or `*`) make a scope readable to queries (pushed into the plan). */
+  readonly actor: PrincipalId
+  /**
+   * The actor's effective role on a scope (own grant or `*`), if any. Must be the strongest role
+   * among the actor's and `*`'s `scope_grants` rows, the rows queries filter by.
+   */
   readonly roleFor: (scopeId: AccessScopeId) => Effect.Effect<Option.Option<Role>, StoreUnavailable>
 }
 
@@ -424,17 +462,18 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
                         : Effect.succeed(Option.some({ value, inclusive: b.value[2] }))
                     )
                   )
+            // The readable-scope filter and the limit are pushed into the plan (open item 8), so
+            // the store stops after `limit` readable rows.
             const plan: IndexRangePlan = {
               index,
               eq,
               lower: yield* bound(built.lower),
               upper: yield* bound(built.upper),
-              order
+              order,
+              readableBy: Option.some([options.actor, Everyone]),
+              limit: Number.isFinite(limit) ? Option.some(Math.max(0, Math.floor(limit))) : Option.none()
             }
-            // Filtering by readable scope happens after the RowStore read, so the limit is
-            // applied here, not pushed down (see DESIGN open question on scoped ranges).
-            const result = yield* visible(table, yield* rows.range(table, plan))
-            return result.slice(0, limit)
+            return yield* Effect.forEach(yield* rows.range(table, plan), (row) => decode(table, row))
           })
         const ordered = (order: "asc" | "desc"): OrderedQuery<RowOf<T>, InvalidRow | StoreUnavailable> => ({
           order: (next) => ordered(next),

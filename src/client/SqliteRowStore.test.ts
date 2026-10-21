@@ -71,7 +71,15 @@ const randomPlan = (r: ReturnType<typeof rng>): Store.IndexRangePlan => {
         : times
   const bound = (): Option.Option<Store.Bound> =>
     r.next() < 0.5 ? Option.none() : Option.some({ value: r.pick(domain, 0), inclusive: r.next() < 0.5 })
-  return { index, eq, lower: bound(), upper: bound(), order: r.next() < 0.5 ? "asc" : "desc" }
+  return {
+    index,
+    eq,
+    lower: bound(),
+    upper: bound(),
+    order: r.next() < 0.5 ? "asc" : "desc",
+    readableBy: Option.none(),
+    limit: Option.none()
+  }
 }
 
 const Db = Layer.effectDiscard(SqliteSyncStorage.migrate(registry)).pipe(

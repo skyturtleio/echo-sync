@@ -10,18 +10,19 @@
  *   for (const check of Conformance.syncStorage(makeSubject))
  *     it.effect(check.name, () => Effect.map(check.run, (cases) => assert.isAbove(cases, 0)))
  *
- * Factory contract: each call returns a fresh, empty store in which every table in `tables` exists
- * (create their DDL; a `SyncStorage` registry must contain them, since persisted undo images are
+ * Factory contract: each call returns a fresh, empty store in which every table in `tables` exists,
+ * and core's `scope_grants` exists empty and accepts grants in `grantedScopes` (range plans filter
+ * readable scopes through it) (create their DDL; a `SyncStorage` registry must contain them, since persisted undo images are
  * resolved by table name). The factory may use a `Scope`: every case (each seed, each interrupt
  * boundary) acquires its own subject in its own scope and closes it before the next case.
  *
  * Every expectation is a constant derived from the fixture the check wrote, never an observation
  * of a subject (DESIGN §14): a subject whose writes are no-ops fails every check.
  */
-import { Array as Arr, Deferred, Effect, Fiber, Option, Schema, Scheduler } from "effect"
+import { Array as Arr, DateTime, Deferred, Effect, Fiber, Option, Schema, Scheduler } from "effect"
 import type { Scope } from "effect"
 import type * as Engine from "../../client/sync/Engine.ts"
-import { AccessScope, Ids, Protocol, Store, SyncTable } from "../index.ts"
+import { AccessScope, Ids, Protocol, ScopeGrants, Store, SyncTable } from "../index.ts"
 import type { Errors, Mutation } from "../index.ts"
 
 // ---------------------------------------------------------------------------------------------
@@ -109,6 +110,34 @@ export const tables: ReadonlyArray<SyncTable.AnySyncTable> = [Items, Tags]
 type Item = typeof Items.Row.Type
 const s1 = AccessScope.AccessScopeId.make("s1")
 const s2 = AccessScope.AccessScopeId.make("s2")
+
+// Readable-scope fixture: the actor u1 reads `mine` (own grant) and `open` (the `*` grant); `theirs`
+// has a grant for u2 only, `s2` none.
+const u1 = AccessScope.PrincipalId.make("u1")
+const READERS: ReadonlyArray<AccessScope.PrincipalId> = [u1, AccessScope.Everyone]
+const mine = AccessScope.AccessScopeId.make("mine")
+const open = AccessScope.AccessScopeId.make("open")
+const theirs = AccessScope.AccessScopeId.make("theirs")
+/** Scopes the suite writes grants in; a store whose grants need the scope to exist must create them. */
+export const grantedScopes: ReadonlyArray<AccessScope.AccessScopeId> = [mine, open, theirs]
+const READABLE: ReadonlyArray<AccessScope.AccessScopeId> = [mine, open]
+const UNREADABLE: ReadonlyArray<AccessScope.AccessScopeId> = [theirs, s2]
+const grant = (scope: AccessScope.AccessScopeId, principal: AccessScope.PrincipalId, role: AccessScope.Role) => {
+  const id = ScopeGrants.grantId(scope, principal)
+  const row = Schema.encodeSync(ScopeGrants.ScopeGrants.wire)({
+    id,
+    accessScopeId: scope,
+    principalId: principal,
+    role,
+    grantedAt: DateTime.makeUnsafe(0)
+  })
+  return [id, row] as const
+}
+const GRANTS = [
+  grant(mine, u1, "reader"),
+  grant(open, AccessScope.Everyone, "writer"),
+  grant(theirs, AccessScope.PrincipalId.make("u2"), "owner")
+]
 const encodeItem = Schema.encodeSync(Items.wire)
 const item = (id: string, fields: Partial<Omit<Item, "id">> = {}) =>
   encodeItem({
@@ -366,7 +395,15 @@ const randomPlan = (rng: ReturnType<typeof prng>, rows: ReadonlyArray<SyncTable.
     const value = valueOf(ranged, false)
     return value === null ? Option.none() : Option.some({ value, inclusive: rng.chance(0.5) })
   }
-  return { index, eq, lower: bound(), upper: bound(), order: rng.chance(0.5) ? "asc" : "desc" }
+  return {
+    index,
+    eq,
+    lower: bound(),
+    upper: bound(),
+    order: rng.chance(0.5) ? "asc" : "desc",
+    readableBy: Option.none(),
+    limit: Option.none()
+  }
 }
 
 const describePlan = (plan: Store.IndexRangePlan) =>
@@ -399,6 +436,77 @@ export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): R
               return yield* fail(`seed ${seed}: scan is not ordered by id code point: ${scanned}`)
             }
             return 40
+          })
+        )
+      }
+      return cases
+    })
+  ),
+  check(
+    "a limited range with a readable-scope constraint returns the first n readable rows in index order, not the readable rows among the first n (open item 8)",
+    Effect.gen(function* () {
+      const fail = violation("scoped limit")
+      let cases = 0
+      for (let seed = 1; seed <= 6; seed++) {
+        cases += yield* use(make, ({ rows, transaction }) =>
+          Effect.gen(function* () {
+            const rng = prng(seed)
+            // Scores 0..39 in index order. The first and last five rows are unreadable, so a store
+            // that limits before filtering returns fewer than n rows in either order.
+            const scopes = Array.from({ length: 40 }, (_, i) =>
+              i < 5 || i >= 35 ? rng.pick(UNREADABLE) : rng.chance(0.3) ? rng.pick(READABLE) : rng.pick(UNREADABLE)
+            )
+            const data = scopes.map((scope, i) => ({
+              ...randomItem(rng, `r${String(i).padStart(2, "0")}`),
+              access_scope_id: scope,
+              score: i
+            }))
+            yield* transaction(
+              Effect.all([
+                Effect.forEach(GRANTS, ([id, row]) => rows.write(ScopeGrants.ScopeGrants, id, Option.some(row))),
+                Effect.forEach(data, (row) => rows.write(Items, String(row["id"]), Option.some(row)))
+              ])
+            )
+            const readableIds = data.filter((_, i) => READABLE.includes(scopes[i] ?? s2)).map((r) => r["id"])
+            let n = 0
+            for (const order of ["asc", "desc"] as const) {
+              const inOrder = order === "asc" ? readableIds : readableIds.toReversed()
+              for (const limit of [0, 1, 2, 3, 7, inOrder.length, inOrder.length + 5]) {
+                const plan: Store.IndexRangePlan = {
+                  index: Items.indexes.by_score,
+                  eq: [],
+                  lower: Option.none(),
+                  upper: Option.none(),
+                  order,
+                  readableBy: Option.some(READERS),
+                  limit: Option.some(limit)
+                }
+                const got = (yield* transaction(rows.range(Items, plan))).map((r) => r["id"])
+                const want = inOrder.slice(0, limit)
+                if (canonical(got) !== canonical(want)) {
+                  return yield* fail(
+                    `seed ${seed}, ${order}, limit ${limit}:\n got ${canonical(got)}\nwant ${canonical(want)}`
+                  )
+                }
+                n++
+              }
+            }
+            // Random plans (eq prefixes, bounds, both orders) with the scope constraint and a limit,
+            // against core's reference over the same fixture.
+            const granted = new Set<string>(GRANTS.map(([id]) => id))
+            for (let p = 0; p < 30; p++) {
+              const plan: Store.IndexRangePlan = {
+                ...randomPlan(rng, data),
+                readableBy: Option.some(READERS),
+                limit: rng.chance(0.2) ? Option.none() : Option.some(rng.int(6))
+              }
+              const want = canonical(Store.planResult(plan, data, (id) => granted.has(id)))
+              const got = canonical(yield* transaction(rows.range(Items, plan)))
+              if (got !== want)
+                return yield* fail(`seed ${seed}, plan ${describePlan(plan)}:\n got ${got}\nwant ${want}`)
+              n++
+            }
+            return n
           })
         )
       }
@@ -780,7 +888,10 @@ export const syncStorage = <R>(make: Effect.Effect<SyncStorageSubject, unknown, 
         if (seeded !== prior) return yield* fail(`seed:\n got ${seeded}\nwant ${prior}`)
         yield* storage.transaction(
           Effect.gen(function* () {
-            const { store, touched } = Store.make(storage.rows, { roleFor: () => Effect.succeedSome("owner" as const) })
+            const { store, touched } = Store.make(storage.rows, {
+              actor: AccessScope.Everyone,
+              roleFor: () => Effect.succeedSome("owner" as const)
+            })
             yield* store.patch(Items, ItemId.make("i1"), { label: "b" })
             yield* store.patch(Items, ItemId.make("i1"), { rank: 99 })
             yield* store.delete(Items, ItemId.make("i2"))

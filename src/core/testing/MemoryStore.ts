@@ -5,7 +5,7 @@
  * `Store.planOrder`, `Store.compareText`), never from JS string comparison.
  */
 import { Effect, Option, Semaphore } from "effect"
-import { Store } from "../index.ts"
+import { ScopeGrants, Store } from "../index.ts"
 import type { SyncTable } from "../index.ts"
 
 export type Tables = Map<string, Map<string, SyncTable.EncodedRow>>
@@ -52,9 +52,7 @@ export const make = (initial: Tables = new Map()): MemoryStore => {
       }),
     range: (table, plan) =>
       Effect.sync(() =>
-        rowsOf(table.name)
-          .filter((row) => Store.planMatches(plan, row))
-          .toSorted(Store.planOrder(plan))
+        Store.planResult(plan, rowsOf(table.name), (id) => tables.get(ScopeGrants.ScopeGrants.name)?.has(id) ?? false)
       ),
     scan: (table) => Effect.sync(() => rowsOf(table.name).toSorted(byId)),
     purgeScope: (scopeId) =>

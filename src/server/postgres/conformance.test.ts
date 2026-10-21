@@ -22,7 +22,14 @@ const subject = Effect.gen(function* () {
     for (const ddl of table.postgres.createIndexes) yield* sql.unsafe(ddl)
     yield* attach(table)
   }
-  const rows = yield* RowStore.make(new Map(Conformance.tables.map((t) => [t.name, "public"])))
+  // The engine's scope_grants (range plans filter readable scopes through it) starts empty too.
+  yield* sql`DELETE FROM echo_sync.scope_grants`
+  for (const scope of Conformance.grantedScopes) {
+    yield* sql`INSERT INTO echo_sync.access_scopes (id) VALUES (${scope}) ON CONFLICT DO NOTHING`
+  }
+  const rows = yield* RowStore.make(
+    new Map([...Conformance.tables.map((t) => [t.name, "public"] as const), ["scope_grants", "echo_sync"] as const])
+  )
   const made: Conformance.RowStoreSubject = {
     rows,
     transaction: <A, E, R>(self: Effect.Effect<A, E, R>) =>

@@ -114,7 +114,7 @@ export const handlers = (options: SyncServerOptions) =>
               mutationId: m.mutationId,
               seq: BigInt(m.seq),
               body: Effect.gen(function* () {
-                const { store } = Store.make(rowStore, { roleFor: roleFor(sql, actor) })
+                const { store } = Store.make(rowStore, { actor, roleFor: roleFor(sql, actor) })
                 yield* Mutation.run(options.mutations, m, {
                   actor,
                   now: yield* DateTime.now,

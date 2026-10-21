@@ -161,7 +161,7 @@ export const runHandler = (
   now: number
 ): Effect.Effect<RunResult, StoreUnavailable> =>
   Effect.gen(function* () {
-    const instance = Store.make(rows, { roleFor: roleFromGrants(rows, actor) })
+    const instance = Store.make(rows, { actor, roleFor: roleFromGrants(rows, actor) })
     const ctx: Mutation.MutationContext = {
       actor,
       now: DateTime.makeUnsafe(now),

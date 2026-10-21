@@ -2,7 +2,7 @@ import * as PgTypes from "@effect/sql-pg/PgTypes"
 import { Effect, Option, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
-import { Errors, type Store, type SyncTable } from "echo-sync"
+import { Errors, ScopeGrants, type Store, type SyncTable } from "echo-sync"
 
 /**
  * The transient store failure for a SQL error. The reason tag leads the message so the ledger
@@ -106,13 +106,30 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
             where.push(`${q(ranged.name)} ${bound.value.inclusive ? loose : strict} $${params.length}`)
           }
         }
+        if (Option.isSome(plan.readableBy)) {
+          // Readable: a grant for one of the principals on the row's scope (any role satisfies
+          // reader), through scope_grants' unique (access_scope_id, principal_id), in this snapshot.
+          const grants = relation(ScopeGrants.ScopeGrants)
+          if (grants === undefined) return Effect.die("RowStore: scope_grants is not mapped to a schema")
+          params.push([...plan.readableBy.value])
+          where.push(
+            `EXISTS (SELECT 1 FROM ${grants} AS g WHERE g."access_scope_id" = t."access_scope_id" AND g."principal_id" = ANY($${params.length}::text[]))`
+          )
+        }
+        let limit = ""
+        if (Option.isSome(plan.limit)) {
+          const n = plan.limit.value
+          if (!Number.isSafeInteger(n) || n < 0) return Effect.die(`range: limit ${n} is not a non-negative integer`)
+          params.push(n)
+          limit = ` LIMIT $${params.length}`
+        }
         const dir = plan.order === "asc" ? "ASC NULLS FIRST" : "DESC NULLS LAST"
-        const order = plan.index.key.map((c) => `${q(c.name)} ${dir}`).join(", ")
+        const order = plan.index.key.map((c) => `t.${q(c.name)} ${dir}`).join(", ")
         return Effect.flatMap(
           query(
             table,
             (rel) =>
-              `SELECT ${selectList(table)} FROM ${rel}${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY ${order}`,
+              `SELECT ${selectList(table, "t")} FROM ${rel} AS t${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY ${order}${limit}`,
             params
           ),
           (rows) => decodeAll(table, rows)

@@ -1,8 +1,8 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import * as Engine from "../../client/sync/Engine.ts"
 import { Ids } from "../index.ts"
-import type { Store } from "../index.ts"
+import { Store } from "../index.ts"
 import * as Conformance from "./Conformance.ts"
 import * as MemoryStore from "./MemoryStore.ts"
 import * as MemorySyncStorage from "./MemorySyncStorage.ts"
@@ -140,6 +140,39 @@ describe("the suite's expectations come from fixtures, not from the subject (DES
     "a storage that drops meta and staging writes",
     Conformance.syncStorage(dropsMetaAndStaging).filter((check) =>
       ["nextSeq allocates", "clearAll", "a storage transaction"].some((prefix) => check.name.startsWith(prefix))
+    )
+  )
+})
+
+/** MemoryStore whose range reads `rewrite(plan)` and applies the readable-scope filter afterwards. */
+const filtersAfter = (rewrite: (plan: Store.IndexRangePlan) => Store.IndexRangePlan) =>
+  Effect.sync((): Conformance.RowStoreSubject => {
+    const store = MemoryStore.make()
+    const grants = (id: string) => store.tables().get("scope_grants")?.has(id) ?? false
+    return {
+      rows: {
+        ...store,
+        range: (table, plan) =>
+          Effect.map(store.range(table, rewrite(plan)), (rows) =>
+            Store.planResult({ ...plan, limit: Option.none() }, rows, grants)
+          )
+      },
+      transaction: store.transaction
+    }
+  })
+const scopedLimit = (checks: ReadonlyArray<Conformance.Check<never>>) =>
+  checks.filter((check) => check.name.startsWith("a limited range with a readable-scope constraint"))
+
+describe("the scoped-limit check catches stores that do not push the scope filter under the limit (open item 8)", () => {
+  // v1's Store.make: the limit applied to the store's rows before the readable-scope filter.
+  mustCatch(
+    "limit before the scope filter",
+    scopedLimit(Conformance.rowStore(filtersAfter((plan) => ({ ...plan, readableBy: Option.none() }))))
+  )
+  mustCatch(
+    "a store that ignores the limit",
+    scopedLimit(
+      Conformance.rowStore(filtersAfter((plan) => ({ ...plan, readableBy: Option.none(), limit: Option.none() })))
     )
   )
 })

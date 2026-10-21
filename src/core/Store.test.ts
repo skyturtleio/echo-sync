@@ -59,7 +59,9 @@ const plan = (
   eq,
   order,
   lower: Option.fromNullishOr(lower),
-  upper: Option.fromNullishOr(upper)
+  upper: Option.fromNullishOr(upper),
+  readableBy: Option.none(),
+  limit: Option.none()
 })
 const plans: ReadonlyArray<Store.IndexRangePlan> = (["asc", "desc"] as const).flatMap((o) => [
   plan(Items.indexes.by_label, [], o),
@@ -157,15 +159,17 @@ const memoryRows = () => {
         if (Option.isSome(row)) table(t).set(id, row.value)
         else table(t).delete(id)
       }),
-    range: (t, p) =>
-      Effect.sync(() => [...table(t).values()].filter((r) => Store.planMatches(p, r)).toSorted(Store.planOrder(p))),
+    range: (t, p) => Effect.sync(() => Store.planResult(p, table(t).values(), (id) => table(ScopeGrants).has(id))),
     scan: (t) => Effect.sync(() => [...table(t).values()])
   }
   const snapshot = () => new Map([...data].map(([name, m]) => [name, new Map(m)]))
   return { rows, data, snapshot }
 }
 
+const ids = (rows: ReadonlyArray<{ readonly id: string }>) => rows.map((r) => r.id)
+
 const roles = (granted: Partial<Record<string, Role>>): Store.StoreOptions => ({
+  actor: PrincipalId.make("u1"),
   roleFor: (scopeId) => Effect.succeed(Option.fromNullishOr(granted[scopeId]))
 })
 
@@ -237,18 +241,39 @@ describe("typed Store over a RowStore", () => {
     expect([...(mem.data.get("scope_grants")?.keys() ?? [])]).toEqual([canonical])
   })
 
-  it("queries skip rows in scopes the actor cannot read", async () => {
+  it("queries return the first n rows the actor can read (own or * grant), skipping unreadable ones in index order", async () => {
     const mem = memoryRows()
-    const admin = Store.make(mem.rows, roles({ s1: "writer", s2: "writer" })).store
+    const s2 = AccessScopeId.make("s2")
+    const s3 = AccessScopeId.make("s3")
+    const admin = Store.make(mem.rows, roles({ s1: "owner", s2: "writer", s3: "owner" })).store
+    // rank 1..6 in one label; readable: s1 (u1's own grant) and s3 (the * grant), not s2.
+    const scopes = [s2, s1, s2, s3, s2, s1]
     await Effect.runPromise(
-      Effect.all([
-        admin.insert(Items, item("a", "a", 1, true, 1)),
-        admin.insert(Items, { ...item("b", "a", 2, true, 1), accessScopeId: AccessScopeId.make("s2") })
-      ])
+      Effect.forEach(scopes, (scope, i) =>
+        admin.insert(Items, { ...item(`r${i + 1}`, "a", i + 1, true, 1), accessScopeId: scope })
+      )
     )
-    const store = Store.make(mem.rows, roles({ s1: "reader" })).store
-    const found = await Effect.runPromise(store.query(Items).withIndex("by_label", (q) => q.eq("label", "a")).collect)
-    expect(found.map((r) => r.id)).toEqual(["a"])
+    const u1 = PrincipalId.make("u1")
+    for (const [scope, principal] of [
+      [s1, u1],
+      [s3, PrincipalId.make("*")]
+    ] as const) {
+      await Effect.runPromise(
+        admin.insert(ScopeGrants, {
+          id: grantId(scope, principal),
+          accessScopeId: scope,
+          principalId: principal,
+          role: "reader",
+          grantedAt: DateTime.makeUnsafe(0)
+        })
+      )
+    }
+    const store = Store.make(mem.rows, roles({ s1: "reader", s3: "reader" })).store
+    const query = store.query(Items).withIndex("by_label", (q) => q.eq("label", "a"))
+    expect(ids(await Effect.runPromise(query.collect))).toEqual(["r2", "r4", "r6"])
+    expect(ids(await Effect.runPromise(query.take(2)))).toEqual(["r2", "r4"])
+    expect(ids(await Effect.runPromise(query.order("desc").take(1)))).toEqual(["r6"])
+    expect(ids(await Effect.runPromise(query.take(0)))).toEqual([])
   })
 })
 

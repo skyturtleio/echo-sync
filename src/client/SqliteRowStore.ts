@@ -14,7 +14,7 @@
 import { Effect, Option, Schema } from "effect"
 import type * as SqlClient from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
-import { Errors, type Registry, type Store, type SyncTable } from "echo-sync"
+import { Errors, ScopeGrants, type Registry, type Store, type SyncTable } from "echo-sync"
 
 type Table = SyncTable.AnySyncTable
 type Value = SyncTable.SqliteValue
@@ -32,12 +32,19 @@ export const unavailable = <A, R>(
 const decodeRows = (table: Table, rows: ReadonlyArray<unknown>) =>
   Effect.forEach(rows, (row) => Effect.orDie(Schema.decodeUnknownEffect(table.sqlite.row)(row)))
 
+/** A plan limit as SQL text; anything but a non-negative safe integer is a caller bug. */
+const limitOf = (n: number) => {
+  if (!Number.isSafeInteger(n) || n < 0) throw new RangeError(`range: limit ${n} is not a non-negative integer`)
+  return String(n)
+}
+
 const bind = (column: SyncTable.Column, value: Schema.Json): Effect.Effect<Value> =>
   Effect.orDie(Schema.encodeEffect(column.sqlite)(value))
 
 export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry): Store.ReplicaRowStore => {
-  const select = (table: Table, where: string, params: ReadonlyArray<Value>, orderBy: string) =>
-    unavailable(sql.unsafe(`SELECT * FROM ${q(table.name)}${where} ORDER BY ${orderBy}`, params)).pipe(
+  // The table is aliased `t`, so a readable-scope semi-join on scope_grants can name it.
+  const select = (table: Table, where: string, params: ReadonlyArray<Value>, orderBy: string, limit = "") =>
+    unavailable(sql.unsafe(`SELECT t.* FROM ${q(table.name)} AS t${where} ORDER BY ${orderBy}${limit}`, params)).pipe(
       Effect.flatMap((rows) => decodeRows(table, rows))
     )
 
@@ -87,12 +94,21 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
             where.push(`${q(ranged.name)} ${bound.value.inclusive ? loose : strict} ?`)
           }
         }
+        if (Option.isSome(plan.readableBy)) {
+          // Readable: a grant for one of the principals on the row's scope (any role satisfies
+          // reader), found through scope_grants' unique (access_scope_id, principal_id).
+          params.push(...plan.readableBy.value)
+          where.push(
+            `EXISTS (SELECT 1 FROM ${q(ScopeGrants.ScopeGrants.name)} AS g WHERE g."access_scope_id" = t."access_scope_id" AND g."principal_id" IN (${plan.readableBy.value.map(() => "?").join(", ")}))`
+          )
+        }
         const dir = plan.order === "asc" ? "ASC NULLS FIRST" : "DESC NULLS LAST"
         return yield* select(
           table,
           where.length === 0 ? "" : ` WHERE ${where.join(" AND ")}`,
           params,
-          plan.index.key.map((c) => `${q(c.name)} ${dir}`).join(", ")
+          plan.index.key.map((c) => `t.${q(c.name)} ${dir}`).join(", "),
+          Option.match(plan.limit, { onNone: () => "", onSome: (n) => ` LIMIT ${limitOf(n)}` })
         )
       }),
 

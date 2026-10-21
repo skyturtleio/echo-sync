@@ -53,7 +53,10 @@ const makeStore = () => {
     range: () => Effect.succeed([]),
     scan: () => Effect.sync(() => [...data.values()])
   }
-  return Store.make(rows, { roleFor: () => Effect.succeed(Option.some("writer" as const)) }).store
+  return Store.make(rows, {
+    actor: PrincipalId.make("*"),
+    roleFor: () => Effect.succeed(Option.some("writer" as const))
+  }).store
 }
 
 describe("mutation args evolve without breaking queued intents (DESIGN §6)", () => {
