@@ -1,7 +1,8 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect } from "effect"
+import { Cause, Effect, Exit } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
-import { isSqlError } from "effect/sql/SqlError"
+import { isSqlError, SqlError, UnknownError } from "effect/sql/SqlError"
+import { Errors } from "echo-sync"
 import * as Conformance from "../../core/testing/Conformance.ts"
 import * as RowStore from "./rowStore.ts"
 import { attach } from "./schema.ts"
@@ -24,9 +25,17 @@ const subject = Effect.gen(function* () {
   const rows = yield* RowStore.make(new Map(Conformance.tables.map((t) => [t.name, "public"])))
   const made: Conformance.RowStoreSubject = {
     rows,
-    transaction: (self) =>
+    transaction: <A, E, R>(self: Effect.Effect<A, E, R>) =>
       sql.withTransaction(self).pipe(
-        Effect.mapError((error) => (isSqlError(error) ? RowStore.unavailable(error) : error)),
+        // Whole cause (Cause.map touches Fail reasons only): a rollback-cleanup defect next to the
+        // body's failure must reach the suite, not be dropped as `mapError` would.
+        Effect.catchCause((cause: Cause.Cause<E | SqlError>) =>
+          Effect.failCause(
+            Cause.map(cause, (error: E | SqlError): E | Errors.StoreUnavailable =>
+              isSqlError(error) ? RowStore.unavailable(error) : error
+            )
+          )
+        ),
         Effect.provideService(SqlClient, sql)
       )
   }
@@ -41,4 +50,36 @@ describe.skipIf(!pgAvailable)("Postgres RowStore conforms to Store.RowStore (DES
       120_000
     )
   }
+
+  it.live("the subject's transaction keeps every reason of a mixed cause (a cleanup defect is never dropped)", () =>
+    Effect.gen(function* () {
+      const { transaction } = yield* subject
+      const bug = new Error("rollback cleanup failed")
+      const sqlError = new SqlError({ reason: new UnknownError({ cause: null, message: "conflict" }) })
+      const exit = yield* Effect.exit(
+        transaction(
+          Effect.failCause(
+            Cause.fromReasons<string | SqlError>([
+              Cause.makeFailReason("abort"),
+              Cause.makeFailReason(sqlError),
+              Cause.makeDieReason(bug)
+            ])
+          )
+        )
+      )
+      if (Exit.isSuccess(exit)) return assert.fail("transaction succeeded")
+      const reasons = exit.cause.reasons.map((r) =>
+        Cause.isFailReason(r)
+          ? r.error === "abort"
+            ? "fail:abort"
+            : r.error instanceof Errors.StoreUnavailable
+              ? "fail:StoreUnavailable"
+              : "fail:other"
+          : Cause.isDieReason(r) && r.defect === bug
+            ? "die:bug"
+            : "other"
+      )
+      assert.deepStrictEqual(reasons, ["fail:abort", "fail:StoreUnavailable", "die:bug"])
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
 })
