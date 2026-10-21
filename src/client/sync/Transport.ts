@@ -60,7 +60,7 @@ const defectsAs =
 /** A `Transport` over an RPC client `Protocol` (see `layerProtocolHttp`). */
 /** The engine's transport plus the pokes stream, which the leader follows with `SyncLoop.followPokes`. */
 export interface SyncTransport extends Engine.Transport<TransportError> {
-  readonly pokes: (clientId: Ids.ClientId) => Stream.Stream<typeof Protocol.Poke.Type, unknown>
+  readonly pokes: (clientId: Ids.ClientId) => Stream.Stream<typeof Protocol.PokesElement.Type, unknown>
 }
 
 export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scope.Scope> = Effect.gen(function* () {

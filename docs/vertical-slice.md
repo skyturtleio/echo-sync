@@ -59,11 +59,12 @@ and a test in `Transport.test.ts` checks all three.
 | `stats?clientId=&todo=` | RPC requests this process received per tag for a client; how often the server's `todos.add` handler started for a todo id |
 
 The Vite harness proxies `/sync` and `/admin` to the server (`ECHO_SLICE_SERVER`, default
-`http://127.0.0.1:5200`). One harness fix was needed. When the server dies mid-response, Vite's proxy kept
-the browser's pokes response open indefinitely, so an idle client never saw the stream end and never
-reconnected. Scenario 5 caught this: after a restart an idle client sent no request for 121 s. The proxy
-now destroys the browser response when the upstream response ends incomplete, which is what a direct
-connection does.
+`http://127.0.0.1:5200`). When the server dies mid-response, Vite's proxy keeps the browser's pokes
+response open indefinitely. Scenario 5 caught this before liveness existed: after a restart an idle client
+sent no request for 121 s, and the harness carried a proxy workaround (destroy the browser response when the
+upstream ended incomplete). That workaround is gone: the client's `idleTimeout` (DESIGN §6 Liveness, default
+45 s; the server heartbeats every 15 s) ends a stream that delivers nothing, so scenario 5 now catches up
+through the idle timeout and the reconnect backoff, as any client behind such a proxy would.
 
 ## Running it
 
@@ -135,8 +136,7 @@ Postgres ledger has exactly one row for each exactly-once mutation they enqueue 
 
 - S4's catch-up time is bounded by the pokes reconnect backoff (1 s doubling to 30 s), not by a resync
   timer: v1 has none (DESIGN §6). A client behind an intermediary that holds a dead response open, as
-  Vite's proxy did, stays deaf until something else wakes it. The HTTP RPC transport has no heartbeat to
-  detect that.
+  Vite's proxy does, is deaf for up to `idleTimeout` (45 s) plus the reconnect backoff.
 - S5 holds the first push open across the leader's closure, but when the gate opens the server may still
   commit that abandoned request, or roll it back and commit the successor's. Both outcomes must give one
   ledger row, so the check accepts either; the evidence line reports how many times the server's handler

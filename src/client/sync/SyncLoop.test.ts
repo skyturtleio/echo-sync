@@ -32,6 +32,10 @@ const fakeEngine = (pushFails: (attempt: number) => Malformed | Offline | undefi
 }
 
 const settle = Effect.repeat(Effect.yieldNow, { times: 50 })
+// Typed as the protocol's element union (not narrowed per tag), as the transport delivers them.
+const element = (tag: "poke" | "heartbeat"): typeof Protocol.PokesElement.Type => ({ _tag: tag })
+const poke = element("poke")
+const heartbeat = element("heartbeat")
 
 it.effect("an integrity error halts push for good while pull keeps running", () =>
   Effect.gen(function* () {
@@ -182,10 +186,10 @@ it.effect(
         Effect.gen(function* () {
           const attempt = attempts.length + 1
           attempts.push(Number(yield* Clock.currentTimeMillis))
-          if (attempt === 1) return Stream.make({}, {}) // two pokes, then a clean end
+          if (attempt === 1) return Stream.make(poke, poke) // two pokes, then a clean end
           if (attempt === 2) return Stream.fail(new Offline())
           if (attempt === 3) return Stream.die(new Error("bad frame"))
-          return Stream.never
+          return Stream.as(Stream.tick("15 seconds"), heartbeat) // live: heartbeats only
         })
       )
       const fiber = yield* Effect.forkChild(SyncLoop.followPokes({ connect, wake: Effect.sync(() => void wakes.n++) }))
@@ -204,16 +208,19 @@ it.effect(
       expect(attempts).toEqual([0, 1000, 3000, 7000])
       expect(wakes.n).toBe(2) // only pokes wake: reconnecting itself does not
       expect(fiber.pollUnsafe()).toBeUndefined()
-      yield* TestClock.adjust("1 hour")
-      yield* settle
-      expect(attempts.length).toBe(4) // a live connection is not replaced
+      for (let i = 0; i < 40; i++) {
+        yield* TestClock.adjust("15 seconds")
+        yield* settle
+      }
+      expect(attempts.length).toBe(4) // a live (heartbeating) connection is not replaced
+      expect(wakes.n).toBe(2)
     })
 )
 
 it.effect("only stream elements wake: a stream with no initial poke wakes nothing until it delivers one", () =>
   Effect.gen(function* () {
     const wakes = { n: 0 }
-    const notifications = yield* Queue.unbounded<object>()
+    const notifications = yield* Queue.unbounded<typeof poke>()
     const connections = { n: 0 }
     // Attempt 1 ends at once with no element; attempt 2 is a live stream that has sent nothing yet.
     const connect = Stream.unwrap(
@@ -224,7 +231,7 @@ it.effect("only stream elements wake: a stream with no initial poke wakes nothin
     yield* TestClock.adjust("1 second")
     yield* settle
     expect([connections.n, wakes.n]).toEqual([2, 0])
-    yield* Queue.offer(notifications, {})
+    yield* Queue.offer(notifications, poke)
     yield* settle
     expect(wakes.n).toBe(1)
   })
@@ -236,7 +243,7 @@ it.effect("the server's initial poke, the first element of each stream, wakes th
     const connections = { n: 0 }
     // Like the real server: one poke right after LISTEN; the first connection then ends.
     const connect = Stream.unwrap(
-      Effect.sync(() => (++connections.n === 1 ? Stream.make({}) : Stream.concat(Stream.make({}), Stream.never)))
+      Effect.sync(() => (++connections.n === 1 ? Stream.make(poke) : Stream.concat(Stream.make(poke), Stream.never)))
     )
     yield* Effect.forkChild(SyncLoop.followPokes({ connect, wake: Effect.sync(() => void wakes.n++) }))
     yield* settle
@@ -245,4 +252,43 @@ it.effect("the server's initial poke, the first element of each stream, wakes th
     yield* settle
     expect([connections.n, wakes.n]).toEqual([2, 2])
   })
+)
+
+it.effect(
+  "a pokes stream silent past idleTimeout is ended and reconnected, and the new stream's initial poke wakes; heartbeats keep it open without waking",
+  () =>
+    Effect.gen(function* () {
+      const wakes = { n: 0 }
+      const first = yield* Queue.unbounded<typeof Protocol.PokesElement.Type>()
+      const connections = { n: 0 }
+      // Connection 1 is fed by the test, then goes silent without ending (a dead proxy); connection 2
+      // is a live server stream: its initial poke, then nothing.
+      const connect = Stream.unwrap(
+        Effect.sync(() =>
+          ++connections.n === 1 ? Stream.fromQueue(first) : Stream.concat(Stream.make(poke), Stream.never)
+        )
+      )
+      yield* Effect.forkChild(
+        SyncLoop.followPokes({ connect, wake: Effect.sync(() => void wakes.n++), idleTimeout: "45 seconds" })
+      )
+      yield* Queue.offer(first, poke)
+      yield* settle
+      expect([connections.n, wakes.n]).toEqual([1, 1])
+      // Heartbeats every 30 s: never 45 s without an element, so the stream stays; none of them wakes.
+      for (let i = 0; i < 3; i++) {
+        yield* TestClock.adjust("30 seconds")
+        yield* Queue.offer(first, heartbeat)
+        yield* settle
+      }
+      expect([connections.n, wakes.n]).toEqual([1, 1])
+      // Silent from here: ended exactly 45 s after the last element, reconnected after the 1 s backoff.
+      yield* TestClock.adjust("44999 millis")
+      yield* settle
+      yield* TestClock.adjust("1 second")
+      yield* settle
+      expect([connections.n, wakes.n]).toEqual([1, 1])
+      yield* TestClock.adjust("1 millis")
+      yield* settle
+      expect([connections.n, wakes.n]).toEqual([2, 2])
+    })
 )

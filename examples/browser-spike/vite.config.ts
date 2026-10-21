@@ -4,15 +4,9 @@ import { middleware } from "./fakeSync.ts"
 
 // The vertical-slice server (examples/server/main.ts): the real SyncRpcs at /sync, scenario hooks at /admin.
 const sliceProxy: ProxyOptions = {
-  target: process.env["ECHO_SLICE_SERVER"] ?? "http://127.0.0.1:5200",
-  // When the server dies mid-response (a live pokes stream), Vite's proxy keeps the browser's response open
-  // forever, so the client never sees the stream end and never reconnects. Break it, as a direct connection would.
-  configure: (proxy) =>
-    void proxy.on("proxyRes", (upstream, _req, res) => {
-      upstream.on("close", () => {
-        if (!upstream.complete) res.destroy()
-      })
-    })
+  target: process.env["ECHO_SLICE_SERVER"] ?? "http://127.0.0.1:5200"
+  // No proxy workaround for a server that dies mid-stream: Vite's proxy keeps the browser's pokes response
+  // open, and the client's idleTimeout (DESIGN §6 Liveness) ends it, as it would behind any such proxy.
 }
 export default defineConfig({
   root: fileURLToPath(new URL(".", import.meta.url)),

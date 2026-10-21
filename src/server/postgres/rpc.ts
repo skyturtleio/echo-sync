@@ -19,6 +19,12 @@ export interface SyncServerOptions {
   /** Upserts and tombstones per pull page. Default 500. */
   readonly pageLimit?: number | undefined
   readonly ledger?: LedgerOptions | undefined
+  /**
+   * Cadence of the `heartbeat` element on every open `pokes` stream (DESIGN §6 Liveness), so a
+   * proxy or the client's `idleTimeout` never sees a live stream as idle. Default 15 s; must stay
+   * below the clients' `idleTimeout` (default 45 s).
+   */
+  readonly heartbeatInterval?: Duration.Input | undefined
 }
 
 /** `notify` channel of `echo_sync.next_position()`: one hint per committed writing transaction. */
@@ -110,6 +116,11 @@ export const claimScope = (sql: SqlClient) => (scopeId: AccessScope.AccessScopeI
 interface ListenSession {
   /** Every notification on the channel, fanned out; pokes carry no payload, so it slides. */
   readonly pubsub: PubSub.PubSub<void>
+  /**
+   * One tick per `heartbeatInterval` while this `LISTEN` is confirmed. Separate from `pubsub`: a
+   * heartbeat sliding over a not-yet-taken poke in one capacity-1 queue would lose the poke.
+   */
+  readonly heartbeats: PubSub.PubSub<void>
   /** Fails with the connection's error once this `LISTEN` is lost. */
   readonly lost: Deferred.Deferred<never, SqlError>
 }
@@ -137,11 +148,15 @@ const listenBackoff = (attempt: number) => Duration.millis(Math.min(50 * 2 ** at
  * The returned stream is one `pokes` subscription: it subscribes to the current session first and
  * emits the initial poke only then, so a commit after that poke notifies it and a commit before
  * it is covered by the pull the poke triggers (subscribe-then-poke). Without a confirmed `LISTEN`
- * it fails `ServerUnavailable` and the client reconnects with backoff.
+ * it fails `ServerUnavailable` and the client reconnects with backoff. After that poke, the stream
+ * also carries a `heartbeat` every `heartbeatInterval` from the session's clock (DESIGN §6
+ * Liveness), so an idle stream is never silent for longer than one interval.
  */
 export const sharedPokes = (
   pg: PgClient.PgClient,
-  options?: {
+  options: {
+    /** Heartbeat cadence of every subscribed stream. */
+    readonly heartbeatInterval: Duration.Input
     /** Runs with each backoff delay just before its sleep starts (tests synchronize their clock on it). */
     readonly onBackoff?: ((delay: Duration.Duration) => Effect.Effect<void>) | undefined
   }
@@ -155,8 +170,14 @@ export const sharedPokes = (
         const queue = yield* pg.listen(pokeChannel)
         const live: ListenSession = {
           pubsub: yield* PubSub.sliding<void>(1),
+          heartbeats: yield* PubSub.sliding<void>(1),
           lost: yield* Deferred.make<never, SqlError>()
         }
+        yield* Effect.forkScoped(
+          Effect.forever(
+            Effect.andThen(Effect.sleep(options.heartbeatInterval), PubSub.publish(live.heartbeats, undefined))
+          )
+        )
         yield* Ref.set(attempts, 0)
         yield* Ref.set(current, Option.some(live))
         yield* Deferred.succeed(ready, undefined)
@@ -171,7 +192,7 @@ export const sharedPokes = (
     const backoff = Effect.gen(function* () {
       yield* Deferred.succeed(ready, undefined)
       const delay = listenBackoff(yield* Ref.getAndUpdate(attempts, (n) => n + 1))
-      if (options?.onBackoff !== undefined) yield* options.onBackoff(delay)
+      if (options.onBackoff !== undefined) yield* options.onBackoff(delay)
       yield* Effect.sleep(delay)
     })
     yield* Effect.forkScoped(Effect.forever(Effect.catch(session, () => backoff)))
@@ -182,12 +203,18 @@ export const sharedPokes = (
         if (Option.isNone(live)) {
           return yield* new Protocol.ServerUnavailable({ message: "LISTEN is not established" })
         }
-        const subscription = yield* PubSub.subscribe(live.value.pubsub)
+        const notifications = yield* PubSub.subscribe(live.value.pubsub)
+        const heartbeats = yield* PubSub.subscribe(live.value.heartbeats)
         if (yield* Deferred.isDone(live.value.lost)) yield* Deferred.await(live.value.lost)
-        return Stream.concat(Stream.succeed(undefined), Stream.fromSubscription(subscription)).pipe(
-          Stream.map((): typeof Protocol.Poke.Type => ({})),
-          Stream.interruptWhen(Deferred.await(live.value.lost))
-        )
+        const poke: typeof Protocol.PokesElement.Type = { _tag: "poke" }
+        const heartbeat: typeof Protocol.PokesElement.Type = { _tag: "heartbeat" }
+        return Stream.concat(
+          Stream.succeed(poke),
+          Stream.merge(
+            Stream.as(Stream.fromSubscription(notifications), poke),
+            Stream.as(Stream.fromSubscription(heartbeats), heartbeat)
+          )
+        ).pipe(Stream.interruptWhen(Deferred.await(live.value.lost)))
       })
     )
   })
@@ -204,7 +231,9 @@ export const handlers = (options: SyncServerOptions) =>
   Protocol.SyncRpcs.toLayer(
     Effect.gen(function* () {
       const sql = yield* SqlClient
-      const pokes = yield* sharedPokes(yield* PgClient.PgClient)
+      const pokes = yield* sharedPokes(yield* PgClient.PgClient, {
+        heartbeatInterval: options.heartbeatInterval ?? "15 seconds"
+      })
       return Protocol.SyncRpcs.of({
         push: (request, { headers }) =>
           Effect.gen(function* () {

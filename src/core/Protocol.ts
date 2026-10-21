@@ -113,8 +113,14 @@ export class ServerUnavailable extends Schema.TaggedError<ServerUnavailable>()("
   message: Schema.String
 }) {}
 
-/** A hint that something may have changed; never data (DESIGN §8). */
-export const Poke = Schema.Struct({})
+/** A hint that something may have changed; never data (DESIGN §8). Wakes the client's sync loop. */
+export const Poke = Schema.TaggedStruct("poke", {})
+
+/** Liveness only (DESIGN §6 Liveness): proves the stream is alive and never wakes the sync loop. */
+export const Heartbeat = Schema.TaggedStruct("heartbeat", {})
+
+/** One `pokes` stream element; the first element of every stream is a `Poke`. */
+export const PokesElement = Schema.Union([Poke, Heartbeat])
 
 export const SyncRpcs = RpcGroup.make(
   Rpc.make("push", {
@@ -129,7 +135,7 @@ export const SyncRpcs = RpcGroup.make(
   }),
   Rpc.make("pokes", {
     payload: { clientId: ClientId },
-    success: Poke,
+    success: PokesElement,
     error: Schema.Union([ServerUnavailable, Unauthorized]),
     stream: true
   })

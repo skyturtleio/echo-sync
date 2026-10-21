@@ -271,7 +271,9 @@ it.effect("a transport built with headers sends them on push, pull and the pokes
               })
             }),
           pokes: (_, { headers }) =>
-            Stream.fromEffect(Effect.sync(() => (seen["pokes"] = headers["x-echo-principal"]))).pipe(Stream.as({}))
+            Stream.fromEffect(Effect.sync(() => (seen["pokes"] = headers["x-echo-principal"]))).pipe(
+              Stream.as({ _tag: "poke" as const })
+            )
         }),
         RpcSerialization.layerNdjson
       ])

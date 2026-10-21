@@ -69,6 +69,14 @@ is never read from the payload. `ClientForbidden` becomes `Unauthorized`.
   (exponential from 50 ms, capped at 5 s, reset once a `LISTEN` is confirmed, not configurable).
   Each attempt runs in its own scope, so an attempt that fails after reserving its connection
   releases it before the backoff. Clients reconnect on any end.
+  **Liveness** (DESIGN §6): the element is `poke | heartbeat`, the first one a poke. While a
+  `LISTEN` is confirmed, its session ticks every `heartbeatInterval` (`SyncServerOptions`, default
+  15 s) into a second sliding `PubSub`, and every subscribed stream emits a `heartbeat` per tick, so
+  an idle stream is never silent longer than one interval. It is a separate `PubSub` because a tick
+  sliding over a not-yet-taken notification in one capacity-1 queue would lose the poke. Heartbeats
+  are a fixed cadence, not "after an interval without a poke": a busy stream also gets them, which
+  costs one small frame per interval. The client wakes only on `poke` and ends a stream that
+  delivers nothing for `idleTimeout` (`LeaderOptions`, default 45 s).
 
 ## Engine state
 

@@ -19,6 +19,7 @@ import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner"
 import type * as Context from "effect/Context"
 import * as DateTime from "effect/DateTime"
+import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
@@ -279,6 +280,11 @@ export interface LeaderOptions {
    * expire are refreshed only by a new leader (e.g. a reload), not per request.
    */
   readonly syncHeaders?: (principal: AccessScope.PrincipalId) => Readonly<Record<string, string>>
+  /**
+   * A pokes stream with no element (poke or heartbeat) for this long is ended and reconnected
+   * (DESIGN §6 Liveness). Default 45 s; must exceed the server's `heartbeatInterval` (default 15 s).
+   */
+  readonly idleTimeout?: Duration.Input
 }
 
 const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: LeaderOptions) =>
@@ -316,7 +322,9 @@ const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: L
       engine = yield* Engine.make({ clientId, actor, storage, registry, mutations, transport })
       const sync = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush })
       yield* Effect.forkScoped(sync.run)
-      yield* Effect.forkScoped(SyncLoop.followPokes({ connect: transport.pokes(clientId), wake: sync.wake }))
+      yield* Effect.forkScoped(
+        SyncLoop.followPokes({ connect: transport.pokes(clientId), wake: sync.wake, idleTimeout: options.idleTimeout })
+      )
       yield* sync.wake
       loop = sync
     }

@@ -47,7 +47,7 @@ const handlers = Protocol.SyncRpcs.toLayer({
   },
   pokes: ({ clientId }) => {
     statsFor(clientId).pokes++
-    return Stream.make({})
+    return Stream.make({ _tag: "poke" as const })
   }
 })
 

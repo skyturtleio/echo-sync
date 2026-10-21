@@ -121,32 +121,40 @@ export const make = <TE>(options: {
   })
 
 /**
- * Follows the server's pokes stream (DESIGN §6, §8, 81a07db): every poke wakes the loop, and the
- * stream is reconnected after ANY end (failure, defect or clean completion) following a backoff that
- * starts at `retryDelay`, doubles up to `maxRetryDelay`, and resets once a connection delivered a poke.
+ * Follows the server's pokes stream (DESIGN §6, §8, 81a07db): every `poke` wakes the loop, a
+ * `heartbeat` only proves liveness (DESIGN §6 Liveness) and never wakes it, and the stream is
+ * reconnected after ANY end (failure, defect, clean completion, or `idleTimeout` with no element at
+ * all) following a backoff that starts at `retryDelay`, doubles up to `maxRetryDelay`, and resets once
+ * a connection delivered a poke. The idle timeout is what notices a connection that died silently (a
+ * proxy that keeps the response open); it must exceed the server's `heartbeatInterval`.
  * Reconnecting does not wake the loop itself: a wake before the server's LISTEN is confirmed could pull
  * before a change that the new stream then never announces. The server emits one poke on every stream
  * right after LISTEN (DESIGN §6, aec6cd4), and that first element is what covers anything missed while
  * disconnected. Pokes are only hints (§8), so nothing here is fatal. Runs until interrupted.
  */
 export const followPokes = <E>(options: {
-  readonly connect: Stream.Stream<unknown, E>
+  readonly connect: Stream.Stream<{ readonly _tag: "poke" | "heartbeat" }, E>
   readonly wake: Effect.Effect<void>
   readonly retryDelay?: Duration.Input
   readonly maxRetryDelay?: Duration.Input
+  /** No element for this long ends the stream (then reconnects). Default 45 s. */
+  readonly idleTimeout?: Duration.Input | undefined
 }): Effect.Effect<never> =>
   Effect.gen(function* () {
     const base = Duration.toMillis(Duration.fromInputUnsafe(options.retryDelay ?? "1 second"))
     const cap = Duration.toMillis(Duration.fromInputUnsafe(options.maxRetryDelay ?? "30 seconds"))
+    const connect = Stream.timeout(options.connect, options.idleTimeout ?? "45 seconds")
     let delay = base
     while (true) {
       const connection = { poked: false }
       const ended = yield* Effect.exit(
-        Stream.runForEach(options.connect, () =>
-          Effect.andThen(
-            Effect.sync(() => (connection.poked = true)),
-            options.wake
-          )
+        Stream.runForEach(connect, (element) =>
+          element._tag === "poke"
+            ? Effect.andThen(
+                Effect.sync(() => (connection.poked = true)),
+                options.wake
+              )
+            : Effect.void
         )
       )
       if (connection.poked) delay = base

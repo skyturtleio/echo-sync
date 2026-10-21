@@ -23,6 +23,7 @@ import { SqlClient } from "effect/sql/SqlClient"
 import { SqlError, UnknownError } from "effect/sql/SqlError"
 import { AccessScope, Ids, Mutation, Protocol } from "echo-sync"
 import * as TestClock from "effect/testing/TestClock"
+import * as SyncLoop from "../../client/sync/SyncLoop.ts"
 import { layerHttp, sharedPokes } from "./rpc.ts"
 import { grant, Items, pgAvailable, registry, RowId, TestDatabase } from "./test-support.ts"
 
@@ -48,13 +49,14 @@ const connectWith = (wrap: (sql: SqlClient) => SqlClient) =>
     return yield* connectTo(Context.add(db, SqlClient, wrap(sql)))
   })
 
-const connectTo = (db: Context.Context<SqlClient | PgClient.PgClient>) =>
+const connectTo = (db: Context.Context<SqlClient | PgClient.PgClient>, heartbeatInterval?: Duration.Input) =>
   Effect.gen(function* () {
     const app = layerHttp({
       registry,
       mutations,
       principalFor: () => Effect.succeed(AccessScope.PrincipalId.make("p")),
-      ledger: { conflictRetry: undefined }
+      ledger: { conflictRetry: undefined },
+      heartbeatInterval
     }).pipe(Layer.provide(Layer.succeedContext(db)))
     const web = HttpRouter.toWebHandler(app, { disableLogger: true })
     yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
@@ -385,6 +387,41 @@ describe.skipIf(!pgAvailable)("one LISTEN per server process (§6)", () => {
   )
 })
 
+describe.skipIf(!pgAvailable)("pokes liveness (§6)", () => {
+  it.live(
+    "an idle pokes stream carries a heartbeat at least every heartbeatInterval, and no heartbeat makes the client pull",
+    () =>
+      Effect.gen(function* () {
+        const db = yield* Effect.context<SqlClient | PgClient.PgClient>()
+        const client = yield* connectTo(db, "200 millis")
+        const seen: Array<{ readonly tag: string; readonly at: number }> = []
+        const pulls = { n: 0 }
+        // The leader's loop: followPokes over the real RPC stream, `wake` is what runs a pull.
+        const stream = client
+          .pokes({ clientId: Ids.ClientId.make("d") })
+          .pipe(Stream.tap((element) => Effect.sync(() => void seen.push({ tag: element._tag, at: Date.now() }))))
+        yield* Effect.forkChild(SyncLoop.followPokes({ connect: stream, wake: Effect.sync(() => void pulls.n++) }))
+        yield* eventually(
+          Effect.sync(() => seen.length >= 5),
+          "an initial poke and four heartbeats"
+        )
+        // No commit happened: the initial poke, then heartbeats only, never more than one interval
+        // (plus scheduling slack) apart.
+        assert.deepStrictEqual(
+          seen.map((e) => e.tag),
+          ["poke", ...Arr.makeBy(seen.length - 1, () => "heartbeat")]
+        )
+        const gaps = seen.slice(1).map((e, i) => e.at - (seen[i]?.at ?? e.at))
+        assert.isTrue(
+          gaps.every((gap) => gap < 450),
+          `gaps ${gaps.join(", ")} ms`
+        )
+        assert.strictEqual(pulls.n, 1) // the initial poke's pull only
+      }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
+    60_000
+  )
+})
+
 /** A channel name over 63 bytes: `PgClient.listen` reserves its pool connection, then rejects it. */
 const tooLong = "x".repeat(64)
 
@@ -462,7 +499,10 @@ describe.skipIf(!pgAvailable)("re-establishing the shared LISTEN (§6)", () => {
         // once the sleep it should release is about to be registered, never on an attempt count
         // (which moves before the attempt's asynchronous reservation has failed).
         const delays: Array<number> = []
-        yield* sharedPokes(pg, { onBackoff: (d) => Effect.sync(() => void delays.push(Duration.toMillis(d))) })
+        yield* sharedPokes(pg, {
+          heartbeatInterval: "1 hour",
+          onBackoff: (d) => Effect.sync(() => void delays.push(Duration.toMillis(d)))
+        })
         const backoffs = (n: number) =>
           eventually(
             Effect.sync(() => delays.length === n),
