@@ -1,45 +1,37 @@
 /**
  * Client reconciliation engine (DESIGN §6, §8, §9).
  *
- * Pure Effect code over three ports: a transactional `SyncStorage` (replica rows, outbox,
- * sync metadata, staged pull pages, notices), an `Executor` that runs a mutation handler
- * optimistically against the replica, and a `Transport` for push/pull.
+ * Pure Effect code over two ports: a transactional `SyncStorage` (replica rows, outbox, sync
+ * metadata, staged pull pages, notices) and a `Transport` for push/pull. Handlers run through
+ * core's typed store (`Store.make`) and mutation registry (`Mutation.run`), the same code the
+ * server runs authoritatively.
  *
  * Replay-set invariant (§8): a pending mutation leaves the outbox only inside the transaction
- * that installs a complete pull page set (`more: false`) carrying its ack. Pages with
- * `more: true` are staged durably and never applied on their own: a page's payloads are read at
- * that page's snapshot, which can already contain effects whose log entries (and acks) arrive
- * in later pages, so applying early would either expose a torn transaction or replay a pending
- * mutation over a server row that already contains it.
+ * that installs a complete pull page set (`PullDone`) carrying its ack, or when a push response
+ * reports an outcome the installed replica already covers. `PullPage`s are staged durably and
+ * never applied on their own: a page's payloads are read at that page's snapshot, which can
+ * already contain effects whose log entries (and acks) arrive in later pages, so applying early
+ * would either expose a torn transaction or replay a pending mutation over a server row that
+ * already contains it.
  */
-import { Array as Arr, Clock, Effect, Option, Schema, Semaphore } from "effect"
-import { ResnapshotRequired } from "./Wire.ts"
-import type {
-  Cursor,
-  MutationEnvelope,
-  MutationOutcome,
-  MutationRejection,
-  PullDone,
-  PullPage,
-  PullRequest,
-  PullResponse,
-  PushRequest,
-  PushResponse,
-  RowWriter,
-  UndoImage
-} from "./Wire.ts"
+import { Array as Arr, Clock, DateTime, Effect, Option, Predicate, Schema, Semaphore } from "effect"
+import { AccessScope, Errors, Mutation, Protocol, ScopeGrants, Store } from "../../core/index.ts"
+import type { Ids, Registry } from "../../core/index.ts"
 
-/** An outbox entry. `createdAt` is the fixed `ctx.now` for every optimistic run of it. */
+type PullPage = typeof Protocol.PullPage.Type
+type PullDone = typeof Protocol.PullDone.Type
+
+/** An outbox entry. `createdAt` (epoch ms) is the fixed `ctx.now` for every optimistic run of it. */
 export interface PendingMutation {
-  readonly envelope: MutationEnvelope
+  readonly envelope: Mutation.MutationEnvelope
   readonly createdAt: number
-  readonly undo: ReadonlyArray<UndoImage>
+  readonly undo: ReadonlyArray<Store.UndoImage>
 }
 
 export interface SyncMeta {
   /** Position through which the installed replica is authoritative. */
-  readonly cursor: Cursor
-  /** Highest `seq` the server has reported as processed; never resent. */
+  readonly cursor: Ids.Cursor
+  /** Highest `seq` the server has reported as processed (0 = none); never resent. */
   readonly pushedThrough: number
   /**
    * The server demanded a resnapshot: the next page set starts from `null` and replaces the
@@ -51,88 +43,149 @@ export interface SyncMeta {
 export const initialMeta: SyncMeta = { cursor: null, pushedThrough: 0, resnapshot: false }
 
 /** The cursor the in-progress page set started from. */
-const pullFrom = (meta: SyncMeta): Cursor => (meta.resnapshot ? null : meta.cursor)
+const pullFrom = (meta: SyncMeta): Ids.Cursor => (meta.resnapshot ? null : meta.cursor)
 
 /** A mutation that left the outbox without being applied as intended, retained for inspection (§9). */
 export type Notice =
   /** The server processed it and rejected it with a typed error. */
-  | { readonly _tag: "Rejected"; readonly envelope: MutationEnvelope; readonly error: MutationRejection }
+  | {
+      readonly _tag: "Rejected"
+      readonly envelope: Mutation.MutationEnvelope
+      readonly error: Mutation.MutationRejection
+    }
   /**
    * Processed, outcome unknown: its ledger row expired before the ack was pulled (§16.5). Its
    * effect, if any, is in the installed replica.
    */
-  | { readonly _tag: "OutcomeUnknown"; readonly envelope: MutationEnvelope }
+  | { readonly _tag: "OutcomeUnknown"; readonly envelope: Mutation.MutationEnvelope }
+
+type StoreUnavailable = Errors.StoreUnavailable
 
 /**
  * Durable client state. Every method other than `transaction` must be called inside
- * `transaction`; transactions are serializable and roll back every write on failure.
+ * `transaction`. Transactions are serialized, and each one commits or rolls back rows, outbox,
+ * seq counter, meta, staging and notices together, from one decision.
  */
-export interface SyncStorage<E> {
-  readonly transaction: <A, E2, R>(self: Effect.Effect<A, E2, R>) => Effect.Effect<A, E | E2, R>
-  readonly rows: RowWriter<E>
-  readonly meta: Effect.Effect<SyncMeta, E>
-  readonly setMeta: (meta: SyncMeta) => Effect.Effect<void, E>
+export interface SyncStorage {
+  readonly transaction: <A, E, R>(self: Effect.Effect<A, E, R>) => Effect.Effect<A, E | StoreUnavailable, R>
+  readonly rows: Store.ReplicaRowStore
+  readonly meta: Effect.Effect<SyncMeta, StoreUnavailable>
+  readonly setMeta: (meta: SyncMeta) => Effect.Effect<void, StoreUnavailable>
   /** Unreleased outbox entries in ascending `seq`. */
-  readonly pending: Effect.Effect<ReadonlyArray<PendingMutation>, E>
+  readonly pending: Effect.Effect<ReadonlyArray<PendingMutation>, StoreUnavailable>
   /**
    * The outbox entry for a caller-generated `mutationId`, pending or released (DESIGN §9 rule 1:
    * release marks the row; released rows are retained for a window, then pruned).
    */
-  readonly lookup: (mutationId: string) => Effect.Effect<Option.Option<MutationEnvelope>, E>
+  readonly lookup: (
+    mutationId: Ids.MutationId
+  ) => Effect.Effect<Option.Option<Mutation.MutationEnvelope>, StoreUnavailable>
   /**
    * Allocates the next outbox `seq` from durable state (DESIGN §6): starts at 1, monotone,
-   * never reused; rolled back with the transaction, so it is also gap-free.
+   * never reused by a committed entry; rolled back with the transaction, so also gap-free.
    */
-  readonly nextSeq: Effect.Effect<number, E>
-  readonly appendPending: (entry: PendingMutation) => Effect.Effect<void, E>
-  readonly setUndo: (seq: number, undo: ReadonlyArray<UndoImage>) => Effect.Effect<void, E>
+  readonly nextSeq: Effect.Effect<Ids.Seq, StoreUnavailable>
+  readonly appendPending: (entry: PendingMutation) => Effect.Effect<void, StoreUnavailable>
+  readonly setUndo: (seq: Ids.Seq, undo: ReadonlyArray<Store.UndoImage>) => Effect.Effect<void, StoreUnavailable>
   /** Marks entries released: gone from `pending`, still found by `lookup` until pruned. */
-  readonly release: (seqs: ReadonlyArray<number>) => Effect.Effect<void, E>
+  readonly release: (seqs: ReadonlyArray<Ids.Seq>) => Effect.Effect<void, StoreUnavailable>
   /**
    * Pages of the in-progress set, in arrival order. Durable: after a reload the engine resumes
    * the set with `meta.cursor` and the last staged page's continuation.
    */
-  readonly staged: Effect.Effect<ReadonlyArray<PullPage>, E>
-  readonly stage: (page: PullPage) => Effect.Effect<void, E>
-  readonly clearStaged: Effect.Effect<void, E>
-  readonly addNotices: (notices: ReadonlyArray<Notice>) => Effect.Effect<void, E>
-}
-
-export interface RunResult {
-  /** First-touch pre-images of every row the handler wrote, in write order. */
-  readonly undo: ReadonlyArray<UndoImage>
-  readonly rejection: Option.Option<MutationRejection>
-}
-
-export interface Executor<E> {
-  /**
-   * Runs the handler for `envelope` against the replica with `ctx.now = createdAt` and
-   * `ctx.random` seeded from the mutation identity, so every rebase reproduces the same
-   * optimistic result. Reports pre-images even when the handler rejects.
-   */
-  readonly run: (envelope: MutationEnvelope, createdAt: number) => Effect.Effect<RunResult, E>
+  readonly staged: Effect.Effect<ReadonlyArray<PullPage>, StoreUnavailable>
+  readonly stage: (page: PullPage) => Effect.Effect<void, StoreUnavailable>
+  readonly clearStaged: Effect.Effect<void, StoreUnavailable>
+  readonly addNotices: (notices: ReadonlyArray<Notice>) => Effect.Effect<void, StoreUnavailable>
 }
 
 export interface Transport<E> {
-  readonly push: (request: PushRequest) => Effect.Effect<PushResponse, E>
-  readonly pull: (request: PullRequest) => Effect.Effect<PullResponse, E | ResnapshotRequired>
+  readonly push: (request: Protocol.PushRequest) => Effect.Effect<Protocol.PushResponse, E>
+  readonly pull: (
+    request: Protocol.PullRequest
+  ) => Effect.Effect<Protocol.PullResponse, E | Protocol.ResnapshotRequired>
 }
 
 /** The handler rejected the mutation against the local replica; nothing was saved. */
 export class LocallyRejected extends Schema.TaggedError<LocallyRejected>()("LocallyRejected", {
   name: Schema.String,
-  error: Schema.Unknown
+  error: Mutation.MutationRejection
 }) {}
 
-const restore = <E>(rows: RowWriter<E>, undo: ReadonlyArray<UndoImage>) =>
-  Effect.forEach(Arr.reverse(undo), (image) => rows.write(image.table, image.id, image.before), {
-    discard: true
+// ---------------------------------------------------------------------------------------------
+// Running a handler (shared with the reference server)
+// ---------------------------------------------------------------------------------------------
+
+/** `actor`'s effective role on a scope, read from the `scope_grants` rows in `rows` (§4). */
+export const roleFromGrants =
+  (rows: Store.RowStore, actor: AccessScope.PrincipalId) =>
+  (scopeId: AccessScope.AccessScopeId): Effect.Effect<Option.Option<AccessScope.Role>, StoreUnavailable> =>
+    Effect.gen(function* () {
+      const roles: Array<AccessScope.Role> = []
+      for (const who of [actor, AccessScope.Everyone]) {
+        const row = yield* rows.read(ScopeGrants.ScopeGrants, ScopeGrants.grantId(scopeId, who))
+        if (Option.isNone(row)) continue
+        const grant = yield* Effect.orDie(Schema.decodeUnknownEffect(ScopeGrants.ScopeGrants.wire)(row.value))
+        roles.push(grant.role)
+      }
+      return Option.fromNullishOr(AccessScope.strongest(roles))
+    })
+
+export interface RunResult {
+  /** First-touch pre-images of every row the handler wrote, in write order. */
+  readonly undo: ReadonlyArray<Store.UndoImage>
+  readonly rejection: Option.Option<Mutation.MutationRejection>
+}
+
+/**
+ * Runs `envelope`'s handler against `rows` as `actor` with `ctx.now = now` and `ctx.random`
+ * seeded from the mutation identity, so every rebase reproduces the same optimistic result.
+ * Writes go straight to `rows` (the caller owns the transaction); on rejection the partial
+ * writes remain and the caller restores them from `undo`. Transient failures propagate.
+ */
+export const runHandler = (
+  rows: Store.RowStore,
+  mutations: Mutation.MutationRegistry,
+  actor: AccessScope.PrincipalId,
+  envelope: Mutation.MutationEnvelope,
+  now: number
+): Effect.Effect<RunResult, StoreUnavailable> =>
+  Effect.gen(function* () {
+    const instance = Store.make(rows, { roleFor: roleFromGrants(rows, actor) })
+    const ctx: Mutation.MutationContext = {
+      actor,
+      now: DateTime.makeUnsafe(now),
+      random: Mutation.seededRandom(envelope.clientId, envelope.mutationId),
+      store: instance.store
+    }
+    const rejection = yield* Mutation.run(mutations, envelope, ctx).pipe(
+      Effect.as(Option.none<Mutation.MutationRejection>()),
+      Effect.catch((error) =>
+        error instanceof Errors.StoreUnavailable ? Effect.fail(error) : Effect.succeed(Option.some(error))
+      )
+    )
+    return { undo: yield* instance.touched, rejection }
   })
 
+/** Restores pre-images in reverse write order. */
+export const restore = (rows: Store.RowStore, undo: ReadonlyArray<Store.UndoImage>) =>
+  Effect.forEach(Arr.reverse(undo), (image) => rows.write(image.table, image.id, image.before), { discard: true })
+
+// ---------------------------------------------------------------------------------------------
+// Rebase and install
+// ---------------------------------------------------------------------------------------------
+
+interface Context {
+  readonly storage: SyncStorage
+  readonly mutations: Mutation.MutationRegistry
+  readonly actor: AccessScope.PrincipalId
+}
+
 /** Re-runs `entry` optimistically and records its fresh undo images. */
-const replay = <E>(storage: SyncStorage<E>, executor: Executor<E>, entry: PendingMutation) =>
+const replay = (context: Context, entry: PendingMutation) =>
   Effect.gen(function* () {
-    const run = yield* executor.run(entry.envelope, entry.createdAt)
+    const { storage } = context
+    const run = yield* runHandler(storage.rows, context.mutations, context.actor, entry.envelope, entry.createdAt)
     // A pending mutation that no longer applies locally has no optimistic effect; it stays
     // queued because only the server's verdict removes it.
     if (Option.isSome(run.rejection)) {
@@ -144,7 +197,7 @@ const replay = <E>(storage: SyncStorage<E>, executor: Executor<E>, entry: Pendin
   })
 
 /** The notice a released mutation leaves behind, if any. */
-const noticeFor = (envelope: MutationEnvelope, outcome: MutationOutcome): Option.Option<Notice> => {
+const noticeFor = (envelope: Mutation.MutationEnvelope, outcome: Mutation.MutationOutcome): Option.Option<Notice> => {
   if (outcome._tag === "Applied") return Option.none()
   // ClientExpired answers a resubmission whose ledger row expired: it was processed before.
   if (outcome.error._tag === "ClientExpired") return Option.some({ _tag: "OutcomeUnknown", envelope })
@@ -155,24 +208,24 @@ const noticeFor = (envelope: MutationEnvelope, outcome: MutationOutcome): Option
  * The rebase every replay-set change goes through, inside the caller's transaction: undo all
  * pending optimistic effects (reverse order), run `install` against the authoritative base,
  * release the entries `settle` says are covered by that base (with their notices), and re-run
- * the rest with fresh undo images. Returns the released seqs.
+ * the rest with fresh undo images.
  */
-const rebase = <E>(
-  storage: SyncStorage<E>,
-  executor: Executor<E>,
-  install: Effect.Effect<void, E>,
-  settle: (envelope: MutationEnvelope) => Option.Option<Option.Option<Notice>>
+const rebase = (
+  context: Context,
+  install: Effect.Effect<void, StoreUnavailable>,
+  settle: (envelope: Mutation.MutationEnvelope) => Option.Option<Option.Option<Notice>>
 ) =>
   Effect.gen(function* () {
+    const { storage } = context
     const pending = yield* storage.pending
     for (const entry of Arr.reverse(pending)) yield* restore(storage.rows, entry.undo)
     yield* install
-    const released: Array<number> = []
+    const released: Array<Ids.Seq> = []
     const notices: Array<Notice> = []
     for (const entry of pending) {
       const settled = settle(entry.envelope)
       if (Option.isNone(settled)) {
-        yield* replay(storage, executor, entry)
+        yield* replay(context, entry)
         continue
       }
       released.push(entry.envelope.seq)
@@ -180,7 +233,22 @@ const rebase = <E>(
     }
     yield* storage.release(released)
     yield* storage.addNotices(notices)
-    return released
+  })
+
+const applyChange = (storage: SyncStorage, registry: Registry.SyncRegistry, change: Protocol.Change) =>
+  Effect.gen(function* () {
+    if (change._tag === "scopePurged") return yield* storage.rows.purgeScope(change.scopeId)
+    const table = registry.get(change.table)
+    if (Option.isNone(table)) {
+      // DESIGN §8: during a deploy that adds a synced table, clients on the old registry receive
+      // its rows; they arrive with the next app version, whose manifest change rebuilds the
+      // replica from null. Failing here would stop sync for every stale client.
+      return yield* Effect.logWarning(`echo-sync: skipping ${change._tag} for unknown table ${change.table}`)
+    }
+    if (change._tag === "tombstone") return yield* storage.rows.write(table.value, change.id, Option.none())
+    const id = change.row["id"]
+    if (!Predicate.isString(id)) return yield* Effect.die(`echo-sync: upsert for ${change.table} without a string id`)
+    yield* storage.rows.write(table.value, id, Option.some(change.row))
   })
 
 /**
@@ -188,45 +256,23 @@ const rebase = <E>(
  * inside one storage transaction. A set that started from cursor `null` is a snapshot of every
  * readable scope, so it replaces the replica instead of patching it (rows of scopes revoked
  * while the client could not see the log would otherwise survive a resnapshot).
- * Changes for a table the client's registry does not know are skipped with a log line (DESIGN
- * §8): during a deploy that adds a synced table, clients on the old registry receive its rows;
- * they arrive with the next app version, whose manifest change rebuilds the replica from null.
  * Exported so tests can build a deliberately wrong page-at-a-time client.
  */
-export const applyPageSet = <E>(
-  storage: SyncStorage<E>,
-  executor: Executor<E>,
-  knownTable: (name: string) => boolean,
+export const applyPageSet = (
+  context: Context & { readonly registry: Registry.SyncRegistry },
   pages: ReadonlyArray<PullPage>,
   done: PullDone
 ) =>
   Effect.gen(function* () {
+    const { storage } = context
     const meta = yield* storage.meta
-    const set: ReadonlyArray<PullResponse> = [...pages, done]
+    const set: ReadonlyArray<Protocol.PullResponse> = [...pages, done]
     const install = Effect.gen(function* () {
       if (pullFrom(meta) === null) yield* storage.rows.clearAll
-      for (const page of set) {
-        for (const change of page.changes) {
-          if (change._tag !== "scopePurged" && !knownTable(change.table)) {
-            yield* Effect.logWarning(`echo-sync: skipping ${change._tag} for unknown table ${change.table}`)
-            continue
-          }
-          switch (change._tag) {
-            case "upsert":
-              yield* storage.rows.write(change.table, change.row.id, Option.some(change.row))
-              break
-            case "tombstone":
-              yield* storage.rows.write(change.table, change.id, Option.none())
-              break
-            case "scopePurged":
-              yield* storage.rows.purgeScope(change.scopeId)
-              break
-          }
-        }
-      }
+      for (const page of set) for (const change of page.changes) yield* applyChange(storage, context.registry, change)
     })
     const outcomes = new Map(set.flatMap((page) => page.acks.map((ack) => [ack.mutationId, ack.outcome])))
-    yield* rebase(storage, executor, install, (envelope) => {
+    yield* rebase(context, install, (envelope) => {
       const outcome = outcomes.get(envelope.mutationId)
       if (outcome !== undefined) return Option.some(noticeFor(envelope, outcome))
       // Every seq ≤ the floor was processed (clients push in seq order) and the ledger row
@@ -234,13 +280,17 @@ export const applyPageSet = <E>(
       if (envelope.seq <= done.expiredThrough) return Option.some(Option.some({ _tag: "OutcomeUnknown", envelope }))
       return Option.none()
     })
-    // `pushedThrough` is deliberately not raised here: a pending entry below a released one was
-    // processed, but if its outcome is at a position ≤ the old cursor no pull will ever ack it
-    // (a duplicate enqueued after its original was released). It must be resent so the push
-    // response's position releases it (§8 corollary).
+    // `pushedThrough` is deliberately not raised here (§8: it advances only on push responses):
+    // a pending entry below a released one was processed, but if its outcome is at a position
+    // ≤ the old cursor no pull will ever ack it (a duplicate enqueued after its original was
+    // released). It must be resent so the push response's position releases it.
     yield* storage.setMeta({ ...meta, cursor: done.nextCursor, resnapshot: false })
     yield* storage.clearStaged
   })
+
+// ---------------------------------------------------------------------------------------------
+// Engine
+// ---------------------------------------------------------------------------------------------
 
 export interface PushResult {
   /** Number of mutations the server reported as processed in this cycle. */
@@ -249,46 +299,50 @@ export interface PushResult {
   readonly stopped: boolean
 }
 
-export interface Engine<E, TE> {
+export interface Engine<TE> {
   /**
    * Appends to the outbox and applies optimistically in one transaction ("saved" on success).
    * `mutationId` is the caller's idempotency key: enqueuing an id the outbox knows (pending or
    * released, §9) returns the original envelope without running the handler again.
    */
   readonly mutate: (
-    mutationId: string,
+    mutationId: Ids.MutationId,
     name: string,
-    args: unknown
-  ) => Effect.Effect<MutationEnvelope, E | LocallyRejected>
-  /** Sends unprocessed outbox entries in order until none remain or the server stops. */
-  readonly push: Effect.Effect<PushResult, E | TE>
-  /** Pulls until `more: false`, staging intermediate pages, then installs the set atomically. */
-  readonly pull: Effect.Effect<void, E | TE | ResnapshotRequired>
+    args: Schema.Json
+  ) => Effect.Effect<Mutation.MutationEnvelope, StoreUnavailable | LocallyRejected>
+  /** Sends unprocessed outbox entries in seq order until none remain or the server stops. */
+  readonly push: Effect.Effect<PushResult, StoreUnavailable | TE>
+  /** Pulls until `PullDone`, staging intermediate pages, then installs the set atomically. */
+  readonly pull: Effect.Effect<void, StoreUnavailable | TE | Protocol.ResnapshotRequired>
 }
 
-export const make = <E, TE>(options: {
-  readonly clientId: string
-  readonly storage: SyncStorage<E>
-  readonly executor: Executor<E>
+export const make = <TE>(options: {
+  readonly clientId: Ids.ClientId
+  /** The principal this client acts as; optimistic role checks read its replica grants. */
+  readonly actor: AccessScope.PrincipalId
+  readonly storage: SyncStorage
+  /** The client's tables; pull changes for tables it does not know are skipped. */
+  readonly registry: Registry.SyncRegistry
+  readonly mutations: Mutation.MutationRegistry
   readonly transport: Transport<TE>
-  /** Whether the client's registry has a table of this sync name (core: `Registry.get`). */
-  readonly knownTable: (name: string) => boolean
+  /** Mutations per push request (default 50; the protocol caps a request at 100). */
   readonly pushBatchSize?: number
-}): Effect.Effect<Engine<E, TE>> =>
+}): Effect.Effect<Engine<TE>> =>
   Effect.gen(function* () {
-    const { clientId, storage, executor, transport } = options
-    const batchSize = options.pushBatchSize ?? 50
+    const { clientId, storage, transport } = options
+    const context = { storage, mutations: options.mutations, actor: options.actor, registry: options.registry }
+    const batchSize = Math.min(options.pushBatchSize ?? 50, 100)
     const pushLock = yield* Semaphore.make(1)
     const pullLock = yield* Semaphore.make(1)
 
-    const mutate = (mutationId: string, name: string, args: unknown) =>
+    const mutate = (mutationId: Ids.MutationId, name: string, args: Schema.Json) =>
       storage.transaction(
         Effect.gen(function* () {
           const known = yield* storage.lookup(mutationId)
           if (Option.isSome(known)) return known.value
-          const envelope: MutationEnvelope = { clientId, mutationId, seq: yield* storage.nextSeq, name, args }
+          const envelope: Mutation.MutationEnvelope = { clientId, mutationId, seq: yield* storage.nextSeq, name, args }
           const createdAt = yield* Clock.currentTimeMillis
-          const run = yield* executor.run(envelope, createdAt)
+          const run = yield* runHandler(storage.rows, options.mutations, options.actor, envelope, createdAt)
           if (Option.isSome(run.rejection)) {
             return yield* new LocallyRejected({ name, error: run.rejection.value })
           }
@@ -305,10 +359,10 @@ export const make = <E, TE>(options: {
             Effect.all({ meta: storage.meta, pending: storage.pending })
           )
           const batch = pending.filter((entry) => entry.envelope.seq > meta.pushedThrough).slice(0, batchSize)
-          if (batch.length === 0) return { processed, stopped: false }
+          if (!Arr.isReadonlyArrayNonEmpty(batch)) return { processed, stopped: false }
           const response = yield* transport.push({
             clientId,
-            mutations: batch.map(({ envelope }) => ({
+            mutations: Arr.map(batch, ({ envelope }) => ({
               mutationId: envelope.mutationId,
               seq: envelope.seq,
               name: envelope.name,
@@ -331,7 +385,7 @@ export const make = <E, TE>(options: {
                     .map((result) => [result.mutationId, result.outcome])
                 )
                 if (covered.size > 0) {
-                  yield* rebase(storage, executor, Effect.void, (envelope) => {
+                  yield* rebase(context, Effect.void, (envelope) => {
                     const outcome = covered.get(envelope.mutationId)
                     return outcome === undefined ? Option.none() : Option.some(noticeFor(envelope, outcome))
                   })
@@ -341,9 +395,7 @@ export const make = <E, TE>(options: {
             )
           }
           processed += response.results.length
-          if (response.results.length < batch.length) {
-            return { processed, stopped: true }
-          }
+          if (response.results.length < batch.length) return { processed, stopped: true }
         }
       })
     )
@@ -355,13 +407,13 @@ export const make = <E, TE>(options: {
             Effect.all({ meta: storage.meta, staged: storage.staged })
           )
           const continuation = Option.fromNullishOr(staged.at(-1)?.continuation)
-          const request: PullRequest = { clientId, cursor: pullFrom(meta), continuation }
+          const request: Protocol.PullRequest = { clientId, cursor: pullFrom(meta), continuation }
           const page = yield* transport.pull(request).pipe(
-            Effect.map(Option.some<PullResponse>),
+            Effect.map(Option.some<Protocol.PullResponse>),
             // Generic `TE` defeats `catchTag`'s tag extraction, so narrow by class.
             Effect.catch((error) =>
               Effect.gen(function* () {
-                if (!(error instanceof ResnapshotRequired)) return yield* Effect.fail(error)
+                if (!(error instanceof Protocol.ResnapshotRequired)) return yield* Effect.fail(error)
                 if (request.cursor === null && Option.isNone(continuation)) return yield* error
                 // Never apply a partial set: drop it and start a snapshot from null. The
                 // replica (and its cursor) keeps serving reads until that snapshot is installed.
@@ -374,7 +426,7 @@ export const make = <E, TE>(options: {
                     yield* storage.setMeta({ ...current, resnapshot: true })
                   })
                 )
-                return Option.none<PullResponse>()
+                return Option.none<Protocol.PullResponse>()
               })
             )
           )
@@ -387,7 +439,7 @@ export const make = <E, TE>(options: {
           return yield* storage.transaction(
             Effect.gen(function* () {
               const set = yield* storage.staged
-              yield* applyPageSet(storage, executor, options.knownTable, set, response)
+              yield* applyPageSet(context, set, response)
             })
           )
         }

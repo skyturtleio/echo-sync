@@ -25,23 +25,27 @@
 import { Array as Arr, Clock, Deferred, Effect, Fiber, Option, Order, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import * as Engine from "../../client/sync/Engine.ts"
-import type { EncodedRow, MutationEnvelope, PullDone, PullResponse } from "../../client/sync/Wire.ts"
+import { Ids, ScopeGrants } from "../index.ts"
+import type { AccessScope, Mutation, Protocol, SyncTable } from "../index.ts"
 import * as MemoryStore from "./MemoryStore.ts"
 import * as MemorySyncStorage from "./MemorySyncStorage.ts"
 import * as RefServer from "./RefServer.ts"
 import {
   ANYONE,
-  COUNTERS,
-  GRANTS,
-  NOTES,
-  grantId,
-  knownTable,
+  Counters,
+  Notes,
+  clientRegistry,
   grantRow,
-  restore,
-  roleOf,
-  runMutation
+  mutations,
+  principal as asPrincipal,
+  scope
 } from "./SimApp.ts"
-import type { Role } from "./SimApp.ts"
+
+type EncodedRow = SyncTable.EncodedRow
+type MutationEnvelope = Mutation.MutationEnvelope
+type PullDone = typeof Protocol.PullDone.Type
+type PullResponse = Protocol.PullResponse
+type Role = AccessScope.Role
 
 export class TransportFailed extends Schema.TaggedError<TransportFailed>()("TransportFailed", {
   during: Schema.String
@@ -137,20 +141,29 @@ const diff = (actual: string, expected: string) => {
  * Rows of `tables` the client should hold: known tables only (DESIGN §8 skips the rest), in
  * scopes `principal` can read, judged by the grant rows in `tables`.
  */
-const view = (tables: MemoryStore.Tables, principal: string) =>
-  Effect.gen(function* () {
-    const source = MemoryStore.make(tables)
+const view = (tables: MemoryStore.Tables, principal: AccessScope.PrincipalId) =>
+  Effect.sync(() => {
+    const readable = new Set<string>()
+    for (const row of tables.get(ScopeGrants.ScopeGrants.name)?.values() ?? []) {
+      const who = row["principal_id"]
+      if (who === principal || who === ANYONE) readable.add(String(row["access_scope_id"]))
+    }
     const out: MemoryStore.Tables = new Map()
     for (const [table, rows] of tables) {
-      if (!knownTable(table)) continue
+      if (Option.isNone(clientRegistry.get(table))) continue
       const kept = new Map<string, EncodedRow>()
-      for (const [id, row] of rows) {
-        if (Option.isSome(yield* roleOf(source, principal, row.access_scope_id))) kept.set(id, row)
-      }
+      for (const [id, row] of rows) if (readable.has(String(row["access_scope_id"]))) kept.set(id, row)
       if (kept.size > 0) out.set(table, kept)
     }
     return out
   })
+
+/** An out-of-band grant (or revoke, `role` none) with core's derived grant id. */
+const grantWrite = (scopeId: string, who: string, role: Option.Option<Role>): RefServer.DirectWrite => ({
+  table: ScopeGrants.ScopeGrants,
+  id: ScopeGrants.grantId(scope(scopeId), asPrincipal(who)),
+  row: Option.map(role, (r) => grantRow(scopeId, who, r))
+})
 
 const skewed = (base: Clock.Clock, ms: number): Clock.Clock => ({
   currentTimeMillisUnsafe: () => base.currentTimeMillisUnsafe() + ms,
@@ -166,10 +179,10 @@ const dupKey = (clientId: string, seq: number) => `${clientId}#${seq}`
 
 const SCOPES = ["s0", "s1", "s2", "s3"]
 const PRINCIPALS = ["alice", "bob"]
-const CLIENTS: ReadonlyArray<readonly [string, string]> = [
-  ["c1", "alice"],
-  ["c2", "alice"],
-  ["c3", "bob"]
+const CLIENTS: ReadonlyArray<readonly [Ids.ClientId, AccessScope.PrincipalId]> = [
+  [Ids.ClientId.make("c1"), asPrincipal("alice")],
+  [Ids.ClientId.make("c2"), asPrincipal("alice")],
+  [Ids.ClientId.make("c3"), asPrincipal("bob")]
 ]
 const ROLES: ReadonlyArray<Role> = ["reader", "writer", "owner"]
 
@@ -207,12 +220,12 @@ export const run = (options: Options) =>
 
     // Initial grants: a global catalog scope, private scopes, and a shared one.
     yield* server.writeDirect([
-      { table: GRANTS, id: grantId("s0", ANYONE), row: Option.some(grantRow("s0", ANYONE, "reader")) },
-      { table: GRANTS, id: grantId("s0", "alice"), row: Option.some(grantRow("s0", "alice", "owner")) },
-      { table: GRANTS, id: grantId("s1", "alice"), row: Option.some(grantRow("s1", "alice", "owner")) },
-      { table: GRANTS, id: grantId("s2", "bob"), row: Option.some(grantRow("s2", "bob", "owner")) },
-      { table: GRANTS, id: grantId("s3", "alice"), row: Option.some(grantRow("s3", "alice", "writer")) },
-      { table: GRANTS, id: grantId("s3", "bob"), row: Option.some(grantRow("s3", "bob", "writer")) }
+      grantWrite("s0", ANYONE, Option.some("reader")),
+      grantWrite("s0", "alice", Option.some("owner")),
+      grantWrite("s1", "alice", Option.some("owner")),
+      grantWrite("s2", "bob", Option.some("owner")),
+      grantWrite("s3", "alice", Option.some("writer")),
+      grantWrite("s3", "bob", Option.some("writer"))
     ])
 
     const clients = yield* Effect.forEach(CLIENTS, ([clientId, principal]) =>
@@ -220,16 +233,13 @@ export const run = (options: Options) =>
         server.register(clientId, principal)
         const disk = MemorySyncStorage.makeDisk()
         const reference = MemorySyncStorage.make(disk)
-        const storage: Engine.SyncStorage<never> =
+        const storage: Engine.SyncStorage =
           options.seqFromPending === true
-            ? { ...reference, nextSeq: Effect.sync(() => (disk.outbox.at(-1)?.envelope.seq ?? 0) + 1) }
+            ? { ...reference, nextSeq: Effect.sync(() => Ids.Seq.make((disk.outbox.at(-1)?.envelope.seq ?? 0) + 1)) }
             : reference
         // Set by the interleaving step: the next pull request announces itself and waits.
         const ctl: { gate: Option.Option<{ arrived: Deferred.Deferred<void>; release: Deferred.Deferred<void> }> } = {
           gate: Option.none()
-        }
-        const executor: Engine.Executor<never> = {
-          run: (envelope, createdAt) => runMutation(disk.replica, principal, envelope, createdAt)
         }
         const transport: Engine.Transport<TransportFailed> = {
           push: (request) =>
@@ -270,11 +280,18 @@ export const run = (options: Options) =>
           disk,
           ctl,
           storage,
-          executor,
           transport,
           online: true,
           skew: 0,
-          engine: yield* Engine.make({ clientId, storage, executor, transport, knownTable, pushBatchSize: 4 })
+          engine: yield* Engine.make({
+            clientId,
+            actor: principal,
+            storage,
+            registry: clientRegistry,
+            mutations,
+            transport,
+            pushBatchSize: 4
+          })
         }
         return client
       })
@@ -284,7 +301,8 @@ export const run = (options: Options) =>
     /** The deliberately wrong client: applies each `PullPage` as it arrives. */
     const incrementalPull = (client: Client) =>
       Effect.gen(function* () {
-        const { storage, executor, transport } = client
+        const { storage, transport } = client
+        const context = { storage, mutations, actor: client.principal, registry: clientRegistry }
         while (true) {
           const meta = client.disk.meta
           const from = meta.resnapshot ? null : meta.cursor
@@ -307,20 +325,18 @@ export const run = (options: Options) =>
               continue
             }
             const done: PullDone = page
-            return yield* storage.transaction(
-              Engine.applyPageSet(storage, executor, knownTable, client.disk.staged, done)
-            )
+            return yield* storage.transaction(Engine.applyPageSet(context, client.disk.staged, done))
           }
           const early: PullDone = {
             _tag: "PullDone",
             changes: page.changes,
             acks: page.acks,
             nextCursor: from,
-            expiredThrough: 0
+            expiredThrough: Ids.SeqFloor.make(0)
           }
           yield* storage.transaction(
             Effect.gen(function* () {
-              yield* Engine.applyPageSet(storage, executor, knownTable, [], early)
+              yield* Engine.applyPageSet(context, [], early)
               yield* storage.stage({ ...page, changes: [], acks: [] })
             })
           )
@@ -334,8 +350,10 @@ export const run = (options: Options) =>
         if (snapshot === undefined) return yield* violated("cursor names a server commit", `${cursor}`)
         const store = MemoryStore.make(yield* view(snapshot, client.principal))
         for (const entry of client.disk.outbox) {
-          const result = yield* runMutation(store, client.principal, entry.envelope, entry.createdAt)
-          if (Option.isSome(result.rejection)) yield* restore(store, result.undo)
+          const result = yield* Effect.orDie(
+            Engine.runHandler(store, mutations, client.principal, entry.envelope, entry.createdAt)
+          )
+          if (Option.isSome(result.rejection)) yield* Engine.restore(store, result.undo)
         }
         return canonical(store.tables())
       })
@@ -394,60 +412,58 @@ export const run = (options: Options) =>
 
     const randomMutation = (client: Client) => {
       // Mostly rows this client can see (so most intents apply locally), sometimes any id.
-      const visible = [...(client.disk.replica.tables().get(COUNTERS)?.keys() ?? [])]
+      const visible = [...(client.disk.replica.tables().get(Counters.name)?.keys() ?? [])]
       const pool = visible.length > 0 && rng.chance(0.85) ? visible : ids
       const id = rng.pick(pool)
       const other = rng.pick(pool)
-      const scope = rng.pick(SCOPES)
+      const target = rng.pick(SCOPES)
       const kind = rng.int(10)
-      if (kind < 2 || Option.isNone(id) || Option.isNone(other) || Option.isNone(scope)) {
+      if (kind < 2 || Option.isNone(id) || Option.isNone(other) || Option.isNone(target)) {
         const fresh = `${client.clientId}-${ids.length}`
         ids.push(fresh)
-        return { name: "create", args: { id: fresh, scope: Option.getOrElse(scope, () => "s1") } }
+        return { name: "create", args: { id: fresh, scope: Option.getOrElse(target, () => "s1") } }
       }
       if (kind < 6) return { name: "increment", args: { id: id.value, by: 1 + rng.int(5) } }
       if (kind < 8) return { name: "transfer", args: { from: id.value, to: other.value, amount: 1 + rng.int(3) } }
-      if (kind < 9) return { name: "move", args: { id: id.value, scope: scope.value } }
+      if (kind < 9) return { name: "move", args: { id: id.value, scope: target.value } }
       return { name: "remove", args: { id: id.value } }
     }
 
     const serverWrite = Effect.gen(function* () {
-      const scope = Option.getOrElse(rng.pick(SCOPES), () => "s0")
+      const scopeId = Option.getOrElse(rng.pick(SCOPES), () => "s0")
       const principal = Option.getOrElse(rng.pick([...PRINCIPALS, ANYONE]), () => ANYONE)
       const kind = rng.int(5)
       if (kind === 4) {
         // A table added by a newer server deploy: clients must skip it and keep syncing.
         stats.unknownTableWrites++
         const id = `n${rng.int(8)}`
-        note(`server: write ${NOTES}/${id} in ${scope} (unknown to clients)`)
+        note(`server: write ${Notes.name}/${id} in ${scopeId} (unknown to clients)`)
         return yield* server.writeDirect([
           {
-            table: NOTES,
+            table: Notes,
             id,
-            row: rng.chance(0.8) ? Option.some({ id, access_scope_id: scope, body: `b${step}` }) : Option.none()
+            row: rng.chance(0.8) ? Option.some({ id, access_scope_id: scopeId, body: `b${step}` }) : Option.none()
           }
         ])
       }
       if (kind === 0) {
         const role = Option.getOrElse(rng.pick(ROLES), (): Role => "reader")
-        note(`server: grant ${principal} ${role} on ${scope}`)
-        return yield* server.writeDirect([
-          { table: GRANTS, id: grantId(scope, principal), row: Option.some(grantRow(scope, principal, role)) }
-        ])
+        note(`server: grant ${principal} ${role} on ${scopeId}`)
+        return yield* server.writeDirect([grantWrite(scopeId, principal, Option.some(role))])
       }
       if (kind === 1) {
-        note(`server: revoke ${principal} on ${scope}`)
-        return yield* server.writeDirect([{ table: GRANTS, id: grantId(scope, principal), row: Option.none() }])
+        note(`server: revoke ${principal} on ${scopeId}`)
+        return yield* server.writeDirect([grantWrite(scopeId, principal, Option.none())])
       }
       const id = rng.pick(ids)
       if (Option.isNone(id)) return
-      const row = yield* server.store.read(COUNTERS, id.value)
+      const row = yield* server.store.read(Counters, id.value)
       if (Option.isNone(row)) return
       const value = Number(row.value.value)
       note(`server: out-of-band ${kind === 2 ? "bump" : "delete"} ${id.value}`)
       yield* server.writeDirect([
         {
-          table: COUNTERS,
+          table: Counters,
           id: id.value,
           row: kind === 2 ? Option.some({ ...row.value, value: value + 100 }) : Option.none()
         }
@@ -488,10 +504,11 @@ export const run = (options: Options) =>
       Effect.gen(function* () {
         client.engine = yield* Engine.make({
           clientId: client.clientId,
+          actor: client.principal,
           storage: client.storage,
-          executor: client.executor,
+          registry: clientRegistry,
+          mutations,
           transport: client.transport,
-          knownTable,
           pushBatchSize: 4
         })
       })
@@ -549,7 +566,9 @@ export const run = (options: Options) =>
         }
         const { name, args } = randomMutation(client)
         // Caller-generated, unordered idempotency key (DESIGN §6).
-        const mutationId = `m${rng.int(2 ** 30).toString(36)}-${client.clientId}-${client.disk.lastSeq}`
+        const mutationId = Ids.MutationId.make(
+          `m${rng.int(2 ** 30).toString(36)}-${client.clientId}-${client.disk.lastSeq}`
+        )
         note(`${client.clientId}: mutate ${name} ${JSON.stringify(args)}`)
         yield* ignoreExpected(withClock(client, client.engine.mutate(mutationId, name, args).pipe(Effect.tap(record))))
       })

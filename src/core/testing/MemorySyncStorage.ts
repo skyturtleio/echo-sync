@@ -12,7 +12,8 @@
  */
 import { Effect, Option, Schema, Semaphore } from "effect"
 import * as Engine from "../../client/sync/Engine.ts"
-import type { MutationEnvelope, PullPage } from "../../client/sync/Wire.ts"
+import { Ids } from "../index.ts"
+import type { Mutation, Protocol } from "../index.ts"
 import * as MemoryStore from "./MemoryStore.ts"
 
 export interface Disk {
@@ -23,8 +24,8 @@ export interface Disk {
   /** Unreleased entries, ascending `seq`. */
   outbox: Array<Engine.PendingMutation>
   /** Released-row markers by `mutationId`, until pruned. */
-  released: Map<string, MutationEnvelope>
-  staged: Array<PullPage>
+  released: Map<string, Mutation.MutationEnvelope>
+  staged: Array<typeof Protocol.PullPage.Type>
   notices: Array<Engine.Notice>
   /** Fault injection: the Nth replica write from now dies (a crash mid-transaction). */
   crashAfterWrites: Option.Option<number>
@@ -49,7 +50,7 @@ export const pruneReleased = (disk: Disk) => {
   disk.released = new Map()
 }
 
-export const make = (disk: Disk): Engine.SyncStorage<never> => {
+export const make = (disk: Disk): Engine.SyncStorage => {
   const lock = Semaphore.makeUnsafe(1)
   const crashPoint = Effect.suspend(() => {
     if (Option.isNone(disk.crashAfterWrites)) return Effect.void
@@ -88,6 +89,9 @@ export const make = (disk: Disk): Engine.SyncStorage<never> => {
         )
       ),
     rows: {
+      read: disk.replica.read,
+      range: disk.replica.range,
+      scan: disk.replica.scan,
       write: (table, id, row) => Effect.andThen(crashPoint, disk.replica.write(table, id, row)),
       purgeScope: (scopeId) => Effect.andThen(crashPoint, disk.replica.purgeScope(scopeId)),
       clearAll: Effect.andThen(crashPoint, disk.replica.clearAll)
@@ -107,7 +111,7 @@ export const make = (disk: Disk): Engine.SyncStorage<never> => {
       ),
     nextSeq: Effect.sync(() => {
       disk.lastSeq += 1
-      return disk.lastSeq
+      return Ids.Seq.make(disk.lastSeq)
     }),
     appendPending: (entry) =>
       Effect.sync(() => {

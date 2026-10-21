@@ -1,13 +1,13 @@
 import { assert, describe, it } from "@effect/vitest"
 import type { Scheduler } from "effect/Scheduler"
-import { Deferred, Effect, Fiber, Option } from "effect"
+import { DateTime, Deferred, Effect, Fiber, Option, Schema } from "effect"
 import * as Engine from "../../client/sync/Engine.ts"
-import type { PullResponse } from "../../client/sync/Wire.ts"
-import { ResnapshotRequired } from "../../client/sync/Wire.ts"
+import { Ids, Protocol, ScopeGrants } from "../index.ts"
+import type { SyncTable } from "../index.ts"
 import * as MemoryStore from "./MemoryStore.ts"
 import * as MemorySyncStorage from "./MemorySyncStorage.ts"
 import * as RefServer from "./RefServer.ts"
-import { COUNTERS, GRANTS, grantRow, knownTable, runMutation } from "./SimApp.ts"
+import { clientRegistry, CounterId, Counters, grantRow, mutations, principal, scope } from "./SimApp.ts"
 import * as Simulation from "./Simulation.ts"
 
 // Reproduce a failure with SIM_SEED=<seed>; widen the sweep with SIM_SEEDS=<n>.
@@ -15,23 +15,33 @@ const only = Number(process.env["SIM_SEED"] ?? 0)
 const seeds = only > 0 ? [only] : Array.from({ length: Number(process.env["SIM_SEEDS"] ?? 40) }, (_, i) => i + 1)
 
 const grant = grantRow("s", "p", "owner")
-const counter = { id: "x", access_scope_id: "s", value: 0, updated_at: 0 }
+const grantId = ScopeGrants.grantId(scope("s"), principal("p"))
+const counterRow = (id: string, value: number): SyncTable.EncodedRow =>
+  Schema.encodeSync(Counters.wire)({
+    id: CounterId.make(id),
+    accessScopeId: scope("s"),
+    value,
+    updatedAt: DateTime.makeUnsafe(0)
+  })
+const counter = counterRow("x", 0)
+const id = Ids.MutationId.make
+const clientId = Ids.ClientId.make("c")
+const position = (p: bigint) => Ids.Position.make(p)
+const engineOptions = { clientId, actor: principal("p"), registry: clientRegistry, mutations }
 
 /** A client disk that has installed `grant` and `counter` at cursor 1. */
 const installedDisk = (): MemorySyncStorage.Disk => ({
   ...MemorySyncStorage.makeDisk(),
   replica: MemoryStore.make(
     new Map([
-      [GRANTS, new Map([[grant.id, grant]])],
-      [COUNTERS, new Map([["x", counter]])]
+      [ScopeGrants.ScopeGrants.name, new Map([[grantId, grant]])],
+      [Counters.name, new Map([["x", counter]])]
     ])
   ),
-  meta: { ...Engine.initialMeta, cursor: 1n }
+  meta: { ...Engine.initialMeta, cursor: position(1n) }
 })
-const executorFor = (disk: MemorySyncStorage.Disk): Engine.Executor<never> => ({
-  run: (envelope, createdAt) => runMutation(disk.replica, "p", envelope, createdAt)
-})
-const valueOf = (disk: MemorySyncStorage.Disk, id: string) => disk.replica.tables().get(COUNTERS)?.get(id)?.["value"]
+const valueOf = (disk: MemorySyncStorage.Disk, rowId: string) =>
+  disk.replica.tables().get(Counters.name)?.get(rowId)?.["value"]
 
 describe("reconciliation simulation", () => {
   it.effect(
@@ -121,17 +131,15 @@ describe("reconciliation simulation", () => {
       const release = yield* Deferred.make<void>()
       let pulls = 0
       const engine = yield* Engine.make({
-        clientId: "c",
-        knownTable,
+        ...engineOptions,
         storage: MemorySyncStorage.make(disk),
-        executor: executorFor(disk),
         transport: {
           push: (request) =>
             Effect.succeed({
               results: request.mutations.map((m) => ({
                 mutationId: m.mutationId,
                 outcome: { _tag: "Applied" as const },
-                position: 5n
+                position: position(5n)
               }))
             }),
           pull: () =>
@@ -140,21 +148,21 @@ describe("reconciliation simulation", () => {
               if (pulls > 1) return yield* new Simulation.TransportFailed({ during: "replacement snapshot" })
               yield* Deferred.succeed(arrived, undefined)
               yield* Deferred.await(release)
-              return yield* new ResnapshotRequired({ reason: "gcHorizon" })
+              return yield* new Protocol.ResnapshotRequired({ reason: "gcHorizon" })
             })
         }
       })
       const pulling = yield* Effect.forkChild(Effect.exit(engine.pull))
       yield* Deferred.await(arrived)
-      const first = yield* engine.mutate("u-a", "increment", { id: "x", by: 1 })
+      const first = yield* engine.mutate(id("u-a"), "increment", { id: "x", by: 1 })
       yield* engine.push
       yield* Deferred.succeed(release, undefined)
       yield* Fiber.join(pulling)
 
       assert.isTrue(disk.meta.resnapshot)
-      assert.strictEqual(disk.meta.cursor, 1n) // the installed replica is still authoritative here
+      assert.strictEqual(disk.meta.cursor, position(1n)) // the installed replica is still authoritative here
       assert.strictEqual(disk.meta.pushedThrough, first.seq) // a stale write would make it resend
-      const second = yield* engine.mutate("u-b", "increment", { id: "x", by: 1 })
+      const second = yield* engine.mutate(id("u-b"), "increment", { id: "x", by: 1 })
       assert.deepStrictEqual([first.seq, second.seq], [1, 2])
     })
   )
@@ -162,40 +170,38 @@ describe("reconciliation simulation", () => {
   it.effect("an enqueue retried after its original was released (and the engine recreated) adds no intent", () =>
     Effect.gen(function* () {
       const server = RefServer.make({ pageSize: 10 })
-      server.register("c", "p")
+      server.register(clientId, principal("p"))
       yield* server.writeDirect([
-        { table: GRANTS, id: grant.id, row: Option.some(grant) },
-        { table: COUNTERS, id: "x", row: Option.some(counter) }
+        { table: ScopeGrants.ScopeGrants, id: grantId, row: Option.some(grant) },
+        { table: Counters, id: "x", row: Option.some(counter) }
       ])
       const disk = MemorySyncStorage.makeDisk()
       const options = {
-        clientId: "c",
-        knownTable,
+        ...engineOptions,
         storage: MemorySyncStorage.make(disk),
-        executor: executorFor(disk),
         transport: {
-          push: (request: Parameters<typeof server.push>[0]) => server.push(request, Option.none()),
+          push: (request: Protocol.PushRequest) => server.push(request, Option.none()),
           pull: server.pull
         }
       }
       let engine = yield* Engine.make(options)
       yield* engine.pull
-      const inc = yield* engine.mutate("u-inc", "increment", { id: "x", by: 5 })
-      const create = yield* engine.mutate("u-create", "create", { id: "y", scope: "s" })
-      yield* engine.mutate("u-remove", "remove", { id: "y" })
+      const inc = yield* engine.mutate(id("u-inc"), "increment", { id: "x", by: 5 })
+      const create = yield* engine.mutate(id("u-create"), "create", { id: "y", scope: "s" })
+      yield* engine.mutate(id("u-remove"), "remove", { id: "y" })
       yield* engine.push
       yield* engine.pull
       assert.strictEqual(disk.outbox.length, 0)
 
       engine = yield* Engine.make(options)
-      assert.strictEqual((yield* engine.mutate("u-inc", "increment", { id: "x", by: 5 })).seq, inc.seq)
-      assert.strictEqual((yield* engine.mutate("u-create", "create", { id: "y", scope: "s" })).seq, create.seq)
+      assert.strictEqual((yield* engine.mutate(id("u-inc"), "increment", { id: "x", by: 5 })).seq, inc.seq)
+      assert.strictEqual((yield* engine.mutate(id("u-create"), "create", { id: "y", scope: "s" })).seq, create.seq)
       assert.strictEqual(disk.outbox.length, 0)
       yield* engine.push
       yield* engine.pull
       assert.strictEqual(valueOf(disk, "x"), 5) // 10 would be the increment applied twice
-      assert.isUndefined(disk.replica.tables().get(COUNTERS)?.get("y")) // a re-run create would resurrect y
-      assert.isTrue(Option.isNone(yield* server.store.read(COUNTERS, "y")))
+      assert.isUndefined(disk.replica.tables().get(Counters.name)?.get("y")) // a re-run create would resurrect y
+      assert.isTrue(Option.isNone(yield* server.store.read(Counters, "y")))
       assert.deepStrictEqual([...server.executions.values()], [1, 1, 1])
     })
   )
@@ -227,8 +233,8 @@ describe("reconciliation simulation", () => {
         storage.transaction(
           Effect.gen(function* () {
             yield* storage.nextSeq
-            yield* storage.rows.write("t", "a", Option.some({ id: "a", access_scope_id: "s" }))
-            yield* storage.setMeta({ cursor: 1n, pushedThrough: 1, resnapshot: false })
+            yield* storage.rows.write(Counters, "a", Option.some(counterRow("a", 0)))
+            yield* storage.setMeta({ cursor: position(1n), pushedThrough: 1, resnapshot: false })
           })
         ),
         { scheduler, signal: controller.signal }
@@ -236,9 +242,9 @@ describe("reconciliation simulation", () => {
       if (yielded) controller.abort()
       while (tasks.length > 0) tasks.shift()?.()
       await running
-      const hasRow = disk.replica.tables().get("t")?.has("a") ?? false
+      const hasRow = disk.replica.tables().get(Counters.name)?.has("a") ?? false
       outcomes.add(hasRow)
-      if (hasRow !== (disk.lastSeq === 1) || hasRow !== (disk.meta.cursor === 1n)) split.push(boundary)
+      if (hasRow !== (disk.lastSeq === 1) || hasRow !== (disk.meta.cursor === position(1n))) split.push(boundary)
     }
     assert.deepStrictEqual(split, [])
     assert.strictEqual(outcomes.size, 2) // the sweep spans the transaction
@@ -254,7 +260,7 @@ describe("reconciliation simulation", () => {
           Effect.exit(
             store.transaction(
               Effect.gen(function* () {
-                yield* store.write("t", "a", Option.some({ id: "a", access_scope_id: "s" }))
+                yield* store.write(Counters, "a", Option.some(counterRow("a", 0)))
                 yield* Deferred.succeed(wrote, undefined)
                 yield* Deferred.await(gate)
                 return yield* Effect.fail("abort")
@@ -264,14 +270,14 @@ describe("reconciliation simulation", () => {
         )
         yield* Deferred.await(wrote)
         const b = yield* Effect.forkChild(
-          store.transaction(store.write("t", "b", Option.some({ id: "b", access_scope_id: "s" })))
+          store.transaction(store.write(Counters, "b", Option.some(counterRow("b", 0))))
         )
         // Give B every chance to run while A is suspended (it must wait for A's permit).
         for (let i = 0; i < 10; i++) yield* Effect.yieldNow
         if (ending === "fail") yield* Deferred.succeed(gate, undefined)
         else yield* Fiber.interrupt(a)
         yield* Fiber.join(b)
-        assert.deepStrictEqual([...(store.tables().get("t")?.keys() ?? [])], ["b"], ending)
+        assert.deepStrictEqual([...(store.tables().get(Counters.name)?.keys() ?? [])], ["b"], ending)
       }
     })
   )
@@ -279,28 +285,26 @@ describe("reconciliation simulation", () => {
   it.effect("an ack on a PullPage whose payloads lack the effect neither drops nor double-applies the intent", () =>
     Effect.gen(function* () {
       const disk = installedDisk()
-      const responses: Array<Option.Option<PullResponse>> = [
+      const responses: Array<Option.Option<Protocol.PullResponse>> = [
         // Page 1 (snapshot before the mutation committed elsewhere in the set) carries the ack.
         Option.some({
           _tag: "PullPage",
           changes: [],
-          acks: [{ mutationId: "u-7f3a", position: 2n, outcome: { _tag: "Applied" } }],
-          continuation: "k"
+          acks: [{ mutationId: id("u-7f3a"), position: position(2n), outcome: { _tag: "Applied" } }],
+          continuation: Protocol.PullContinuation.make("k")
         }),
         Option.none(), // connection drops before the final page
         Option.some({
           _tag: "PullDone",
-          changes: [{ _tag: "upsert", table: COUNTERS, row: { ...counter, value: 5 } }],
+          changes: [{ _tag: "upsert", table: Counters.name, row: counterRow("x", 5) }],
           acks: [],
-          nextCursor: 3n,
-          expiredThrough: 0
+          nextCursor: position(3n),
+          expiredThrough: Ids.SeqFloor.make(0)
         })
       ]
       const engine = yield* Engine.make({
-        clientId: "c",
-        knownTable,
+        ...engineOptions,
         storage: MemorySyncStorage.make(disk),
-        executor: executorFor(disk),
         transport: {
           push: () => Effect.die("unused"),
           pull: () => {
@@ -312,7 +316,7 @@ describe("reconciliation simulation", () => {
         }
       })
 
-      yield* engine.mutate("u-7f3a", "increment", { id: "x", by: 5 })
+      yield* engine.mutate(id("u-7f3a"), "increment", { id: "x", by: 5 })
       yield* Effect.exit(engine.pull)
       // Acked but the covering state is not installed: still pending, still visible once.
       assert.strictEqual(disk.outbox.length, 1)
@@ -321,7 +325,7 @@ describe("reconciliation simulation", () => {
       yield* engine.pull
       assert.strictEqual(disk.outbox.length, 0)
       assert.strictEqual(valueOf(disk, "x"), 5) // 10 would mean the intent was replayed over its own result
-      assert.strictEqual(disk.meta.cursor, 3n)
+      assert.strictEqual(disk.meta.cursor, position(3n))
     })
   )
 })

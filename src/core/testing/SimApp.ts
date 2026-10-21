@@ -1,176 +1,81 @@
 /**
- * The application the simulation runs: one `counters` table plus the `scope_grants` system
- * table, and intent-shaped mutations (increment/transfer are wrong if replayed over a server
- * result that already contains them).
- *
- * `runMutation` is the shared executor: the same handler runs optimistically on a client
- * replica and authoritatively on the reference server, with scope-role checks against the
- * grant rows of whichever store it runs on, and first-touch undo images for every write.
- * TEMPORARY stand-in for core's `Store.make` + `MutationRegistry.run`.
+ * The application the simulation runs, declared with core's real APIs: a `counters` SyncTable,
+ * intent-shaped mutations (increment/transfer are wrong if replayed over a server result that
+ * already contains them), and a `notes` table that only the server's registry has (a table
+ * added by a newer deploy, DESIGN §8). Grants are core's `scope_grants` system table.
  */
-import { Array as Arr, Effect, Option, Schema } from "effect"
-import type { EncodedRow, MutationEnvelope, MutationRejection, UndoImage } from "../../client/sync/Wire.ts"
-import type { MemoryStore } from "./MemoryStore.ts"
+import { DateTime, Effect, Schema } from "effect"
+import { AccessScope, Mutation, Registry, ScopeGrants, SyncTable } from "../index.ts"
 
-export const COUNTERS = "counters"
-export const GRANTS = "scope_grants"
-export const ANYONE = "*"
-/** A table the server syncs but the clients' registry does not have (an older app version). */
-export const NOTES = "notes"
-/** The clients' registry. */
-export const knownTable = (name: string) => name === COUNTERS || name === GRANTS
+export const CounterId = Schema.String.check(Schema.isNonEmpty()).pipe(Schema.brand("sim/CounterId"))
+export const NoteId = Schema.String.check(Schema.isNonEmpty()).pipe(Schema.brand("sim/NoteId"))
 
-export type Role = "reader" | "writer" | "owner"
-
-export const grantId = (scopeId: string, principal: string) => `${scopeId}|${principal}`
-
-export const grantRow = (scopeId: string, principal: string, role: Role): EncodedRow => ({
-  id: grantId(scopeId, principal),
-  access_scope_id: scopeId,
-  principal_id: principal,
-  role
+export const Counters = SyncTable.make("counters", {
+  id: CounterId,
+  accessScopeId: AccessScope.AccessScopeId,
+  value: Schema.Int,
+  updatedAt: Schema.DateTimeUtc
 })
 
-const Counter = Schema.Struct({
-  id: Schema.String,
-  access_scope_id: Schema.String,
-  value: Schema.Number,
-  updated_at: Schema.Number
+export const Notes = SyncTable.make("notes", {
+  id: NoteId,
+  accessScopeId: AccessScope.AccessScopeId,
+  body: Schema.String
 })
-type Counter = typeof Counter.Type
 
-const GrantRole = Schema.Struct({ role: Schema.Literals(["reader", "writer", "owner"]) })
+/** The clients' registry (an older app version: no `notes`). */
+export const clientRegistry = Registry.make([Counters])
+/** The server's registry. */
+export const serverRegistry = Registry.make([Counters, Notes])
 
-export const Args = {
-  create: Schema.Struct({ id: Schema.String, scope: Schema.String }),
-  increment: Schema.Struct({ id: Schema.String, by: Schema.Number }),
-  transfer: Schema.Struct({ from: Schema.String, to: Schema.String, amount: Schema.Number }),
-  move: Schema.Struct({ id: Schema.String, scope: Schema.String }),
-  remove: Schema.Struct({ id: Schema.String })
-}
-export type MutationName = keyof typeof Args
+const create = Mutation.make("create", {
+  args: Schema.Struct({ id: CounterId, scope: AccessScope.AccessScopeId }),
+  handler: (ctx, { id, scope }) =>
+    ctx.store.insert(Counters, { id, accessScopeId: scope, value: 0, updatedAt: ctx.now })
+})
 
-class Rejected extends Schema.TaggedError<Rejected>()("Rejected", {
-  reason: Schema.Literals(["ArgsDecodeFailed", "UnknownMutation", "RowNotFound", "ScopeForbidden", "Exists"]),
-  detail: Schema.String
-}) {}
+const increment = Mutation.make("increment", {
+  args: Schema.Struct({ id: CounterId, by: Schema.Int }),
+  handler: (ctx, { id, by }) =>
+    Effect.gen(function* () {
+      const row = yield* ctx.store.get(Counters, id)
+      yield* ctx.store.patch(Counters, id, { value: row.value + by, updatedAt: ctx.now })
+    })
+})
 
-export const roleOf = (store: MemoryStore, principal: string, scopeId: string) =>
-  Effect.gen(function* () {
-    let best: Option.Option<Role> = Option.none()
-    for (const who of [principal, ANYONE]) {
-      const row = yield* store.read(GRANTS, grantId(scopeId, who))
-      const decoded = Option.flatMap(row, Schema.decodeUnknownOption(GrantRole))
-      if (Option.isSome(decoded)) {
-        const role = decoded.value.role
-        if (Option.isNone(best) || rank[role] > rank[best.value]) best = Option.some(role)
-      }
-    }
-    return best
+const transfer = Mutation.make("transfer", {
+  args: Schema.Struct({ from: CounterId, to: CounterId, amount: Schema.Int }),
+  handler: (ctx, { from, to, amount }) =>
+    Effect.gen(function* () {
+      const a = yield* ctx.store.get(Counters, from)
+      yield* ctx.store.patch(Counters, from, { value: a.value - amount, updatedAt: ctx.now })
+      const b = yield* ctx.store.get(Counters, to)
+      yield* ctx.store.patch(Counters, to, { value: b.value + amount, updatedAt: ctx.now })
+    })
+})
+
+const move = Mutation.make("move", {
+  args: Schema.Struct({ id: CounterId, scope: AccessScope.AccessScopeId }),
+  handler: (ctx, { id, scope }) => ctx.store.patch(Counters, id, { accessScopeId: scope, updatedAt: ctx.now })
+})
+
+const remove = Mutation.make("remove", {
+  args: Schema.Struct({ id: CounterId }),
+  handler: (ctx, { id }) => ctx.store.delete(Counters, id)
+})
+
+export const mutations = Mutation.makeRegistry([create, increment, transfer, move, remove])
+
+export const ANYONE = AccessScope.Everyone
+export const scope = (id: string) => AccessScope.AccessScopeId.make(id)
+export const principal = (id: string) => AccessScope.PrincipalId.make(id)
+
+/** A `scope_grants` row in wire form, with core's derived id (DESIGN §4). */
+export const grantRow = (scopeId: string, who: string, role: AccessScope.Role): SyncTable.EncodedRow =>
+  Schema.encodeSync(ScopeGrants.ScopeGrants.wire)({
+    id: ScopeGrants.grantId(scope(scopeId), principal(who)),
+    accessScopeId: scope(scopeId),
+    principalId: principal(who),
+    role,
+    grantedAt: DateTime.makeUnsafe(0)
   })
-
-const rank: Record<Role, number> = { reader: 1, writer: 2, owner: 3 }
-
-export interface RunResult {
-  readonly undo: ReadonlyArray<UndoImage>
-  readonly rejection: Option.Option<MutationRejection>
-}
-
-/**
- * Runs one mutation against `store` as `principal` with `ctx.now = now`. Writes go straight
- * to the store (the caller owns the transaction); on rejection the partial writes remain and
- * the caller restores them from `undo`. The server derives log entries from `undo` plus the
- * rows' state after commit.
- */
-export const runMutation = (
-  store: MemoryStore,
-  principal: string,
-  envelope: MutationEnvelope,
-  now: number
-): Effect.Effect<RunResult> => {
-  const undo: Array<UndoImage> = []
-  const touched = new Set<string>()
-
-  const canWrite = (scopeId: string) =>
-    Effect.gen(function* () {
-      const role = yield* roleOf(store, principal, scopeId)
-      if (Option.isNone(role) || role.value === "reader") {
-        return yield* new Rejected({ reason: "ScopeForbidden", detail: scopeId })
-      }
-    })
-  const get = (id: string) =>
-    Effect.gen(function* () {
-      const row = yield* store.read(COUNTERS, id)
-      if (Option.isNone(row)) return yield* new Rejected({ reason: "RowNotFound", detail: id })
-      const role = yield* roleOf(store, principal, row.value.access_scope_id)
-      if (Option.isNone(role)) return yield* new Rejected({ reason: "ScopeForbidden", detail: id })
-      return yield* Schema.decodeUnknownEffect(Counter)(row.value).pipe(Effect.orDie)
-    })
-  const write = (id: string, before: Option.Option<EncodedRow>, row: Option.Option<Counter>) =>
-    Effect.gen(function* () {
-      if (Option.isSome(before)) yield* canWrite(before.value.access_scope_id)
-      if (Option.isSome(row)) yield* canWrite(row.value.access_scope_id)
-      if (!touched.has(id)) {
-        touched.add(id)
-        undo.push({ table: COUNTERS, id, before })
-      }
-      yield* store.write(COUNTERS, id, row)
-    })
-  const put = (row: Counter) =>
-    Effect.gen(function* () {
-      const before = yield* store.read(COUNTERS, row.id)
-      yield* write(row.id, before, Option.some({ ...row, updated_at: now }))
-    })
-
-  const argsError = Effect.mapError(() => new Rejected({ reason: "ArgsDecodeFailed", detail: envelope.name }))
-
-  const handler = Effect.gen(function* () {
-    switch (envelope.name) {
-      case "create": {
-        const { id, scope } = yield* Schema.decodeUnknownEffect(Args.create)(envelope.args).pipe(argsError)
-        const existing = yield* store.read(COUNTERS, id)
-        if (Option.isSome(existing)) return yield* new Rejected({ reason: "Exists", detail: id })
-        return yield* put({ id, access_scope_id: scope, value: 0, updated_at: now })
-      }
-      case "increment": {
-        const { id, by } = yield* Schema.decodeUnknownEffect(Args.increment)(envelope.args).pipe(argsError)
-        const row = yield* get(id)
-        return yield* put({ ...row, value: row.value + by })
-      }
-      case "transfer": {
-        const { from, to, amount } = yield* Schema.decodeUnknownEffect(Args.transfer)(envelope.args).pipe(argsError)
-        const a = yield* get(from)
-        yield* put({ ...a, value: a.value - amount })
-        const b = yield* get(to)
-        return yield* put({ ...b, value: b.value + amount })
-      }
-      case "move": {
-        const { id, scope } = yield* Schema.decodeUnknownEffect(Args.move)(envelope.args).pipe(argsError)
-        const row = yield* get(id)
-        return yield* put({ ...row, access_scope_id: scope })
-      }
-      case "remove": {
-        const { id } = yield* Schema.decodeUnknownEffect(Args.remove)(envelope.args).pipe(argsError)
-        const before = yield* store.read(COUNTERS, id)
-        yield* get(id)
-        return yield* write(id, before, Option.none())
-      }
-      default:
-        return yield* new Rejected({ reason: "UnknownMutation", detail: envelope.name })
-    }
-  })
-
-  return handler.pipe(
-    Effect.map(() => ({ undo, rejection: Option.none<MutationRejection>() })),
-    Effect.catchTag("Rejected", (error) =>
-      Effect.succeed({
-        undo,
-        rejection: Option.some<MutationRejection>({ _tag: error.reason, detail: error.detail })
-      })
-    )
-  )
-}
-
-/** Restores pre-images in reverse write order. */
-export const restore = (store: MemoryStore, undo: ReadonlyArray<UndoImage>) =>
-  Effect.forEach(Arr.reverse(undo), (image) => store.write(image.table, image.id, image.before), { discard: true })
