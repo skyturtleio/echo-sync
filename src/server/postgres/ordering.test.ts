@@ -49,7 +49,9 @@ const writersRaceAPullingReader = Effect.gen(function* () {
  * and commits; the reader pulls once; A commits; the reader syncs. Without the lock B's position
  * is above A's and committed first, so the pull's cursor passes A's position before A is visible.
  * With the lock B's allocation queues behind A's transaction, so the pull cannot pass A. Returns
- * the rows the reader never received.
+ * the rows the reader never received. The writers are forked into the helper's own scope, so a
+ * failure or interruption while A is held interrupts them (rolling A back and returning its
+ * connection) before the test's database layer shuts its pool down.
  */
 const readerPullsBetweenOutOfOrderCommits = Effect.gen(function* () {
   const sql = yield* SqlClient
@@ -60,7 +62,7 @@ const readerPullsBetweenOutOfOrderCommits = Effect.gen(function* () {
   const aInserted = yield* Deferred.make<void>()
   const releaseA = yield* Deferred.make<void>()
   const bCommitted = yield* Deferred.make<void>()
-  const writerA = yield* Effect.forkChild(
+  const writerA = yield* Effect.forkScoped(
     sql.withTransaction(
       Effect.gen(function* () {
         yield* sql`INSERT INTO items (id, access_scope_id) VALUES ('a', 's1')`
@@ -70,7 +72,7 @@ const readerPullsBetweenOutOfOrderCommits = Effect.gen(function* () {
     )
   )
   yield* Deferred.await(aInserted)
-  const writerB = yield* Effect.forkChild(
+  const writerB = yield* Effect.forkScoped(
     sql
       .withTransaction(sql`INSERT INTO items (id, access_scope_id) VALUES ('b', 's1')`)
       .pipe(Effect.andThen(Deferred.succeed(bCommitted, undefined)))
@@ -92,7 +94,7 @@ const readerPullsBetweenOutOfOrderCommits = Effect.gen(function* () {
 
   const received = new Set(replica.received.flatMap((c) => (c._tag === "upsert" ? [String(c.row["id"])] : [])))
   return ["a", "b"].filter((id) => !received.has(id))
-})
+}).pipe(Effect.scoped)
 
 /** The engine's position allocation with the advisory lock removed; everything else unchanged. */
 const withoutEngineLock = Effect.gen(function* () {
