@@ -248,13 +248,21 @@ interface Classified {
 }
 
 /**
+ * Optionality at the field level: the node itself or, through field-level unions (`NullOr`
+ * etc.), any member. Does not descend into Objects/Arrays, so optional properties inside a JSON
+ * column remain allowed.
+ */
+const optionalAtField = (ast: SchemaAST.AST): boolean =>
+  SchemaAST.isOptional(ast) || (ast._tag === "Union" && ast.types.some(optionalAtField))
+
+/**
  * Classifies a field by its *encoded* side (what is stored), so a transformed field (branded,
  * refined, or decoded into another type) maps by the column it actually occupies.
  */
 const classify = (ast: SchemaAST.AST): Classified | string => {
   const encoded = SchemaAST.toEncoded(ast)
   // Both sides: an encoded-side default or optional key would let a stored row omit the key.
-  if (SchemaAST.isOptional(ast) || SchemaAST.isOptional(encoded)) {
+  if (optionalAtField(ast) || optionalAtField(encoded)) {
     return "optional keys and encoded-side defaults are not supported; use Schema.NullOr"
   }
   if (encoded._tag === "Null") return "a field cannot be only null"

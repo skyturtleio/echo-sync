@@ -1,7 +1,7 @@
 import { Cause, DateTime, Effect, Option, Schema, SchemaGetter } from "effect"
 import { describe, expect, it } from "vitest"
 import { AccessScopeId, PrincipalId } from "./AccessScope.ts"
-import { StoreUnavailable } from "./Errors.ts"
+import { RowNotFound, StoreUnavailable } from "./Errors.ts"
 import { ClientId, MutationId, Seq } from "./Ids.ts"
 import * as Mutation from "./Mutation.ts"
 import * as Protocol from "./Protocol.ts"
@@ -148,6 +148,42 @@ describe("mutation outcome classification over the whole cause (DESIGN §6)", ()
       )
     )
     expect(err._tag).toBe("StoreUnavailable")
+  })
+})
+
+const strict = (reasons: ReadonlyArray<Cause.Reason<string | RowNotFound>>) =>
+  Mutation.makeRegistry([
+    Mutation.make("strict", {
+      args: Schema.Struct({}),
+      error: Schema.NonEmptyString,
+      handler: () => Effect.failCause(Cause.fromReasons(reasons))
+    })
+  ])
+const outcome = (reasons: ReadonlyArray<Cause.Reason<string | RowNotFound>>) =>
+  Effect.runPromise(Effect.exit(Mutation.run(strict(reasons), { name: "strict", args: {} }, ctx())))
+describe("every domain failure in a cause must encode before any is reported (DESIGN §6)", () => {
+  const valid = Cause.makeFailReason("valid")
+  const unencodable = Cause.makeFailReason("") // type-valid string, rejected by NonEmptyString
+
+  it("an unencodable domain failure next to a valid one dies, in either order, never a DomainError", async () => {
+    for (const reasons of [
+      [valid, unencodable],
+      [unencodable, valid],
+      [Cause.makeFailReason(new RowNotFound({ table: "t", id: "1" })), unencodable]
+    ]) {
+      const exit = await outcome(reasons)
+      const cause = exit._tag === "Failure" ? exit.cause : Cause.empty
+      expect(exit._tag).toBe("Failure")
+      expect(Cause.hasFails(cause)).toBe(false)
+      expect(Cause.hasDies(cause)).toBe(true)
+    }
+  })
+
+  it("when every failure encodes, the first in cause order is the rejection", async () => {
+    const err = await Effect.runPromise(
+      Effect.flip(Mutation.run(strict([valid, Cause.makeFailReason("second")]), { name: "strict", args: {} }, ctx()))
+    )
+    expect(err).toMatchObject({ _tag: "DomainError", mutation: "strict", error: "valid" })
   })
 })
 

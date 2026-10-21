@@ -115,6 +115,10 @@ const isStoreFailure = (
   e instanceof StoreUnavailable ||
   e instanceof ArgsDecodeFailed
 
+/** Turns every failure in `cause` into a defect, keeping dies and interrupts. */
+const asDefects = (cause: Cause.Cause<unknown>): Cause.Cause<never> =>
+  Cause.fromReasons(cause.reasons.map((r) => (Cause.isFailReason(r) ? Cause.makeDieReason(r.error) : r)))
+
 export const make = <const Name extends string, A extends PureSchema, E extends PureSchema = Schema.Never>(
   name: Name,
   options: {
@@ -138,18 +142,25 @@ export const make = <const Name extends string, A extends PureSchema, E extends 
     const failures = cause.reasons.filter(Cause.isFailReason).map((r) => r.error)
     const [first] = failures
     if (first === undefined || failures.length !== cause.reasons.length) {
-      return Effect.failCause(
-        Cause.fromReasons(cause.reasons.map((r) => (Cause.isFailReason(r) ? Cause.makeDieReason(r.error) : r)))
-      )
+      return Effect.failCause(asDefects(cause))
     }
     const transient = failures.find((e) => e instanceof StoreUnavailable)
     if (transient !== undefined) return Effect.fail(transient)
-    if (isStoreFailure(first)) return Effect.fail(first)
-    return encodeError(first).pipe(
-      // An undeclared or unencodable domain error is a bug in the mutation, not an outcome.
-      Effect.orDie,
-      Effect.flatMap((encoded) => Effect.fail(new DomainError({ mutation: name, error: encoded })))
-    )
+    // Every domain failure must be declared and encodable, not only the one reported (DESIGN §6):
+    // an undeclared or unencodable domain error anywhere is a bug in the mutation, so the
+    // mutation dies with the full cause. Otherwise the first failure in cause order is reported.
+    return Effect.gen(function* () {
+      const encoded: Array<Schema.Json> = []
+      for (const e of failures) {
+        if (isStoreFailure(e)) continue
+        const result = yield* Effect.exit(encodeError(e))
+        if (result._tag === "Failure") return yield* Effect.failCause(asDefects(cause))
+        encoded.push(result.value)
+      }
+      if (isStoreFailure(first)) return yield* Effect.fail(first)
+      // `first` is a domain failure, so it was encoded first.
+      return yield* new DomainError({ mutation: name, error: encoded[0] ?? null })
+    })
   }
   return {
     name,

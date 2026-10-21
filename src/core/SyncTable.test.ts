@@ -169,6 +169,18 @@ describe("SyncTable declaration-time rejection", () => {
     )
     // @ts-expect-error an encoded-side default lets a stored row omit the key (§11 key presence)
     expectRejected(() => SyncTable.make("t", { ...base, x: encodedDefault }), /field "x".*encoded-side defaults/)
+  })
+
+  it("rejects an encoded-side default hidden under NullOr, but allows optional keys inside a JSON column", () => {
+    const encodedDefault = Schema.String.pipe(
+      Schema.withDecodingDefaultKey(Effect.succeed("d"), { encodingStrategy: "omit" })
+    )
+    expectRejected(
+      () => SyncTable.make("t", { ...base, x: Schema.NullOr(encodedDefault) }),
+      /field "x".*encoded-side defaults/
+    )
+    const json = SyncTable.make("t", { ...base, j: Schema.Struct({ a: Schema.optionalKey(Schema.String) }) })
+    expect(json.columns.find((c) => c.field === "j")?.kind).toBe("json")
     // @ts-expect-error optional keys are not supported
     expectRejected(() => SyncTable.make("t", { ...base, o: Schema.optionalKey(Schema.String) }), /field "o".*optional/)
   })
