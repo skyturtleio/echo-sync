@@ -435,6 +435,9 @@ A cursor or continuation below the horizon gets `ResnapshotRequired { reason: "g
   cursor past it, a device loses an ack to expiry only if its storage went back in time (restored
   from a backup, copied profile). Its next pull then reports `expiredThrough ≥` that seq, and the
   client releases the mutation as `OutcomeUnknown` (tested end to end with the real Engine).
+- **Head.** Pull's head is the greatest of the GC horizon, the log's and the ledger's highest
+  positions, and `max(clients.expired_position)`: an expired row's position outlives the row, so
+  expiring the newest ledger row never moves a cursor or a resumed page set back (tested).
 - Floors are permanent: nothing deletes a `clients` row's floor. Forgetting idle clients is out
   of scope (DESIGN §16 item 5).
 

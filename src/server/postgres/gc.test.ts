@@ -318,6 +318,33 @@ describe.skipIf(!pgAvailable)("ledger expiry (DESIGN §16 item 5)", () => {
   )
 
   it.live(
+    "expiring the newest ledger row never moves the head back: a cursor at its position does not regress and a page set resumed at it continues",
+    () =>
+      Effect.gen(function* () {
+        const c = yield* ledgerClient
+        yield* insert("a")
+        yield* insert("b")
+        // A mutation that writes nothing: its ledger row is the only record of the newest position.
+        const last = yield* runMutation({ principalId: "p", clientId: "c1", mutationId: "m1", seq: 1n }, Effect.void)
+        yield* c.replica.sync()
+        assert.strictEqual(c.replica.cursor, last.position)
+        yield* c.replica.sync() // stamps m1
+        // Another client's initial walk is mid-set at that head.
+        const other = new Replica("p", "d")
+        assert.strictEqual((yield* other.pullOnce(1))._tag, "PullPage")
+
+        yield* ageAcks(10)
+        assert.deepStrictEqual(yield* expireAt(0), { clients: 1, deleted: 1 })
+
+        yield* c.replica.sync()
+        assert.strictEqual(c.replica.cursor, last.position, "the cursor does not regress")
+        yield* other.sync()
+        assert.strictEqual(other.cursor, last.position)
+        assert.deepStrictEqual(other.view(), yield* serverView("p"))
+      }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live(
     "ledger rows written before migration 003 come through it unstamped and are never expired until a pull acks them",
     () =>
       Effect.gen(function* () {

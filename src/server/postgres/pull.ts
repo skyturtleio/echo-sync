@@ -111,7 +111,10 @@ export const pull = Effect.fnUntraced(function* (registry: Registry.SyncRegistry
         SELECT gc_horizon,
                GREATEST(gc_horizon,
                         (SELECT max(position) FROM echo_sync.log),
-                        (SELECT max(position) FROM echo_sync.mutations)) AS head,
+                        (SELECT max(position) FROM echo_sync.mutations),
+                        -- An expired ledger row's position outlives it here, so expiry never
+                        -- moves the head (and with it a cursor or continuation) back.
+                        (SELECT max(expired_position) FROM echo_sync.clients)) AS head,
                (SELECT expired_through FROM echo_sync.clients WHERE client_id = ${request.clientId}) AS expired_through
         FROM echo_sync.engine_state`
       const state = stateRows[0]
