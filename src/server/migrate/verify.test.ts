@@ -167,6 +167,11 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
       "tags: (in schema zz) declared column name is missing"
     ],
     [
+      "two well-formed captured relations of the same name (the log cannot tell them apart)",
+      "CREATE SCHEMA zz;CREATE TABLE zz.tags (LIKE public.tags INCLUDING ALL);CREATE TRIGGER echo_sync_capture AFTER INSERT OR UPDATE OR DELETE ON zz.tags FOR EACH ROW EXECUTE FUNCTION echo_sync.echo_sync_capture_changes();CREATE TRIGGER echo_sync_reject_truncate BEFORE TRUNCATE ON zz.tags FOR EACH STATEMENT EXECUTE FUNCTION echo_sync.reject_truncate()",
+      "tags: captured in 2 schemas (public, zz)"
+    ],
+    [
       "a disabled truncate guard",
       "ALTER TABLE tags DISABLE TRIGGER echo_sync_reject_truncate",
       "tags: echo_sync truncate guard trigger"
@@ -264,4 +269,69 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
       )
     })
   }
+  // The TODO sequence for renames and drops, carried out by hand exactly as written, reaches a
+  // database the verifier accepts: table + column rename, a dropped column whose index the DROP
+  // COLUMN removes and is then recreated under its name, and an index replaced under its name on
+  // unchanged columns after a column rename.
+  const NotesV1 = SyncTable.make(
+    "notes",
+    { ...base, title: Schema.String, legacy: Schema.NullOr(Schema.String), rank: Schema.Int },
+    { indexes: { by_title: ["title"], by_legacy: ["legacy"], by_rank: ["rank"] } }
+  )
+  const CardsV1 = SyncTable.make(
+    "cards",
+    { ...base, title: Schema.String, rank: Schema.Int },
+    { indexes: { by_title: ["title"] } }
+  )
+  const PapersV2 = SyncTable.make(
+    "papers",
+    { ...base, heading: Schema.String, rank: Schema.Int },
+    { indexes: { by_title: ["heading", "rank"], by_rank: ["rank"], by_legacy: ["rank", "heading"] } }
+  )
+  const CardsV2 = SyncTable.make(
+    "cards",
+    { ...base, heading: Schema.String, rank: Schema.Int },
+    { indexes: { by_title: ["rank"] } }
+  )
+  const renameV1 = Registry.make([NotesV1, CardsV1])
+  const renameV2 = Registry.make([PapersV2, CardsV2])
+  const renameFirst = Migrate.generate({
+    previous: Migrate.emptySnapshot,
+    registry: renameV1,
+    existing: [],
+    name: "init"
+  })
+  const renameSecond = Migrate.generate({
+    previous: Migrate.decodeSnapshot(renameFirst.snapshot),
+    registry: renameV2,
+    intent: {
+      renames: { tables: { papers: "notes" }, columns: { papers: { heading: "title" }, cards: { heading: "title" } } },
+      acknowledgeDrops: ["papers.legacy"]
+    },
+    existing: [renameFirst.id],
+    name: "rename"
+  })
+  it.layer(EmptyDatabase)((db) => {
+    db.effect("the hand-carried TODO sequence for renames and drops passes the verifier", () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient
+        const migrations = yield* load([renameFirst, renameSecond])
+        yield* startUp(renameV1, { [renameFirst.id]: migrations[renameFirst.id] ?? Effect.die("missing") })
+        assert.deepStrictEqual(yield* driftOf(renameV1), [])
+        yield* sql`INSERT INTO notes (id, access_scope_id, title, legacy, rank) VALUES ('n1', 's', 't', 'x', 1)`
+        const hand = renameSecond.steps.flatMap((s) =>
+          s._tag === "Todo"
+            ? s.lines.filter((l) => /^ {2}[A-Z]+ [^<]*;$/.test(l)).map((l) => l.trim().slice(0, -1))
+            : []
+        )
+        assert.isTrue(hand.length > 0)
+        assert.isFalse(renameSecond.steps.some((s) => s._tag === "Ddl"))
+        for (const statement of hand) yield* sql.unsafe(statement)
+        yield* startUp(renameV2, migrations)
+        assert.deepStrictEqual(yield* driftOf(renameV2), [])
+        const [row] = yield* sql<{ heading: string }>`SELECT heading FROM papers WHERE id = 'n1'`
+        assert.strictEqual(row?.heading, "t")
+      })
+    )
+  })
 })

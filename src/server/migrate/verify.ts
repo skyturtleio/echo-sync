@@ -278,6 +278,14 @@ export const verify = (registry: Registry.SyncRegistry) =>
         WHERE t.tgfoid = 'echo_sync.echo_sync_capture_changes'::regproc AND c.relname = ${table.name}
         ORDER BY n.nspname`
       let relations: ReadonlyArray<Relation> = attached
+      if (attached.length > 1) {
+        // echo_sync.log.table_name is unqualified: two captured relations of one name write
+        // indistinguishable log rows, however well-formed each is (attach refuses this).
+        mismatches.push({
+          table: table.name,
+          problem: `captured in ${attached.length} schemas (${attached.map((r) => r.schema).join(", ")}); the log names tables unqualified, so exactly one may be attached`
+        })
+      }
       if (attached.length === 0) {
         mismatches.push({
           table: table.name,

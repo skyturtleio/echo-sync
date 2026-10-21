@@ -171,8 +171,11 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
       todo(
         `Table ${from} is declared renamed to ${name}. Renames are never generated; apply by hand:`,
         `  ALTER TABLE ${quote(from)} RENAME TO ${quote(name)};`,
-        `  rename each index ${from}__<index> to ${name}__<index>, and re-run attach for ${name}.`,
-        `The steps below for ${name} depend on it and are TODOs too.`
+        ...was.indexes.map(
+          (i) => `  ALTER INDEX ${quote(indexName(from, i.name))} RENAME TO ${quote(indexName(name, i.name))};`
+        ),
+        `Re-run attach for ${name} at startup. The steps below for ${name} depend on this and are TODOs too;`,
+        `they use the new index names.`
       )
     }
 
@@ -188,16 +191,16 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
       const next = now.get(prior.name)
       if (next === undefined || next.kind !== prior.kind) blocked.add(prior.name)
     }
-    const emit = (statement: string, refs: ReadonlyArray<string>, ...comment: ReadonlyArray<string>) => {
+    /** The TODO a step referencing `refs` waits for, if any. */
+    const dependency = (refs: ReadonlyArray<string>) => {
       const on = refs.filter((r) => blocked.has(r))
-      if (from === undefined && on.length === 0) {
-        ddl(statement, ...comment)
-        return
-      }
-      todo(
-        `Depends on the ${from !== undefined ? `rename of table ${from}` : `TODO for ${on.map((c) => `${name}.${c}`).join(", ")}`} above; run by hand after it:`,
-        `  ${statement};`
-      )
+      if (from !== undefined) return `rename of table ${from}`
+      return on.length > 0 ? `TODO for ${on.map((c) => `${name}.${c}`).join(", ")}` : undefined
+    }
+    const emit = (statement: string, refs: ReadonlyArray<string>, ...comment: ReadonlyArray<string>) => {
+      const waits = dependency(refs)
+      if (waits === undefined) ddl(statement, ...comment)
+      else todo(`Depends on the ${waits} above; run by hand after it:`, `  ${statement};`)
     }
     // Columns in declaration order, so generated DDL follows the SyncTable.
     for (const column of table.columns) {
@@ -264,11 +267,15 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
     for (const prior of was.columns) {
       if (now.has(prior.name) || renameSources.has(prior.name)) continue
       const key = `${name}.${prior.name}`
+      const goes = was.indexes.filter((i) => i.columns.includes(prior.name)).map((i) => indexName(name, i.name))
       todo(
         drops.has(key)
           ? `Column ${key} is no longer declared and its drop is acknowledged. Drops are never generated; when no reader needs it:`
           : `Column ${key} is no longer declared; its data is kept. Acknowledge with acknowledgeDrops: ["${key}"]. To drop by hand:`,
-        `  ALTER TABLE ${quote(name)} DROP COLUMN ${quote(prior.name)};`
+        `  ALTER TABLE ${quote(name)} DROP COLUMN ${quote(prior.name)};`,
+        ...(goes.length > 0
+          ? [`PostgreSQL drops ${goes.join(", ")} with the column; any replacement index is a TODO below.`]
+          : [])
       )
     }
 
@@ -285,9 +292,28 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
     for (const prior of was.indexes) {
       const next = newIndexes.get(prior.name)
       if (next !== undefined && sameList(next.columns, prior.columns)) continue
-      // The live index still carries the previous table's name until a table rename is applied.
-      emit(`DROP INDEX ${quote(indexName(from ?? name, prior.name))}`, prior.columns)
-      if (next !== undefined) emit(createFor(next.name), next.columns)
+      const drop = `DROP INDEX ${quote(indexName(name, prior.name))}`
+      // A replacement is one unit: the CREATE reuses the name, so it can only run after the DROP.
+      const waits = dependency([...prior.columns, ...(next?.columns ?? [])])
+      if (waits === undefined) {
+        ddl(drop)
+        if (next !== undefined) ddl(createFor(next.name))
+        continue
+      }
+      // An index on a dropped column goes with the column (the drop TODO says so): no DROP INDEX.
+      // A kind change is hand-carried as add/backfill/drop, which may or may not have removed it.
+      const goesWithColumn = prior.columns.some((c) => !now.has(c) && !renameSources.has(c))
+      const changesKind = prior.columns.some((c) => {
+        const current = now.get(c)
+        return current !== undefined && old.get(c)?.kind !== current.kind
+      })
+      const statements = [
+        ...(goesWithColumn ? [] : [changesKind ? drop.replace("DROP INDEX ", "DROP INDEX IF EXISTS ") : drop]),
+        ...(next === undefined ? [] : [createFor(next.name)])
+      ]
+      if (statements.length > 0) {
+        todo(`Depends on the ${waits} above; run by hand after it:`, ...statements.map((st) => `  ${st};`))
+      }
     }
     for (const next of table.manifest.indexes) if (!oldIndexes.has(next.name)) emit(createFor(next.name), next.columns)
 
