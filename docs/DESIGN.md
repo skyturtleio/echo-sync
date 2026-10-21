@@ -1,6 +1,6 @@
 # Echo Sync — Design Baseline
 
-Status: baseline v0.2 (2026-10-21; v0.1 + foundation deltas: grants as SyncTable, per-page snapshots with staged apply, pinned index ordering, bigint Position, RowStore layering). This document consolidates three design threads and is
+Status: baseline v0.3 (2026-10-21; v0.2 + substrate deltas: PullPage|PullDone with opaque continuation, replace-on-null, client_scopes state-diff membership, own OpfsSqlite host, handover semantics). This document consolidates three design threads and is
 the single source of truth for implementation. Changes to this document require sign-off in
 the coordinator thread. When implementation reveals a design error, propose the change,
 do not silently diverge.
@@ -82,7 +82,8 @@ Engine tables (Postgres schema `echo_sync`):
 | `scope_grants` | a **system `SyncTable`** (`id`, `accessScopeId` = the granted scope, `principalId`, `role`, `grantedAt`); `role ∈ {reader, writer, owner}`; principal `*` = everyone (global catalogs). Replicates like any row so clients can run optimistic role checks. v1 disclosure policy: anyone who can read a scope sees who else is granted on it. Writes require `owner` on that scope; the only exception is scope creation (engine primitive: insert `access_scopes` row + first `owner` grant for the actor, allowed for any principal on a fresh id). `(accessScopeId, principalId)` is unique — derive `id` from it so duplicates are structurally impossible. |
 | `clients(client_id, principal_id, cursor, last_seen_at, created_at)` | one row per client device/profile |
 | `mutations(client_id, mutation_id, position, outcome, received_at)` | ledger: exactly-once + ack delivery |
-| `log(position, table_name, row_id, access_scope_id, op, txid, committed_at)` | change identity, not payload |
+| `client_scopes(client_id, position, scope_ids)` | the set of scopes a client **holds** as of each completed pull (written at `PullDone` under `nextCursor`, `ON CONFLICT DO NOTHING`; rows below the cursor a client presents are pruned on that pull). The wire cursor is a bare `Position`, and the held set cannot be rebuilt from the log (identity only, GC'd, revoke+re-grant cancels out), so it is recorded as an explicit fact. A presented cursor with no record ⇒ `ResnapshotRequired(unknownCursor)`, never trusted. |
+| `log(position, table_name, row_id, access_scope_id, op, txid, committed_at)` | change identity, not payload. `table_name` is the **sync table name**, the identity shared with clients (SQLite has no schemas), unqualified; `attach` maps it to exactly one Postgres relation and refuses a second relation with the same name in another schema. |
 | `migrations(...)` | `effect/sql/Migrator` history table (configured name) |
 
 Principals are opaque strings supplied by the app (`principalFor(request)`). Authentication is
@@ -181,8 +182,11 @@ v1 mechanism: the trigger function `echo_sync_capture_changes()` itself takes
 `pg_advisory_xact_lock(<echo key>)` before allocating a log position. Because the lock is
 transaction-scoped and taken inside the trigger, **every writer participates** (mutators,
 imports, scripts, cascades) without opt-in; positions are allocated in commit order. Ledger
-positions are allocated under the same lock. Scale-out path (xid-horizon / commit-ordered
-cursors) is documented, not built.
+positions are allocated under the same lock. Cost, accepted for v1: because the lock is
+transaction-scoped, writers to synced tables are **serialized from their first captured row
+until commit**, so a transaction that touches a synced table early and then does slow work
+holds every other synced writer. Keep such transactions short. Scale-out path (xid-horizon /
+commit-ordered cursors) is documented, not built.
 
 `TRUNCATE` does not fire row triggers: unsupported on synced tables in v1 (statement-level
 trigger raises). Retention: `echo_sync.log` is GC'd past a configurable horizon; a client whose
@@ -213,6 +217,18 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   mitigate with a large page size, not by applying early. (Under this load `PullPage` keeps being returned; the client keeps staging.)
 - `Position` is a branded `bigint` in memory (native comparison; `number` loses precision and
   string comparison is lexicographic) and a decimal string on the wire and in structured clone.
+  `@effect/sql-pg` 4.0.5 already decodes `int8` to `bigint` (verified), so the server needs no
+  extra decode. `PullContinuation` is declared in core as an opaque value (core cannot import
+  server); the server owns its Schema and encodes to that opaque form. It must survive
+  structured clone and storage in the client's staging table.
+- Membership is a **state diff, not a log replay**: at each page the server compares the scopes
+  the client holds (`client_scopes` at the cursor, §4) with the scopes readable in the page's
+  snapshot. Held-but-unreadable ⇒ `scopePurged`; readable-but-not-held ⇒ start a row walk;
+  outstanding walks continue; only when none remain does the page read log entries `> position`
+  in readable scopes. A log entry whose row is gone or whose row's current scope is unreadable
+  is delivered as a tombstone, so no payload ever leaves a readable scope. `ResnapshotRequired`
+  carries a reason (`gcHorizon | unknownCursor | staleContinuation`); the client treats every
+  reason the same way (discard staged pages, cursor `null`, replace the replica).
 - **Invariant: a pending mutation leaves the client's optimistic replay set only when the
   authoritative replica state covering its outcome has been installed**, i.e. when the pull
   that delivers its ack is applied. An ack alone never removes an optimistic mutation.
@@ -234,13 +250,27 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
 
 ## 9. Client
 
-- One **leader worker** (dedicated `Worker`) owns the single SQLite connection
-  (`@effect/sql-sqlite-wasm` `OpfsWorker`, AccessHandlePool VFS on OPFS — worker-only,
-  single connection by construction), the outbox, the sync loop, and query execution.
-- Leadership via Web Locks. Tabs reach the leader through a `SharedWorker` router holding a
-  `MessagePort` to the current leader; tab↔leader traffic is Effect RPC over the worker
-  transport. Fallback when `SharedWorker` is unavailable must be capability-tested and must
-  **never** allow a second DB owner; the exact support matrix is a spike deliverable.
+- One **leader worker** (dedicated `Worker`) owns the single SQLite connection (AccessHandlePool
+  VFS on OPFS — worker-only, single connection by construction), the outbox, the sync loop, and
+  query execution. The connection is hosted by our own `src/client/worker/OpfsSqlite.ts`, not
+  `@effect/sql-sqlite-wasm`'s `OpfsWorker.run`: that helper registers the VFS under the fixed name
+  `"opfs"`, which is also its OPFS directory, and takes exclusive access handles on every file in
+  it, so two identities (`appId`/`profile`) on one origin block each other (reproduced). Ours
+  speaks the same port protocol (so the stock `SqliteClient.layer({ worker })` drives it) with a
+  per-identity pool directory `echo-sync/<appId>/<profile>`. The protocol is internal to that
+  package: re-verify `OpfsSqlite.ts` on every `@effect/sql-sqlite-wasm` bump.
+- Leadership via Web Locks (`echo:<appId>:<profile>:leader`, plus per-incarnation and per-tab
+  locks for death detection; never timeouts). Tabs reach the leader through a `SharedWorker`
+  router that holds the leader's control port and relinks a fresh `MessageChannel` per tab;
+  tab↔leader traffic is Effect RPC over the worker transport. Handover: an in-flight request
+  fails with `LeaderUnavailable{LeaderLost}` (the tab cannot know whether it committed; `enqueue`
+  is idempotent on `mutationId` so retrying it is safe); an open subscription stream terminates
+  with the same error and the caller re-subscribes (the new leader cannot know which result
+  version was last seen, so a transparent resume would duplicate or skip). Without
+  `SharedWorker` (capability-tested) the mode is `single-tab`: secondary tabs fail closed with
+  `LeaderUnavailable{SecondaryTabWithoutRouter}` and take over only when the owner closes; a
+  second DB owner is unreachable in every mode because opening the database sits behind the
+  leader lock. Details and the support matrix: `docs/browser-substrate.md`.
 - Local mutation: in one SQLite transaction, append outbox entry + record undo images + apply
   handler. Only after commit does the caller see "saved".
 - On pull apply, in one SQLite transaction: undo pending optimistic effects (reverse order),
@@ -360,9 +390,9 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
 
 ## 16. Open items tracked by the coordinator
 
-1. Exact leader handover + RPC stream behavior across handover; browser support matrix.
-2. Grant-added snapshot delivery mechanics within paginated pull — resolved in §8 (row walk then log); verify in the server substrate tests.
+1. Leader handover + stream behavior — resolved in §9 / `docs/browser-substrate.md`; only Chromium is verified by test, other browsers are documentation-only (support matrix is a user decision when targets are known).
+2. Grant-added snapshot delivery — resolved in §8 (state diff + row walk then log), covered by the server substrate's grant / random grant-revoke tests.
 3. Global catalog snapshot format (leaning NDJSON+gzip) — deferred past v1 vertical slice.
 4. Protocol conformance test suite for a future non-TS client.
-5. Ledger retention / client epoch expiry policy, separate from log GC.
+5. Ledger retention / client epoch expiry policy, separate from log GC. v1: `collectGarbage` never touches the ledger or `client_scopes`. **Constraint on any future expiry:** a resnapshot acks only ledger rows that still exist, so if a client's ledger rows are expired while it still holds pending mutations, it re-pushes them and the server executes them again (double apply). Expiry must therefore forget the `clientId` binding and reject that client's later submissions as a terminal `ClientExpired` (client drops pending mutations with a notice) rather than treating them as new.
 6. Local full-text search: the pinned wa-sqlite build lacks FTS5 (§10); decide custom build vs. non-FTS search when the search primitive is scheduled.
