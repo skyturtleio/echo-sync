@@ -26,9 +26,12 @@ unordered idempotency key, `seq` the client's outbox sequence.
 - `log`: identity only, `(position, table_name, row_id, access_scope_id, op, txid, committed_at)`.
   `table_name` is the unqualified name, so `attach` refuses a second synced table with the same
   name in another schema (`TableNameConflict`).
-- `attach` is atomic and serialized. It runs the name check and both trigger DDLs in one
-  transaction (a savepoint inside a migration), behind a second advisory lock ("echosync" + 1,
-  so it doesn't stall writers). Two concurrent attaches of one name can't both pass the check.
+- `attach` is atomic and serialized. It owns its transaction at READ COMMITTED (calling it
+  inside a caller's transaction is a defect, DESIGN §4) and runs the name check and both trigger
+  DDLs in it, behind a second advisory lock ("echosync" + 1, so it doesn't stall writers).
+  READ COMMITTED matters: each statement after the lock gets a fresh snapshot, whereas an
+  ambient REPEATABLE READ snapshot taken earlier would miss a concurrent attach that already
+  committed (the reviewer's reproduction, now a test). Two concurrent attaches of one name can't both pass the check.
   A failure between the two DDLs leaves neither trigger, never a captured table that can still
   be truncated. Both cases are tested, with timing and failure injected through event triggers.
 - `echo_sync_capture_changes()`: row trigger. A delete, a scope move, or a primary-key change
@@ -64,6 +67,21 @@ returns, so that is a defect (tested). In one transaction:
    mutation that writes nothing still gets an ack position.
 
 Lock order is client row, then engine lock, everywhere, so the two can't deadlock.
+
+`seq < 1` is a malformed envelope (`MalformedEnvelope`), checked before anything else: nothing
+runs and nothing is recorded. `runBatch` checks every item first, so one bad item rejects the
+whole push. Without this guard, `seq ≤ 0` would fall under the default floor 0 and be answered
+`clientExpired` although it was never processed.
+
+Failures are classified over the whole `Cause`, never by its first reason:
+- the body counts as rejected only if its cause consists solely of `MutationRejected`; a
+  rejection combined with a defect (say, in a finalizer) is not ledgered;
+- the attempt becomes `MutationTransient` only if every reason is a SQL failure, either typed or
+  a cleanup defect carrying a `SqlError`;
+- anything else (a programmer defect, an interruption) is re-raised with the full cause, typed
+  failures turned into defects, so a bug never looks like a retryable transient.
+
+Both orderings of SQL defect and programmer defect are tested.
 
 `40001` and deadlocks are retried with a `Schedule` (default: 4 retries, exponential from
 10 ms). Anything else becomes `MutationTransient`, which means *outcome unknown*, not "not
@@ -241,3 +259,7 @@ done by hand while building this:
 | no future-position check on continuations | forged-continuation test |
 | no advisory lock in `attach` | concurrent-attach test |
 | `attach` DDLs not in one transaction | incomplete-attach test |
+| `attach` accepts an ambient transaction / no READ COMMITTED | REPEATABLE READ attach test |
+| outer `catchTag` + `catchDefect` instead of whole-cause classification | compound-cause test |
+| `catchTag("MutationRejected")` on the body | rejection-plus-defect test |
+| no `seq ≥ 1` guard | malformed-envelope test |
