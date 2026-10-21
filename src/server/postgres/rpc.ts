@@ -1,10 +1,10 @@
 import * as PgClient from "@effect/sql-pg/PgClient"
-import { DateTime, Effect, Layer, Option, Schema, Stream } from "effect"
+import { Cause, DateTime, Effect, Layer, Option, Schema, Stream } from "effect"
 import type { Headers } from "effect/http/Headers"
 import type * as HttpRouter from "effect/http/HttpRouter"
 import { RpcSerialization, RpcServer } from "effect/rpc"
 import { SqlClient } from "effect/sql/SqlClient"
-import type { SqlError } from "effect/sql/SqlError"
+import { isSqlError, type SqlError } from "effect/sql/SqlError"
 import { AccessScope, Ids, Mutation, Protocol, type Registry, Store } from "echo-sync"
 import { type ClientForbidden, type LedgerOptions, registerClient, runBatch } from "./ledger.ts"
 import { pull } from "./pull.ts"
@@ -29,6 +29,51 @@ const forbidden = (error: ClientForbidden) =>
 
 const serverUnavailable = (error: SqlError) =>
   new Protocol.ServerUnavailable({ message: `${error.reason._tag}: ${error.message}` })
+
+const isNotSql = <E>(error: E | SqlError): error is Exclude<E, SqlError> => !isSqlError(error)
+
+/**
+ * Whole-cause classification of a handler failure, precedence defect > transient > typed (DESIGN
+ * §6). A `SqlError` may arrive as a failure or, from the pinned client's `orDie` rollback on a
+ * dead connection, as a defect; both are infrastructure. Any other defect keeps the whole cause
+ * as defects, so a programmer bug is never reported as retryable. Without either, the typed
+ * failures (and any interruption) pass through.
+ */
+const classifyCause = <E>(
+  cause: Cause.Cause<E>
+):
+  | { readonly _tag: "defect"; readonly cause: Cause.Cause<never> }
+  | { readonly _tag: "unavailable"; readonly error: SqlError }
+  | { readonly _tag: "typed"; readonly cause: Cause.Cause<Exclude<E, SqlError>> } => {
+  if (cause.reasons.some((r) => Cause.isDieReason(r) && !isSqlError(r.defect))) {
+    return {
+      _tag: "defect",
+      cause: Cause.fromReasons(cause.reasons.map((r) => (Cause.isFailReason(r) ? Cause.makeDieReason(r.error) : r)))
+    }
+  }
+  for (const r of cause.reasons) {
+    const error = Cause.isFailReason(r) ? r.error : Cause.isDieReason(r) ? r.defect : undefined
+    if (isSqlError(error)) return { _tag: "unavailable", error }
+  }
+  return {
+    _tag: "typed",
+    cause: Cause.fromReasons(
+      cause.reasons.flatMap((r): ReadonlyArray<Cause.Reason<Exclude<E, SqlError>>> =>
+        Cause.isFailReason(r) ? (isNotSql(r.error) ? [Cause.makeFailReason(r.error)] : []) : [r]
+      )
+    )
+  }
+}
+
+/** Pull/pokes: infrastructure ⇒ `ServerUnavailable`; a defect from the server is always a bug. */
+const toServerFailure = <E>(
+  cause: Cause.Cause<E>
+): Effect.Effect<never, Exclude<E, SqlError> | Protocol.ServerUnavailable> => {
+  const verdict = classifyCause(cause)
+  return verdict._tag === "unavailable"
+    ? Effect.fail(serverUnavailable(verdict.error))
+    : Effect.failCause<Exclude<E, SqlError>>(verdict.cause)
+}
 
 const decodeRole = Schema.decodeUnknownOption(AccessScope.Role)
 
@@ -88,9 +133,15 @@ export const handlers = (options: SyncServerOptions) =>
             }
             return response
           }).pipe(
+            // Infrastructure before the first mutation (catalog read): nothing processed, a
+            // transient stop. runBatch already turns infrastructure failures inside it into one.
+            Effect.catchCause((cause) => {
+              const verdict = classifyCause(cause)
+              return verdict._tag === "unavailable"
+                ? Effect.succeed<Protocol.PushResponse>({ results: [] })
+                : Effect.failCause(verdict.cause)
+            }),
             Effect.catchTag("ClientForbidden", (e) => Effect.fail(forbidden(e))),
-            // Before the first mutation (catalog read): nothing processed, a transient stop.
-            Effect.catchTag("SqlError", () => Effect.succeed<Protocol.PushResponse>({ results: [] })),
             Effect.provideService(SqlClient, sql)
           ),
         pull: (request, { headers }) =>
@@ -104,9 +155,8 @@ export const handlers = (options: SyncServerOptions) =>
               limit: options.pageLimit ?? 500
             })
           }).pipe(
+            Effect.catchCause(toServerFailure),
             Effect.catchTag("ClientForbidden", (e) => Effect.fail(forbidden(e))),
-            // Infrastructure failure: typed transient, so a defect always means a bug (§6).
-            Effect.catchTag("SqlError", (e) => Effect.fail(serverUnavailable(e))),
             Effect.provideService(SqlClient, sql)
           ),
         pokes: ({ clientId }, { headers }) =>
@@ -116,13 +166,11 @@ export const handlers = (options: SyncServerOptions) =>
               yield* registerClient(principalId, clientId)
               const notifications = yield* pg.listen(pokeChannel)
               return Stream.fromQueue(notifications).pipe(Stream.map((): typeof Protocol.Poke.Type => ({})))
-            }).pipe(
-              Effect.catchTag("ClientForbidden", (e) => Effect.fail(forbidden(e))),
-              Effect.provideService(SqlClient, sql)
-            )
+            }).pipe(Effect.provideService(SqlClient, sql))
           ).pipe(
             // A lost LISTEN connection ends the stream typed; the client reconnects on any end (§6).
-            Stream.catchTag("SqlError", (e) => Stream.fail(serverUnavailable(e)))
+            Stream.catchCause((cause) => Stream.fromEffect(toServerFailure(cause))),
+            Stream.catchTag("ClientForbidden", (e) => Stream.fail(forbidden(e)))
           )
       })
     })

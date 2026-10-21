@@ -1,10 +1,11 @@
 import { assert, describe, it } from "@effect/vitest"
 import type * as PgClient from "@effect/sql-pg/PgClient"
-import { Array as Arr, Cause, Effect, Exit, Fiber, Layer, Option, Schedule, Schema, Stream } from "effect"
+import { Array as Arr, Cause, Context, Effect, Exit, Fiber, Layer, Option, Schedule, Schema, Stream } from "effect"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
 import { RpcClient, RpcSerialization } from "effect/rpc"
 import { SqlClient } from "effect/sql/SqlClient"
+import { SqlError, UnknownError } from "effect/sql/SqlError"
 import { AccessScope, Ids, Mutation, Protocol } from "echo-sync"
 import { layerHttp } from "./rpc.ts"
 import { grant, Items, pgAvailable, registry, RowId, TestDatabase } from "./test-support.ts"
@@ -24,31 +25,59 @@ const mutations = Mutation.makeRegistry([addItem])
  * A real RpcClient (HTTP POST, NDJSON) against the mounted router, as the browser transport
  * speaks it (DESIGN §6). The handler shares the test's database clients.
  */
-const connect = Effect.gen(function* () {
-  const db = yield* Effect.context<SqlClient | PgClient.PgClient>()
-  const app = layerHttp({
-    registry,
-    mutations,
-    principalFor: () => Effect.succeed(AccessScope.PrincipalId.make("p")),
-    ledger: { conflictRetry: undefined }
-  }).pipe(Layer.provide(Layer.succeedContext(db)))
-  const web = HttpRouter.toWebHandler(app, { disableLogger: true })
-  yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
-  const fetch: typeof globalThis.fetch = Object.assign(
-    (input: RequestInfo | URL, init?: RequestInit) => web.handler(new Request(input, init)),
-    { preconnect: globalThis.fetch.preconnect }
-  )
-  return yield* RpcClient.make(Protocol.SyncRpcs).pipe(
-    Effect.provide(
-      RpcClient.layerProtocolHttp({ url: "http://echo.test/sync" }).pipe(
-        Layer.provide([
-          RpcSerialization.layerNdjson,
-          FetchHttpClient.layer.pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch)(fetch)))
-        ])
+const connectWith = (wrap: (sql: SqlClient) => SqlClient) =>
+  Effect.gen(function* () {
+    const db = yield* Effect.context<SqlClient | PgClient.PgClient>()
+    const sql = Context.get(db, SqlClient)
+    return yield* connectTo(Context.add(db, SqlClient, wrap(sql)))
+  })
+
+const connectTo = (db: Context.Context<SqlClient | PgClient.PgClient>) =>
+  Effect.gen(function* () {
+    const app = layerHttp({
+      registry,
+      mutations,
+      principalFor: () => Effect.succeed(AccessScope.PrincipalId.make("p")),
+      ledger: { conflictRetry: undefined }
+    }).pipe(Layer.provide(Layer.succeedContext(db)))
+    const web = HttpRouter.toWebHandler(app, { disableLogger: true })
+    yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
+    const fetch: typeof globalThis.fetch = Object.assign(
+      (input: RequestInfo | URL, init?: RequestInit) => web.handler(new Request(input, init)),
+      { preconnect: globalThis.fetch.preconnect }
+    )
+    return yield* RpcClient.make(Protocol.SyncRpcs).pipe(
+      Effect.provide(
+        RpcClient.layerProtocolHttp({ url: "http://echo.test/sync" }).pipe(
+          Layer.provide([
+            RpcSerialization.layerNdjson,
+            FetchHttpClient.layer.pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch)(fetch)))
+          ])
+        )
       )
     )
-  )
-})
+  })
+
+const connect = connectWith((sql) => sql)
+
+/**
+ * A SqlClient whose transactions run `inner` replaced by `around(inner)`: deterministic fault
+ * injection at the transaction boundary (pull's REPEATABLE READ snapshot is its only one).
+ */
+const aroundTransactions =
+  (
+    around: (
+      inner: Effect.Effect<unknown, unknown, unknown>,
+      sql: SqlClient
+    ) => Effect.Effect<unknown, unknown, unknown>
+  ) =>
+  (sql: SqlClient): SqlClient =>
+    new Proxy(sql, {
+      get: (target, key, receiver) =>
+        key === "withTransaction"
+          ? (inner: Effect.Effect<unknown, unknown, unknown>) => target.withTransaction(around(inner, target))
+          : Reflect.get(target, key, receiver)
+    })
 
 const push = (ids: Arr.NonEmptyReadonlyArray<readonly [string, string]>) =>
   Protocol.PushRequest.make({
@@ -131,6 +160,39 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (§6, §8)", () => {
         client.pull({ clientId: Ids.ClientId.make("d"), cursor: null, continuation: Option.none() })
       )
       assert.deepStrictEqual(failureTag(exit), "ServerUnavailable")
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
+  it.live("a connection lost before ROLLBACK of a failed pull is ServerUnavailable, not the rollback's defect", () =>
+    Effect.gen(function* () {
+      yield* grant("p", "s1")
+      // Pull fails typed (unknownCursor) inside its snapshot; the backend then dies, so the
+      // pinned client's ROLLBACK raises a defect carrying a SqlError.
+      const client = yield* connectWith(
+        aroundTransactions((inner, sql) =>
+          Effect.tapError(inner, () => Effect.ignore(sql`SELECT pg_terminate_backend(pg_backend_pid())`))
+        )
+      )
+      const exit = yield* Effect.exit(
+        client.pull({ clientId: Ids.ClientId.make("d"), cursor: Ids.Position.make(1n), continuation: Option.none() })
+      )
+      assert.deepStrictEqual(failureTag(exit), "ServerUnavailable")
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
+  it.live("a SQL failure together with a programmer defect under pull still reaches the client as a defect", () =>
+    Effect.gen(function* () {
+      yield* grant("p", "s1")
+      const sqlError = new SqlError({ reason: new UnknownError({ cause: null, message: "connection lost" }) })
+      const client = yield* connectWith(
+        aroundTransactions(() =>
+          Effect.failCause(Cause.fromReasons([Cause.makeFailReason(sqlError), Cause.makeDieReason(new Error("bug"))]))
+        )
+      )
+      const exit = yield* Effect.exit(
+        client.pull({ clientId: Ids.ClientId.make("d"), cursor: null, continuation: Option.none() })
+      )
+      assert.isTrue(Exit.hasDies(exit), failureTag(exit))
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
