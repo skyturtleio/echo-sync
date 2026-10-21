@@ -412,8 +412,9 @@ seq, position)` is kept forever; only its `outcome` (and `acked_at`) is cleared.
   statements. A presented cursor proves the client installed every ack at or below it (§8: acks
   for `(cursor, nextCursor]` arrive in the set that produced the cursor). A row never stamped is
   never expired, whatever its age; an expired row is never stamped again.
-- **`expireLedger({ retention })`** (default 7 days; a retention below 48 h throws
-  `LedgerRetentionTooShort` when the job is constructed) is one run, by the Effect `Clock` like
+- **`expireLedger({ retention })`** (default 7 days; a retention below 48 h fails the Effect with
+  a typed `LedgerRetentionTooShort` before any SQL, so a scheduled job fails on its first run and
+  can `catchTag` it) is one run, by the Effect `Clock` like
   `collectGarbage`; the app schedules it (`examples/server` runs it hourly). One READ COMMITTED
   transaction sets `outcome = NULL, acked_at = NULL` on every row with an outcome and
   `acked_at ≤ now − retention`, and per client raises `expired_through` to the highest cleared

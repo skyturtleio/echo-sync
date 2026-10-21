@@ -426,11 +426,25 @@ describe.skipIf(!pgAvailable)("ledger expiry (DESIGN §16 item 5)", () => {
       }).pipe(Effect.provide(EmptyDatabase))
   )
 
-  it("a retention below 48 h is refused when the job is constructed", () => {
-    assert.throws(() => expireLedger({ retention: "47 hours" }), LedgerRetentionTooShort)
-    assert.doesNotThrow(() => expireLedger({ retention: "48 hours" }))
-    assert.doesNotThrow(() => expireLedger())
-  })
+  it.live(
+    "a retention below 48 h fails the job typed with LedgerRetentionTooShort before touching the ledger; 48 h runs",
+    () =>
+      Effect.gen(function* () {
+        const c = yield* ledgerClient
+        yield* c.submit("m1", 1)
+        yield* c.replica.sync()
+        yield* c.replica.sync()
+        yield* ageAcks(10)
+        const before = yield* c.state
+        // Constructing it never throws; the failure is in the error channel, so a scheduler can catchTag it.
+        const tooShort = expireLedger({ retention: "47 hours" })
+        const failure = yield* Effect.flip(tooShort)
+        assert.instanceOf(failure, LedgerRetentionTooShort)
+        assert.deepStrictEqual([failure.retentionMillis, failure.minimumMillis], [47 * 3_600_000, 48 * 3_600_000])
+        assert.deepStrictEqual(yield* c.state, before, "nothing expired")
+        assert.deepStrictEqual(yield* expireLedger({ retention: "48 hours" }), { clients: 1, expired: 1 })
+      }).pipe(Effect.provide(TestDatabase))
+  )
 })
 
 /** A well-formed, decodable continuation for client `d` of principal `p`. */
