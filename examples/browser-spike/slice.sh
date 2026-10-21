@@ -306,7 +306,7 @@ return { released: (await Promise.all(['$c1', '$c2', '$c3'].map((id) => released
 await watch()
 return await converged([row('$c1', 't1'), row('$c2', 't2'), row('$c3', 't3')], 20000)" >/dev/null
   # Both offline, both edit all three rows: c1 different fields, c2 the same field, c3 A's edit is one the
-  # server's real mutator rejects (blocked title; control no-reject: an ordinary title).
+  # server's real mutator rejects (blocked title; control no-reject switches off only the server's check).
   ab tab "$CB" >/dev/null
   b1=$(ev <<<"$(npre "$S")
 echo.setOffline(true)
