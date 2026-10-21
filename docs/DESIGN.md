@@ -134,6 +134,18 @@ reactivity keys. Column naming on the wire and in SQL is `snake_case`; TS is `ca
 Mapping rules are explicit and finite. Supported leaf types map to native columns (text,
 integer, double, boolean, timestamptz/text-ISO, uuid/text); `NullOr` ⇒ nullable; anything else
 that is `Schema.Struct`/`Array`/`Union`/etc. ⇒ JSON column decoded with the same Schema.
+
+Field admissibility, enforced by `SyncTable.make` (a rejected field is a construction error,
+not a runtime surprise): a field's encoded form must always carry the key (no encoded-side
+defaults or optional keys; `NullOr` is the only way to say "absent"), so §11's key-presence rule
+is true for every table; a field schema must have no service requirements (`R = never`), since
+row codecs run at storage and wire edges with no context; and a transformed field (e.g. a
+branded or refined timestamp) must round-trip through every codec, nullable or not. The
+manifest hashes the **storage shape only** (columns, column kinds, nullability, indexes).
+Refinements and brands are validation, not storage: changing one does not change the manifest
+and does not rebuild the replica, because a rebuild would refetch the same rows; tightening a
+refinement against existing data is a §11 backfill (expand → backfill → enforce), never a hash
+change.
 Unsupported or ambiguous mappings (e.g. a bare `Schema.Number` with no integer/finite
 refinement where the dialect needs to know) **fail at declaration time with a clear error**;
 nothing is guessed.
