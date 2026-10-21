@@ -174,7 +174,9 @@ Outcomes: permanent failures (decode, forbidden, domain error) are recorded in t
 processed-with-typed-error and the batch continues; transient failures (serialization `40001`
 after bounded retries, connection) stop the batch at that mutation without recording it, so the
 client retries from there and ordering is preserved. Retried mutations with a known identity
-return the recorded outcome without re-executing.
+return the recorded outcome without re-executing. Every push outcome carries the ledger
+`position` it was recorded at, so the client can tell whether its installed replica already
+covers it (§8).
 
 ## 7. Log ordering invariant
 
@@ -235,7 +237,12 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   reason the same way (discard staged pages, cursor `null`, replace the replica).
 - **Invariant: a pending mutation leaves the client's optimistic replay set only when the
   authoritative replica state covering its outcome has been installed**, i.e. when the pull
-  that delivers its ack is applied. An ack alone never removes an optimistic mutation.
+  that delivers its ack is applied. An ack alone never removes an optimistic mutation. One
+  corollary, not an exception: a push outcome whose ledger `position ≤` the client's current
+  cursor is **already covered** by the installed replica (pull acks only `(cursor, nextCursor]`,
+  so no later pull will ever ack it), and the client releases it on receipt of the push
+  response, with the outcome as its notice. This is how a mutation that was duplicated into the
+  outbox after its original was released (§9) terminates instead of staying pending forever.
 - Initial sync = pull from `null` cursor. The log may be GC'd, so it cannot be log-driven:
   the server keyset-paginates current rows of all readable scopes by `(table, id)` with
   per-page snapshots, records the max position `head` at the first page, then continues with
@@ -280,6 +287,15 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
 - On pull apply, in one SQLite transaction: undo pending optimistic effects (reverse order),
   apply server changes, drop acked mutations, re-run still-pending mutations. Rejected mutations
   are dropped and surfaced as typed notices (retained for inspection, not silently erased).
+- Outbox idempotency must outlive release. `enqueue` is idempotent on `mutationId` so a retry
+  after `LeaderLost` is safe, but the original may already have been pushed, acked, pulled and
+  released in the retry window; a retry that then inserts a fresh row would replay the effect
+  optimistically a second time and (see §8) get a position the pull window never acks. So
+  release **marks** the outbox row (`released_at`) instead of deleting it; `enqueue` of a known
+  id, pending or released, returns its original `seq` and inserts nothing; `pending()` excludes
+  released rows; released rows are pruned after a retention window (default 24 h, far beyond any
+  handover retry). The §8 position rule is the backstop if a released row has already been
+  pruned.
 - Replica is disposable; outbox is not. Schema manifest change ⇒ rebuild replica, keep outbox.
 - `navigator.storage.persist()`, pending-writes warning on clear/sign-out, export of pending
   mutations.
