@@ -125,7 +125,9 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
     )
   })
 
-  // Each case starts from a verified v1 database and breaks one thing by hand.
+  // Each case starts from a verified v1 database and breaks one thing by hand. A statement
+  // prefixed with FAILS is expected to fail.
+  const FAILS = "!"
   const drifted: ReadonlyArray<[string, string, string]> = [
     ["a declared column dropped", "ALTER TABLE docs DROP COLUMN score", "docs: declared column score is missing"],
     [
@@ -153,7 +155,62 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
       "ALTER TABLE docs DROP CONSTRAINT docs_title_rank_key",
       "docs: declared unique set (title, rank)"
     ],
-    ["capture detached", "DROP TRIGGER echo_sync_capture ON tags", "tags: not attached"]
+    ["capture detached", "DROP TRIGGER echo_sync_capture ON tags", "tags: not attached"],
+    [
+      "a disabled capture trigger on scope_grants (never re-attached at startup)",
+      "ALTER TABLE echo_sync.scope_grants DISABLE TRIGGER echo_sync_capture",
+      "scope_grants: echo_sync capture trigger"
+    ],
+    [
+      "a second captured relation of the same name, in a schema sorting after the good one",
+      "CREATE SCHEMA zz;CREATE TABLE zz.tags (id text PRIMARY KEY);CREATE TRIGGER echo_sync_capture AFTER INSERT OR UPDATE OR DELETE ON zz.tags FOR EACH ROW EXECUTE FUNCTION echo_sync.echo_sync_capture_changes();CREATE TRIGGER echo_sync_reject_truncate BEFORE TRUNCATE ON zz.tags FOR EACH STATEMENT EXECUTE FUNCTION echo_sync.reject_truncate()",
+      "tags: (in schema zz) declared column name is missing"
+    ],
+    [
+      "a disabled truncate guard",
+      "ALTER TABLE tags DISABLE TRIGGER echo_sync_reject_truncate",
+      "tags: echo_sync truncate guard trigger"
+    ],
+    [
+      "a capture trigger restricted to INSERT",
+      "CREATE OR REPLACE TRIGGER echo_sync_capture AFTER INSERT ON tags FOR EACH ROW EXECUTE FUNCTION echo_sync.echo_sync_capture_changes()",
+      "tags: echo_sync capture trigger"
+    ],
+    [
+      "a capture trigger with a WHEN clause",
+      "CREATE OR REPLACE TRIGGER echo_sync_capture AFTER INSERT OR UPDATE OR DELETE ON tags FOR EACH ROW WHEN (pg_trigger_depth() < 1) EXECUTE FUNCTION echo_sync.echo_sync_capture_changes()",
+      "tags: echo_sync capture trigger"
+    ],
+    [
+      "a capture trigger that fires only for UPDATE OF one column",
+      "CREATE OR REPLACE TRIGGER echo_sync_capture AFTER INSERT OR UPDATE OF name OR DELETE ON tags FOR EACH ROW EXECUTE FUNCTION echo_sync.echo_sync_capture_changes()",
+      "tags: echo_sync capture trigger"
+    ],
+    [
+      "a declared index marked invalid",
+      "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'docs__by_at'::regclass",
+      "docs: index docs__by_at is"
+    ],
+    [
+      "a unique set backed only by an index left invalid by a failed CREATE UNIQUE INDEX CONCURRENTLY",
+      `ALTER TABLE docs DROP CONSTRAINT docs_title_rank_key;INSERT INTO docs (id, access_scope_id, title, label, rank, score, done, at, meta) VALUES ('d1', 's', 't', null, 1, 0, true, null, '{"tags":[]}'), ('d2', 's', 't', null, 1, 0, true, null, '{"tags":[]}');${FAILS}CREATE UNIQUE INDEX CONCURRENTLY docs_title_rank_key ON docs (title, rank)`,
+      "docs: declared unique set (title, rank)"
+    ],
+    [
+      "a unique set (title, rank) replaced by UNIQUE (title) INCLUDE (rank)",
+      "ALTER TABLE docs DROP CONSTRAINT docs_title_rank_key;CREATE UNIQUE INDEX docs_title_inc ON docs (title) INCLUDE (rank)",
+      "docs: declared unique set (title, rank)"
+    ],
+    [
+      "a unique set made NULLS NOT DISTINCT",
+      "ALTER TABLE docs DROP CONSTRAINT docs_title_rank_key;CREATE UNIQUE INDEX docs_title_rank_nnd ON docs (title, rank) NULLS NOT DISTINCT",
+      "docs: declared unique set (title, rank)"
+    ],
+    [
+      "a unique set whose key is DESC",
+      "ALTER TABLE docs DROP CONSTRAINT docs_title_rank_key;CREATE UNIQUE INDEX docs_title_rank_desc ON docs (title, rank DESC)",
+      "docs: declared unique set (title, rank)"
+    ]
   ]
   for (const [label, sabotage, expected] of drifted) {
     it.layer(EmptyDatabase)((db) => {
@@ -162,12 +219,47 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
           const sql = yield* SqlClient
           yield* startUp(v1, yield* load([first]))
           assert.deepStrictEqual(yield* driftOf(v1), [])
-          for (const statement of sabotage.split(";")) yield* sql.unsafe(statement)
+          for (const statement of sabotage.split(";")) {
+            if (!statement.startsWith(FAILS)) {
+              yield* sql.unsafe(statement)
+              continue
+            }
+            // The sabotage itself must fail (leaving its debris behind), or the case tests nothing.
+            const exit = yield* Effect.exit(sql.unsafe(statement.slice(FAILS.length)))
+            assert.isTrue(exit._tag === "Failure", `expected "${statement}" to fail`)
+          }
           const mismatches = yield* driftOf(v1)
           assert.isTrue(
             mismatches.some((m) => m.startsWith(expected)),
             `expected a mismatch starting "${expected}", got ${JSON.stringify(mismatches)}`
           )
+        })
+      )
+    })
+  }
+  // Changes the policy allows: INCLUDE payload is not key; extra columns and indexes are fine.
+  const accepted: ReadonlyArray<[string, string]> = [
+    [
+      "a declared index rebuilt as a covering index with an INCLUDE payload",
+      "DROP INDEX docs__by_at;CREATE INDEX docs__by_at ON docs (at ASC NULLS FIRST, id ASC) INCLUDE (title)"
+    ],
+    [
+      "a unique set backed by a unique index with an INCLUDE payload",
+      "ALTER TABLE docs DROP CONSTRAINT docs_title_rank_key;CREATE UNIQUE INDEX docs_title_rank_inc ON docs (title, rank) INCLUDE (score)"
+    ],
+    [
+      "an extra undeclared column and index",
+      "ALTER TABLE docs ADD COLUMN extra int;CREATE INDEX docs_extra ON docs (extra)"
+    ]
+  ]
+  for (const [label, change] of accepted) {
+    it.layer(EmptyDatabase)((db) => {
+      db.effect(`the verifier accepts ${label}`, () =>
+        Effect.gen(function* () {
+          const sql = yield* SqlClient
+          yield* startUp(v1, yield* load([first]))
+          for (const statement of change.split(";")) yield* sql.unsafe(statement)
+          assert.deepStrictEqual(yield* driftOf(v1), [])
         })
       )
     })

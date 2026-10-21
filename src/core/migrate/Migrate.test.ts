@@ -12,6 +12,8 @@ const snapshotOf = (...tables: ReadonlyArray<SyncTable.AnySyncTable>) =>
   Migrate.decodeSnapshot(Migrate.encodeSnapshot(Migrate.snapshotOf(Registry.make(tables))))
 const ddlOf = (steps: ReadonlyArray<Migrate.Step>) => steps.flatMap((s) => (s._tag === "Ddl" ? [s.sql] : []))
 const todos = (steps: ReadonlyArray<Migrate.Step>) => steps.filter((s) => s._tag === "Todo")
+const lines = (steps: ReadonlyArray<Migrate.Step>) =>
+  todos(steps).map((s) => (s._tag === "Todo" ? s.lines.join("\n") : ""))
 
 describe("the generator never emits DDL for a rename, drop, lossy type change or unique-set change (DESIGN §11)", () => {
   const v1 = SyncTable.make(
@@ -84,6 +86,57 @@ describe("the generator never emits DDL for a rename, drop, lossy type change or
     expect(() => Migrate.plan(before, registry, { renames: { columns: { docs: { heading: "nope" } } } })).toThrow(
       Migrate.MigrationPlanError
     )
+  })
+})
+
+describe("DDL that depends on a TODO rename or kind change is a TODO too (DESIGN §11)", () => {
+  it("a combined table and column rename is one table TODO and one column TODO, no DDL, no intent error", () => {
+    const v1 = SyncTable.make("docs", { ...base, title: Schema.String, body: Schema.String })
+    const v2 = SyncTable.make("articles", { ...base, heading: Schema.String, body: Schema.String })
+    const steps = Migrate.plan(snapshotOf(v1), Registry.make([v2]), {
+      renames: { tables: { articles: "docs" }, columns: { articles: { heading: "title" } } }
+    })
+    expect(ddlOf(steps)).toEqual([])
+    const text = lines(steps)
+    expect(text.length).toBe(2)
+    expect(text[0]).toContain('ALTER TABLE "docs" RENAME TO "articles"')
+    expect(text[1]).toContain('ALTER TABLE "articles" RENAME COLUMN "title" TO "heading"')
+  })
+
+  it("an index on a renamed column, and any change on a renamed table, is a TODO; unrelated changes stay DDL", () => {
+    const v1 = SyncTable.make(
+      "docs",
+      { ...base, title: Schema.String, rank: Schema.Int },
+      { indexes: { by_title: ["title"] } }
+    )
+    const v2 = SyncTable.make(
+      "docs",
+      { ...base, heading: Schema.String, rank: Schema.Int, note: Schema.NullOr(Schema.String) },
+      { indexes: { by_heading: ["heading"], by_rank: ["rank"] } }
+    )
+    const steps = Migrate.plan(snapshotOf(v1), Registry.make([v2]), {
+      renames: { columns: { docs: { heading: "title" } } }
+    })
+    expect(ddlOf(steps)).toEqual([
+      'ALTER TABLE "docs" ADD COLUMN "note" text COLLATE "C"',
+      'CREATE INDEX "docs__by_rank" ON "docs" ("rank" ASC NULLS FIRST, "id" ASC)'
+    ])
+    const text = lines(steps).join("\n")
+    expect(text).toContain('DROP INDEX "docs__by_title"')
+    expect(text).toContain('CREATE INDEX "docs__by_heading" ON "docs" ("heading" ASC NULLS FIRST, "id" ASC)')
+
+    const renamed = SyncTable.make(
+      "articles",
+      { ...base, title: Schema.String, rank: Schema.Int, note: Schema.NullOr(Schema.String) },
+      { indexes: { by_title: ["title", "rank"] } }
+    )
+    const moved = Migrate.plan(snapshotOf(v1), Registry.make([renamed]), { renames: { tables: { articles: "docs" } } })
+    expect(ddlOf(moved)).toEqual([])
+    const movedText = lines(moved).join("\n")
+    expect(movedText).toContain('ALTER TABLE "articles" ADD COLUMN "note" text COLLATE "C"')
+    // The live index still has the previous table's name until the rename is applied.
+    expect(movedText).toContain('DROP INDEX "docs__by_title"')
+    expect(movedText).toContain('CREATE INDEX "articles__by_title"')
   })
 })
 

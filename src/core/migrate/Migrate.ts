@@ -9,7 +9,8 @@
  * Only safe operations become DDL: create table, add a nullable column, add a NOT NULL column
  * with an intent default (added with the default, which is then dropped), `DROP NOT NULL`, and
  * index add / drop / change. Renames, column and table drops, lossy type changes, unique-set
- * changes and backfills become commented TODOs, never DDL, whatever the intent says.
+ * changes and backfills become commented TODOs, never DDL, whatever the intent says, and so
+ * does any step that references a table or column whose rename, drop or kind change is a TODO.
  *
  * `scope_grants` is the engine's table (created by `001_engine`) and is never planned here.
  */
@@ -138,9 +139,11 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
     if (!after.has(to) || before.has(to)) fail(`renames.tables: "${to}" is not a newly declared table`)
     if (!before.has(from) || after.has(from)) fail(`renames.tables: "${from}" is not a removed table`)
   }
+  /** The previous manifest of a current table, resolved through a declared table rename. */
+  const previousOf = (table: string) => before.get(table) ?? before.get(tableRenames.get(table) ?? "")
   for (const [table, columns] of Object.entries(intent.renames?.columns ?? {})) {
     const now = after.get(table)
-    const was = before.get(table)
+    const was = previousOf(table)
     if (now === undefined || was === undefined) fail(`renames.columns: "${table}" is not a table in both manifests`)
     for (const [to, from] of Object.entries(columns)) {
       if (!now?.manifest.columns.some((c) => c.name === to) || was?.columns.some((c) => c.name === to)) {
@@ -154,18 +157,9 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
 
   for (const table of tables) {
     const name = table.name
-    const was = before.get(name)
+    const from = before.has(name) ? undefined : tableRenames.get(name)
+    const was = previousOf(name)
     if (was === undefined) {
-      const from = tableRenames.get(name)
-      if (from !== undefined) {
-        todo(
-          `Table ${from} is declared renamed to ${name}. Renames are never generated; apply by hand:`,
-          `  ALTER TABLE ${quote(from)} RENAME TO ${quote(name)};`,
-          `  rename each index ${from}__<index> to ${name}__<index>, re-run attach for ${name},`,
-          `  and reconcile any column or index differences between the two manifests.`
-        )
-        continue
-      }
       ddl(
         table.postgres.createTable,
         `New table ${name}. Run attach(${name}) at server startup (outside this transaction).`
@@ -173,23 +167,50 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
       for (const index of table.postgres.createIndexes) ddl(index)
       continue
     }
+    if (from !== undefined) {
+      todo(
+        `Table ${from} is declared renamed to ${name}. Renames are never generated; apply by hand:`,
+        `  ALTER TABLE ${quote(from)} RENAME TO ${quote(name)};`,
+        `  rename each index ${from}__<index> to ${name}__<index>, and re-run attach for ${name}.`,
+        `The steps below for ${name} depend on it and are TODOs too.`
+      )
+    }
 
     const renames = new Map(Object.entries(intent.renames?.columns?.[name] ?? {}))
     const renameSources = new Set(renames.values())
     const old = new Map(was.columns.map((c) => [c.name, c]))
     const now = new Map(table.manifest.columns.map((c) => [c.name, c]))
+    // Columns whose rename, drop or kind change is a TODO (old and new names): DDL that
+    // references one cannot assume the column exists in its declared shape (§11), and neither
+    // can any DDL on a table whose rename is a TODO.
+    const blocked = new Set<string>([...renames.keys(), ...renameSources])
+    for (const prior of was.columns) {
+      const next = now.get(prior.name)
+      if (next === undefined || next.kind !== prior.kind) blocked.add(prior.name)
+    }
+    const emit = (statement: string, refs: ReadonlyArray<string>, ...comment: ReadonlyArray<string>) => {
+      const on = refs.filter((r) => blocked.has(r))
+      if (from === undefined && on.length === 0) {
+        ddl(statement, ...comment)
+        return
+      }
+      todo(
+        `Depends on the ${from !== undefined ? `rename of table ${from}` : `TODO for ${on.map((c) => `${name}.${c}`).join(", ")}`} above; run by hand after it:`,
+        `  ${statement};`
+      )
+    }
     // Columns in declaration order, so generated DDL follows the SyncTable.
     for (const column of table.columns) {
       const c = { name: column.name, kind: column.kind, nullable: column.nullable }
       const prior = old.get(c.name)
       const key = `${name}.${c.name}`
       if (prior === undefined) {
-        const from = renames.get(c.name)
-        if (from !== undefined) {
-          const source = old.get(from)
+        const previousName = renames.get(c.name)
+        if (previousName !== undefined) {
+          const source = old.get(previousName)
           todo(
-            `Column ${name}.${from} is declared renamed to ${c.name}. Renames are never generated; apply by hand:`,
-            `  ALTER TABLE ${quote(name)} RENAME COLUMN ${quote(from)} TO ${quote(c.name)};`,
+            `Column ${name}.${previousName} is declared renamed to ${c.name}. Renames are never generated; apply by hand:`,
+            `  ALTER TABLE ${quote(name)} RENAME COLUMN ${quote(previousName)} TO ${quote(c.name)};`,
             ...(source !== undefined && (source.kind !== c.kind || source.nullable !== c.nullable)
               ? [
                   `  then reconcile the type/nullability change (${source.kind}${source.nullable ? " null" : ""} → ${c.kind}${c.nullable ? " null" : ""}).`
@@ -200,22 +221,24 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
         }
         const type = columnType(c.kind)
         if (c.nullable) {
-          ddl(`ALTER TABLE ${quote(name)} ADD COLUMN ${quote(c.name)} ${type}`)
+          emit(`ALTER TABLE ${quote(name)} ADD COLUMN ${quote(c.name)} ${type}`, [c.name])
           continue
         }
         const value = defaults.get(key)
         if (value !== undefined) {
           usedDefaults.add(key)
-          ddl(
+          emit(
             `ALTER TABLE ${quote(name)} ADD COLUMN ${quote(c.name)} ${type} NOT NULL DEFAULT ${value}`,
+            [c.name],
             `The default backfills existing rows once and is dropped next: every insert carries every`,
             `declared column (§5), and the live catalog keeps no default the manifest does not know.`
           )
-          ddl(`ALTER TABLE ${quote(name)} ALTER COLUMN ${quote(c.name)} DROP DEFAULT`)
+          emit(`ALTER TABLE ${quote(name)} ALTER COLUMN ${quote(c.name)} DROP DEFAULT`, [c.name])
           continue
         }
-        ddl(
+        emit(
           `ALTER TABLE ${quote(name)} ADD COLUMN ${quote(c.name)} ${type}`,
+          [c.name],
           `Expand step: added nullable; see the TODO below to reach NOT NULL.`
         )
         todo(...notNullSequence(name, c.name))
@@ -230,8 +253,9 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
       }
       if (prior.nullable && !c.nullable) todo(...notNullSequence(name, c.name))
       if (!prior.nullable && c.nullable) {
-        ddl(
+        emit(
           `ALTER TABLE ${quote(name)} ALTER COLUMN ${quote(c.name)} DROP NOT NULL`,
+          [c.name],
           `Loss-free, but dataHash changes: every client rebuilds its replica. A client still at the old`,
           `manifest cannot decode a null in ${key}, so ship clients before writing nulls.`
         )
@@ -261,10 +285,11 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
     for (const prior of was.indexes) {
       const next = newIndexes.get(prior.name)
       if (next !== undefined && sameList(next.columns, prior.columns)) continue
-      ddl(`DROP INDEX ${quote(indexName(name, prior.name))}`)
-      if (next !== undefined) ddl(createFor(next.name))
+      // The live index still carries the previous table's name until a table rename is applied.
+      emit(`DROP INDEX ${quote(indexName(from ?? name, prior.name))}`, prior.columns)
+      if (next !== undefined) emit(createFor(next.name), next.columns)
     }
-    for (const next of table.manifest.indexes) if (!oldIndexes.has(next.name)) ddl(createFor(next.name))
+    for (const next of table.manifest.indexes) if (!oldIndexes.has(next.name)) emit(createFor(next.name), next.columns)
 
     // Unique sets: TODO only (adding can fail on data; removing needs the generated constraint name).
     const oldUnique = new Set(was.unique.map(setKey))
@@ -302,7 +327,7 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
     const removed =
       column === undefined
         ? before.has(d) && !after.has(d)
-        : (before.get(table ?? "")?.columns.some((c) => c.name === column) ?? false) &&
+        : (previousOf(table ?? "")?.columns.some((c) => c.name === column) ?? false) &&
           !(after.get(table ?? "")?.manifest.columns.some((c) => c.name === column) ?? true)
     if (!removed) fail(`acknowledgeDrops: "${d}" is not a removed table or column`)
   }
