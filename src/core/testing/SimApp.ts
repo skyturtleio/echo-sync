@@ -64,7 +64,22 @@ const remove = Mutation.make("remove", {
   handler: (ctx, { id }) => ctx.store.delete(Counters, id)
 })
 
-export const mutations = Mutation.makeRegistry([create, increment, transfer, move, remove])
+/**
+ * Creates a scope (DESIGN §4), then optionally creates a counter in it. A counter id that exists
+ * makes the mutation fail after the claim, so a test can reach a rejected creation.
+ */
+const createScope = Mutation.make("createScope", {
+  args: Schema.Struct({ scope: AccessScope.AccessScopeId, counter: Schema.NullOr(CounterId) }),
+  handler: (ctx, { scope, counter }) =>
+    Effect.gen(function* () {
+      yield* ctx.store.createScope(scope)
+      if (counter !== null) {
+        yield* ctx.store.insert(Counters, { id: counter, accessScopeId: scope, value: 0, updatedAt: ctx.now })
+      }
+    })
+})
+
+export const mutations = Mutation.makeRegistry([create, increment, transfer, move, remove, createScope])
 
 export const ANYONE = AccessScope.Everyone
 export const scope = (id: string) => AccessScope.AccessScopeId.make(id)

@@ -224,6 +224,59 @@ describe("reconciliation simulation", () => {
     })
   )
 
+  it.effect(
+    "the reference server's scope claim: an applied creation takes the id, a rejected one leaves it fresh, and an orphaned scope is never re-claimable (DESIGN §4)",
+    () =>
+      Effect.gen(function* () {
+        const server = RefServer.make({ pageSize: 10 })
+        const seqs = new Map<string, number>()
+        const submit = (client: string, who: string, args: { scope: string; counter: string | null }) =>
+          Effect.gen(function* () {
+            server.register(client, principal(who))
+            const seq = (seqs.get(client) ?? 0) + 1
+            seqs.set(client, seq)
+            const response = yield* server.push(
+              {
+                clientId: Ids.ClientId.make(client),
+                mutations: [{ mutationId: id(`${client}-${seq}`), seq: Ids.Seq.make(seq), name: "createScope", args }]
+              },
+              Option.none()
+            )
+            const outcome = response.results[0]?.outcome
+            return outcome === undefined ? "none" : outcome._tag === "Applied" ? "Applied" : outcome.error._tag
+          })
+        const owners = (scopeId: string) =>
+          Effect.map(server.store.scan(ScopeGrants.ScopeGrants), (rows) =>
+            rows.filter((r) => r["access_scope_id"] === scopeId).map((r) => `${r["principal_id"]}:${r["role"]}`)
+          )
+        yield* server.writeDirect([{ table: Counters, id: "taken", row: Option.some(counterRow("taken", 0)) }])
+
+        // Applied: the id is taken, by p as owner; q cannot create it again.
+        assert.strictEqual(yield* submit("cp", "p", { scope: "A", counter: null }), "Applied")
+        assert.deepStrictEqual(yield* owners("A"), ["p:owner"])
+        assert.strictEqual(yield* submit("cq", "q", { scope: "A", counter: null }), "ScopeForbidden")
+        assert.deepStrictEqual(yield* owners("A"), ["p:owner"])
+
+        // Rejected after the claim (the counter id exists): no grant, and the id stays fresh.
+        assert.strictEqual(yield* submit("cq", "q", { scope: "B", counter: "taken" }), "RowAlreadyExists")
+        assert.deepStrictEqual(yield* owners("B"), [])
+        assert.strictEqual(yield* submit("cr", "r", { scope: "B", counter: null }), "Applied")
+        assert.deepStrictEqual(yield* owners("B"), ["r:owner"])
+
+        // Orphaned: every grant of A is gone (a replica would call A fresh), but A stays taken.
+        yield* server.writeDirect([
+          {
+            table: ScopeGrants.ScopeGrants,
+            id: ScopeGrants.grantId(scope("A"), principal("p")),
+            row: Option.none()
+          }
+        ])
+        assert.deepStrictEqual(yield* owners("A"), [])
+        assert.strictEqual(yield* submit("cq", "q", { scope: "A", counter: null }), "ScopeForbidden")
+        assert.deepStrictEqual(yield* owners("A"), [])
+      })
+  )
+
   // Reviewer's reproduction: interrupt at every scheduler boundary of one transaction.
   it("an interrupted storage transaction commits rows, seq and meta together or not at all", async () => {
     const split: Array<number> = []
