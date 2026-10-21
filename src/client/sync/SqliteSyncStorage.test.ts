@@ -392,7 +392,7 @@ it.effect("a database created by main's first outbox DDL migrates forward: undo 
 )
 
 it.live(
-  "a transaction queued behind a long one can be interrupted while it waits; the rest commit, one at a time",
+  "a transaction or admitted statement queued behind a long transaction can be interrupted while it waits; the rest commit, one at a time",
   () =>
     Effect.gen(function* () {
       const { storage } = yield* makeStorage
@@ -428,8 +428,10 @@ it.live(
       const a = yield* queued("a")
       const x = yield* queued("x")
       const b = yield* queued("b")
+      // `admit` (the leader's exec/subscribe path) waits on the same permit.
+      const y = yield* Effect.forkChild(storage.admit(Effect.sync(() => ran.push("y"))))
       for (let i = 0; i < 100; i++) yield* Effect.yieldNow
-      const interrupting = yield* Effect.forkChild(Fiber.interrupt(x))
+      const interrupting = yield* Effect.forkChild(Fiber.interruptAll([x, y]))
       for (let i = 0; i < 100; i++) yield* Effect.yieldNow
       // The interrupt completes while the holder still owns the connection.
       const done = interrupting.pollUnsafe() !== undefined

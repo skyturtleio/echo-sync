@@ -195,6 +195,10 @@ tables and replica schema, one transaction) and builds `Engine.make` over the SQ
   from one tab or several, each get a distinct gap-free seq, but in no promised order. A mutate queued
   behind a long pull install can be interrupted while it waits; its handler never runs, and the interrupt
   completes no later than the end of the holder's transaction.
+- Every tab RPC that touches SQLite takes the same permit: `enqueue`/`exportPending` through the
+  engine's storage transaction, each `subscribe` emission's read transaction through it too, and `exec`
+  and `notices` through `admit` (permit, no transaction of its own). None waits on the connection lease uncancellably.
+  `exec` is for the harness and diagnostics: its writes bypass the engine (no outbox row, no undo image).
 
 ## Tests
 

@@ -162,7 +162,16 @@ const toEnvelope = (entry: Outbox.OutboxEntry): Effect.Effect<Mutation.MutationE
  * The storage port over `sql`. `rows` is the SQLite `ReplicaRowStore` for `registry` on the same
  * connection, so its statements join this storage's transactions.
  */
-export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry): Engine.SyncStorage => {
+/** The engine's storage port plus admission for SQL the leader runs outside the engine. */
+export interface SqliteSyncStorage extends Engine.SyncStorage {
+  /**
+   * Run `self` holding the storage permit but with no transaction of its own (statements autocommit),
+   * so SQL outside the engine (the tab `exec`/`subscribe` RPCs) waits as cancellably as `transaction`.
+   */
+  readonly admit: <A, E, R>(self: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
+}
+
+export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry): SqliteSyncStorage => {
   const rows = SqliteRowStore.make(sql, registry)
   const permit = Semaphore.makeUnsafe(1)
   const run = <A>(effect: Effect.Effect<A, SqlError, SqlClient.SqlClient>) =>
@@ -194,12 +203,13 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
   })
 
   return {
+    admit: (self) => permit.withPermit(self),
     // BEGIN/COMMIT failures map like any statement's; the body's own errors pass through unchanged.
     // `withTransaction` waits for the connection lease uninterruptibly; waiting for `permit` first makes
     // a transaction queued behind a long one (e.g. a pull install) cancellable while it waits. Admission
     // is serialized, not fair (DESIGN §9, aa267ac): a fiber that just released may take the permit again
     // ahead of a waiter. Order between mutations comes from the caller sequencing them, never from here.
-    // The lease still serializes against SQL that bypasses this storage.
+    // The leader runs its own SQL through `admit` or `transaction`, so nothing it serves bypasses the permit.
     transaction: (self) =>
       permit
         .withPermit(sql.withTransaction(self))

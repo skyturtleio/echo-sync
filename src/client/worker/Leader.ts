@@ -81,13 +81,14 @@ const localOnly: Engine.Transport<never> = {
 
 const makeHandlers = (
   sql: SqlClient.SqlClient,
-  storage: Engine.SyncStorage,
+  storage: SqliteSyncStorage.SqliteSyncStorage,
   engine: Engine.Engine<unknown>,
   loop: SyncLoop.SyncLoop | undefined,
   info: { leaderId: string; clientId: string; dbName: string; syncing: boolean }
 ) =>
   LeaderRpcs.toHandlers({
-    exec: ({ sql: text, params }) => sql.unsafe<Row>(text, params).pipe(Effect.mapError(toFailure)),
+    // Every RPC takes the storage permit, so one queued behind a long install is cancellable while it waits.
+    exec: ({ sql: text, params }) => storage.admit(sql.unsafe<Row>(text, params).pipe(Effect.mapError(toFailure))),
     enqueue: ({ envelope }) =>
       engine.mutate(envelope.mutationId, envelope.name, envelope.args).pipe(
         Effect.tap(() => loop?.wake ?? Effect.void),
@@ -99,15 +100,16 @@ const makeHandlers = (
         .reactive(
           query.tables,
           // One read transaction per emission, so a batch never mixes replica versions (DESIGN §10).
-          sql.withTransaction(Effect.forEach(query.statements, (s) => sql.unsafe<Row>(s.sql, s.params)))
+          storage
+            .transaction(
+              Effect.forEach(query.statements, (s) => sql.unsafe<Row>(s.sql, s.params)).pipe(Effect.mapError(toFailure))
+            )
+            .pipe(Effect.catchTag("StoreUnavailable", (error) => Effect.fail(unavailable(error))))
         )
-        .pipe(
-          Stream.map((results) => ({ results })),
-          Stream.mapError(toFailure)
-        ),
+        .pipe(Stream.map((results) => ({ results }))),
     leaderInfo: () => Effect.succeed(info),
     syncStatus: () => (loop === undefined ? Stream.fail(new SyncDisabled()) : loop.changes),
-    notices: () => SqliteSyncStorage.notices(sql).pipe(Effect.mapError(unavailable)),
+    notices: () => storage.admit(SqliteSyncStorage.notices(sql)).pipe(Effect.mapError(unavailable)),
     // Reads the outbox only: never depends on push state, so a halted push cannot block recovery.
     exportPending: () =>
       storage.transaction(storage.pending).pipe(
