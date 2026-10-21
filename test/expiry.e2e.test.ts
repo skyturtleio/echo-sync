@@ -96,7 +96,10 @@ describe.skipIf(!pgAvailable)("expiry floor (DESIGN §16.5) against the real ser
           yield* engine.mutate(mid("m3"), "items.add", { id: "i3", body: "above the floor" })
           assert.deepStrictEqual(yield* items, ["i1", "i2", "i3"]) // i2 and i3 are optimistic
 
-          // The operator raises the floor past m2, as expiry would once m2's ledger row is gone.
+          // Synthetic fixture standing in for expiry: the floor is raised past m2 by hand. A compliant
+          // retention floor (DESIGN §16.5: never above the client's last presented cursor, only after the
+          // released-row window) could not cover a never-pushed m2, so this proves the protocol and the
+          // client's settlement of an expired seq, not a legal retention lifecycle.
           yield* pg`UPDATE echo_sync.clients SET expired_through = 2,
             expired_position = (SELECT position FROM echo_sync.mutations WHERE client_id = ${clientId} AND mutation_id = 'm1')
             WHERE client_id = ${clientId}`
