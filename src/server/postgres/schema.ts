@@ -1,4 +1,4 @@
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import * as PgMigrator from "@effect/sql-pg/PgMigrator"
 import { SqlClient } from "effect/sql/SqlClient"
 import engine from "./migrations/001_engine.ts"
@@ -36,10 +36,12 @@ export class TableNameConflict extends Schema.TaggedError<TableNameConflict>()("
  * Starts change capture on an app table. The table must have `id` (primary key, text-castable)
  * and `access_scope_id text not null`. Idempotent.
  *
- * Atomic: the name check and both triggers commit together (a savepoint when called inside a
- * migration's transaction), so a table is never captured but truncatable. Attaches serialize on
- * an engine advisory lock, so two concurrent attaches of one name from different schemas cannot
- * both pass the check.
+ * Owns its transaction, at READ COMMITTED: the name check and both triggers commit together, so
+ * a table is never captured but truncatable. Attaches serialize on an engine advisory lock, and
+ * READ COMMITTED gives the check a fresh snapshot after the lock, so two concurrent attaches of
+ * one name from different schemas cannot both pass. Inside a caller's transaction (e.g. a
+ * REPEATABLE READ snapshot taken before a concurrent attach committed) the check could miss that
+ * attach, so calling it there is a defect (DESIGN §4).
  *
  * Every writer participates: mutators, imports, scripts, and cascades all go through the row
  * trigger, which takes the engine lock before allocating a log position (§7).
@@ -47,12 +49,16 @@ export class TableNameConflict extends Schema.TaggedError<TableNameConflict>()("
 export const attach = (tableName: string) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient
+    if (Option.isSome(yield* Effect.serviceOption(sql.transactionService))) {
+      return yield* Effect.die("attach must own its transaction; do not call it inside withTransaction")
+    }
     yield* sql.withTransaction(
       Effect.gen(function* () {
+        yield* sql`SET TRANSACTION ISOLATION LEVEL READ COMMITTED`
         // Engine key + 1 ("echosync" + 1): distinct from the position lock, so attaching does
         // not stall writers.
         yield* sql`SELECT pg_advisory_xact_lock(7305797848413072996)`
-        // A fresh statement snapshot after the lock: a concurrent attach that held it is visible.
+        // READ COMMITTED: a fresh statement snapshot after the lock sees any attach that held it.
         const target = yield* sql<{ schema: string; name: string }>`
           SELECT n.nspname AS schema, c.relname AS name FROM pg_class c
           JOIN pg_namespace n ON n.oid = c.relnamespace

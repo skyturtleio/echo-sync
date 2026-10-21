@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect } from "effect"
+import { Deferred, Effect, Exit, Fiber } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { attach, syncedTables } from "./schema.ts"
 import { grant, pgAvailable, Replica, serverView, TestDatabase } from "./test-support.ts"
@@ -99,5 +99,40 @@ describe.skipIf(!pgAvailable)("change capture (§7)", () => {
       const triggers = yield* sql<{ tgname: string }>`SELECT tgname FROM pg_trigger WHERE tgrelid = 'half'::regclass`
       assert.deepStrictEqual(triggers, [])
     }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live(
+    "attach inside a caller's REPEATABLE READ transaction is refused (its stale snapshot would admit a duplicate name)",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient
+        yield* sql`CREATE SCHEMA a`
+        yield* sql`CREATE SCHEMA b`
+        for (const schema of ["a", "b"]) {
+          yield* sql`CREATE TABLE ${sql(schema)}.dup (id text PRIMARY KEY, access_scope_id text NOT NULL)`
+        }
+        // The reviewer's reproduction: T2 fixes a snapshot, T1 attaches a.dup and commits, T2 attaches b.dup.
+        const snapshotTaken = yield* Deferred.make<void>()
+        const otherAttached = yield* Deferred.make<void>()
+        const t2 = yield* Effect.forkChild(
+          Effect.exit(
+            sql.withTransaction(
+              Effect.gen(function* () {
+                yield* sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`
+                yield* sql`SELECT 1`
+                yield* Deferred.succeed(snapshotTaken, undefined)
+                yield* Deferred.await(otherAttached)
+                yield* attach("b.dup")
+              })
+            )
+          )
+        )
+        yield* Deferred.await(snapshotTaken)
+        yield* attach("a.dup")
+        yield* Deferred.succeed(otherAttached, undefined)
+        const exit = yield* Fiber.join(t2)
+        assert.isTrue(Exit.hasDies(exit))
+        assert.strictEqual((yield* syncedTables).filter((t) => t.name === "dup").length, 1)
+      }).pipe(Effect.provide(TestDatabase))
   )
 })
