@@ -189,6 +189,12 @@ tables and replica schema, one transaction) and builds `Engine.make` over the SQ
   halted) are RPCs on `LeaderRpcs`.
 - `RpcClient.layerProtocolHttp({ url })` posts to `<url>/` (trailing slash): the server route must accept
   it. The harness's fake server normalizes it.
+- Ordering (DESIGN §9): the storage permit serializes transactions and makes a queued one cancellable,
+  but it is not fair: a releasing fiber may barge ahead of a waiter. Order among one tab's mutations
+  comes from the caller: await each `enqueue` before issuing the next. Enqueues issued concurrently,
+  from one tab or several, each get a distinct gap-free seq, but in no promised order. A mutate queued
+  behind a long pull install can be interrupted while it waits; its handler never runs, and the interrupt
+  completes no later than the end of the holder's transaction.
 
 ## Tests
 
