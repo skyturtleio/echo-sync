@@ -18,6 +18,7 @@
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner"
 import type * as Context from "effect/Context"
+import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
@@ -179,7 +180,13 @@ export const makeHandlers = ({
             readOnly(
               Effect.gen(function* () {
                 const rows = storage.rows
-                const instance = Store.make(rows, { actor, roleFor: Engine.roleFromGrants(rows, actor) })
+                // Query handlers get a ReadStore, so createScope is unreachable: no claim, no clock.
+                const instance = Store.make(rows, {
+                  actor,
+                  roleFor: Engine.roleFromGrants(rows, actor),
+                  claimScope: () => Effect.succeed(false),
+                  now: DateTime.makeUnsafe(0)
+                })
                 const result = yield* Query.run(queries, name, args, instance.store).pipe(
                   // A failed run still read tables; the stream ends with its error either way.
                   Effect.ensuring(Effect.flatMap(instance.reads, (tables) => watch([...tables])))

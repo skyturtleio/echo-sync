@@ -491,10 +491,12 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
     createScope: (scopeId) =>
       Effect.gen(function* () {
         const forbidden = Effect.gen(function* () {
-          const held = yield* options.roleFor(scopeId)
+          const held = yield* roleFor(scopeId)
           return yield* new ScopeForbidden({ scopeId, required: "owner", held: Option.getOrNull(held) })
         })
         if (options.actor === Everyone) return yield* forbidden
+        // A replica's claim reads scope_grants; record it like any role lookup (DESIGN §10.1).
+        yield* read(ScopeGrants)
         if (!(yield* options.claimScope(scopeId))) return yield* forbidden
         const id = grantId(scopeId, options.actor)
         const encoded = yield* encode(ScopeGrants, {
