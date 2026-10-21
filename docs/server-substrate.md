@@ -26,8 +26,9 @@ A column the app added to the relation but not to the SyncTable never leaves the
 there is one definition of the encoding (core's). Writes go the other way: each wire value is
 encoded through `column.postgres`, jsonb bound with `PgTypes.jsonb`. A stored row that fails to
 decode is a defect. Tested: a table with a timestamp and an undeclared column (walk and log
-paths), and `RowStore.range` against core's reference predicate and order (code-point text,
-NULLS FIRST ascending).
+paths), and core's `Conformance.rowStore` suite (`conformance.test.ts`): seeded random range
+plans against `Store.planMatches`/`planOrder`, exact read/write round-trips, and all-or-nothing
+transactions under failure, defect and interruption at every boundary, on attached tables.
 
 Only registry tables that are attached are synced (`resolveTables`). A captured relation outside
 the registry is skipped; its log entries arrive as tombstones, never as payloads.
@@ -323,7 +324,7 @@ done by hand while building this:
 | retry only when every reason is a conflict | conflict-plus-rejection retry and exhaustion tests |
 | retry despite a defect in the cause | conflict-plus-defect test |
 | `SELECT t.*` / undecoded payloads | wire-form test, every scope test |
-| `ASC NULLS LAST`, or jsonb not bound as jsonb | RowStore range test |
+| `ASC NULLS LAST`, or jsonb not bound as jsonb | Conformance.rowStore (range, read/write) |
 | a transient stop turned into a die | connection-lost-mid-batch RPC test |
 | mutation transaction at READ COMMITTED | two-client increment and same-id insert tests |
 | RowStore defaulting an unmapped table to `public` | unattached-table test |
