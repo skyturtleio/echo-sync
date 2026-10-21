@@ -502,12 +502,24 @@ const todosByProject = Query.make("todos.byProject", {
   - Verifier policy: extra undeclared live columns and extra indexes are allowed; a declared
     column missing, of the wrong type (text without `COLLATE "C"` included) or nullability,
     a declared index or unique set missing or with different key columns / order / `NULLS`
-    placement, a primary key not on `id`, a missing `echo_sync` capture trigger, or a registry
-    table that is not attached, is drift. Scope: registry tables including `scope_grants`; the
-    engine's own tables are not checked. Compare the structured catalog (`pg_index.indkey`,
+    placement, a primary key not on `id`, a missing or non-functional `echo_sync` trigger
+    (either of capture / truncate guard absent, disabled, or with the wrong timing, events,
+    `WHEN` clause or column list — check `tgenabled`, `tgtype`, `tgqual`, `tgattr` on every
+    relation carrying the function, not the first), or a registry table that is not attached,
+    is drift. A declared index or unique set is compared against a **valid, ready, live**
+    index (`indisvalid`, `indisready`, `indislive`) whose **key** columns (`indnkeyatts`, not
+    `INCLUDE` payload) match in order, collation and `NULLS` placement; a unique set's expected
+    shape is the one `SyncTable`'s DDL generates (`NULLS DISTINCT`, default placement), which
+    differs from query indexes (`NULLS FIRST`). Scope: registry tables including
+    `scope_grants`; the engine's own tables are not checked. Compare the structured catalog (`pg_index.indkey`,
     `indoption`, `indcollation`, `pg_attribute`), never a string match against generated DDL.
     The result is one typed `Drift` error listing every mismatch; the server runs it after
     `migrate` and before serving.
+  - Any generated DDL step that references a table or column whose rename, drop or kind
+    change is itself a TODO is emitted as a TODO too, in dependency order after it, never as
+    executable DDL against a relation the module cannot assume exists. The generator resolves
+    the previous manifest through table renames before diffing columns, so a combined
+    table-and-column rename produces one table TODO and one column TODO, not an intent error.
 - **Additive column evolution (observed on pinned Effect 4.0.5 `Schema.Struct`):** wire and
   storage row codecs **drop excess keys on decode** and **fail on a missing key**. Never set
   `onExcessProperty: "error"` on row codecs. Consequences, which are the v1 rule: (1) a new
