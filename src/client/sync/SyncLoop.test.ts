@@ -3,7 +3,7 @@ import { Cause, Effect, Schema } from "effect"
 import { RpcClientError } from "effect/rpc"
 import { TestClock } from "effect/testing"
 import { Ids, Protocol } from "echo-sync"
-import type * as Engine from "./Engine.ts"
+import * as Engine from "./Engine.ts"
 import * as SyncLoop from "./SyncLoop.ts"
 import * as Transport from "./Transport.ts"
 
@@ -137,5 +137,37 @@ it.effect("a transient failure alone (RpcClientError) is retried, never halts", 
     yield* settle
     expect(calls.push).toBe(2)
     expect((yield* loop.status).push).toEqual({ _tag: "Active" })
+  })
+)
+
+it.effect("a pull that fails with MalformedChange is retried with backoff and never halts push", () =>
+  Effect.gen(function* () {
+    const calls = { push: 0, pull: 0 }
+    const engine: Engine.Engine<never> = {
+      mutate: () => Effect.die("unused"),
+      push: Effect.sync(() => {
+        calls.push++
+        return { processed: 0, stopped: false }
+      }),
+      pull: Effect.suspend(() => {
+        calls.pull++
+        return calls.pull === 1
+          ? Effect.fail(new Engine.MalformedChange({ table: "t", message: "row does not decode" }))
+          : Effect.void
+      })
+    }
+    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush })
+    yield* Effect.forkChild(loop.run)
+    yield* settle
+    const failed = yield* loop.status
+    expect(failed.push).toEqual({ _tag: "Active" })
+    expect(failed.lastError).toContain("MalformedChange")
+    yield* TestClock.adjust("999 millis")
+    yield* settle
+    expect(calls.pull).toBe(1)
+    yield* TestClock.adjust("1 millis")
+    yield* settle
+    expect(calls).toEqual({ push: 2, pull: 2 })
+    expect(yield* loop.status).toEqual({ push: { _tag: "Active" }, lastError: null })
   })
 )
