@@ -576,16 +576,23 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
   re-sends the latest state. A `track` call never blocks snapshot delivery or reconnect, and a
   `track` whose stream has closed is dropped. The tab API therefore guarantees only that the
   latest desired state is eventually visible while the stream is open.
-  Latest-wins is strict and enforced at the receiver (§12 revision fencing): the tab assigns a
-  `revision` to every desired state it accepts, strictly increasing per `(room, tab)` for the
-  life of the `presence` stream (the join carries revision 0 with the initial state; each
-  accepted `track` increments it). Revisions are tab-owned, so they survive handover (the tab
-  re-sends its latest `(state, revision)` to the new leader) and a leader never generates one.
-  Both senders carry the revision with the state; the leader's entry keeps the highest
-  revision it has accepted and never sends a lower one after a higher one. A `track` attempt
-  that timed out or was interrupted may still reach the server later; the server's fence makes
-  that harmless, so no sender waits for a cancelled attempt to finish before sending a newer
-  state, and no client-side reconciliation against snapshots is needed.
+  Latest-wins is strict and enforced at the receiver (§12 revision fencing): the tab owns one
+  `revision` counter per `(room, tab)` for the **life of the tab client** (amendment after the
+  87a85e8 review: it lives outside any per-stream cell and is never reset when a `presence`
+  stream closes and a new one opens; a fresh tab id starts at 0). The counter is consumed by
+  every tab-side event that the server may see out of order: the first open of a room, each
+  accepted `track`, every later re-open, and every handover rejoin (`LeaderLost`) each take the
+  next value, and a join carries the latest desired state with that value. Leader-initiated
+  rejoins (idle timeout, `Unauthorized` retry, sender restart) re-send the leader's latest
+  `(state, revision)` unchanged; a leader never generates a revision. The leader's entry keeps
+  the highest revision it has accepted and never sends a lower one after a higher one. The
+  `(state, revision)` pair a join or sender uses is captured in one synchronous step, never a
+  revision read before and a state read after an intervening effect. A `track` or `room`
+  attempt that timed out or was interrupted may still reach the server later; the §12 fence
+  makes that harmless, so no sender waits for a cancelled attempt before sending a newer state,
+  and no client-side reconciliation against snapshots is needed. Accepted residue: two attempts
+  carrying the *same* revision (a leader rejoin retried with no intervening `track`) may replace
+  each other once, which costs one extra rejoin and never strands or regresses state.
 - **Typed notice decoding** (ruling from the HeyBabe trial): a retained notice carries the
   envelope's `args` and a `DomainError.error` as `Schema.Json`, so a mutation's static types stop
   at the notice. The stored notice shape, `Notice = Rejected { envelope, error } |
@@ -815,12 +822,18 @@ const todosByProject = Query.make("todos.byProject", {
   announced. **Revision fencing (coordinator ruling, ws/presence-client review):** the payload
   of `room` and `track` carries `revision` (a non-negative integer assigned by the tab, see
   §9.1 Presence); the entry stores the revision it was installed with, and `track` is a no-op
-  when its `revision` is not greater than the stored one. A rejoin installs the carried
-  `(state, revision)` unconditionally (it is a new entry). A cancelled or timed-out `track`
-  is therefore never a remote completion barrier the client must wait for: a late request
-  that reaches the server after a newer one cannot overwrite it, and the room converges on
-  the highest revision the tab has sent. Required field, lands with the presence client
-  before any app consumes presence. `room` is an `AccessScopeId`: the principal must hold a grant in that scope
+  when its `revision` is not greater than the stored one. A join whose `revision` is **greater
+  than or equal to** the stored one installs the carried `(state, revision)`, replacing the
+  entry and ending the older stream as above; a join whose `revision` is **lower** is a
+  superseded attempt (amendment after the 87a85e8 review): the server installs nothing, leaves
+  the entry and its stream untouched, and ends the superseded stream without emitting an
+  element (the only case in which a `room` stream carries no snapshot; no live client observes
+  it, because a client issues a new join only after abandoning the old attempt). Fencing is
+  therefore by revision for both joins and tracks, so neither a late `track` nor a late `room`
+  request from an abandoned attempt, an old leader, or a closed-and-reopened subscription can
+  displace a newer entry. A cancelled or timed-out request is never a remote completion
+  barrier the client must wait for, and the room converges on the highest revision the tab has
+  sent. Required field, lands with the presence client before any app consumes presence. `room` is an `AccessScopeId`: the principal must hold a grant in that scope
   (`roleFor`, same check as reads) or the call fails `Unauthorized`. `state` is `Schema.Json`;
   `RoomSnapshot` is `{ room, entries: ReadonlyArray<{ principalId, clientId, tabId, state }> }`,
   emitted on join and on every change (coalescing allowed). Server state is in-memory and
