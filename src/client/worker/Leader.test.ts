@@ -11,7 +11,8 @@ import * as Engine from "../sync/Engine.ts"
 import * as SqliteSyncStorage from "../sync/SqliteSyncStorage.ts"
 import * as SyncLoop from "../sync/SyncLoop.ts"
 import { enqueueAndWake, makeHandlers } from "./Leader.ts"
-import { LeaderRpcs } from "./LeaderRpcs.ts"
+import { type LeaderCalls, tabApi } from "./LeaderClient.ts"
+import { LeaderRpcs, LeaderUnavailable } from "./LeaderRpcs.ts"
 
 const T = SyncTable.make("t", { id: Schema.String.pipe(Schema.brand("TId")), accessScopeId: AccessScope.AccessScopeId })
 const registry = Registry.make([T])
@@ -195,7 +196,8 @@ const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
       mutations: Mutation.makeRegistry([addRaw]),
       transport: {
         push: () => Effect.die(new Error("no transport")),
-        pull: () => Effect.die(new Error("no transport"))
+        pull: () =>
+          Effect.succeed(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "2", expiredThrough: 0 }))
       }
     })
     const handlers = yield* makeHandlers({
@@ -359,5 +361,115 @@ it.live("revoking a grant re-emits a live query whose handler only used db.query
       storage.rows.write(ScopeGrants.ScopeGrants, ScopeGrants.grantId(scope, me), Option.none())
     )
     expect(yield* next).toEqual(0)
+  }).pipe(Effect.scoped)
+)
+
+// ---------------------------------------------------------------------------------------------
+// Tab-side API (DESIGN §9.1) over a real leader, with leader loss injected between tab and leader
+// ---------------------------------------------------------------------------------------------
+
+const leaderLost = new LeaderUnavailable({ reason: "LeaderLost", message: "injected" })
+
+/** `LeaderCalls` straight onto the leader's handlers; tests override the calls they inject faults into. */
+const passThrough = (client: Effect.Success<ReturnType<typeof leaderRpc>>["client"]): LeaderCalls => ({
+  enqueue: (envelope) => client.enqueue({ envelope }),
+  subscribe: (name, args) => client.subscribe({ name, args }),
+  notices: client.notices(),
+  dismissNotices: (ids) => client.dismissNotices({ ids })
+})
+
+it.live("mutate retried across LeaderLost after the lost leader committed leaves exactly one outbox row", () =>
+  Effect.gen(function* () {
+    const { client, count } = yield* leaderRpc({ allowRawExec: false })
+    const presented: Array<string> = []
+    // The first attempt commits on the leader, then the tab sees the leader go away before the reply.
+    const enqueue: LeaderCalls["enqueue"] = (envelope) =>
+      Effect.suspend(() => {
+        presented.push(envelope.mutationId)
+        const real = client.enqueue({ envelope })
+        return presented.length === 1 ? Effect.andThen(real, Effect.fail(leaderLost)) : real
+      })
+    const api = tabApi({ ...passThrough(client), enqueue })
+    const enqueued = yield* api.mutate(addRaw, { id: "r1" })
+    expect(presented.length).toBe(2)
+    // Fails if a retry minted a new id: the second attempt would append a second entry (and a second apply).
+    expect(new Set(presented).size).toBe(1)
+    expect(yield* count("echo_outbox")).toBe(1)
+    expect(yield* count("raw")).toBe(1)
+    expect(enqueued.seq).toBe(1)
+  }).pipe(Effect.scoped)
+)
+
+it.live("a query subscription across handover keeps the last emission until the new leader's fresh one", () =>
+  Effect.gen(function* () {
+    const { client, write, row } = yield* leaderRpc({ allowRawExec: false })
+    yield* write(Flags, row("f", "c"))
+    const lost = yield* Deferred.make<void>()
+    const elected = yield* Deferred.make<void>()
+    let opens = 0
+    const subscribe: LeaderCalls["subscribe"] = (name, args) =>
+      Stream.suspend(() => {
+        opens++
+        const real = client.subscribe({ name, args })
+        // First leader: ends with LeaderLost when `lost` fires. Next leader: answers once `elected` fires.
+        return opens === 1
+          ? real.pipe(Stream.interruptWhen(Effect.andThen(Deferred.await(lost), Effect.fail(leaderLost))))
+          : Stream.unwrap(Effect.as(Deferred.await(elected), real))
+      })
+    const api = tabApi({ ...passThrough(client), subscribe })
+    const ended = yield* Deferred.make<string>()
+    const emissions = yield* Queue.unbounded<{ readonly target: string; readonly n: number }>()
+    yield* Effect.forkScoped(
+      Stream.runForEach(api.subscribe(pick, {}), (a) => Queue.offer(emissions, a)).pipe(
+        Effect.exit,
+        Effect.flatMap((exit) =>
+          Deferred.succeed(ended, Exit.isFailure(exit) ? String(Cause.squash(exit.cause)) : "done")
+        )
+      )
+    )
+    const next = Queue.take(emissions).pipe(Effect.timeout("5 seconds"))
+    expect(yield* next).toEqual({ target: "c", n: 0 })
+    yield* Deferred.succeed(lost, undefined)
+    yield* Effect.sleep("150 millis")
+    // Written while no leader serves this tab: nothing may be emitted (no reset, no error) until a fresh run.
+    yield* write(C, row("c1"))
+    yield* Effect.sleep("150 millis")
+    expect(yield* Queue.size(emissions)).toBe(0)
+    expect(yield* Deferred.poll(ended)).toEqual(Option.none())
+    yield* Deferred.succeed(elected, undefined)
+    expect(yield* next).toEqual({ target: "c", n: 1 })
+    expect(opens).toBe(2)
+    expect(yield* Deferred.poll(ended)).toEqual(Option.none())
+  }).pipe(Effect.scoped)
+)
+
+const noticeFor = (mutationId: string, seq: number) => ({
+  _tag: "OutcomeUnknown" as const,
+  envelope: {
+    clientId: Ids.ClientId.make("c"),
+    mutationId: Ids.MutationId.make(mutationId),
+    seq: Ids.Seq.make(seq),
+    name: "raw.add",
+    args: {}
+  }
+})
+
+const ids = (list: ReadonlyArray<{ readonly notice: { readonly envelope: { readonly mutationId: string } } }>) =>
+  list.map((n) => n.notice.envelope.mutationId)
+
+it.live("a dismissed notice is gone from the notices stream, and an undismissed one survives a pull", () =>
+  Effect.gen(function* () {
+    const { client, storage, engine } = yield* leaderRpc({ allowRawExec: false })
+    yield* storage.transaction(storage.addNotices([noticeFor("m1", 1), noticeFor("m2", 2)]))
+    const api = tabApi(passThrough(client))
+    const { next } = yield* collect(api.notices)
+    const first = yield* next
+    expect(ids(first)).toEqual(["m1", "m2"])
+    const m1 = first.find((n) => n.notice.envelope.mutationId === "m1")
+    yield* api.dismissNotices(m1 === undefined ? [] : [m1.id])
+    expect(ids(yield* next)).toEqual(["m2"])
+    yield* engine.pull
+    const afterPull = yield* Stream.runHead(client.notices())
+    expect(Option.map(afterPull, ids)).toEqual(Option.some(["m2"]))
   }).pipe(Effect.scoped)
 )

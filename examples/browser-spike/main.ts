@@ -5,6 +5,7 @@
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import * as Option from "effect/Option"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as LeaderClientModule from "../../src/client/worker/LeaderClient.ts"
@@ -67,20 +68,27 @@ interface Subscription {
   readonly cancel: () => void
 }
 
+// `status` is a stream (current value first); the scenarios poll it.
+const currentStatus = Stream.runHead(client.status).pipe(
+  Effect.flatMap((head) => (Option.isSome(head) ? Effect.succeed(head.value) : Effect.die(new Error("no status"))))
+)
+
 const echo = {
-  status: () => Effect.runPromise(client.status),
+  status: () => Effect.runPromise(currentStatus),
   /** Status once a leader is connected, or the current status after `timeoutMs`. */
   ready: async (timeoutMs = 10_000) => {
     const deadline = Date.now() + timeoutMs
-    let status = await Effect.runPromise(client.status)
+    let status = await Effect.runPromise(currentStatus)
     while (status.leaderId === undefined && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 50))
-      status = await Effect.runPromise(client.status)
+      status = await Effect.runPromise(currentStatus)
     }
     return status
   },
   info: () => run(client.leaderInfo),
-  notices: () => run(client.notices),
+  /** The current notice list (first emission of the notices stream). */
+  notices: () => run(Stream.runHead(client.notices).pipe(Effect.map((head) => Option.getOrElse(head, () => [])))),
+  dismissNotices: (ids: ReadonlyArray<number>) => run(client.dismissNotices(ids)),
   exportPending: () => run(client.exportPending),
   /** First sync status emission (or the `SyncDisabled` error on a local-only leader). */
   syncStatus: () => run(Stream.runHead(client.syncStatus)),
@@ -142,7 +150,7 @@ const echo = {
   subscribe: (statements: ReadonlyArray<string>, tables: ReadonlyArray<string>): Subscription => {
     const sub: Subscription = { emissions: [], ended: undefined, cancel: () => Effect.runFork(Fiber.interrupt(fiber)) }
     const fiber = Effect.runFork(
-      client.subscribe({ statements: statements.map((sql) => ({ sql, params: [] })), tables }).pipe(
+      client.subscribeRaw({ statements: statements.map((sql) => ({ sql, params: [] })), tables }).pipe(
         Stream.runForEach((result) => Effect.sync(() => void sub.emissions.push(result))),
         Effect.exit,
         Effect.map((exit) => {
@@ -184,7 +192,7 @@ setInterval(() => void render(), 250)
 const liveCount = Effect.gen(function* () {
   yield* client.exec("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
   yield* client
-    .subscribe({ statements: [{ sql: "SELECT count(*) AS n FROM items", params: [] }], tables: ["items"] })
+    .subscribeRaw({ statements: [{ sql: "SELECT count(*) AS n FROM items", params: [] }], tables: ["items"] })
     .pipe(
       Stream.runForEach((r) =>
         Effect.sync(() => {

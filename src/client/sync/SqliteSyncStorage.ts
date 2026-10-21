@@ -276,6 +276,15 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
   }
 }
 
+/** Delete the notices with these ids; the only way a notice is ever removed (DESIGN §9.1). */
+export const dismissNotices = (
+  sql: SqlClient.SqlClient,
+  ids: ReadonlyArray<number>
+): Effect.Effect<void, Errors.StoreUnavailable> =>
+  ids.length === 0
+    ? Effect.void
+    : Effect.asVoid(SqliteRowStore.unavailable(sql`DELETE FROM echo_notices WHERE ${sql.in("id", ids)}`))
+
 /** Every retained notice, oldest first, with its id (DESIGN §9: retained for inspection). */
 export const notices = (
   sql: SqlClient.SqlClient

@@ -214,7 +214,10 @@ export const makeHandlers = ({
     },
     leaderInfo: () => Effect.succeed(info),
     syncStatus: () => (loop === undefined ? Stream.fail(new SyncDisabled()) : loop.changes),
-    notices: () => storage.admit(SqliteSyncStorage.notices(sql)).pipe(Effect.mapError(unavailable)),
+    notices: () =>
+      sql.reactive(["echo_notices"], storage.admit(SqliteSyncStorage.notices(sql)).pipe(Effect.mapError(unavailable))),
+    dismissNotices: ({ ids }) =>
+      storage.transaction(SqliteSyncStorage.dismissNotices(sql, ids)).pipe(Effect.mapError(unavailable)),
     // Reads the outbox only: never depends on push state, so a halted push cannot block recovery.
     exportPending: () =>
       storage.transaction(storage.pending).pipe(

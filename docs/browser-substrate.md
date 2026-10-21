@@ -26,7 +26,8 @@ tab B ──spawns──▶ leader-candidate worker B (queued on the leader lock
   (`Connected`). When the leader changes, it relinks every live tab.
 - Tab↔leader traffic is Effect RPC (`RpcClient.layerProtocolWorker` / `RpcServer.layerProtocolWorkerRunner`
   over `BrowserWorker` / `BrowserWorkerRunner.layerMessagePort`) for the Schema-defined `LeaderRpcs`:
-  `exec`, `enqueue`, `subscribe` (stream), `leaderInfo`.
+  `exec` (only with `allowRawExec`), `enqueue`, `subscribe` (registered query, stream), `subscribeRaw`
+  (raw live query under `query_only`, stream), `notices` (stream), `dismissNotices`, `leaderInfo`.
 - Workers are spawned by the **tab**, never by the SharedWorker: no nested workers are needed (Safari
   shipped workers-in-SharedWorker late), and a candidate's lifetime is its tab's.
 
@@ -84,17 +85,20 @@ is still the active connection, and a displaced connection completes its `lost` 
 | What | Behavior | Why |
 |---|---|---|
 | Request in flight when the leader dies | Fails with `LeaderUnavailable{reason:"LeaderLost"}` | The tab cannot know whether it committed. |
+| `mutate` after `LeaderLost` | Retried automatically with the id fixed before the first attempt, so exactly one outbox row | `LeaderClient.mutate` (DESIGN §9.1); tested in `Leader.test.ts` with the loss after the commit. |
 | `enqueue` retry after `LeaderLost` | Safe: idempotent on `mutationId`, pending or released (returns the existing `seq`, allocates none) | Verified across a real handover and at the commit-before-lost-response crash point, with two tabs retrying the same id at once. |
 | `exec` retry | Only if the statement is idempotent | Raw SQL, harness/diagnostics only. |
 | Request issued while no leader is connected | Waits for the next leader | Leadership gaps are short (lock queue). |
-| Open `subscribe` stream | **Terminates** with `LeaderUnavailable{LeaderLost}`; the caller re-subscribes | See below. |
+| Open `subscribe` (registered query) or `notices` stream | **Resumes** on the next leader; nothing is emitted in between, so the consumer keeps the last emission until the fresh first one | DESIGN §9.1; see below. |
+| Open `subscribeRaw` or `syncStatus` stream | **Terminates** with `LeaderUnavailable{LeaderLost}`; the caller re-subscribes | See below. |
 | Replica / outbox | Persist (same OPFS file; the new leader reopens it) | Verified. |
 
-Streams terminate rather than resume transparently because the server side of the stream (its
-`Reactivity` registration) died with the old leader, and the new leader cannot know which result
-version the subscriber last saw. A silent resume would either duplicate or skip an emission. Re-subscribing
-gives a fresh, complete first emission from the new leader, which is what a UI binding wants anyway. A
-higher-level query layer can hide this with `Stream.retry` on `LeaderLost` (the harness does exactly that).
+The server side of a stream (its `Reactivity` registration) dies with the old leader, and the new leader
+cannot know which result version the subscriber last saw. A resumed stream therefore never tries to
+continue: the tab re-subscribes and the new leader sends a fresh, complete first result, which may repeat
+the last value (never skip a change). `subscribe` and `notices` do this inside `LeaderClient` (their
+results are whole values, so a repeat is harmless); the raw `subscribeRaw` and `syncStatus` streams still
+end with `LeaderLost` and leave it to the caller (the harness scenarios assert that end).
 
 ## Fallback without SharedWorker
 
@@ -185,7 +189,7 @@ tables and replica schema, one transaction) and builds `Engine.make` over the SQ
   A new leader starts a fresh loop, so a halt re-trips on its first push (DESIGN §6).
 - Without `syncUrl` the replica is local-only: enqueue still applies and persists; `syncStatus` fails
   with `SyncDisabled`.
-- `syncStatus` (stream, ends with `LeaderLost` on handover like `subscribe`), `notices` and
+- `syncStatus` (stream, ends with `LeaderLost` on handover like `subscribeRaw`), `notices` (stream) and
   `exportPending` (pending outbox in seq order; reads storage only, so it is available while push is
   halted) are RPCs on `LeaderRpcs`.
 - `RpcClient.layerProtocolHttp({ url })` posts to `<url>/` (trailing slash): the server route must accept

@@ -145,8 +145,13 @@ export class LeaderRpcs extends RpcGroup.make(
   Rpc.make("leaderInfo", { success: LeaderInfo }),
   /** The sync loop's status: the current value, then every change (push halted, last transient error). */
   Rpc.make("syncStatus", { success: SyncStatus, error: SyncDisabled, stream: true }),
-  /** Retained notices (rejected / outcome-unknown mutations), oldest first. */
-  Rpc.make("notices", { success: Schema.Array(StoredNotice), error: SqlFailure }),
+  /**
+   * Retained notices (rejected / outcome-unknown mutations), oldest first: the current list, then the
+   * list after every change to `echo_notices`. The engine never removes one; only `dismissNotices` does.
+   */
+  Rpc.make("notices", { success: Schema.Array(StoredNotice), error: SqlFailure, stream: true }),
+  /** Delete the notices with these ids (DESIGN §9.1). Unknown ids are ignored, so a retry is harmless. */
+  Rpc.make("dismissNotices", { payload: { ids: Schema.Array(Schema.Int) }, error: SqlFailure }),
   /** Every pending outbox entry in seq order. Always available, also while push is halted (DESIGN §6). */
   Rpc.make("exportPending", { success: Schema.Array(PendingExport), error: SqlFailure })
 ) {}

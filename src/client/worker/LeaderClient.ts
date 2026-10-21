@@ -7,8 +7,12 @@
  * - In-flight requests fail with `LeaderUnavailable { reason: "LeaderLost" }`. The request may or may
  *   not have been applied before the leader died; `enqueue` is idempotent on `mutationId`, so retry it.
  * - Requests issued while no leader is connected wait for the next one.
- * - Open `subscribe` streams terminate with `LeaderUnavailable { reason: "LeaderLost" }`. They do not
- *   resume silently: the caller re-subscribes and receives a fresh full result from the new leader.
+ * - `mutate` fixes its `mutationId` before the first attempt and retries `LeaderLost` with it, so a
+ *   mutation that committed on the lost leader lands on the §9 idempotency rule: one outbox row.
+ * - `subscribe` (registered queries) and `notices` re-subscribe to the next leader on `LeaderLost`; the
+ *   stream emits nothing in between, so a consumer keeps the last emission until a fresh one arrives.
+ * - Raw `subscribeRaw` streams and `syncStatus` terminate with `LeaderUnavailable { reason: "LeaderLost" }`;
+ *   the caller re-subscribes and receives a fresh full result from the new leader.
  */
 import * as BrowserWorker from "@effect/platform-browser/BrowserWorker"
 import * as Context from "effect/Context"
@@ -17,8 +21,12 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Schedule from "effect/Schedule"
+import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
+import * as SubscriptionRef from "effect/SubscriptionRef"
+import { type Errors, Ids, type Mutation, type Query } from "echo-sync"
 import { RpcClient } from "effect/rpc"
 import { RpcClientError } from "effect/rpc/RpcClientError"
 import type { LocallyRejected } from "../sync/Engine.ts"
@@ -77,23 +85,133 @@ export class LeaderClient extends Context.Service<
       sql: string,
       params?: SqlParams
     ) => Effect.Effect<Rows, SqlFailure | RawExecDisabled | LeaderUnavailable>
-    /** Runs the mutation optimistically; resolves only after the outbox entry is committed in SQLite. */
+    /**
+     * The one write API (DESIGN §9.1): encodes `args`, generates the `mutationId` once, and enqueues,
+     * retrying `LeaderLost` only. Resolves after the leader committed the optimistic apply and the outbox
+     * entry. `options.mutationId` is for replay and tests; apps never mint ids.
+     */
+    readonly mutate: MutateFn
+    /**
+     * One attempt of the raw enqueue `mutate` is built on, with a caller-chosen `mutationId` (replay of an
+     * exported entry, tests). Resolves only after the outbox entry is committed in SQLite.
+     */
     readonly enqueue: (
       envelope: OutboxEnvelope
     ) => Effect.Effect<Enqueued, SqlFailure | LocallyRejected | LeaderUnavailable>
-    /** Raw live query for the dev harness; `RawExecDisabled` unless the leader allows raw SQL. */
-    readonly subscribe: (
+    /** A registered query's live result, decoded with its `success` schema; survives handover. */
+    readonly subscribe: SubscribeFn
+    /**
+     * The raw read escape hatch for the dev harness: declared tables, statements run under `query_only`;
+     * `RawExecDisabled` unless the leader allows raw SQL. Ends on handover.
+     */
+    readonly subscribeRaw: (
       query: LiveQuery
     ) => Stream.Stream<QueryResult, SqlFailure | RawExecDisabled | LeaderUnavailable>
     readonly leaderInfo: Effect.Effect<LeaderInfo, LeaderUnavailable>
     /** The leader's sync status; ends with `LeaderLost` on handover (re-subscribe, like `subscribe`). */
     readonly syncStatus: Stream.Stream<SyncStatus, SyncDisabled | LeaderUnavailable>
-    readonly notices: Effect.Effect<ReadonlyArray<StoredNotice>, SqlFailure | LeaderUnavailable>
+    /** Retained notices, current list then every change; survives handover. */
+    readonly notices: Stream.Stream<ReadonlyArray<StoredNotice>, SqlFailure | LeaderUnavailable>
+    /** The only way a notice is removed (DESIGN §9.1). Idempotent, so retried across `LeaderLost`. */
+    readonly dismissNotices: (ids: ReadonlyArray<number>) => Effect.Effect<void, SqlFailure | LeaderUnavailable>
     /** Pending outbox entries for export (DESIGN §9); available while push is halted. */
     readonly exportPending: Effect.Effect<ReadonlyArray<PendingExport>, SqlFailure | LeaderUnavailable>
-    readonly status: Effect.Effect<Status>
+    /** This tab's view of the topology: the current value, then every change. */
+    readonly status: Stream.Stream<Status>
   }
 >()("echo-sync/client/LeaderClient") {}
+
+type MutateFn = <A extends Mutation.PureSchema, E extends Mutation.PureSchema>(
+  mutation: Mutation.Mutation<string, A, E>,
+  args: A["Type"],
+  options?: { readonly mutationId?: Ids.MutationId }
+) => Effect.Effect<Enqueued, SqlFailure | LocallyRejected | LeaderUnavailable>
+
+/** Errors a registered query's stream can end with (a run's `ReadError`s, minus the transient one). */
+export type SubscribeError =
+  | SqlFailure
+  | LeaderUnavailable
+  | Query.UnknownQuery
+  | Query.QueryArgsDecodeFailed
+  | Errors.RowNotFound
+  | Errors.ScopeForbidden
+  | Errors.InvalidRow
+
+type SubscribeFn = <A extends Mutation.PureSchema, S extends Mutation.PureSchema>(
+  query: Query.Query<string, A, S>,
+  args: A["Type"]
+) => Stream.Stream<S["Type"], SubscribeError>
+
+const isLeaderLost = (e: unknown): e is LeaderUnavailable => e instanceof LeaderUnavailable && e.reason === "LeaderLost"
+
+// No tight loop while the old connection is not yet marked lost: the next attempt waits for a new leader.
+const lostBackoff = Schedule.spaced("50 millis")
+
+/** Re-open `open` on the next leader whenever it ends with `LeaderLost`, emitting nothing in between. */
+const resubscribing = <A, E>(
+  open: Stream.Stream<A, E | LeaderUnavailable>
+): Stream.Stream<A, E | LeaderUnavailable> => {
+  const loop: Stream.Stream<A, E | LeaderUnavailable> = open.pipe(
+    Stream.catchIf(isLeaderLost, () =>
+      Stream.unwrap(
+        Effect.as(
+          Effect.sleep("50 millis"),
+          Stream.suspend(() => loop)
+        )
+      )
+    )
+  )
+  return loop
+}
+
+/** The leader RPCs the tab API is built on, each failing with `LeaderLost` when its leader goes away. */
+export interface LeaderCalls {
+  readonly enqueue: (
+    envelope: OutboxEnvelope
+  ) => Effect.Effect<Enqueued, SqlFailure | LocallyRejected | LeaderUnavailable>
+  readonly subscribe: (name: string, args: Schema.Json) => Stream.Stream<Schema.Json, SubscribeError>
+  readonly notices: Stream.Stream<ReadonlyArray<StoredNotice>, SqlFailure | LeaderUnavailable>
+  readonly dismissNotices: (ids: ReadonlyArray<number>) => Effect.Effect<void, SqlFailure | LeaderUnavailable>
+}
+
+/**
+ * The DESIGN §9.1 semantics over `calls`: id generation, `LeaderLost` retry and re-subscription, and the
+ * tab-side encode/decode. Exported so they are tested against a real leader without a browser.
+ */
+export const tabApi = (calls: LeaderCalls) => {
+  const mutate: MutateFn = (mutation, args, options) =>
+    Effect.gen(function* () {
+      // A bad value of the mutation's own `args` type is the caller's bug, not an outcome.
+      const encoded: Schema.Json = yield* Effect.orDie(
+        Schema.encodeUnknownEffect(Schema.toCodecJson(mutation.args))(args)
+      )
+      // Fixed once, before the first attempt: every retry presents the same idempotency key (DESIGN §9).
+      const mutationId = options?.mutationId ?? Ids.MutationId.make(crypto.randomUUID())
+      return yield* calls
+        .enqueue({ mutationId, name: mutation.name, args: encoded })
+        .pipe(Effect.retry({ while: isLeaderLost, schedule: lostBackoff }))
+    })
+  const subscribe: SubscribeFn = (query, args) =>
+    Stream.unwrap(
+      Effect.gen(function* () {
+        const encoded: Schema.Json = yield* Effect.orDie(
+          Schema.encodeUnknownEffect(Schema.toCodecJson(query.args))(args)
+        )
+        const decode = Schema.decodeUnknownEffect(Schema.toCodecJson(query.success))
+        // A leader result that does not decode is a version skew between tab and leader code: a defect.
+        return resubscribing(calls.subscribe(query.name, encoded)).pipe(
+          Stream.mapEffect((result) => Effect.orDie(decode(result)))
+        )
+      })
+    )
+  return {
+    mutate,
+    subscribe,
+    notices: resubscribing(calls.notices),
+    dismissNotices: (ids: ReadonlyArray<number>) =>
+      calls.dismissNotices(ids).pipe(Effect.retry({ while: isLeaderLost, schedule: lostBackoff }))
+  }
+}
 
 const makeRpcClient = RpcClient.make(LeaderRpcs)
 type Client = Effect.Success<typeof makeRpcClient>
@@ -176,15 +294,26 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
         )
       )
 
+    const status = yield* SubscriptionRef.make<Status>({ mode, tabId, isLeaderTab, leaderId: undefined })
+    // Called from DOM callbacks after every change to `active` or `isLeaderTab`; `set` never suspends here.
+    const publishStatus = () =>
+      Effect.runSync(SubscriptionRef.set(status, { mode, tabId, isLeaderTab, leaderId: active?.leaderId }))
+
+    const enqueue = (envelope: OutboxEnvelope) => withLeader((client) => client.enqueue({ envelope }))
     const service = LeaderClient.of({
       exec: (sql, params = []) => withLeader((client) => client.exec({ sql, params })),
-      enqueue: (envelope) => withLeader((client) => client.enqueue({ envelope })),
+      enqueue,
+      ...tabApi({
+        enqueue,
+        subscribe: (name, args) => streamWithLeader((client) => client.subscribe({ name, args })),
+        notices: streamWithLeader((client) => client.notices()),
+        dismissNotices: (ids) => withLeader((client) => client.dismissNotices({ ids }))
+      }),
       leaderInfo: withLeader((client) => client.leaderInfo()),
-      subscribe: (query) => streamWithLeader((client) => client.subscribeRaw({ query })),
+      subscribeRaw: (query) => streamWithLeader((client) => client.subscribeRaw({ query })),
       syncStatus: streamWithLeader((client) => client.syncStatus()),
-      notices: withLeader((client) => client.notices()),
       exportPending: withLeader((client) => client.exportPending()),
-      status: Effect.sync(() => ({ mode, tabId, isLeaderTab, leaderId: active?.leaderId }))
+      status: SubscriptionRef.changes(status)
     })
 
     if (unsupported !== undefined) {
@@ -216,6 +345,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
       if (active !== undefined) displace(active)
       const connection: Active = { leaderId, scope: Scope.forkUnsafe(scope), lost: Deferred.makeUnsafe<void>() }
       active = connection
+      publishStatus()
       // Requests wait for this connection's handshake rather than using the displaced one.
       publish(undefined)
       fork(
@@ -224,6 +354,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
             Effect.sync(() => {
               if (active === connection) {
                 active = undefined
+                publishStatus()
                 publish(undefined)
               }
               displace(connection)
@@ -278,6 +409,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
         }
         case "Elected": {
           isLeaderTab = true
+          publishStatus()
           const channel = new MessageChannel()
           if (router !== undefined) {
             const routerPort: ToLeader = { _tag: "RouterPort", port: channel.port1 }
