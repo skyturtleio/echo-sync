@@ -302,9 +302,18 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
 
     const status = yield* SubscriptionRef.make<Status>({ mode, tabId, isLeaderTab: false, leaderId: undefined })
     // Called from DOM callbacks after every change to `active` or `localEpoch`; `set` never suspends here.
+    // Never claims a leader this tab does not own: while connected to another epoch, `isLeaderTab` is false
+    // even if this tab's own epoch has not been seen to end yet (its lock callback can arrive later). With no
+    // connection yet (right after election, before the handshake) it is true, so a fresh leader tab does not
+    // flicker to false on its way to connecting to its own worker.
     const publishStatus = () =>
       Effect.runSync(
-        SubscriptionRef.set(status, { mode, tabId, isLeaderTab: localEpoch !== undefined, leaderId: active?.leaderId })
+        SubscriptionRef.set(status, {
+          mode,
+          tabId,
+          isLeaderTab: localEpoch !== undefined && (active === undefined || active.leaderId === localEpoch),
+          leaderId: active?.leaderId
+        })
       )
 
     const enqueue = (envelope: OutboxEnvelope) => withLeader((client) => client.enqueue({ envelope }))

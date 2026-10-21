@@ -17,6 +17,26 @@ const appId = params.get("app") ?? "spike"
 const profile = params.get("profile") ?? "default"
 const noSharedWorker = params.has("noSharedWorker")
 
+let releaseEpochWatch = () => {}
+const epochWatchGate = new Promise<void>((resolve) => {
+  releaseEpochWatch = resolve
+})
+const isEpoch = (name: string) => /^echo:[^:]+:[^:]+:leader:./.test(name)
+if (params.has("holdEpochWatch")) {
+  // Fault injection: this tab's shared-mode waits on epoch locks (`awaitLockReleased`) get their grant but
+  // run their callback only after `echo.releaseEpochWatch()`, so a leader epoch's end reaches this tab late.
+  const locks = navigator.locks
+  const request = locks.request.bind(locks)
+  Object.defineProperty(locks, "request", {
+    value: (name: string, options: LockOptions, callback: LockGrantedCallback<unknown>) =>
+      options.mode === "shared" && isEpoch(name)
+        ? request(name, options, async (lock) => {
+            await epochWatchGate
+            return callback(lock)
+          })
+        : request(name, options, callback)
+  })
+}
 if (noSharedWorker) {
   // Simulates a browser without SharedWorker (e.g. Chrome Android) to exercise the fail-closed fallback.
   Reflect.deleteProperty(globalThis, "SharedWorker")
@@ -78,6 +98,11 @@ const statusLog: Array<LeaderClientModule.Status> = []
 
 const echo = {
   statusLog,
+  /** Lets the epoch-lock callbacks held by `?holdEpochWatch` run. */
+  releaseEpochWatch: () => {
+    releaseEpochWatch()
+    return true
+  },
   watchStatus: () => {
     Effect.runFork(Stream.runForEach(client.status, (s) => Effect.sync(() => void statusLog.push(s))))
     return true
