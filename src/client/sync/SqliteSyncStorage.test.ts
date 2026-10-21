@@ -7,6 +7,8 @@ import type { Scheduler } from "effect/Scheduler"
 import * as SqlClient from "effect/sql/SqlClient"
 import { AccessScope, Registry, SyncTable } from "../../core/index.ts"
 import * as Outbox from "../Outbox.ts"
+import * as SqliteRowStore from "../SqliteRowStore.ts"
+import * as Engine from "./Engine.ts"
 import * as SqliteSyncStorage from "./SqliteSyncStorage.ts"
 
 const TId = Schema.String.pipe(Schema.brand("TId"))
@@ -280,3 +282,54 @@ it("a data-shape migration interrupted at any scheduler boundary leaves the old 
   expect([...outcomes.keys()].toSorted()).toEqual(["new", "old"])
   expect((outcomes.get("old") ?? []).length).toBeGreaterThan(10) // the sweep spans the transaction
 })
+
+it.effect("after a rebuild, installing the null-cursor set replays pending on top of it and recaptures undo", () =>
+  Effect.gen(function* () {
+    yield* seedOldReplica
+    expect(yield* SqliteSyncStorage.migrate(reshaped)).toEqual({ rebuilt: true })
+    const sql = yield* SqlClient.SqlClient
+    const storage = SqliteSyncStorage.make(sql, reshaped)
+    const t = SqliteRowStore.make(sql, reshaped)
+    const tTable = Option.getOrUndefined(reshaped.get("t"))
+    if (tTable === undefined) return yield* Effect.die(new Error("no table t"))
+    // Optimistic handler: upserts row <mutationId> with n = 1, reporting the row's pre-image.
+    const executor: Engine.Executor<unknown> = {
+      run: (envelope) =>
+        Effect.gen(function* () {
+          const before = yield* t.read(tTable, envelope.mutationId)
+          const row = { id: envelope.mutationId, access_scope_id: "s", n: 1 }
+          yield* storage.rows.write("t", envelope.mutationId, Option.some(row))
+          return {
+            undo: [
+              {
+                table: "t",
+                id: envelope.mutationId,
+                before: Option.map(before, (r) => ({ ...r, id: envelope.mutationId, access_scope_id: "s" }))
+              }
+            ],
+            rejection: Option.none()
+          }
+        })
+    }
+    const done = {
+      _tag: "PullDone" as const,
+      changes: [{ _tag: "upsert" as const, table: "t", row: { id: "srv", access_scope_id: "s", n: null } }],
+      acks: [],
+      nextCursor: 9n,
+      expiredThrough: 0
+    }
+    yield* storage.transaction(
+      Engine.applyPageSet(storage, executor, (name) => Option.isSome(reshaped.get(name)), [], done)
+    )
+    const rows = yield* t.scan(tTable)
+    expect(rows.map((r) => [r["id"], r["n"]])).toEqual([
+      ["p", 1],
+      ["srv", null]
+    ])
+    const pending = yield* storage.pending
+    expect(pending.map((e) => [e.envelope.mutationId, e.undo])).toEqual([
+      ["p", [{ table: "t", id: "p", before: Option.none() }]]
+    ])
+    expect((yield* storage.meta).cursor).toBe(9n)
+  }).pipe(Effect.provide(Db))
+)
