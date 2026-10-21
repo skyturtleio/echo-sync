@@ -13,7 +13,7 @@
   "scripts": {
     "check": "tsc --noEmit && oxlint --deny-warnings && oxfmt --check && vitest run",
     "test": "vitest run",
-    "test:pg": "ECHO_PG_URL=${ECHO_PG_URL:-postgres://postgres:echo@localhost:5432/postgres} vitest run src/server",
+    "test:pg": "ECHO_PG_URL=${ECHO_PG_URL:-postgres://postgres:echo@localhost:5432/postgres} vitest run src/server test/",
     "lint": "oxlint --deny-warnings",
     "fmt": "oxfmt",
     "spike": "vite --config examples/browser-spike/vite.config.ts"
