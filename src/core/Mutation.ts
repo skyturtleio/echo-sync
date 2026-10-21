@@ -205,3 +205,69 @@ export const run = (
     ? Effect.fail(new UnknownMutation({ name: envelope.name }))
     : mutation.execute(ctx, envelope.args)
 }
+
+// ---------------------------------------------------------------------------------------------
+// Typed notice decoding (DESIGN §9.1)
+// ---------------------------------------------------------------------------------------------
+
+/** `decodeNotice` was given a notice of another mutation, or one its schemas cannot decode. */
+export class NoticeMismatch extends Schema.TaggedError<NoticeMismatch>()("NoticeMismatch", {
+  /** The mutation decoded against. */
+  mutation: Schema.String,
+  /** The envelope's mutation name. */
+  name: Schema.String,
+  message: Schema.String
+}) {}
+
+/** A `DomainError` whose payload is decoded with its mutation's `error` schema. */
+export interface TypedDomainError<Name extends string, E> {
+  readonly _tag: "DomainError"
+  readonly mutation: Name
+  readonly error: E
+}
+
+/** A notice's envelope args and outcome, typed by its mutation. Other rejections pass through. */
+export interface DecodedNotice<Name extends string, A, E> {
+  readonly args: A
+  readonly outcome:
+    | typeof Applied.Type
+    | {
+        readonly _tag: "Rejected"
+        readonly error: Exclude<MutationRejection, DomainError> | TypedDomainError<Name, E>
+      }
+}
+
+/**
+ * Decodes a retained notice against `mutation`: `args` with its `args` schema and, for a
+ * `Rejected` outcome whose error is a `DomainError`, the payload with its `error` schema. Any
+ * other rejection is returned as is. A notice of a different mutation, or one these schemas
+ * cannot decode (a different args version, a corrupted payload), is `NoticeMismatch`, never a
+ * defect. Pure: the schemas are service-free, so it runs on the tab and on the server.
+ */
+export const decodeNotice = <Name extends string, A extends PureSchema, E extends PureSchema>(
+  mutation: Mutation<Name, A, E>,
+  notice: {
+    readonly envelope: { readonly name: string; readonly args: Schema.Json }
+    readonly outcome: MutationOutcome
+  }
+): Effect.Effect<DecodedNotice<Name, A["Type"], E["Type"]>, NoticeMismatch> =>
+  Effect.gen(function* () {
+    const { envelope, outcome } = notice
+    const mismatch = (message: string) => new NoticeMismatch({ mutation: mutation.name, name: envelope.name, message })
+    if (envelope.name !== mutation.name) {
+      return yield* mismatch(`a notice of "${envelope.name}" cannot be decoded as "${mutation.name}"`)
+    }
+    const args: A["Type"] = yield* Schema.decodeUnknownEffect(Schema.toCodecJson(mutation.args))(envelope.args).pipe(
+      Effect.mapError((e) => mismatch(`args: ${e.message}`))
+    )
+    if (outcome._tag === "Applied") return { args, outcome }
+    const domain = outcome.error
+    if (domain._tag !== "DomainError") return { args, outcome: { _tag: "Rejected", error: domain } }
+    if (domain.mutation !== mutation.name) {
+      return yield* mismatch(`a domain error of "${domain.mutation}" cannot be decoded as "${mutation.name}"`)
+    }
+    const error: E["Type"] = yield* Schema.decodeUnknownEffect(Schema.toCodecJson(mutation.error))(domain.error).pipe(
+      Effect.mapError((e) => mismatch(`error: ${e.message}`))
+    )
+    return { args, outcome: { _tag: "Rejected", error: { _tag: "DomainError", mutation: mutation.name, error } } }
+  })
