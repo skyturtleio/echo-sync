@@ -79,6 +79,17 @@ const localOnly: Engine.Transport<never> = {
   pull: () => Effect.die(new Error("echo-sync: local-only replica has no transport"))
 }
 
+/**
+ * The leader's `enqueue`: `Engine.mutate`, then wake the sync loop however the mutate ended. The wake is
+ * a finalizer, not a success tap: an interrupt that lands while COMMIT runs (masked) still commits the
+ * entry, and a skipped wake would leave it unsent until some unrelated event (a quiet pokes stream has
+ * no timer). A wake after a mutate that saved nothing costs one extra, coalesced cycle.
+ */
+export const enqueueAndWake =
+  <TE>(engine: Engine.Engine<TE>, wake: Effect.Effect<void>) =>
+  (mutationId: Ids.MutationId, name: string, args: Schema.Json) =>
+    engine.mutate(mutationId, name, args).pipe(Effect.ensuring(wake))
+
 const makeHandlers = (
   sql: SqlClient.SqlClient,
   storage: SqliteSyncStorage.SqliteSyncStorage,
@@ -90,8 +101,7 @@ const makeHandlers = (
     // Every RPC takes the storage permit, so one queued behind a long install is cancellable while it waits.
     exec: ({ sql: text, params }) => storage.admit(sql.unsafe<Row>(text, params).pipe(Effect.mapError(toFailure))),
     enqueue: ({ envelope }) =>
-      engine.mutate(envelope.mutationId, envelope.name, envelope.args).pipe(
-        Effect.tap(() => loop?.wake ?? Effect.void),
+      enqueueAndWake(engine, loop?.wake ?? Effect.void)(envelope.mutationId, envelope.name, envelope.args).pipe(
         Effect.map(({ clientId, mutationId, seq }) => ({ clientId, mutationId, seq })),
         Effect.catchTag("StoreUnavailable", (error) => Effect.fail(unavailable(error)))
       ),
