@@ -7,8 +7,9 @@ import { type SyncedTable, syncedTables } from "./schema.ts"
 const RowKey = Schema.Struct({ table: Schema.String, rowId: Schema.String })
 
 /**
- * Server-side progress of an unfinished page set (DESIGN.md §8). Opaque to the client, which
- * resends it verbatim; Schema-encoded on the wire (positions as decimal strings).
+ * Server-side progress of an unfinished page set (DESIGN.md §8). Private to the server: on the
+ * wire it is an opaque string (core's branded `PullContinuation`), the JSON encoding of this
+ * struct, which the client resends verbatim.
  *
  * Invariant: the pages so far deliver every log change with position ≤ `position` in every scope
  * of `scopes`, plus the current rows of the first entry of `walking` up to its `after`. The log is
@@ -17,7 +18,7 @@ const RowKey = Schema.Struct({ table: Schema.String, rowId: Schema.String })
  * It is untrusted input. Forging it can only hurt the forger: payloads are always filtered by the
  * request principal's current grants, and identity fields are checked against the request.
  */
-export const PullContinuation = Schema.Struct({
+const Continuation = Schema.Struct({
   clientId: Schema.String,
   principalId: Schema.String,
   /** The request cursor this page set started from; `null` = initial sync. */
@@ -29,7 +30,10 @@ export const PullContinuation = Schema.Struct({
   /** Scopes whose current rows are being delivered, in order; `after` = last row delivered. */
   walking: Schema.Array(Schema.Struct({ scopeId: Schema.String, after: Schema.NullOr(RowKey) }))
 })
-export type PullContinuation = typeof PullContinuation.Type
+type Continuation = typeof Continuation.Type
+const ContinuationJson = Schema.fromJsonString(Continuation)
+const encodeContinuation = Schema.encodeSync(ContinuationJson)
+const decodeContinuation = Schema.decodeUnknownEffect(ContinuationJson)
 
 export type Change =
   | {
@@ -54,7 +58,8 @@ export type PullResponse =
       readonly _tag: "PullPage"
       readonly changes: ReadonlyArray<Change>
       readonly acks: ReadonlyArray<Ack>
-      readonly continuation: PullContinuation
+      /** Opaque; send back verbatim with the same cursor. */
+      readonly continuation: string
     }
   | {
       readonly _tag: "PullDone"
@@ -80,7 +85,7 @@ export interface PullRequest {
   readonly principalId: string
   readonly clientId: string
   readonly cursor: bigint | null
-  readonly continuation: Option.Option<PullContinuation>
+  readonly continuation: Option.Option<string>
   /** Upper bound on upserts and tombstones per page (≥ 1). Purges are not counted. */
   readonly limit: number
 }
@@ -116,14 +121,17 @@ interface RowPayload {
 export const pull = Effect.fnUntraced(function* (request: PullRequest) {
   const sql = yield* SqlClient
   yield* registerClient(request.principalId, request.clientId)
-  const resumed = Option.getOrUndefined(request.continuation)
+  const stale = new ResnapshotRequired({ reason: "staleContinuation" })
+  const resumed: Continuation | undefined = Option.isSome(request.continuation)
+    ? yield* decodeContinuation(request.continuation.value).pipe(Effect.mapError(() => stale))
+    : undefined
   if (
     resumed !== undefined &&
     (resumed.clientId !== request.clientId ||
       resumed.principalId !== request.principalId ||
       resumed.cursor !== request.cursor)
   ) {
-    return yield* new ResnapshotRequired({ reason: "staleContinuation" })
+    return yield* stale
   }
 
   const response = yield* sql.withTransaction(
@@ -250,14 +258,14 @@ export const pull = Effect.fnUntraced(function* (request: PullRequest) {
             _tag: "PullPage",
             changes,
             acks,
-            continuation: {
+            continuation: encodeContinuation({
               clientId: request.clientId,
               principalId: request.principalId,
               cursor: request.cursor,
               position: nextPosition,
               scopes,
               walking
-            }
+            })
           }
       return { result, scopes }
     })

@@ -12,13 +12,5 @@ export {
   runBatch,
   runMutation
 } from "./ledger.ts"
-export {
-  type Ack,
-  type Change,
-  pull,
-  PullContinuation,
-  type PullRequest,
-  type PullResponse,
-  ResnapshotRequired
-} from "./pull.ts"
+export { type Ack, type Change, pull, type PullRequest, type PullResponse, ResnapshotRequired } from "./pull.ts"
 export { attach, migrate, migrationsTable, type SyncedTable, syncedTables, TableNameConflict } from "./schema.ts"

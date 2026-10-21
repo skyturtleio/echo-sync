@@ -3,7 +3,7 @@ import * as PgClient from "@effect/sql-pg/PgClient"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
 import type { ClientForbidden } from "./ledger.ts"
-import { type Change, pull, type PullContinuation, type PullResponse, type ResnapshotRequired } from "./pull.ts"
+import { type Change, pull, type PullResponse, type ResnapshotRequired } from "./pull.ts"
 import { attach, migrate, syncedTables } from "./schema.ts"
 
 /**
@@ -75,7 +75,7 @@ export class Replica {
   readonly rows = new Map<string, { readonly scopeId: string; readonly row: unknown }>()
   readonly acked = new Set<number>()
   cursor: bigint | null = null
-  continuation: Option.Option<PullContinuation> = Option.none()
+  continuation: Option.Option<string> = Option.none()
   /** Every change ever received, for leak checks. */
   readonly received: Array<Change> = []
   private staged: Array<Change> = []
@@ -94,6 +94,8 @@ export class Replica {
       this.continuation = Option.some(response.continuation)
       return
     }
+    // A set started from cursor null replaces the replica (§8): nothing older survives.
+    if (this.cursor === null) this.rows.clear()
     for (const change of this.staged) {
       if (change._tag === "Upsert") this.rows.set(`${change.table}/${change.rowId}`, change)
       else if (change._tag === "Delete") this.rows.delete(`${change.table}/${change.rowId}`)
@@ -121,6 +123,14 @@ export class Replica {
         return response
       }
     )
+  }
+
+  /** Drops the cursor and staged pages, as a client does on `ResnapshotRequired`. */
+  resnapshot() {
+    this.cursor = null
+    this.continuation = Option.none()
+    this.staged = []
+    this.stagedAcks = []
   }
 
   /** Pulls until a page set completes. */

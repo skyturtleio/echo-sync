@@ -3,6 +3,7 @@ import { Effect, Option } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { TestClock } from "effect/testing"
 import { collectGarbage } from "./gc.ts"
+import { runMutation } from "./ledger.ts"
 import { pull } from "./pull.ts"
 import { grant, pgAvailable, Replica, serverView, TestDatabase } from "./test-support.ts"
 
@@ -44,6 +45,8 @@ describe.skipIf(!pgAvailable)("log GC (§7)", () => {
       yield* behind.sync()
       yield* insert("b")
       yield* insert("c")
+      // Deleted while `behind` is behind: its tombstone is GC'd and can never be delivered.
+      yield* Effect.flatMap(SqlClient, (sql) => sql`DELETE FROM items WHERE id = 'a'`)
       const current = new Replica("p", "current")
       yield* current.sync()
 
@@ -57,9 +60,33 @@ describe.skipIf(!pgAvailable)("log GC (§7)", () => {
       yield* current.sync()
       assert.deepStrictEqual(current.view(), yield* serverView("p"))
 
-      const fresh = new Replica("p", "behind")
-      yield* fresh.sync()
-      assert.deepStrictEqual(fresh.view(), yield* serverView("p"))
+      // Resnapshot on the same replica: the null-cursor set replaces what it held, so the row
+      // whose tombstone was collected is gone too.
+      assert.isTrue(behind.rows.has("items/a"))
+      behind.resnapshot()
+      yield* behind.sync()
+      assert.deepStrictEqual(behind.view(), yield* serverView("p"))
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("log GC never deletes ledger rows or held-scope records (would cause double apply after resnapshot)", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      yield* grant("p", "s1")
+      const replica = new Replica("p", "c1")
+      yield* replica.sync()
+      yield* runMutation({ principalId: "p", clientId: "c1", mutationId: 1 }, insert("a"))
+      yield* replica.sync()
+      const snapshot = Effect.all([
+        sql`SELECT client_id, mutation_id, position, outcome FROM echo_sync.mutations ORDER BY position`,
+        sql`SELECT client_id, position, scope_ids FROM echo_sync.client_scopes ORDER BY client_id, position`,
+        sql`SELECT client_id, principal_id FROM echo_sync.clients ORDER BY client_id`
+      ])
+      const before = yield* snapshot
+      assert.isAbove(before[0].length + before[1].length, 1)
+      const gc = yield* gcAt(twoHours)
+      assert.isAbove(gc.deleted, 0)
+      assert.deepStrictEqual(yield* snapshot, before)
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -80,7 +107,7 @@ describe.skipIf(!pgAvailable)("log GC (§7)", () => {
 })
 
 describe.skipIf(!pgAvailable)("pull continuation (§8)", () => {
-  it.live("a continuation replayed by another client, principal, or cursor is refused", () =>
+  it.live("a continuation replayed by another client, principal, or cursor, or garbled, is refused", () =>
     Effect.gen(function* () {
       yield* grant("p", "s1")
       yield* grant("q", "s1")
@@ -95,6 +122,14 @@ describe.skipIf(!pgAvailable)("pull continuation (§8)", () => {
       ]
       for (const replay of replays) {
         const failure = yield* Effect.flip(pull({ ...replay, continuation, limit: 10 }))
+        assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "staleContinuation")
+      }
+      const tampered = page.continuation.replace(/"position":"\d+"/, '"position":"x"')
+      assert.notStrictEqual(tampered, page.continuation)
+      for (const garbled of ["", "not json", tampered]) {
+        const failure = yield* Effect.flip(
+          pull({ principalId: "p", clientId: "d", cursor: null, continuation: Option.some(garbled), limit: 10 })
+        )
         assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "staleContinuation")
       }
     }).pipe(Effect.provide(TestDatabase))
