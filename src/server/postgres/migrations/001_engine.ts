@@ -101,11 +101,14 @@ export default Effect.gen(function* () {
   // The lock is held until commit, so the next allocation can only happen after this
   // transaction is visible: positions are handed out in commit order.
   // Key = bytes of "echosync" as a signed int8.
+  // The NOTIFY is delivered at commit (and deduplicated within a transaction): it is the poke
+  // stream's hint that something may have changed (DESIGN §8). It carries no data.
   yield* sql`
     CREATE FUNCTION echo_sync.next_position() RETURNS bigint
     LANGUAGE plpgsql VOLATILE AS $$
     BEGIN
       PERFORM pg_advisory_xact_lock(7305797848413072995);
+      PERFORM pg_notify('echo_sync', '');
       RETURN nextval('echo_sync.position_seq');
     END
     $$`
