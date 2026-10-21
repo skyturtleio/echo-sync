@@ -5,7 +5,7 @@
  * TEMPORARY shapes: `RangePlan` and `compareValues` mirror what `src/core` will export
  * (`IndexRangePlan`, `compareKeys`); switch to those when ws/foundation lands.
  */
-import { Array as Arr, Effect, Option, Order } from "effect"
+import { Array as Arr, Effect, Option, Order, Semaphore } from "effect"
 import type { EncodedRow } from "../../client/sync/Wire.ts"
 
 export interface Bound {
@@ -59,12 +59,18 @@ export interface MemoryStore {
   readonly purgeScope: (scopeId: string) => Effect.Effect<void>
   readonly clearAll: Effect.Effect<void>
   readonly range: (table: string, plan: RangePlan) => Effect.Effect<ReadonlyArray<EncodedRow>>
-  /** Runs `self` atomically: every write is rolled back if it fails or is interrupted. */
+  /**
+   * Runs `self` serializably: transactions run one at a time (snapshot, body and rollback under
+   * one permit), and every write is rolled back if the body fails or is interrupted. Not
+   * re-entrant. Without serialization a rollback would restore a snapshot taken before another
+   * transaction committed, erasing that commit.
+   */
   readonly transaction: <A, E, R>(self: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
 }
 
 export const make = (initial: Tables = new Map()): MemoryStore => {
   let tables = cloneTables(initial)
+  const lock = Semaphore.makeUnsafe(1)
   const tableOf = (name: string) => {
     const existing = tables.get(name)
     if (existing !== undefined) return existing
@@ -130,15 +136,17 @@ export const make = (initial: Tables = new Map()): MemoryStore => {
     }),
     range,
     transaction: (self) =>
-      Effect.suspend(() => {
-        const before = cloneTables(tables)
-        return self.pipe(
-          Effect.onExit((exit) =>
-            Effect.sync(() => {
-              if (exit._tag === "Failure") tables = before
-            })
+      lock.withPermit(
+        Effect.suspend(() => {
+          const before = cloneTables(tables)
+          return self.pipe(
+            Effect.onExit((exit) =>
+              Effect.sync(() => {
+                if (exit._tag === "Failure") tables = before
+              })
+            )
           )
-        )
-      })
+        })
+      )
   }
 }

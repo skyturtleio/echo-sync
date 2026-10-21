@@ -39,8 +39,6 @@ export interface PendingMutation {
 export interface SyncMeta {
   /** Position through which the installed replica is authoritative. */
   readonly cursor: Cursor
-  /** Last outbox `seq` ever assigned (survives removal of acked entries, never reused). */
-  readonly lastSeq: number
   /** Highest `seq` the server has reported as processed; never resent. */
   readonly pushedThrough: number
   /**
@@ -50,7 +48,7 @@ export interface SyncMeta {
   readonly resnapshot: boolean
 }
 
-export const initialMeta: SyncMeta = { cursor: null, lastSeq: 0, pushedThrough: 0, resnapshot: false }
+export const initialMeta: SyncMeta = { cursor: null, pushedThrough: 0, resnapshot: false }
 
 /** The cursor the in-progress page set started from. */
 const pullFrom = (meta: SyncMeta): Cursor => (meta.resnapshot ? null : meta.cursor)
@@ -74,11 +72,22 @@ export interface SyncStorage<E> {
   readonly rows: RowWriter<E>
   readonly meta: Effect.Effect<SyncMeta, E>
   readonly setMeta: (meta: SyncMeta) => Effect.Effect<void, E>
-  /** Outbox entries in ascending `seq`. */
+  /** Unreleased outbox entries in ascending `seq`. */
   readonly pending: Effect.Effect<ReadonlyArray<PendingMutation>, E>
+  /**
+   * The outbox entry for a caller-generated `mutationId`, pending or released (DESIGN §9 rule 1:
+   * release marks the row; released rows are retained for a window, then pruned).
+   */
+  readonly lookup: (mutationId: string) => Effect.Effect<Option.Option<MutationEnvelope>, E>
+  /**
+   * Allocates the next outbox `seq` from durable state (DESIGN §6): starts at 1, monotone,
+   * never reused; rolled back with the transaction, so it is also gap-free.
+   */
+  readonly nextSeq: Effect.Effect<number, E>
   readonly appendPending: (entry: PendingMutation) => Effect.Effect<void, E>
   readonly setUndo: (seq: number, undo: ReadonlyArray<UndoImage>) => Effect.Effect<void, E>
-  readonly removePending: (seqs: ReadonlyArray<number>) => Effect.Effect<void, E>
+  /** Marks entries released: gone from `pending`, still found by `lookup` until pruned. */
+  readonly release: (seqs: ReadonlyArray<number>) => Effect.Effect<void, E>
   /**
    * Pages of the in-progress set, in arrival order. Durable: after a reload the engine resumes
    * the set with `meta.cursor` and the last staged page's continuation.
@@ -169,7 +178,7 @@ const rebase = <E>(
       released.push(entry.envelope.seq)
       if (Option.isSome(settled.value)) notices.push(settled.value.value)
     }
-    yield* storage.removePending(released)
+    yield* storage.release(released)
     yield* storage.addNotices(notices)
     return released
   })
@@ -234,8 +243,8 @@ export interface PushResult {
 export interface Engine<E, TE> {
   /**
    * Appends to the outbox and applies optimistically in one transaction ("saved" on success).
-   * `mutationId` is the caller's idempotency key: enqueuing an id that is still pending returns
-   * the existing envelope without running the handler again.
+   * `mutationId` is the caller's idempotency key: enqueuing an id the outbox knows (pending or
+   * released, §9) returns the original envelope without running the handler again.
    */
   readonly mutate: (
     mutationId: string,
@@ -264,17 +273,15 @@ export const make = <E, TE>(options: {
     const mutate = (mutationId: string, name: string, args: unknown) =>
       storage.transaction(
         Effect.gen(function* () {
-          const existing = (yield* storage.pending).find((entry) => entry.envelope.mutationId === mutationId)
-          if (existing !== undefined) return existing.envelope
-          const meta = yield* storage.meta
-          const envelope: MutationEnvelope = { clientId, mutationId, seq: meta.lastSeq + 1, name, args }
+          const known = yield* storage.lookup(mutationId)
+          if (Option.isSome(known)) return known.value
+          const envelope: MutationEnvelope = { clientId, mutationId, seq: yield* storage.nextSeq, name, args }
           const createdAt = yield* Clock.currentTimeMillis
           const run = yield* executor.run(envelope, createdAt)
           if (Option.isSome(run.rejection)) {
             return yield* new LocallyRejected({ name, error: run.rejection.value })
           }
           yield* storage.appendPending({ envelope, createdAt, undo: run.undo })
-          yield* storage.setMeta({ ...meta, lastSeq: envelope.seq })
           return envelope
         })
       )
@@ -347,8 +354,14 @@ export const make = <E, TE>(options: {
                 if (request.cursor === null && Option.isNone(continuation)) return yield* error
                 // Never apply a partial set: drop it and start a snapshot from null. The
                 // replica (and its cursor) keeps serving reads until that snapshot is installed.
+                // Re-read meta: the request was built before the network wait, and push responses
+                // may have advanced `pushedThrough` meanwhile; a stale write would resend them.
                 yield* storage.transaction(
-                  Effect.andThen(storage.clearStaged, storage.setMeta({ ...meta, resnapshot: true }))
+                  Effect.gen(function* () {
+                    const current = yield* storage.meta
+                    yield* storage.clearStaged
+                    yield* storage.setMeta({ ...current, resnapshot: true })
+                  })
                 )
                 return Option.none<PullResponse>()
               })

@@ -4,8 +4,12 @@
  * A seeded PRNG drives a schedule of local mutations, pushes (lost requests, transient stops
  * at random positions, lost responses), paginated pulls (failing between pages), server
  * out-of-band writes, grant/revoke/move, client reload (memory lost, disk kept), going
- * offline, log GC (forces resnapshot), optional ledger GC, and clock skew. Time is the
- * ambient `Clock` (run under `TestClock`), skewed per client.
+ * offline, log GC (forces resnapshot), optional ledger GC, clock skew, enqueue retries after
+ * release (answered by released-row markers, or ended by the §8 position backstop once the
+ * markers were pruned), crashes in the middle of a storage transaction followed by a reload,
+ * and local mutations/pushes committing while a pull is suspended on the network. Time is the
+ * ambient `Clock` (run under `TestClock`), skewed per client. Intents count as committed from
+ * `mutate`'s return value, independently of the outbox.
  *
  * Invariants checked after every client step:
  * - replica = replay(pending, server state at the installed cursor restricted to the client's
@@ -18,11 +22,12 @@
  * replicas equal the server restricted to readable scopes, and each server rejection
  * surfaced as exactly one notice.
  */
-import { Array as Arr, Clock, Effect, Option, Order, Schema } from "effect"
+import { Array as Arr, Clock, Deferred, Effect, Fiber, Option, Order, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import * as Engine from "../../client/sync/Engine.ts"
-import type { EncodedRow, MutationEnvelope, PullDone, PullPage, PullResponse } from "../../client/sync/Wire.ts"
+import type { EncodedRow, MutationEnvelope, PullDone, PullResponse } from "../../client/sync/Wire.ts"
 import * as MemoryStore from "./MemoryStore.ts"
+import * as MemorySyncStorage from "./MemorySyncStorage.ts"
 import * as RefServer from "./RefServer.ts"
 import { ANYONE, COUNTERS, GRANTS, grantId, grantRow, restore, roleOf, runMutation } from "./SimApp.ts"
 import type { Role } from "./SimApp.ts"
@@ -60,8 +65,14 @@ export interface Stats {
   readonly notices: number
   readonly transientStops: number
   readonly lostResponses: number
-  /** Enqueue retries that arrived after their original was released (duplicates). */
+  /** Enqueue retries after release whose marker was pruned: a duplicate the backstop ends. */
   readonly lateRetries: number
+  /** Enqueue retries after release answered by the released-row marker (no new intent). */
+  readonly markerHits: number
+  /** Crashes injected in the middle of a storage transaction. */
+  readonly crashes: number
+  /** Local mutations/pushes run while a pull was suspended on the network. */
+  readonly interleaved: number
   /** Pending mutations released by an expired ledger row rather than an ack. */
   readonly expired: number
 }
@@ -117,60 +128,6 @@ const view = (tables: MemoryStore.Tables, principal: string) =>
     return out
   })
 
-export interface Disk {
-  readonly replica: MemoryStore.MemoryStore
-  meta: Engine.SyncMeta
-  outbox: Array<Engine.PendingMutation>
-  staged: Array<PullPage>
-  notices: Array<Engine.Notice>
-}
-
-export const makeStorage = (disk: Disk): Engine.SyncStorage<never> => ({
-  transaction: (self) =>
-    Effect.suspend(() => {
-      const saved = { meta: disk.meta, outbox: disk.outbox, staged: disk.staged, notices: disk.notices }
-      return disk.replica.transaction(self).pipe(
-        Effect.onExit((exit) =>
-          Effect.sync(() => {
-            if (exit._tag === "Failure") Object.assign(disk, saved)
-          })
-        )
-      )
-    }),
-  rows: { write: disk.replica.write, purgeScope: disk.replica.purgeScope, clearAll: disk.replica.clearAll },
-  meta: Effect.sync(() => disk.meta),
-  setMeta: (meta) =>
-    Effect.sync(() => {
-      disk.meta = meta
-    }),
-  pending: Effect.sync(() => disk.outbox),
-  appendPending: (entry) =>
-    Effect.sync(() => {
-      disk.outbox = [...disk.outbox, entry]
-    }),
-  setUndo: (seq, undo) =>
-    Effect.sync(() => {
-      disk.outbox = disk.outbox.map((e) => (e.envelope.seq === seq ? { ...e, undo } : e))
-    }),
-  removePending: (ids) =>
-    Effect.sync(() => {
-      const gone = new Set(ids)
-      disk.outbox = disk.outbox.filter((e) => !gone.has(e.envelope.seq))
-    }),
-  staged: Effect.sync(() => disk.staged),
-  stage: (page) =>
-    Effect.sync(() => {
-      disk.staged = [...disk.staged, page]
-    }),
-  clearStaged: Effect.sync(() => {
-    disk.staged = []
-  }),
-  addNotices: (notices) =>
-    Effect.sync(() => {
-      disk.notices = [...disk.notices, ...notices]
-    })
-})
-
 const skewed = (base: Clock.Clock, ms: number): Clock.Clock => ({
   currentTimeMillisUnsafe: () => base.currentTimeMillisUnsafe() + ms,
   currentTimeMillis: Effect.map(base.currentTimeMillis, (t) => t + ms),
@@ -205,7 +162,10 @@ export const run = (options: Options) =>
       transientStops: 0,
       lostResponses: 0,
       expired: 0,
-      lateRetries: 0
+      lateRetries: 0,
+      markerHits: 0,
+      crashes: 0,
+      interleaved: 0
     }
     const committed: Array<MutationEnvelope> = []
     const ids: Array<string> = []
@@ -230,14 +190,12 @@ export const run = (options: Options) =>
     const clients = yield* Effect.forEach(CLIENTS, ([clientId, principal]) =>
       Effect.gen(function* () {
         server.register(clientId, principal)
-        const disk: Disk = {
-          replica: MemoryStore.make(),
-          meta: Engine.initialMeta,
-          outbox: [],
-          staged: [],
-          notices: []
+        const disk = MemorySyncStorage.makeDisk()
+        const storage = MemorySyncStorage.make(disk)
+        // Set by the interleaving step: the next pull request announces itself and waits.
+        const ctl: { gate: Option.Option<{ arrived: Deferred.Deferred<void>; release: Deferred.Deferred<void> }> } = {
+          gate: Option.none()
         }
-        const storage = makeStorage(disk)
         const executor: Engine.Executor<never> = {
           run: (envelope, createdAt) => runMutation(disk.replica, principal, envelope, createdAt)
         }
@@ -256,6 +214,12 @@ export const run = (options: Options) =>
             }),
           pull: (request) =>
             Effect.gen(function* () {
+              if (Option.isSome(ctl.gate)) {
+                const { arrived, release } = ctl.gate.value
+                ctl.gate = Option.none()
+                yield* Deferred.succeed(arrived, undefined)
+                yield* Deferred.await(release)
+              }
               if (faults && rng.chance(0.15)) return yield* new TransportFailed({ during: "pull request" })
               const response = yield* server.pull(request).pipe(
                 Effect.tapError(() =>
@@ -272,6 +236,7 @@ export const run = (options: Options) =>
           clientId,
           principal,
           disk,
+          ctl,
           storage,
           executor,
           transport,
@@ -442,86 +407,160 @@ export const run = (options: Options) =>
       ])
     })
 
+    /** Records an intent the caller was told is saved, independently of the outbox. */
+    const record = (envelope: MutationEnvelope) =>
+      Effect.sync(() => {
+        if (!committed.some((e) => e.clientId === envelope.clientId && e.seq === envelope.seq)) committed.push(envelope)
+      })
+
+    const reload = (client: Client) =>
+      Effect.gen(function* () {
+        client.engine = yield* Engine.make({
+          clientId: client.clientId,
+          storage: client.storage,
+          executor: client.executor,
+          transport: client.transport,
+          pushBatchSize: 4
+        })
+      })
+
+    const mutateStep = (client: Client) =>
+      Effect.gen(function* () {
+        // Enqueue retried after its original was released (a handover retry landing late).
+        const releasedHere = committed.filter(
+          (e) => e.clientId === client.clientId && !client.disk.outbox.some((p) => p.envelope.seq === e.seq)
+        )
+        const late = rng.pick(releasedHere)
+        if (Option.isSome(late) && rng.chance(0.08)) {
+          const original = late.value
+          const marker = client.disk.released.get(original.mutationId)
+          if (marker !== undefined) {
+            // §9 rule 1: the marker answers with the seq it records; no handler, no new intent.
+            stats.markerHits++
+            note(`${client.clientId}: retry enqueue of released ${original.mutationId} (marker)`)
+            const lastSeq = client.disk.lastSeq
+            const again = yield* client.engine.mutate(original.mutationId, original.name, original.args)
+            if (again.seq !== marker.seq || client.disk.lastSeq !== lastSeq) {
+              return yield* violated("enqueue of a released id adds no intent", original.mutationId)
+            }
+            return
+          }
+          // Marker pruned: the duplicate gets a fresh seq and only the §8 position backstop
+          // ends it. Off with ledger expiry, modelling DESIGN §16.5: expiry is allowed only after
+          // the released-row retention window, so no such duplicate exists when rows expire (a
+          // duplicate's fresh seq is above the floor, and nothing could recognise it).
+          if (options.ledgerGc !== true) {
+            stats.lateRetries++
+            note(`${client.clientId}: retry enqueue of released ${original.mutationId} (pruned)`)
+            return yield* ignoreExpected(
+              withClock(
+                client,
+                client.engine.mutate(original.mutationId, original.name, original.args).pipe(Effect.tap(record))
+              )
+            )
+          }
+        }
+        const retry = client.disk.outbox.at(-1)
+        if (retry !== undefined && rng.chance(0.05)) {
+          note(`${client.clientId}: retry enqueue ${retry.envelope.mutationId}`)
+          const again = yield* client.engine.mutate(retry.envelope.mutationId, "increment", { id: "ignored", by: 99 })
+          if (again.seq !== retry.envelope.seq)
+            return yield* violated("enqueue is idempotent on mutationId", again.mutationId)
+          return
+        }
+        const { name, args } = randomMutation(client)
+        // Caller-generated, unordered idempotency key (DESIGN §6).
+        const mutationId = `m${rng.int(2 ** 30).toString(36)}-${client.clientId}-${client.disk.lastSeq}`
+        note(`${client.clientId}: mutate ${name} ${JSON.stringify(args)}`)
+        yield* ignoreExpected(withClock(client, client.engine.mutate(mutationId, name, args).pipe(Effect.tap(record))))
+      })
+
+    const pushStep = (client: Client) =>
+      Effect.gen(function* () {
+        if (!client.online) return
+        note(`${client.clientId}: push`)
+        yield* ignoreExpected(client.engine.push)
+      })
+
+    const pullStep = (client: Client) =>
+      Effect.gen(function* () {
+        if (!client.online) return
+        note(`${client.clientId}: pull from ${client.disk.meta.cursor} (${client.disk.staged.length} staged)`)
+        yield* ignoreExpected(pull(client))
+      })
+
+    /** A pull suspended on the network while local mutations and pushes commit (P1 shape). */
+    const interleavedStep = (client: Client) =>
+      Effect.gen(function* () {
+        if (!client.online) return
+        const arrived = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        client.ctl.gate = Option.some({ arrived, release })
+        note(`${client.clientId}: pull (suspended) from ${client.disk.meta.cursor}`)
+        const fiber = yield* Effect.forkChild(ignoreExpected(pull(client)))
+        yield* Deferred.await(arrived)
+        if (rng.chance(0.3)) {
+          note(`server: GC log ≤ head ${server.head()} (pull will need a resnapshot)`)
+          server.gcLog(server.head())
+          if (options.ledgerGc === true) server.gcLedger(server.head())
+        }
+        for (let i = 0; i <= rng.int(3); i++) {
+          stats.interleaved++
+          yield* rng.chance(0.6) ? mutateStep(client) : pushStep(client)
+        }
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(fiber)
+      })
+
+    /** A crash in the middle of a pull install or push-backstop transaction, then a reload. */
+    const crashStep = (client: Client) =>
+      Effect.gen(function* () {
+        if (!client.online) return
+        stats.crashes++
+        client.disk.crashAfterWrites = Option.some(rng.int(6))
+        const op = rng.chance(0.6) ? pullStep(client) : pushStep(client)
+        note(`${client.clientId}: crash armed`)
+        yield* op.pipe(
+          Effect.catchDefect((defect) =>
+            defect instanceof MemorySyncStorage.SimulatedCrash
+              ? Effect.sync(() => note("  ↳ crashed mid-transaction"))
+              : Effect.die(defect)
+          )
+        )
+        client.disk.crashAfterWrites = Option.none()
+        yield* reload(client)
+      })
+
     const clientStep = (client: Client) =>
       Effect.gen(function* () {
         const roll = rng.int(100)
-        if (roll < 40) {
-          const { name, args } = randomMutation(client)
-          note(`${client.clientId}: mutate ${name} ${JSON.stringify(args)}`)
-          // Caller-generated, unordered idempotency key (DESIGN §6); occasionally a retried
-          // enqueue of a still-pending id, which must not create a second intent.
-          // Off with ledger expiry, modelling DESIGN §16.5: expiry is allowed only with §9 rule (1)
-          // (released-row markers), so no duplicate exists. A duplicate gets a fresh seq above the
-          // floor, so once its original's ledger row expired nothing could recognise it.
-          const released =
-            options.ledgerGc === true
-              ? []
-              : committed.filter(
-                  (e) =>
-                    e.clientId === client.clientId &&
-                    !client.disk.outbox.some((p) => p.envelope.mutationId === e.mutationId)
-                )
-          const late = rng.pick(released)
-          if (Option.isSome(late) && rng.chance(0.05)) {
-            // Handover retry that lands after its original was pushed, acked, pulled and
-            // released, with no released-row marker (DESIGN §9 rule 1 deliberately absent here):
-            // the §8 position backstop must terminate the duplicate.
-            stats.lateRetries++
-            note(`${client.clientId}: retry enqueue of released ${late.value.mutationId}`)
-            return yield* ignoreExpected(
-              withClock(client, client.engine.mutate(late.value.mutationId, late.value.name, late.value.args))
-            )
-          }
-          const retry = client.disk.outbox.at(-1)
-          if (retry !== undefined && rng.chance(0.05)) {
-            note(`${client.clientId}: retry enqueue ${retry.envelope.mutationId}`)
-            const again = yield* client.engine.mutate(retry.envelope.mutationId, "increment", { id: "ignored", by: 99 })
-            if (again.seq !== retry.envelope.seq)
-              return yield* violated("enqueue is idempotent on mutationId", again.mutationId)
-            return
-          }
-          const mutationId = `m${rng.int(2 ** 30).toString(36)}-${client.clientId}-${client.disk.meta.lastSeq}`
-          yield* ignoreExpected(withClock(client, client.engine.mutate(mutationId, name, args)))
-        } else if (roll < 60) {
-          if (!client.online) return
-          note(`${client.clientId}: push`)
-          yield* ignoreExpected(client.engine.push)
-        } else if (roll < 85) {
-          if (!client.online) return
-          note(`${client.clientId}: pull from ${client.disk.meta.cursor} (${client.disk.staged.length} staged)`)
-          yield* ignoreExpected(pull(client))
-        } else if (roll < 92) {
+        if (roll < 38) return yield* mutateStep(client)
+        if (roll < 56) return yield* pushStep(client)
+        if (roll < 76) return yield* pullStep(client)
+        if (roll < 81) return yield* interleavedStep(client)
+        if (roll < 84) return yield* crashStep(client)
+        if (roll < 87) {
+          note(`${client.clientId}: released-row retention passed (markers pruned)`)
+          return MemorySyncStorage.pruneReleased(client.disk)
+        }
+        if (roll < 93) {
           if (client.disk.staged.length > 0) stats.reloadsMidSet++
           note(`${client.clientId}: reload (${client.disk.staged.length} staged)`)
-          client.engine = yield* Engine.make({
-            clientId: client.clientId,
-            storage: client.storage,
-            executor: client.executor,
-            transport: client.transport,
-            pushBatchSize: 4
-          })
-        } else if (roll < 97) {
-          client.online = !client.online
-          note(`${client.clientId}: ${client.online ? "online" : "offline"}`)
-        } else {
-          client.skew = rng.int(2) === 0 ? 0 : (rng.int(2) === 0 ? -1 : 1) * rng.int(3_600_000)
-          note(`${client.clientId}: clock skew ${client.skew}ms`)
+          return yield* reload(client)
         }
+        if (roll < 97) {
+          client.online = !client.online
+          return note(`${client.clientId}: ${client.online ? "online" : "offline"}`)
+        }
+        client.skew = rng.int(2) === 0 ? 0 : (rng.int(2) === 0 ? -1 : 1) * rng.int(3_600_000)
+        note(`${client.clientId}: clock skew ${client.skew}ms`)
       })
-
-    const recordCommitted = (client: Client, before: number) => {
-      for (const entry of client.disk.outbox) {
-        if (entry.envelope.seq > before) committed.push(entry.envelope)
-      }
-    }
 
     for (step = 1; step <= options.steps; step++) {
       const roll = rng.int(100)
       if (roll < 85) {
         const client = Option.getOrThrow(rng.pick(clients))
-        const before = client.disk.meta.lastSeq
         yield* clientStep(client)
-        recordCommitted(client, before)
         yield* checkClient(client)
       } else if (roll < 95) {
         yield* serverWrite
