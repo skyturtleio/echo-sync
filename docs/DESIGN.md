@@ -83,7 +83,7 @@ Engine tables (Postgres schema `echo_sync`):
 | `clients(client_id, principal_id, cursor, last_seen_at, created_at)` | one row per client device/profile |
 | `mutations(client_id, mutation_id, position, outcome, received_at)` | ledger: exactly-once + ack delivery |
 | `client_scopes(client_id, position, scope_ids)` | the set of scopes a client **holds** as of each completed pull (written at `PullDone` under `nextCursor`, `ON CONFLICT DO NOTHING`; rows below the cursor a client presents are pruned on that pull). The wire cursor is a bare `Position`, and the held set cannot be rebuilt from the log (identity only, GC'd, revoke+re-grant cancels out), so it is recorded as an explicit fact. A presented cursor with no record ⇒ `ResnapshotRequired(unknownCursor)`, never trusted. |
-| `log(position, table_name, row_id, access_scope_id, op, txid, committed_at)` | change identity, not payload. `table_name` is the **sync table name**, the identity shared with clients (SQLite has no schemas), unqualified; `attach` maps it to exactly one Postgres relation and refuses a second relation with the same name in another schema. `attach` owns its transaction (READ COMMITTED) and refuses to run inside an ambient one, like the ledger: its uniqueness check must see concurrent commits, which a caller's REPEATABLE READ snapshot hides. |
+| `log(position, table_name, row_id, access_scope_id, op, txid, committed_at)` | change identity, not payload. `table_name` is the **sync table name**, the identity shared with clients (SQLite has no schemas), unqualified; `attach` maps it to exactly one Postgres relation and refuses a second relation with the same name in another schema. `attach` owns its transaction (READ COMMITTED) and refuses to run inside an ambient one, like the ledger: its uniqueness check must see concurrent commits, which a caller's REPEATABLE READ snapshot hides. Schema and table identifiers are quoted the same way for the catalog lookup and the trigger DDL, so `schema: "Public"` and `public` are different relations and the second attach of one name is refused, never silently captured twice. The server `RowStore` resolves a sync table to its attached relation only; a table with no attach mapping is a defect (the trigger is missing, so a write would never reach the log), never a fallback to `public`. |
 | `migrations(...)` | `effect/sql/Migrator` history table (configured name) |
 
 Principals are opaque strings supplied by the app (`principalFor(request)`). Authentication is
@@ -183,7 +183,11 @@ const setCompleted = Mutation.make("todos.setCompleted", {
 Server execution: one short Postgres transaction per mutation, in client order:
 authorize → run handler (writes fire triggers → `echo_sync.log`) → write ledger row with
 `position` → commit. Push is HTTP-batched (default 50, cap 100 / ~1 MB): **batch at the HTTP
-level, commit at the mutation level.**
+level, commit at the mutation level.** The mutation transaction runs at **SERIALIZABLE**, set as
+the first statement of the outer transaction (before the client registration and ledger lookup),
+so two clients' read-modify-write handlers on the same row cannot both commit a lost update at
+READ COMMITTED; the `40001` retry below re-runs the whole attempt, registration and ledger
+lookup included. `attach` is the one place that deliberately runs READ COMMITTED (§4).
 
 Outcomes: permanent failures (decode, forbidden, domain error) are recorded in the ledger as
 processed-with-typed-error and the batch continues; transient failures (serialization `40001`
