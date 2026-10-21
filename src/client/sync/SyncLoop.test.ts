@@ -19,7 +19,7 @@ class Offline extends Schema.TaggedError<Offline>()("Offline", {}) {}
 /** Fake engine: `pushFails` decides each push attempt's outcome; counts calls. */
 const fakeEngine = (pushFails: (attempt: number) => Malformed | Offline | undefined) => {
   const calls = { push: 0, pull: 0 }
-  const engine: Engine.Engine<never, Malformed | Offline> = {
+  const engine: Engine.Engine<Malformed | Offline> = {
     mutate: () => Effect.die("unused"),
     push: Effect.suspend(() => {
       const error = pushFails(calls.push++)
@@ -39,10 +39,17 @@ it.effect("an integrity error halts push for good while pull keeps running", () 
     yield* Effect.forkChild(loop.run)
     yield* settle
     expect((yield* loop.status).push).toEqual({ _tag: "Halted", message: "MalformedEnvelope: bad envelope" })
-    // Neither waking nor time passing retries the push; pull still runs on every cycle.
+    // A halt is not a failure: the halting cycle still pulled, and no backoff delays the next one.
+    expect(calls.pull).toBe(1)
+    expect((yield* loop.status).lastError).toBeNull()
+    yield* TestClock.adjust("1 minute")
+    yield* settle
+    expect(calls.pull).toBe(1) // no backoff retry was scheduled
+    // Neither waking nor time passing retries the push; pull still runs on every cycle, at once.
     for (let i = 0; i < 3; i++) {
       yield* loop.wake
       yield* settle
+      expect(calls.pull).toBe(i + 2)
       yield* TestClock.adjust("1 minute")
     }
     expect(calls.push).toBe(1)

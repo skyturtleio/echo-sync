@@ -7,67 +7,38 @@
  * so concurrent engine fibers (mutate, push, pull) never interleave statements inside another fiber's
  * transaction.
  *
- * Stored forms are parsed with Schema when read. They mirror `Wire.ts` and are replaced by core's
- * Protocol codecs in the same change that swaps `Wire.ts` for `src/core`.
+ * Every method fails only with `StoreUnavailable` (retryable SQL errors); any other SQL error, or a
+ * stored form that does not decode, is corruption or a bug, so a defect. Stored forms use core's
+ * schemas: staged pages are `Protocol.PullPage` JSON, notices carry `Mutation.MutationEnvelope` and
+ * `Mutation.MutationRejection`, and undo images store their table by sync name, resolved through the
+ * registry when read (a rebuild empties them, so a name is always registered).
  */
 import { Effect, Option, Schema } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
-import type { SqlError } from "effect/sql/SqlError"
-import { AccessScope, type Errors, type Registry, SyncTable } from "echo-sync"
-import * as SqliteRowStore from "../SqliteRowStore.ts"
+import { isSqlError, type SqlError } from "effect/sql/SqlError"
+import { Ids, Mutation, Protocol, type Registry, type Store, SyncTable } from "echo-sync"
 import * as Outbox from "../Outbox.ts"
+import * as SqliteRowStore from "../SqliteRowStore.ts"
 import type * as Engine from "./Engine.ts"
-import type { MutationEnvelope, PullPage, RowWriter, UndoImage } from "./Wire.ts"
 
-const Row = Schema.StructWithRest(Schema.Struct({ id: Schema.String, access_scope_id: Schema.String }), [
-  Schema.Record(Schema.String, Schema.Unknown)
-])
-const Tagged = Schema.StructWithRest(Schema.Struct({ _tag: Schema.String }), [
-  Schema.Record(Schema.String, Schema.Unknown)
-])
-const Outcome = Schema.Union([
-  Schema.Struct({ _tag: Schema.Literal("Applied") }),
-  Schema.Struct({ _tag: Schema.Literal("Rejected"), error: Tagged })
-])
-const Change = Schema.Union([
-  Schema.Struct({ _tag: Schema.Literal("upsert"), table: Schema.String, row: Row }),
-  Schema.Struct({ _tag: Schema.Literal("tombstone"), table: Schema.String, id: Schema.String }),
-  Schema.Struct({ _tag: Schema.Literal("scopePurged"), scopeId: Schema.String })
-])
-/** A staged page; positions are decimal strings in storage (DESIGN §8: bigint in memory). */
-const StoredPage = Schema.fromJsonString(
-  Schema.Struct({
-    _tag: Schema.Literal("PullPage"),
-    changes: Schema.Array(Change),
-    acks: Schema.Array(
-      Schema.Struct({ mutationId: Schema.String, position: Schema.BigIntFromString, outcome: Outcome })
-    ),
-    continuation: Schema.String
-  })
-)
-/** Undo images: `before` is `null` when the row did not exist. */
+const StoredPage = Schema.fromJsonString(Protocol.PullPage)
 const StoredUndo = Schema.fromJsonString(
-  Schema.Array(Schema.Struct({ table: Schema.String, id: Schema.String, before: Schema.OptionFromNullOr(Row) }))
+  Schema.Array(
+    Schema.Struct({
+      table: Schema.String,
+      id: Schema.String,
+      before: Schema.OptionFromNullOr(SyncTable.EncodedRow)
+    })
+  )
 )
-const Envelope = Schema.Struct({
-  clientId: Schema.String,
-  mutationId: Schema.String,
-  seq: Schema.Number,
-  name: Schema.String,
-  args: Schema.Unknown
-})
 const StoredNotice = Schema.fromJsonString(
   Schema.Union([
-    Schema.Struct({ _tag: Schema.Literal("Rejected"), envelope: Envelope, error: Tagged }),
-    Schema.Struct({ _tag: Schema.Literal("OutcomeUnknown"), envelope: Envelope })
+    Schema.TaggedStruct("Rejected", { envelope: Mutation.MutationEnvelope, error: Mutation.MutationRejection }),
+    Schema.TaggedStruct("OutcomeUnknown", { envelope: Mutation.MutationEnvelope })
   ])
 )
 const StoredMeta = Schema.fromJsonString(
-  Schema.Struct({
-    cursor: Schema.NullOr(Schema.BigIntFromString),
-    pushedThrough: Schema.Number,
-    resnapshot: Schema.Boolean
-  })
+  Schema.Struct({ cursor: Ids.Cursor, pushedThrough: Schema.Int, resnapshot: Schema.Boolean })
 )
 
 // Our own rows failing to decode means corruption or a version skew: a defect, never retryable.
@@ -82,6 +53,8 @@ const encode = <S extends Schema.Codec<unknown, string>>(schema: S) => {
 const decodePage = decode(StoredPage)
 const encodePage = encode(StoredPage)
 const decodeUndo = decode(StoredUndo)
+const decodeEnvelope = Schema.decodeUnknownEffect(Mutation.MutationEnvelope)
+const decodeSeq = Schema.decodeUnknownEffect(Ids.Seq)
 const encodeUndo = encode(StoredUndo)
 const encodeNotice = encode(StoredNotice)
 const decodeMeta = decode(StoredMeta)
@@ -171,81 +144,82 @@ export const migrate = (
     )
   })
 
-const toEnvelope = (entry: Outbox.OutboxEntry): MutationEnvelope => ({
-  clientId: entry.clientId,
-  mutationId: entry.mutationId,
-  seq: entry.seq,
-  name: entry.name,
-  args: entry.args
-})
+const encodeUndoImages = (undo: ReadonlyArray<Store.UndoImage>) =>
+  encodeUndo(undo.map((image) => ({ table: image.table.name, id: image.id, before: image.before })))
 
-const toCoreRow = Schema.decodeUnknownEffect(SyncTable.EncodedRow)
+const toEnvelope = (entry: Outbox.OutboxEntry): Effect.Effect<Mutation.MutationEnvelope> =>
+  Effect.orDie(
+    decodeEnvelope({
+      clientId: entry.clientId,
+      mutationId: entry.mutationId,
+      seq: entry.seq,
+      name: entry.name,
+      args: entry.args
+    })
+  )
 
 /**
- * `rows` is the SQLite `ReplicaRowStore` for `registry`, on the same connection, so its statements join
- * this storage's transactions. Until the engine takes core's ports (reconcile's type swap), the engine's
- * name-keyed `RowWriter` is adapted here: a name the registry does not know is a defect, because the
- * engine skips unknown tables before writing (DESIGN §8) and handlers only write registered tables.
+ * The storage port over `sql`. `rows` is the SQLite `ReplicaRowStore` for `registry` on the same
+ * connection, so its statements join this storage's transactions.
  */
-export const make = (
-  sql: SqlClient.SqlClient,
-  registry: Registry.SyncRegistry
-): Engine.SyncStorage<SqlError | Errors.StoreUnavailable> => {
-  const store = SqliteRowStore.make(sql, registry)
-  const tableNamed = (name: string) =>
-    Option.match(registry.get(name), {
-      onNone: () => Effect.die(new Error(`echo-sync: write to unregistered table ${name}`)),
-      onSome: Effect.succeed
-    })
-  const rows: RowWriter<Errors.StoreUnavailable> = {
-    write: (name, id, row) =>
-      Effect.gen(function* () {
-        const table = yield* tableNamed(name)
-        const value = Option.isNone(row) ? Option.none() : Option.some(yield* Effect.orDie(toCoreRow(row.value)))
-        yield* store.write(table, id, value)
-      }),
-    purgeScope: (scopeId) => store.purgeScope(AccessScope.AccessScopeId.make(scopeId)),
-    clearAll: store.clearAll
-  }
-  const provide = <A, E>(effect: Effect.Effect<A, E, SqlClient.SqlClient>) =>
-    Effect.provideService(effect, SqlClient.SqlClient, sql)
+export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry): Engine.SyncStorage => {
+  const rows = SqliteRowStore.make(sql, registry)
+  const run = <A>(effect: Effect.Effect<A, SqlError, SqlClient.SqlClient>) =>
+    SqliteRowStore.unavailable(Effect.provideService(effect, SqlClient.SqlClient, sql))
+
+  const decodeUndoImages = (text: string) =>
+    Effect.flatMap(decodeUndo(text), (images) =>
+      Effect.forEach(images, (image) =>
+        Option.match(registry.get(image.table), {
+          onNone: () => Effect.die(new Error(`echo_outbox: undo image for unregistered table ${image.table}`)),
+          onSome: (table): Effect.Effect<Store.UndoImage> => Effect.succeed({ ...image, table })
+        })
+      )
+    )
 
   const pending = Effect.gen(function* () {
     const result: Array<Engine.PendingMutation> = []
-    const undo = yield* sql<{ readonly seq: number; readonly undo: string }>`
-      SELECT seq, undo FROM echo_outbox WHERE released_at IS NULL ORDER BY seq`
+    const undo = yield* run(sql<{ readonly seq: number; readonly undo: string }>`
+      SELECT seq, undo FROM echo_outbox WHERE released_at IS NULL ORDER BY seq`)
     const undoBySeq = new Map(undo.map((r) => [r.seq, r.undo]))
-    for (const entry of yield* provide(Outbox.pending)) {
+    for (const entry of yield* run(Outbox.pending)) {
       result.push({
-        envelope: toEnvelope(entry),
+        envelope: yield* toEnvelope(entry),
         createdAt: entry.createdAt,
-        undo: yield* decodeUndo(undoBySeq.get(entry.seq) ?? "[]")
+        undo: yield* decodeUndoImages(undoBySeq.get(entry.seq) ?? "[]")
       })
     }
     return result
   })
 
   return {
-    transaction: (self) => sql.withTransaction(self),
+    // BEGIN/COMMIT failures map like any statement's; the body's own errors pass through unchanged.
+    transaction: (self) =>
+      sql
+        .withTransaction(self)
+        .pipe(Effect.catchIf(isSqlError, (error) => SqliteRowStore.unavailable(Effect.fail(error)))),
     rows,
     meta: Effect.gen(function* () {
-      const stored = yield* sql<{ readonly value: string }>`SELECT value FROM echo_meta WHERE key = 'sync_meta'`
+      const stored = yield* run(sql<{ readonly value: string }>`SELECT value FROM echo_meta WHERE key = 'sync_meta'`)
       const text = stored[0]?.value
       return text === undefined ? initialMeta : yield* decodeMeta(text)
     }),
     setMeta: (meta) =>
       Effect.gen(function* () {
         const value = yield* encodeMeta(meta)
-        yield* sql`INSERT INTO echo_meta (key, value) VALUES ('sync_meta', ${value})
-          ON CONFLICT (key) DO UPDATE SET value = excluded.value`
+        yield* run(sql`INSERT INTO echo_meta (key, value) VALUES ('sync_meta', ${value})
+          ON CONFLICT (key) DO UPDATE SET value = excluded.value`)
       }),
     pending,
-    lookup: (mutationId) => provide(Outbox.lookup(mutationId)).pipe(Effect.map(Option.map(toEnvelope))),
-    nextSeq: provide(Outbox.nextSeq),
+    lookup: (mutationId) =>
+      Effect.flatMap(run(Outbox.lookup(mutationId)), (entry) =>
+        Option.isNone(entry) ? Effect.succeedNone : Effect.asSome(toEnvelope(entry.value))
+      ),
+    nextSeq: Effect.flatMap(run(Outbox.nextSeq), (seq) => Effect.orDie(decodeSeq(seq))),
     appendPending: (entry) =>
       Effect.gen(function* () {
-        const undo = yield* encodeUndo(entry.undo)
-        yield* provide(
+        const undo = yield* encodeUndoImages(entry.undo)
+        yield* run(
           Outbox.insert({
             seq: entry.envelope.seq,
             clientId: entry.envelope.clientId,
@@ -257,29 +231,29 @@ export const make = (
           })
         )
       }),
-    setUndo: (seq, undo: ReadonlyArray<UndoImage>) =>
+    setUndo: (seq, undo) =>
       Effect.gen(function* () {
-        const text = yield* encodeUndo(undo)
-        yield* sql`UPDATE echo_outbox SET undo = ${text} WHERE seq = ${seq}`
+        const text = yield* encodeUndoImages(undo)
+        yield* run(sql`UPDATE echo_outbox SET undo = ${text} WHERE seq = ${seq}`)
       }),
-    release: (seqs) => provide(Outbox.markReleased(seqs)),
+    release: (seqs) => run(Outbox.markReleased(seqs)),
     staged: Effect.gen(function* () {
-      const stored = yield* sql<{ readonly page: string }>`SELECT page FROM echo_staged ORDER BY ord`
-      return yield* Effect.forEach(stored, (r): Effect.Effect<PullPage> => decodePage(r.page))
+      const stored = yield* run(sql<{ readonly page: string }>`SELECT page FROM echo_staged ORDER BY ord`)
+      return yield* Effect.forEach(stored, (r) => decodePage(r.page))
     }),
     stage: (page) =>
       Effect.gen(function* () {
         const text = yield* encodePage(page)
-        yield* sql`INSERT INTO echo_staged (page) VALUES (${text})`
+        yield* run(sql`INSERT INTO echo_staged (page) VALUES (${text})`)
       }),
-    clearStaged: Effect.asVoid(sql`DELETE FROM echo_staged`),
+    clearStaged: Effect.asVoid(run(sql`DELETE FROM echo_staged`)),
     addNotices: (notices) =>
       Effect.forEach(
         notices,
         (notice) =>
           Effect.gen(function* () {
             const text = yield* encodeNotice(notice)
-            yield* sql`INSERT INTO echo_notices (notice) VALUES (${text})`
+            yield* run(sql`INSERT INTO echo_notices (notice) VALUES (${text})`)
           }),
         { discard: true }
       )

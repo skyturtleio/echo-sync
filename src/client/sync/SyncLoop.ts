@@ -10,6 +10,7 @@
  * (who owns the transport's error union) loses nothing.
  */
 import { Duration, Effect, Option, Queue, Schema, type Stream, SubscriptionRef } from "effect"
+import type { Errors } from "echo-sync"
 import type * as Engine from "./Engine.ts"
 
 export const PushState = Schema.Union([
@@ -38,10 +39,10 @@ export interface SyncLoop {
 const describe = (error: unknown): string =>
   error instanceof Error ? `${error.name}: ${error.message}` : typeof error === "string" ? error : JSON.stringify(error)
 
-export const make = <E, TE>(options: {
-  readonly engine: Engine.Engine<E, TE>
+export const make = <TE>(options: {
+  readonly engine: Engine.Engine<TE>
   /** Whether a push failure is an integrity error that must stop pushing (see module doc). */
-  readonly isFatalPush: (error: E | TE) => boolean
+  readonly isFatalPush: (error: Errors.StoreUnavailable | TE) => boolean
   /** First retry delay after a transient failure; doubles up to `maxRetryDelay`. */
   readonly retryDelay?: Duration.Input
   readonly maxRetryDelay?: Duration.Input

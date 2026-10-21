@@ -2,12 +2,11 @@
 import "../testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { expect, it } from "@effect/vitest"
-import { Deferred, Effect, Fiber, Layer, Option, Schema, Scope } from "effect"
+import { DateTime, Deferred, Effect, Fiber, Layer, Option, Schema, Scope } from "effect"
 import type { Scheduler } from "effect/Scheduler"
 import * as SqlClient from "effect/sql/SqlClient"
-import { AccessScope, Registry, SyncTable } from "echo-sync"
+import { AccessScope, Ids, Mutation, Protocol, Registry, ScopeGrants, SyncTable } from "echo-sync"
 import * as Outbox from "../Outbox.ts"
-import * as SqliteRowStore from "../SqliteRowStore.ts"
 import * as Engine from "./Engine.ts"
 import * as SqliteSyncStorage from "./SqliteSyncStorage.ts"
 
@@ -26,10 +25,17 @@ const makeStorage = Effect.gen(function* () {
   return { storage: SqliteSyncStorage.make(sql, registry), rows }
 })
 
-const entry = (seq: number, mutationId: string) => ({
-  envelope: { clientId: "c", mutationId, seq, name: "t", args: { mutationId } },
+const mid = Ids.MutationId.make
+const seqOf = Ids.Seq.make
+const pos = Ids.Position.make
+const row = (id: string): SyncTable.EncodedRow => ({ id, access_scope_id: "s" })
+const decodePage = Schema.decodeUnknownSync(Protocol.PullPage)
+const decodeDone = Schema.decodeUnknownSync(Protocol.PullDone)
+
+const entry = (seq: Ids.Seq, mutationId: string) => ({
+  envelope: { clientId: Ids.ClientId.make("c"), mutationId: mid(mutationId), seq, name: "t", args: { mutationId } },
   createdAt: 0,
-  undo: [{ table: "t", id: mutationId, before: Option.none() }]
+  undo: [{ table: T, id: mutationId, before: Option.none() }]
 })
 
 it.live("a transaction failing on one fiber rolls back only its own writes while another fiber commits", () =>
@@ -40,9 +46,9 @@ it.live("a transaction failing on one fiber rolls back only its own writes while
       storage
         .transaction(
           Effect.gen(function* () {
-            yield* storage.rows.write("t", "lost", Option.some({ id: "lost", access_scope_id: "s" }))
+            yield* storage.rows.write(T, "lost", Option.some(row("lost")))
             yield* storage.appendPending(entry(yield* storage.nextSeq, "lost"))
-            yield* storage.setMeta({ cursor: 9n, pushedThrough: 9, resnapshot: true })
+            yield* storage.setMeta({ cursor: pos(9n), pushedThrough: 9, resnapshot: true })
             yield* Deferred.succeed(wrote, undefined)
             yield* Effect.sleep("20 millis")
             return yield* Effect.fail("crash")
@@ -54,7 +60,7 @@ it.live("a transaction failing on one fiber rolls back only its own writes while
     // Starts while the failing transaction is open; must not run inside it.
     yield* storage.transaction(
       Effect.gen(function* () {
-        yield* storage.rows.write("t", "kept", Option.some({ id: "kept", access_scope_id: "s" }))
+        yield* storage.rows.write(T, "kept", Option.some(row("kept")))
         yield* storage.appendPending(entry(yield* storage.nextSeq, "kept"))
       })
     )
@@ -62,7 +68,7 @@ it.live("a transaction failing on one fiber rolls back only its own writes while
     expect(yield* rows.ids).toEqual(["kept"])
     const pending = yield* storage.transaction(storage.pending)
     expect(pending.map((e) => [e.envelope.mutationId, e.envelope.seq])).toEqual([["kept", 1]])
-    expect(pending[0]?.undo).toEqual([{ table: "t", id: "kept", before: Option.none() }])
+    expect(pending[0]?.undo).toEqual([{ table: T, id: "kept", before: Option.none() }])
     expect(yield* storage.meta).toEqual({ cursor: null, pushedThrough: 0, resnapshot: false })
   }).pipe(Effect.provide(Db))
 )
@@ -80,11 +86,11 @@ it.effect("nextSeq starts at 1 and never reuses a seq, even after its released r
       )
     expect(yield* append("a")).toBe(1)
     expect(yield* append("b")).toBe(2)
-    yield* storage.transaction(storage.release([2]))
-    expect((yield* storage.lookup("b")).pipe(Option.map((e) => e.seq))).toEqual(Option.some(2))
+    yield* storage.transaction(storage.release([seqOf(2)]))
+    expect((yield* storage.lookup(mid("b"))).pipe(Option.map((e) => e.seq))).toEqual(Option.some(2))
     expect((yield* storage.pending).map((e) => e.envelope.seq)).toEqual([1])
     yield* Effect.provideService(Outbox.pruneReleased(-1), SqlClient.SqlClient, yield* SqlClient.SqlClient)
-    expect(yield* storage.lookup("b")).toEqual(Option.none())
+    expect(yield* storage.lookup(mid("b"))).toEqual(Option.none())
     expect(yield* append("c")).toBe(3)
   }).pipe(Effect.provide(Db))
 )
@@ -92,19 +98,25 @@ it.effect("nextSeq starts at 1 and never reuses a seq, even after its released r
 it.effect("staged pages, meta and notices round-trip with bigint positions", () =>
   Effect.gen(function* () {
     const { storage } = yield* makeStorage
-    const page = {
-      _tag: "PullPage" as const,
+    const page = decodePage({
+      _tag: "PullPage",
       changes: [
-        { _tag: "upsert" as const, table: "t", row: { id: "r", access_scope_id: "s", n: 1 } },
-        { _tag: "scopePurged" as const, scopeId: "s2" }
+        { _tag: "upsert", table: "t", row: { id: "r", access_scope_id: "s", n: 1 } },
+        { _tag: "scopePurged", scopeId: "s2" }
       ],
-      acks: [{ mutationId: "m", position: 2n ** 60n, outcome: { _tag: "Applied" as const } }],
+      acks: [
+        {
+          mutationId: "m",
+          position: String(2n ** 60n),
+          outcome: { _tag: "Rejected", error: { _tag: "UnknownMutation", name: "x" } }
+        }
+      ],
       continuation: "k"
-    }
+    })
     yield* storage.transaction(
       Effect.gen(function* () {
         yield* storage.stage(page)
-        yield* storage.setMeta({ cursor: 2n ** 60n + 1n, pushedThrough: 3, resnapshot: false })
+        yield* storage.setMeta({ cursor: pos(2n ** 60n + 1n), pushedThrough: 3, resnapshot: false })
       })
     )
     expect(yield* storage.staged).toEqual([page])
@@ -121,9 +133,9 @@ it.live("an interrupted transaction rolls back rows, outbox, seq and meta togeth
     const fiber = yield* Effect.forkChild(
       storage.transaction(
         Effect.gen(function* () {
-          yield* storage.rows.write("t", "x", Option.some({ id: "x", access_scope_id: "s" }))
+          yield* storage.rows.write(T, "x", Option.some(row("x")))
           yield* storage.appendPending(entry(yield* storage.nextSeq, "x"))
-          yield* storage.setMeta({ cursor: 5n, pushedThrough: 1, resnapshot: false })
+          yield* storage.setMeta({ cursor: pos(5n), pushedThrough: 1, resnapshot: false })
           yield* Deferred.succeed(wrote, undefined)
           return yield* Effect.never
         })
@@ -148,29 +160,31 @@ const reindexed = Registry.make([
     { indexes: { by_scope: ["accessScopeId"] } }
   )
 ])
-const reshaped = Registry.make([
-  SyncTable.make("t", { id: TId, accessScopeId: AccessScope.AccessScopeId, n: Schema.NullOr(Schema.Int) }),
-  SyncTable.make("u", { id: TId, accessScopeId: AccessScope.AccessScopeId })
-])
+const reshapedT = SyncTable.make("t", {
+  id: TId,
+  accessScopeId: AccessScope.AccessScopeId,
+  n: Schema.NullOr(Schema.Int)
+})
+const reshaped = Registry.make([reshapedT, SyncTable.make("u", { id: TId, accessScopeId: AccessScope.AccessScopeId })])
 
-const page = {
-  _tag: "PullPage" as const,
-  changes: [{ _tag: "upsert" as const, table: "t", row: { id: "b", access_scope_id: "s" } }],
+const page = decodePage({
+  _tag: "PullPage",
+  changes: [{ _tag: "upsert", table: "t", row: { id: "b", access_scope_id: "s" } }],
   acks: [],
   continuation: "k"
-}
+})
 
 /** An installed replica mid-sync: rows, a cursor, a staged page, a pending entry with undo, a released one. */
 const seedOldReplica = Effect.gen(function* () {
   const { storage } = yield* makeStorage
   yield* storage.transaction(
     Effect.gen(function* () {
-      yield* storage.rows.write("t", "a", Option.some({ id: "a", access_scope_id: "s" }))
+      yield* storage.rows.write(T, "a", Option.some(row("a")))
       yield* storage.appendPending(entry(yield* storage.nextSeq, "p"))
       yield* storage.appendPending(entry(yield* storage.nextSeq, "r"))
-      yield* storage.release([2])
+      yield* storage.release([seqOf(2)])
       yield* storage.stage(page)
-      yield* storage.setMeta({ cursor: 7n, pushedThrough: 2, resnapshot: true })
+      yield* storage.setMeta({ cursor: pos(7n), pushedThrough: 2, resnapshot: true })
     })
   )
 })
@@ -190,7 +204,7 @@ const classify = Effect.gen(function* () {
   // Kept in every outcome: the outbox (pending and released) and pushedThrough.
   const kept =
     pending.map((e) => e.envelope.seq).join() === "1" &&
-    Option.isSome(yield* storage.lookup("r")) &&
+    Option.isSome(yield* storage.lookup(mid("r"))) &&
     meta.pushedThrough === 2
   const old = [
     hash[0]?.value === registry.dataHash,
@@ -240,8 +254,9 @@ it.effect("an index-only change keeps rows and cursor; a data-shape change rebui
     expect(uniqueScope.dataHash).toBe(registry.dataHash)
     expect(yield* SqliteSyncStorage.migrate(uniqueScope)).toEqual({ rebuilt: true })
     const unique = SqliteSyncStorage.make(sql, uniqueScope)
-    yield* unique.rows.write("t", "u1", Option.some({ id: "u1", access_scope_id: "s" }))
-    const duplicate = yield* Effect.exit(unique.rows.write("t", "u2", Option.some({ id: "u2", access_scope_id: "s" })))
+    const uniqueT = Option.getOrThrow(uniqueScope.get("t"))
+    yield* unique.rows.write(uniqueT, "u1", Option.some(row("u1")))
+    const duplicate = yield* Effect.exit(unique.rows.write(uniqueT, "u2", Option.some(row("u2"))))
     expect(duplicate._tag).toBe("Failure")
     yield* unique.rows.clearAll
 
@@ -300,46 +315,42 @@ it.effect("after a rebuild, installing the null-cursor set replays pending on to
     expect(yield* SqliteSyncStorage.migrate(reshaped)).toEqual({ rebuilt: true })
     const sql = yield* SqlClient.SqlClient
     const storage = SqliteSyncStorage.make(sql, reshaped)
-    const t = SqliteRowStore.make(sql, reshaped)
-    const tTable = Option.getOrUndefined(reshaped.get("t"))
-    if (tTable === undefined) return yield* Effect.die(new Error("no table t"))
-    // Optimistic handler: upserts row <mutationId> with n = 1, reporting the row's pre-image.
-    const executor: Engine.Executor<unknown> = {
-      run: (envelope) =>
-        Effect.gen(function* () {
-          const before = yield* t.read(tTable, envelope.mutationId)
-          const row = { id: envelope.mutationId, access_scope_id: "s", n: 1 }
-          yield* storage.rows.write("t", envelope.mutationId, Option.some(row))
-          return {
-            undo: [
-              {
-                table: "t",
-                id: envelope.mutationId,
-                before: Option.map(before, (r) => ({ ...r, id: envelope.mutationId, access_scope_id: "s" }))
-              }
-            ],
-            rejection: Option.none()
-          }
-        })
-    }
-    const done = {
-      _tag: "PullDone" as const,
-      changes: [{ _tag: "upsert" as const, table: "t", row: { id: "srv", access_scope_id: "s", n: null } }],
+    const tTable = Option.getOrThrow(reshaped.get("t"))
+    // The pending entries' handler: inserts row <mutationId> with n = 1 in scope "s".
+    const insert = Mutation.make("t", {
+      args: Schema.Struct({ mutationId: TId }),
+      handler: (ctx, { mutationId }) =>
+        ctx.store.insert(reshapedT, { id: mutationId, accessScopeId: AccessScope.AccessScopeId.make("s"), n: 1 })
+    })
+    const actor = AccessScope.PrincipalId.make("me")
+    const grant = Schema.encodeSync(ScopeGrants.ScopeGrants.wire)({
+      id: ScopeGrants.grantId(AccessScope.AccessScopeId.make("s"), actor),
+      accessScopeId: AccessScope.AccessScopeId.make("s"),
+      principalId: actor,
+      role: "writer",
+      grantedAt: DateTime.makeUnsafe(0)
+    })
+    // The null-cursor set: the actor's grant and one server row.
+    const done = decodeDone({
+      _tag: "PullDone",
+      changes: [
+        { _tag: "upsert", table: "scope_grants", row: grant },
+        { _tag: "upsert", table: "t", row: { id: "srv", access_scope_id: "s", n: null } }
+      ],
       acks: [],
-      nextCursor: 9n,
+      nextCursor: "9",
       expiredThrough: 0
-    }
-    yield* storage.transaction(
-      Engine.applyPageSet(storage, executor, (name) => Option.isSome(reshaped.get(name)), [], done)
-    )
-    const rows = yield* t.scan(tTable)
+    })
+    const context = { storage, mutations: Mutation.makeRegistry([insert]), actor, registry: reshaped }
+    yield* storage.transaction(Engine.applyPageSet(context, [], done))
+    const rows = yield* storage.rows.scan(tTable)
     expect(rows.map((r) => [r["id"], r["n"]])).toEqual([
       ["p", 1],
       ["srv", null]
     ])
     const pending = yield* storage.pending
     expect(pending.map((e) => [e.envelope.mutationId, e.undo])).toEqual([
-      ["p", [{ table: "t", id: "p", before: Option.none() }]]
+      ["p", [{ table: tTable, id: "p", before: Option.none() }]]
     ])
     expect((yield* storage.meta).cursor).toBe(9n)
   }).pipe(Effect.provide(Db))

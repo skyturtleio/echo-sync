@@ -21,7 +21,10 @@ type Value = SyncTable.SqliteValue
 
 const q = (name: string) => `"${name.replaceAll('"', '""')}"`
 
-const unavailable = <A, R>(effect: Effect.Effect<A, SqlError, R>): Effect.Effect<A, Errors.StoreUnavailable, R> =>
+/** Retryable SQL errors become the transient `StoreUnavailable`; any other SQL error is a defect. */
+export const unavailable = <A, R>(
+  effect: Effect.Effect<A, SqlError, R>
+): Effect.Effect<A, Errors.StoreUnavailable, R> =>
   Effect.catch(effect, (error) =>
     error.isRetryable ? Effect.fail(new Errors.StoreUnavailable({ message: error.message })) : Effect.die(error)
   )
