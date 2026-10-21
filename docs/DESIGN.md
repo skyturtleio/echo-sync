@@ -220,7 +220,13 @@ lifetime; a halt is in-memory, so a reload or leader handover pushes once more a
 succeeds (server fixed) or halts again. A batch that fails the client-side `PushRequest` check
 before sending is fatal the same way, and nothing is sent. Corollary for the server: every
 infrastructure failure (connection, pool, `40001` after retries) must surface as a transient
-*failure*, never leak as a defect, or clients halt until reload. Transient push failures
+*failure*, never leak as a defect, or clients halt until reload. On `push` that failure is the
+short result list (the batch stops at the first unprocessed entry). `pull` and `pokes` carry a
+typed transient member, `Protocol.ServerUnavailable`, for the same purpose: the server maps
+`SqlError`/`StoreUnavailable` to it, so a defect from the server always means a bug. The client
+treats a pull defect as transient anyway (below) as a safety net, not as the contract. The
+`pokes` stream ending for any reason (failure, defect, clean end) is reconnected by the client
+with backoff; it is a hint stream and nothing is lost. Transient push failures
 (`RpcClientError`, `Unauthorized`, interruption) and every pull failure (including a pull defect
 or an undecodable page, mapped to a transient pull error) are retried with backoff. v1 uses one
 backoff per sync cycle (push then pull), not one per operation: a transient push failure also
