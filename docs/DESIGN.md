@@ -732,8 +732,11 @@ const todosByProject = Query.make("todos.byProject", {
   (no-op without an entry). The payload carries `clientId` because it is part of the key
   (ruling, ws/presence-server); the server's internal key also includes the principal, so
   naming another principal's client id can neither replace nor end that principal's entry. A
-  rejoin with the same key replaces the entry, and the older stream's end does not remove the
-  newer one. `room` is an `AccessScopeId`: the principal must hold a grant in that scope
+  rejoin with the same key replaces the entry and ends the older `room` stream (ruling,
+  ws/presence-server review): an entry has exactly one observing stream, so a stream never
+  outlives its entry on an abandoned room. `track` applies its in-memory update and its change
+  tick atomically with respect to interruption, so a state that is installed is always
+  announced. `room` is an `AccessScopeId`: the principal must hold a grant in that scope
   (`roleFor`, same check as reads) or the call fails `Unauthorized`. `state` is `Schema.Json`;
   `RoomSnapshot` is `{ room, entries: ReadonlyArray<{ principalId, clientId, tabId, state }> }`,
   emitted on join and on every change (coalescing allowed). Server state is in-memory and
