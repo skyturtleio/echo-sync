@@ -506,6 +506,17 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
   `"idle" | "pushing" | "pulling" | "backoff"`; `nextRetryAt` is epoch ms while
   `phase === "backoff"`, otherwise `null`. There is no `connected` boolean: a completed cycle
   proves nothing about current connectivity, and v1 adds none (see §16 item 9).
+  **`lastError` shape (coordinator ruling, HeyBabe fifth-pin finding):** `lastError` is
+  `null | { kind, message }`, not a bare string, because an app must distinguish a failed
+  credential refresh ("sign in again") from an unreachable server ("you are offline") without
+  parsing text. `kind` is a closed union: `"credentials"` (`syncHeaders` raised, nothing sent),
+  `"unauthorized"` (the server rejected the credential), `"unavailable"` (`ServerUnavailable`),
+  `"network"` (the request failed before a server response: transport, HTTP, decode of a
+  response that never arrived), `"server"` (any other server-produced transient failure, the
+  stopped-batch case included). `message` is a human-readable description that walks the
+  cause chain (an outer `RpcClientError` must not hide the inner cause's text) and never
+  contains header values, request bodies, or tokens. Cleared (`null`) by the next clean
+  cycle, as before. Consumer-visible shape change; lands before any app ships on `syncStatus`.
 - **`requestSync`**: `Effect<void, SyncDisabled | LeaderUnavailable>` on the tab client. It
   wakes the sync loop (coalesced with the existing wake queue) and completes once the wake is
   accepted. It never implies network success, never clears `Halted`, and retries `LeaderLost`
