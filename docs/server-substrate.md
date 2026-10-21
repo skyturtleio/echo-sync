@@ -92,10 +92,14 @@ is never read from the payload. `ClientForbidden` becomes `Unauthorized`.
   (a per-member `Deferred` the stream interrupts on, completed after the new member is
   installed), so every open stream holds an entry and keeps its room's `PubSub` current; the
   older stream's release does not remove the newer member (the same `Deferred` is its identity).
-  `track`'s state update and its announcement are one uninterruptible step. `track` needs no grant lookup: it only
+  `track`'s state update and its announcement are one uninterruptible step.
+  Room streams carry the §6 heartbeat (DESIGN §16 item 13): the element is `snapshot |
+  heartbeat`, the first one the join snapshot, and every stream emits a `heartbeat` every
+  `heartbeatInterval` (the same `SyncServerOptions` field as pokes, default 15 s) from its own
+  timer merged beside its change subscription. A heartbeat therefore never slides out a pending
+  change tick, is never a snapshot, and reads or changes no room state. `track` needs no grant lookup: it only
   changes an entry the same principal holds. Not handled in v1: a grant revoked while a `room`
-  stream is open leaves the entry until the stream ends, and presence streams carry no
-  heartbeat (DESIGN §16 item 13).
+  stream is open leaves the entry until the stream ends (DESIGN §16 item 13).
 
 ## Engine state
 

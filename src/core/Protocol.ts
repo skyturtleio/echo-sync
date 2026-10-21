@@ -158,8 +158,19 @@ export const PresenceEntry = Schema.Struct({
 export type PresenceEntry = typeof PresenceEntry.Type
 
 /** Every entry of a room, ordered by `(principalId, clientId, tabId)`. */
-export const RoomSnapshot = Schema.Struct({ room: AccessScopeId, entries: Schema.Array(PresenceEntry) })
+export const RoomSnapshot = Schema.TaggedStruct("snapshot", {
+  room: AccessScopeId,
+  entries: Schema.Array(PresenceEntry)
+})
 export type RoomSnapshot = typeof RoomSnapshot.Type
+
+/**
+ * One `room` stream element: a `RoomSnapshot` (the first element of every stream) or a
+ * `Heartbeat` (DESIGN §16 item 13, the §6 Liveness shape), which is never a snapshot and
+ * changes no room state.
+ */
+export const RoomElement = Schema.Union([RoomSnapshot, Heartbeat])
+export type RoomElement = typeof RoomElement.Type
 
 /** The entry's identity and state. `room` is an access scope the principal must be able to read. */
 export const PresencePayload = Schema.Struct({
@@ -172,11 +183,12 @@ export const PresencePayload = Schema.Struct({
 export const PresenceRpcs = RpcGroup.make(
   /**
    * Joins `room` with `state` and observes it: a `RoomSnapshot` on join and after every change
-   * (coalescing allowed). The entry lives exactly while this stream is open.
+   * (coalescing allowed), and a `Heartbeat` every server `heartbeatInterval`. The entry lives
+   * exactly while this stream is open.
    */
   Rpc.make("room", {
     payload: PresencePayload,
-    success: RoomSnapshot,
+    success: RoomElement,
     error: Schema.Union([ServerUnavailable, Unauthorized]),
     stream: true
   }),

@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import type * as PgClient from "@effect/sql-pg/PgClient"
-import { Effect, Exit, Fiber, Layer, Option, Queue, Scheduler, Stream } from "effect"
+import { Clock, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Scheduler, Stream } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
 import { RpcClient, RpcSerialization } from "effect/rpc"
@@ -68,11 +69,13 @@ const open = (client: PresenceClient, p: ReturnType<typeof payload>) =>
     const seen: Array<ReadonlyArray<string>> = []
     const fiber = yield* Effect.forkChild(
       Effect.exit(
-        Stream.runForEach(client.room(p), (snapshot) =>
-          Effect.andThen(
-            Effect.sync(() => void seen.push(show(snapshot))),
-            Queue.offer(snapshots, snapshot)
-          )
+        Stream.runForEach(client.room(p), (element) =>
+          element._tag === "snapshot"
+            ? Effect.andThen(
+                Effect.sync(() => void seen.push(show(element))),
+                Queue.offer(snapshots, element)
+              )
+            : Effect.void
         )
       )
     )
@@ -80,8 +83,10 @@ const open = (client: PresenceClient, p: ReturnType<typeof payload>) =>
   })
 
 /** The room as a list of `principal/client/tab=state`, which is what every assertion compares. */
-const show = (snapshot: Protocol.RoomSnapshot) =>
-  snapshot.entries.map((e) => `${e.principalId}/${e.clientId}/${e.tabId}=${JSON.stringify(e.state)}`)
+const show = (element: Protocol.RoomElement) =>
+  element._tag === "heartbeat"
+    ? ["(heartbeat)"]
+    : element.entries.map((e) => `${e.principalId}/${e.clientId}/${e.tabId}=${JSON.stringify(e.state)}`)
 
 /** Takes snapshots until one shows exactly `want`; fails with the last one seen after 5 s. */
 const until = (snapshots: Queue.Queue<Protocol.RoomSnapshot>, want: ReadonlyArray<string>) =>
@@ -106,7 +111,7 @@ describe("presence state (§12)", () => {
     "a presence entry lives exactly while its stream runs: completion, a failing consumer and interruption each remove it",
     () =>
       Effect.gen(function* () {
-        const presence = yield* Presence.make
+        const presence = yield* Presence.make({ heartbeatInterval: "1 hour" })
         const room = Effect.map(presence.snapshot(s1), show)
 
         // Completion: the consumer takes the join snapshot and stops.
@@ -135,7 +140,7 @@ describe("presence state (§12)", () => {
     "a same-key rejoin ends the replaced stream, so it is never left observing an abandoned room after the room is recreated",
     () =>
       Effect.gen(function* () {
-        const presence = yield* Presence.make
+        const presence = yield* Presence.make({ heartbeatInterval: "1 hour" })
         const room = Effect.map(presence.snapshot(s1), show)
         const watch = (tabId: string) =>
           Effect.gen(function* () {
@@ -166,15 +171,102 @@ describe("presence state (§12)", () => {
       })
   )
 
+  it.effect(
+    "an idle room stream carries a heartbeat every heartbeatInterval, never silent longer than one interval, and a heartbeat changes no room state",
+    () =>
+      Effect.gen(function* () {
+        const presence = yield* Presence.make({ heartbeatInterval: "15 seconds" })
+        const seen: Array<string> = []
+        yield* Effect.forkChild(
+          Stream.runForEach(presence.join(entry("idle")), (element) =>
+            Effect.flatMap(Clock.currentTimeMillis, (at) =>
+              Effect.sync(() => void seen.push(`${at} ${show(element).join(",")}`))
+            )
+          )
+        )
+        yield* settle
+        assert.deepStrictEqual(seen, ["0 p/c1/idle=null"])
+        for (let i = 1; i <= 4; i++) {
+          yield* TestClock.adjust("14999 millis")
+          yield* settle
+          assert.strictEqual(seen.length, i, `silent until the interval ends (${i})`)
+          yield* TestClock.adjust("1 millis")
+          yield* settle
+        }
+        assert.deepStrictEqual(seen, [
+          "0 p/c1/idle=null",
+          "15000 (heartbeat)",
+          "30000 (heartbeat)",
+          "45000 (heartbeat)",
+          "60000 (heartbeat)"
+        ])
+        // The room is exactly the join's: no heartbeat added, removed or changed an entry.
+        assert.deepStrictEqual(show(yield* presence.snapshot(s1)), ["p/c1/idle=null"])
+      })
+  )
+
+  it.effect(
+    "a change pending when a heartbeat arrives, or arriving while a heartbeat is pending, is still delivered as a snapshot: a heartbeat never displaces a change",
+    () =>
+      Effect.gen(function* () {
+        // A consumer that stops pulling after the join snapshot until released, so later elements
+        // wait behind it; once released and quiet, its last snapshot must show the room's state.
+        const slowWatch = Effect.gen(function* () {
+          const presence = yield* Presence.make({ heartbeatInterval: "15 seconds" })
+          const seen: Array<string> = []
+          const release = yield* Deferred.make<void>()
+          yield* Effect.forkChild(
+            Stream.runForEach(presence.join(entry("slow")), (element) =>
+              Effect.andThen(
+                Effect.sync(() => void seen.push(show(element).join(","))),
+                Effect.suspend(() => (seen.length === 1 ? Deferred.await(release) : Effect.void))
+              )
+            )
+          )
+          yield* settle
+          const lastSnapshot = Effect.gen(function* () {
+            assert.deepStrictEqual(seen, ["p/c1/slow=null"], "the consumer is still blocked")
+            yield* Deferred.succeed(release, undefined)
+            yield* settle
+            return seen.filter((e) => e !== "(heartbeat)").at(-1)
+          })
+          return { presence, seen, lastSnapshot }
+        })
+
+        // Changes first, then a heartbeat while the last change is still undelivered. Two changes, so
+        // the last one is still pending even behind a stream stage that reads one element ahead.
+        const a = yield* slowWatch
+        yield* a.presence.track({ ...entry("slow"), state: "earlier" })
+        yield* settle
+        yield* a.presence.track({ ...entry("slow"), state: "changed" })
+        yield* settle
+        yield* TestClock.adjust("15 seconds")
+        yield* settle
+        assert.strictEqual(yield* a.lastSnapshot, 'p/c1/slow="changed"')
+        assert.include(a.seen, "(heartbeat)")
+
+        // A heartbeat first, then the change while the heartbeat is still undelivered.
+        const b = yield* slowWatch
+        yield* TestClock.adjust("15 seconds")
+        yield* settle
+        yield* b.presence.track({ ...entry("slow"), state: "changed" })
+        yield* settle
+        assert.strictEqual(yield* b.lastSnapshot, 'p/c1/slow="changed"')
+        assert.include(b.seen, "(heartbeat)")
+      })
+  )
+
   it.effect("a track interrupted at any point either changed nothing or was announced to every observer", () =>
     Effect.gen(function* () {
-      const presence = yield* Presence.make
+      const presence = yield* Presence.make({ heartbeatInterval: "1 hour" })
       const latest: { state: unknown } = { state: undefined }
       const ready = yield* Queue.unbounded<void>()
       yield* Effect.forkChild(
         Stream.runForEach(presence.join(entry("watch")), (snapshot) =>
           Effect.andThen(
-            Effect.sync(() => void (latest.state = snapshot.entries[0]?.state)),
+            Effect.sync(
+              () => void (latest.state = snapshot._tag === "snapshot" ? snapshot.entries[0]?.state : latest.state)
+            ),
             Queue.offer(ready, undefined)
           )
         )

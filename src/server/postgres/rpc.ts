@@ -318,11 +318,11 @@ export const handlers = (options: SyncServerOptions) =>
  * on join; an entry, once joined, stays until its stream ends, and `track` only changes an entry
  * the same principal holds, so it needs no grant lookup of its own.
  */
-export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor">) =>
+export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor" | "heartbeatInterval">) =>
   Protocol.PresenceRpcs.toLayer(
     Effect.gen(function* () {
       const sql = yield* SqlClient
-      const presence = yield* Presence.make
+      const presence = yield* Presence.make({ heartbeatInterval: options.heartbeatInterval ?? "15 seconds" })
       return Protocol.PresenceRpcs.of({
         room: (payload, { headers }) =>
           Stream.unwrap(
