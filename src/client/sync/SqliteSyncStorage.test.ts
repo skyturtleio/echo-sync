@@ -448,3 +448,56 @@ it.live(
       expect(pending.map((e) => e.envelope.seq)).toEqual([1, 2])
     }).pipe(Effect.provide(Db))
 )
+
+it.live("a mutate queued behind a long pull install can be interrupted while it waits; its handler never runs", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const storage = SqliteSyncStorage.make(sql, registry)
+    const installing = yield* Deferred.make<void>()
+    const gate = yield* Deferred.make<void>()
+    const state = { blockReplay: false, added: 0 }
+    // "block" stalls when the install replays it, so the install holds the connection until `gate` opens.
+    const block = Mutation.make("block", {
+      args: Schema.Struct({}),
+      handler: () =>
+        state.blockReplay ? Effect.andThen(Deferred.succeed(installing, undefined), Deferred.await(gate)) : Effect.void
+    })
+    const add = Mutation.make("add", { args: Schema.Struct({}), handler: () => Effect.sync(() => void state.added++) })
+    const transport: Engine.Transport<never> = {
+      push: () => Effect.die("unused"),
+      pull: () =>
+        Effect.succeed(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "5", expiredThrough: 0 }))
+    }
+    const engine = yield* Engine.make({
+      clientId: Ids.ClientId.make("c"),
+      actor: AccessScope.PrincipalId.make("me"),
+      storage,
+      registry,
+      mutations: Mutation.makeRegistry([block, add]),
+      transport
+    })
+    yield* engine.mutate(mid("p"), "block", {})
+    state.blockReplay = true
+    const pull = yield* Effect.forkChild(engine.pull)
+    yield* Deferred.await(installing)
+
+    const queued = yield* Effect.forkChild(engine.mutate(mid("q"), "add", {}))
+    for (let i = 0; i < 100; i++) yield* Effect.yieldNow
+    const interrupting = yield* Effect.forkChild(Fiber.interrupt(queued))
+    for (let i = 0; i < 100; i++) yield* Effect.yieldNow
+    // No deadlock: the interrupt completes while the install still holds the connection.
+    const doneWhileHeld = interrupting.pollUnsafe() !== undefined
+    state.blockReplay = false
+    yield* Deferred.succeed(gate, undefined)
+    yield* Fiber.join(pull)
+    yield* Fiber.join(interrupting)
+
+    expect(doneWhileHeld).toBe(true)
+    expect(state.added).toBe(0) // the interrupted mutate's handler never ran, before or after release
+    expect(yield* storage.transaction(storage.lookup(mid("q")))).toEqual(Option.none())
+    expect((yield* storage.meta).cursor).toBe(5n) // the install committed
+    // The connection is free again: the next mutate runs and takes the next seq (nothing consumed by q).
+    const r = yield* engine.mutate(mid("r"), "add", {})
+    expect([r.seq, state.added]).toEqual([2, 1])
+  }).pipe(Effect.provide(Db))
+)
