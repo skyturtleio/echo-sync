@@ -147,7 +147,8 @@ export const make = (options: { readonly pageSize: number }) => {
       const results: Array<PushResponse["results"][number]> = []
       for (const [index, item] of request.mutations.entries()) {
         if (Option.isSome(stopAt) && index === stopAt.value) {
-          return { results, stopped: Option.some({ reason: "SerializationFailure" }) }
+          // Transient stop (e.g. serialization failure): only the processed prefix is returned.
+          return { results }
         }
         const recorded = ledgerOf(request.clientId).get(item.mutationId)
         const floor = ledgerFloor.get(request.clientId)
@@ -163,7 +164,7 @@ export const make = (options: { readonly pageSize: number }) => {
             : yield* execute({ clientId: request.clientId, ...item }, now))
         results.push({ mutationId: item.mutationId, ...result })
       }
-      const response: PushResponse = { results, stopped: Option.none() }
+      const response: PushResponse = { results }
       return response
     })
 
@@ -200,7 +201,7 @@ export const make = (options: { readonly pageSize: number }) => {
       const walks = new Map(state.walks)
       for (const scope of state.held) {
         if (readable.has(scope)) continue
-        changes.push({ _tag: "ScopePurged", scopeId: scope })
+        changes.push({ _tag: "scopePurged", scopeId: scope })
         held.delete(scope)
         walks.delete(scope)
       }
@@ -231,7 +232,7 @@ export const make = (options: { readonly pageSize: number }) => {
           Order.mapInput(Order.make(MemoryStore.compareValues), (r: (typeof rows)[number]) => r.key)
         )
         for (const { key, scope, table, row } of ordered.slice(0, options.pageSize)) {
-          changes.push({ _tag: "Upsert", table, row })
+          changes.push({ _tag: "upsert", table, row })
           walks.set(scope, Option.some(key))
         }
         // Scopes with nothing left after this page are complete.
@@ -245,9 +246,9 @@ export const make = (options: { readonly pageSize: number }) => {
       for (const entry of page) {
         const row = yield* store.read(entry.table, entry.id)
         if (Option.isSome(row) && readable.has(row.value.access_scope_id)) {
-          changes.push({ _tag: "Upsert", table: entry.table, row: row.value })
+          changes.push({ _tag: "upsert", table: entry.table, row: row.value })
         } else {
-          changes.push({ _tag: "Tombstone", table: entry.table, id: entry.id })
+          changes.push({ _tag: "tombstone", table: entry.table, id: entry.id })
         }
       }
       const last = page.at(-1)

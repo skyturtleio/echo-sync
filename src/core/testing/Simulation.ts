@@ -205,7 +205,7 @@ export const run = (options: Options) =>
               if (faults && rng.chance(0.1)) return yield* new TransportFailed({ during: "push request" })
               const stopAt = faults && rng.chance(0.15) ? Option.some(rng.int(request.mutations.length)) : Option.none()
               const response = yield* server.push(request, stopAt)
-              if (Option.isSome(response.stopped)) stats.transientStops++
+              if (response.results.length < request.mutations.length) stats.transientStops++
               if (faults && rng.chance(0.15)) {
                 stats.lostResponses++
                 return yield* new TransportFailed({ during: "push response" })

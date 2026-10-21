@@ -39,9 +39,9 @@ export type MutationOutcome =
   | { readonly _tag: "Rejected"; readonly error: MutationRejection }
 
 export type Change =
-  | { readonly _tag: "Upsert"; readonly table: string; readonly row: EncodedRow }
-  | { readonly _tag: "Tombstone"; readonly table: string; readonly id: string }
-  | { readonly _tag: "ScopePurged"; readonly scopeId: string }
+  | { readonly _tag: "upsert"; readonly table: string; readonly row: EncodedRow }
+  | { readonly _tag: "tombstone"; readonly table: string; readonly id: string }
+  | { readonly _tag: "scopePurged"; readonly scopeId: string }
 
 export interface Ack {
   readonly mutationId: string
@@ -106,8 +106,6 @@ export interface PushResponse {
     /** Ledger position the outcome was recorded at (§6); for ClientExpired, the expired floor's. */
     readonly position: Position
   }>
-  /** Present when the server stopped at a transient failure; the rest was not processed. */
-  readonly stopped: Option.Option<{ readonly reason: string }>
 }
 
 /** Raw replica writes used by reconciliation (no role checks; inside the caller's transaction). */

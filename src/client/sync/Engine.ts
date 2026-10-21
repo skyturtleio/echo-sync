@@ -204,13 +204,13 @@ export const applyPageSet = <E>(
       for (const page of set) {
         for (const change of page.changes) {
           switch (change._tag) {
-            case "Upsert":
+            case "upsert":
               yield* storage.rows.write(change.table, change.row.id, Option.some(change.row))
               break
-            case "Tombstone":
+            case "tombstone":
               yield* storage.rows.write(change.table, change.id, Option.none())
               break
-            case "ScopePurged":
+            case "scopePurged":
               yield* storage.rows.purgeScope(change.scopeId)
               break
           }
@@ -237,7 +237,8 @@ export const applyPageSet = <E>(
 export interface PushResult {
   /** Number of mutations the server reported as processed in this cycle. */
   readonly processed: number
-  readonly stopped: Option.Option<{ readonly reason: string }>
+  /** The server stopped at a transient failure (fewer results than mutations sent). */
+  readonly stopped: boolean
 }
 
 export interface Engine<E, TE> {
@@ -294,7 +295,7 @@ export const make = <E, TE>(options: {
             Effect.all({ meta: storage.meta, pending: storage.pending })
           )
           const batch = pending.filter((entry) => entry.envelope.seq > meta.pushedThrough).slice(0, batchSize)
-          if (batch.length === 0) return { processed, stopped: Option.none() }
+          if (batch.length === 0) return { processed, stopped: false }
           const response = yield* transport.push({
             clientId,
             mutations: batch.map(({ envelope }) => ({
@@ -330,8 +331,8 @@ export const make = <E, TE>(options: {
             )
           }
           processed += response.results.length
-          if (Option.isSome(response.stopped) || response.results.length < batch.length) {
-            return { processed, stopped: response.stopped }
+          if (response.results.length < batch.length) {
+            return { processed, stopped: true }
           }
         }
       })

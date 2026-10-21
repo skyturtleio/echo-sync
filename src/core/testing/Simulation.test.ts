@@ -103,8 +103,7 @@ describe("reconciliation simulation", () => {
                 mutationId: m.mutationId,
                 outcome: { _tag: "Applied" as const },
                 position: 5n
-              })),
-              stopped: Option.none()
+              }))
             }),
           pull: () =>
             Effect.gen(function* () {
@@ -217,7 +216,7 @@ describe("reconciliation simulation", () => {
         Option.none(), // connection drops before the final page
         Option.some({
           _tag: "PullDone",
-          changes: [{ _tag: "Upsert", table: COUNTERS, row: { ...counter, value: 5 } }],
+          changes: [{ _tag: "upsert", table: COUNTERS, row: { ...counter, value: 5 } }],
           acks: [],
           nextCursor: 3n,
           expiredThrough: 0
