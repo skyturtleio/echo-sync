@@ -106,8 +106,12 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
       ),
 
     // Only the registry's replicated tables: echo_outbox, echo_staged and echo_meta are untouched.
-    clearAll: Effect.forEach(registry.tables, (table) => unavailable(sql.unsafe(`DELETE FROM ${q(table.name)}`)), {
-      discard: true
-    })
+    // `WHERE true` defeats SQLite's truncate optimization, which deletes without firing the update hook:
+    // live queries (DESIGN §10) would never see the rows go when nothing is installed in their place.
+    clearAll: Effect.forEach(
+      registry.tables,
+      (table) => unavailable(sql.unsafe(`DELETE FROM ${q(table.name)} WHERE true`)),
+      { discard: true }
+    )
   }
 }

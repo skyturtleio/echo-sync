@@ -2,7 +2,7 @@
 import "./testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { expect, it } from "@effect/vitest"
-import { Effect, Layer, Option, Schema } from "effect"
+import { Effect, Fiber, Layer, Option, Queue, Schema, Stream } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
 import { AccessScope, Registry, Store, SyncTable } from "echo-sync"
 import * as Outbox from "./Outbox.ts"
@@ -151,4 +151,35 @@ it.effect("clearAll and purgeScope touch only replicated rows; the outbox and me
     expect(yield* pendingIds).toEqual(["m"])
     expect(yield* metaRows).toEqual(metaBefore)
   }).pipe(Effect.provide(Db))
+)
+
+it.live("clearAll re-emits a live query on the cleared table, even when nothing replaces the rows", () =>
+  Effect.gen(function* () {
+    const { sql, store } = yield* storeFor
+    yield* store.write(Notes, "n1", Option.some(note("n1", "s", "x")))
+    const emissions = yield* Queue.unbounded<ReadonlyArray<string>>()
+    const live = yield* Effect.forkChild(
+      Stream.runForEach(
+        sql.reactive(["notes"], sql<{ readonly id: string }>`SELECT id FROM notes ORDER BY id`),
+        (rows) =>
+          Queue.offer(
+            emissions,
+            rows.map((r) => r.id)
+          )
+      )
+    )
+    expect(yield* Queue.take(emissions)).toEqual(["n1"])
+    // A null-cursor empty resnapshot: clearAll and nothing installed. A plain DELETE takes SQLite's
+    // truncate path, which fires no update hook, so the query would keep showing the revoked row.
+    yield* sql.withTransaction(store.clearAll)
+    const next = yield* Queue.take(emissions).pipe(Effect.timeout("2 seconds"), Effect.option)
+    yield* Fiber.interrupt(live)
+    expect(next).toEqual(Option.some([]))
+  }).pipe(
+    Effect.provide(
+      Layer.effectDiscard(SqliteSyncStorage.migrate(registry)).pipe(
+        Layer.provideMerge(SqliteClient.layerMemory({ installReactivityHooks: true }))
+      )
+    )
+  )
 )
