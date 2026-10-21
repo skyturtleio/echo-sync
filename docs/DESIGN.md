@@ -565,6 +565,16 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
   re-sends the latest state. A `track` call never blocks snapshot delivery or reconnect, and a
   `track` whose stream has closed is dropped. The tab API therefore guarantees only that the
   latest desired state is eventually visible while the stream is open.
+  Latest-wins is strict and enforced at the receiver (§12 revision fencing): the tab assigns a
+  `revision` to every desired state it accepts, strictly increasing per `(room, tab)` for the
+  life of the `presence` stream (the join carries revision 0 with the initial state; each
+  accepted `track` increments it). Revisions are tab-owned, so they survive handover (the tab
+  re-sends its latest `(state, revision)` to the new leader) and a leader never generates one.
+  Both senders carry the revision with the state; the leader's entry keeps the highest
+  revision it has accepted and never sends a lower one after a higher one. A `track` attempt
+  that timed out or was interrupted may still reach the server later; the server's fence makes
+  that harmless, so no sender waits for a cancelled attempt to finish before sending a newer
+  state, and no client-side reconciliation against snapshots is needed.
 - **Typed notice decoding** (ruling from the HeyBabe trial): a retained notice carries the
   envelope's `args` and a `DomainError.error` as `Schema.Json`, so a mutation's static types stop
   at the notice. The stored notice shape, `Notice = Rejected { envelope, error } |
@@ -791,7 +801,15 @@ const todosByProject = Query.make("todos.byProject", {
   ws/presence-server review): an entry has exactly one observing stream, so a stream never
   outlives its entry on an abandoned room. `track` applies its in-memory update and its change
   tick atomically with respect to interruption, so a state that is installed is always
-  announced. `room` is an `AccessScopeId`: the principal must hold a grant in that scope
+  announced. **Revision fencing (coordinator ruling, ws/presence-client review):** the payload
+  of `room` and `track` carries `revision` (a non-negative integer assigned by the tab, see
+  §9.1 Presence); the entry stores the revision it was installed with, and `track` is a no-op
+  when its `revision` is not greater than the stored one. A rejoin installs the carried
+  `(state, revision)` unconditionally (it is a new entry). A cancelled or timed-out `track`
+  is therefore never a remote completion barrier the client must wait for: a late request
+  that reaches the server after a newer one cannot overwrite it, and the room converges on
+  the highest revision the tab has sent. Required field, lands with the presence client
+  before any app consumes presence. `room` is an `AccessScopeId`: the principal must hold a grant in that scope
   (`roleFor`, same check as reads) or the call fails `Unauthorized`. `state` is `Schema.Json`;
   `RoomSnapshot` is `{ room, entries: ReadonlyArray<{ principalId, clientId, tabId, state }> }`,
   emitted on join and on every change (coalescing allowed). Server state is in-memory and
