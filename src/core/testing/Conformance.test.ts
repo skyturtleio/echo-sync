@@ -49,6 +49,53 @@ describe("MemorySyncStorage conforms to SyncStorage", () => {
   register(Conformance.syncStorage(Effect.map(memorySubject, ({ subject }) => subject)))
 })
 
+/**
+ * Like a real database handle: a reopen closes every earlier handle, and a closed handle dies on
+ * use. The suite must only reopen after the transaction it is judging has finished.
+ */
+const closeOnReopen = Effect.sync(() => {
+  const disk = MemorySyncStorage.makeDisk()
+  const handles = { current: 0 }
+  const open = (): Engine.SyncStorage => {
+    const mine = ++handles.current
+    const inner = MemorySyncStorage.make(disk)
+    const live = <A, E, R>(self: Effect.Effect<A, E, R>) =>
+      Effect.suspend(() => (mine === handles.current ? self : Effect.die(new Error("use of a closed storage handle"))))
+    return {
+      transaction: (self) => live(inner.transaction(self)),
+      rows: {
+        read: (table, id) => live(inner.rows.read(table, id)),
+        write: (table, id, row) => live(inner.rows.write(table, id, row)),
+        range: (table, plan) => live(inner.rows.range(table, plan)),
+        scan: (table) => live(inner.rows.scan(table)),
+        purgeScope: (scopeId) => live(inner.rows.purgeScope(scopeId)),
+        clearAll: live(inner.rows.clearAll)
+      },
+      meta: live(inner.meta),
+      setMeta: (meta) => live(inner.setMeta(meta)),
+      pending: live(inner.pending),
+      lookup: (mutationId) => live(inner.lookup(mutationId)),
+      nextSeq: live(inner.nextSeq),
+      appendPending: (entry) => live(inner.appendPending(entry)),
+      setUndo: (seq, undo) => live(inner.setUndo(seq, undo)),
+      release: (seqs) => live(inner.release(seqs)),
+      staged: live(inner.staged),
+      stage: (page) => live(inner.stage(page)),
+      clearStaged: live(inner.clearStaged),
+      addNotices: (notices) => live(inner.addNotices(notices))
+    }
+  }
+  return {
+    storage: open(),
+    reopen: Effect.sync(open),
+    pruneReleased: Effect.sync(() => MemorySyncStorage.pruneReleased(disk))
+  }
+})
+
+describe("a SyncStorage whose reopen closes earlier handles conforms (the suite reopens only after the transaction under test)", () => {
+  register(Conformance.syncStorage(closeOnReopen))
+})
+
 describe("the suite's expectations come from fixtures, not from the subject (DESIGN §14)", () => {
   const noopRows: Store.ReplicaRowStore = {
     read: () => Effect.succeedNone,
@@ -98,8 +145,8 @@ describe("the suite's expectations come from fixtures, not from the subject (DES
 })
 
 // Every row operation awaits a promise (like a real driver), and rollback is skipped when an
-// interruption lands after any I/O has resumed: only a sweep that interrupts exactly at the
-// checkpoints following a resumption can see the partial commit.
+// interruption lands after any I/O has resumed: only a sweep whose interruption requests reach
+// the steps following a resumption can see the partial commit.
 const asyncStore = (broken: boolean) =>
   Effect.sync((): Conformance.RowStoreSubject => {
     const store = MemoryStore.make()

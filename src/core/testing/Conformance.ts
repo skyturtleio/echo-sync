@@ -169,10 +169,12 @@ const rowsOf = (rows: Store.RowStore) =>
   Effect.all({ items: rows.scan(Items), tags: rows.scan(Tags) }).pipe(Effect.map(canonical))
 
 /**
- * A scheduler that requests interruption of the running fiber synchronously, inside its `k`-th
- * `shouldYield` call (the run loop asks before every evaluation step, including the step that
- * resumes after asynchronous I/O). Nothing is dispatched in between, so the interruption lands
- * exactly at that checkpoint, never after the fiber has moved on.
+ * A scheduler that requests interruption of the running fiber synchronously, from its `k`-th
+ * `shouldYield` hook (the run loop calls it once per evaluation step, including the step that
+ * resumes after asynchronous I/O). No polling parent is involved, so the request cannot race the
+ * fiber; the run loop delivers it at its next interruption check, after at most one more
+ * primitive (it checks for a pending interruption before calling the hook). Uninterruptible
+ * regions, such as a store's commit/rollback finalizer, still run to completion.
  */
 const interruptAt = (k: number) => {
   const base = new Scheduler.MixedScheduler()
@@ -198,7 +200,13 @@ interface TransactionCase<S, R> {
   readonly seed: (subject: S) => Effect.Effect<unknown, unknown>
   readonly body: (subject: S) => Effect.Effect<unknown, unknown>
   readonly within: (subject: S, self: Effect.Effect<unknown, unknown>) => Effect.Effect<unknown, unknown>
+  /**
+   * Reads the durable state through a reopened handle. Called only after the tested transaction
+   * has finished: a reopen may close the subject's original handle.
+   */
   readonly observe: (subject: S) => Effect.Effect<string, unknown>
+  /** Reads the same state through the subject's live handle (no reopen). */
+  readonly observeLive: (subject: S) => Effect.Effect<string, unknown>
   /** Durable state after `seed` alone, computed from the fixture. */
   readonly before: string
   /** Durable state after `seed` and a committed `body`, computed from the fixture. */
@@ -253,10 +261,19 @@ const atomicity = <S, R>(options: TransactionCase<S, R>) =>
       yield* use(options.make, (subject) =>
         Effect.gen(function* () {
           yield* options.seed(subject)
-          const seeded = yield* options.observe(subject)
+          const seeded = yield* options.observeLive(subject)
           if (seeded !== options.before) return yield* fail(`seed:\n got ${seeded}\nwant ${options.before}`)
           const end = ending === "fail" ? Effect.fail("abort") : Effect.die("crash")
-          yield* Effect.exit(options.within(subject, Effect.andThen(options.body(subject), end)))
+          const exit = yield* Effect.exit(options.within(subject, Effect.andThen(options.body(subject), end)))
+          // Only the injected ending proves the body ran to its end; any other failure is a defect
+          // of the subject (e.g. a closed handle), not a rollback to judge.
+          const intended =
+            exit._tag === "Failure" &&
+            exit.cause.reasons.length === 1 &&
+            exit.cause.reasons.every((r) =>
+              ending === "fail" ? r._tag === "Fail" && r.error === "abort" : r._tag === "Die" && r.defect === "crash"
+            )
+          if (!intended) return yield* fail(`a body ending in ${ending} did not end that way: ${String(exit)}`)
           const left = yield* options.observe(subject)
           if (left !== options.before) return yield* fail(`a body that ${ending}s left\n ${left}`)
         })
@@ -413,6 +430,7 @@ export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): R
       body: rowBody,
       within: (subject, self) => subject.transaction(self),
       observe: rowObserve,
+      observeLive: rowObserve,
       before: rowBefore,
       after: rowAfter
     })
@@ -791,6 +809,7 @@ export const syncStorage = <R>(make: Effect.Effect<SyncStorageSubject, unknown, 
       body: syncBody,
       within: (subject, self) => subject.storage.transaction(self),
       observe: syncObserve,
+      observeLive: (subject) => durable(subject.storage, SYNC_IDS),
       before: syncBefore,
       after: syncAfter
     })
