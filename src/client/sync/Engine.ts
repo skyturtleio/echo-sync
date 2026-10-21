@@ -17,7 +17,6 @@ import { ResnapshotRequired } from "./Wire.ts"
 import type {
   Cursor,
   MutationEnvelope,
-  MutationOutcome,
   MutationRejection,
   PullDone,
   PullPage,
@@ -39,9 +38,9 @@ export interface PendingMutation {
 export interface SyncMeta {
   /** Position through which the installed replica is authoritative. */
   readonly cursor: Cursor
-  /** Last mutation id ever assigned (survives removal of acked entries). */
-  readonly lastMutationId: number
-  /** Highest mutation id the server has reported as processed; never resent. */
+  /** Last outbox `seq` ever assigned (survives removal of acked entries, never reused). */
+  readonly lastSeq: number
+  /** Highest `seq` the server has reported as processed; never resent. */
   readonly pushedThrough: number
   /**
    * The server demanded a resnapshot: the next page set starts from `null` and replaces the
@@ -50,16 +49,20 @@ export interface SyncMeta {
   readonly resnapshot: boolean
 }
 
-export const initialMeta: SyncMeta = { cursor: null, lastMutationId: 0, pushedThrough: 0, resnapshot: false }
+export const initialMeta: SyncMeta = { cursor: null, lastSeq: 0, pushedThrough: 0, resnapshot: false }
 
 /** The cursor the in-progress page set started from. */
 const pullFrom = (meta: SyncMeta): Cursor => (meta.resnapshot ? null : meta.cursor)
 
-/** A server-rejected mutation, retained for inspection after leaving the outbox (§9). */
-export interface Notice {
-  readonly envelope: MutationEnvelope
-  readonly error: MutationRejection
-}
+/** A mutation that left the outbox without being applied as intended, retained for inspection (§9). */
+export type Notice =
+  /** The server processed it and rejected it with a typed error. */
+  | { readonly _tag: "Rejected"; readonly envelope: MutationEnvelope; readonly error: MutationRejection }
+  /**
+   * Processed, outcome unknown: its ledger row expired before the ack was pulled (§16.5). Its
+   * effect, if any, is in the installed replica.
+   */
+  | { readonly _tag: "OutcomeUnknown"; readonly envelope: MutationEnvelope }
 
 /**
  * Durable client state. Every method other than `transaction` must be called inside
@@ -70,11 +73,11 @@ export interface SyncStorage<E> {
   readonly rows: RowWriter<E>
   readonly meta: Effect.Effect<SyncMeta, E>
   readonly setMeta: (meta: SyncMeta) => Effect.Effect<void, E>
-  /** Outbox entries in ascending `mutationId`. */
+  /** Outbox entries in ascending `seq`. */
   readonly pending: Effect.Effect<ReadonlyArray<PendingMutation>, E>
   readonly appendPending: (entry: PendingMutation) => Effect.Effect<void, E>
-  readonly setUndo: (mutationId: number, undo: ReadonlyArray<UndoImage>) => Effect.Effect<void, E>
-  readonly removePending: (mutationIds: ReadonlyArray<number>) => Effect.Effect<void, E>
+  readonly setUndo: (seq: number, undo: ReadonlyArray<UndoImage>) => Effect.Effect<void, E>
+  readonly removePending: (seqs: ReadonlyArray<number>) => Effect.Effect<void, E>
   /**
    * Pages of the in-progress set, in arrival order. Durable: after a reload the engine resumes
    * the set with `meta.cursor` and the last staged page's continuation.
@@ -124,17 +127,11 @@ const replay = <E>(storage: SyncStorage<E>, executor: Executor<E>, entry: Pendin
     // queued because only the server's verdict removes it.
     if (Option.isSome(run.rejection)) {
       yield* restore(storage.rows, run.undo)
-      yield* storage.setUndo(entry.envelope.mutationId, [])
+      yield* storage.setUndo(entry.envelope.seq, [])
     } else {
-      yield* storage.setUndo(entry.envelope.mutationId, run.undo)
+      yield* storage.setUndo(entry.envelope.seq, run.undo)
     }
   })
-
-/** Outcome of a processed mutation whose ledger row expired before its ack was pulled. */
-const expired = (envelope: MutationEnvelope): MutationOutcome => ({
-  _tag: "Rejected",
-  error: { _tag: "ClientExpired", mutationId: envelope.mutationId }
-})
 
 /**
  * Installs a complete page set: the staged `PullPage`s followed by their `PullDone`. Must run
@@ -173,24 +170,29 @@ export const applyPageSet = <E>(
     }
 
     const outcomes = new Map(set.flatMap((page) => page.acks.map((ack) => [ack.mutationId, ack.outcome])))
-    const acked: Array<number> = []
+    const released: Array<number> = []
     const notices: Array<Notice> = []
     for (const entry of pending) {
-      const id = entry.envelope.mutationId
-      const outcome = outcomes.get(id) ?? (id <= done.expiredThrough ? expired(entry.envelope) : undefined)
-      if (outcome === undefined) {
+      const { envelope } = entry
+      const outcome = outcomes.get(envelope.mutationId)
+      if (outcome !== undefined) {
+        released.push(envelope.seq)
+        if (outcome._tag === "Rejected") notices.push({ _tag: "Rejected", envelope, error: outcome.error })
+      } else if (envelope.seq <= done.expiredThrough) {
+        // Every seq ≤ the floor was processed (clients push in seq order) and the ledger row
+        // that would carry its ack is gone; the installed state already contains its effect.
+        released.push(envelope.seq)
+        notices.push({ _tag: "OutcomeUnknown", envelope })
+      } else {
         yield* replay(storage, executor, entry)
-        continue
       }
-      acked.push(entry.envelope.mutationId)
-      if (outcome._tag === "Rejected") notices.push({ envelope: entry.envelope, error: outcome.error })
     }
-    yield* storage.removePending(acked)
+    yield* storage.removePending(released)
     yield* storage.addNotices(notices)
 
-    // The server processes a client's mutations in order, so an ack for id k means every id
-    // up to k has been processed.
-    const pushedThrough = Math.max(meta.pushedThrough, done.expiredThrough, ...outcomes.keys())
+    // The server processes a client's mutations in seq order, so a released seq k means every
+    // seq up to k has been processed.
+    const pushedThrough = Math.max(meta.pushedThrough, ...released)
     yield* storage.setMeta({ ...meta, cursor: done.nextCursor, pushedThrough, resnapshot: false })
     yield* storage.clearStaged
   })
@@ -202,8 +204,16 @@ export interface PushResult {
 }
 
 export interface Engine<E, TE> {
-  /** Appends to the outbox and applies optimistically in one transaction ("saved" on success). */
-  readonly mutate: (name: string, args: unknown) => Effect.Effect<MutationEnvelope, E | LocallyRejected>
+  /**
+   * Appends to the outbox and applies optimistically in one transaction ("saved" on success).
+   * `mutationId` is the caller's idempotency key: enqueuing an id that is still pending returns
+   * the existing envelope without running the handler again.
+   */
+  readonly mutate: (
+    mutationId: string,
+    name: string,
+    args: unknown
+  ) => Effect.Effect<MutationEnvelope, E | LocallyRejected>
   /** Sends unprocessed outbox entries in order until none remain or the server stops. */
   readonly push: Effect.Effect<PushResult, E | TE>
   /** Pulls until `more: false`, staging intermediate pages, then installs the set atomically. */
@@ -223,18 +233,20 @@ export const make = <E, TE>(options: {
     const pushLock = yield* Semaphore.make(1)
     const pullLock = yield* Semaphore.make(1)
 
-    const mutate = (name: string, args: unknown) =>
+    const mutate = (mutationId: string, name: string, args: unknown) =>
       storage.transaction(
         Effect.gen(function* () {
+          const existing = (yield* storage.pending).find((entry) => entry.envelope.mutationId === mutationId)
+          if (existing !== undefined) return existing.envelope
           const meta = yield* storage.meta
-          const envelope: MutationEnvelope = { clientId, mutationId: meta.lastMutationId + 1, name, args }
+          const envelope: MutationEnvelope = { clientId, mutationId, seq: meta.lastSeq + 1, name, args }
           const createdAt = yield* Clock.currentTimeMillis
           const run = yield* executor.run(envelope, createdAt)
           if (Option.isSome(run.rejection)) {
             return yield* new LocallyRejected({ name, error: run.rejection.value })
           }
           yield* storage.appendPending({ envelope, createdAt, undo: run.undo })
-          yield* storage.setMeta({ ...meta, lastMutationId: envelope.mutationId })
+          yield* storage.setMeta({ ...meta, lastSeq: envelope.seq })
           return envelope
         })
       )
@@ -246,17 +258,19 @@ export const make = <E, TE>(options: {
           const { meta, pending } = yield* storage.transaction(
             Effect.all({ meta: storage.meta, pending: storage.pending })
           )
-          const batch = pending.filter((entry) => entry.envelope.mutationId > meta.pushedThrough).slice(0, batchSize)
+          const batch = pending.filter((entry) => entry.envelope.seq > meta.pushedThrough).slice(0, batchSize)
           if (batch.length === 0) return { processed, stopped: Option.none() }
           const response = yield* transport.push({
             clientId,
             mutations: batch.map(({ envelope }) => ({
               mutationId: envelope.mutationId,
+              seq: envelope.seq,
               name: envelope.name,
               args: envelope.args
             }))
           })
-          const through = response.results.at(-1)?.mutationId
+          // `results` is the processed prefix of the request, in request (= seq) order.
+          const through = batch[response.results.length - 1]?.envelope.seq
           if (through !== undefined) {
             yield* storage.transaction(
               Effect.gen(function* () {

@@ -77,7 +77,7 @@ describe("reconciliation simulation", () => {
         Option.some({
           _tag: "PullPage",
           changes: [],
-          acks: [{ mutationId: 1, position: 2n, outcome: { _tag: "Applied" } }],
+          acks: [{ mutationId: "u-7f3a", position: 2n, outcome: { _tag: "Applied" } }],
           continuation: "k"
         }),
         Option.none(), // connection drops before the final page
@@ -105,7 +105,7 @@ describe("reconciliation simulation", () => {
       })
       const value = () => disk.replica.tables().get(COUNTERS)?.get("x")?.["value"]
 
-      yield* engine.mutate("increment", { id: "x", by: 5 })
+      yield* engine.mutate("u-7f3a", "increment", { id: "x", by: 5 })
       yield* Effect.exit(engine.pull)
       // Acked but the covering state is not installed: still pending, still visible once.
       assert.strictEqual(disk.outbox.length, 1)

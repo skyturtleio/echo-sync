@@ -40,6 +40,7 @@ interface LogEntry {
 
 interface LedgerEntry {
   readonly position: Position
+  readonly seq: number
   readonly outcome: MutationOutcome
 }
 
@@ -68,11 +69,11 @@ export const make = (options: { readonly pageSize: number }) => {
   let head: Position = 0n
   let logFloor: Position = 0n
   let log: Array<LogEntry> = []
-  const ledger = new Map<string, Map<number, LedgerEntry>>()
+  const ledger = new Map<string, Map<string, LedgerEntry>>()
   const principals = new Map<string, string>()
   /** `client_scopes`: scopes held by a client as of each completed pull, by `nextCursor`. */
   const clientScopes = new Map<string, Map<Position, ReadonlySet<string>>>()
-  /** Highest mutationId per client whose ledger row was GC'd (DESIGN §16.5, planned). */
+  /** Highest `seq` per client whose ledger row was GC'd (DESIGN §16.5 floor). */
   const ledgerFloor = new Map<string, number>()
   const continuations = new Map<string, Continuation>()
   const history = new Map<Position, MemoryStore.Tables>([[0n, new Map()]])
@@ -81,7 +82,7 @@ export const make = (options: { readonly pageSize: number }) => {
   const ledgerOf = (clientId: string) => {
     const existing = ledger.get(clientId)
     if (existing !== undefined) return existing
-    const created = new Map<number, LedgerEntry>()
+    const created = new Map<string, LedgerEntry>()
     ledger.set(clientId, created)
     return created
   }
@@ -131,7 +132,7 @@ export const make = (options: { readonly pageSize: number }) => {
           outcome = { _tag: "Applied" }
         }
         head += 1n
-        ledgerOf(envelope.clientId).set(envelope.mutationId, { position: head, outcome })
+        ledgerOf(envelope.clientId).set(envelope.mutationId, { position: head, seq: envelope.seq, outcome })
         const key = `${envelope.clientId}#${envelope.mutationId}`
         executions.set(key, (executions.get(key) ?? 0) + 1)
         commit(head)
@@ -149,11 +150,11 @@ export const make = (options: { readonly pageSize: number }) => {
           return { results, stopped: Option.some({ reason: "SerializationFailure" }) }
         }
         const recorded = ledgerOf(request.clientId).get(item.mutationId)
-        // A resubmitted id at or below the floor was processed and its ledger row is gone:
-        // answer terminally instead of executing it a second time.
+        // Clients push in seq order and every processed mutation is in the ledger, so a seq at
+        // or below the floor was processed and its row is gone: answer terminally, never re-execute.
         const outcome: MutationOutcome =
           recorded?.outcome ??
-          (item.mutationId <= (ledgerFloor.get(request.clientId) ?? 0)
+          (item.seq <= (ledgerFloor.get(request.clientId) ?? 0)
             ? { _tag: "Rejected", error: { _tag: "ClientExpired", mutationId: item.mutationId } }
             : yield* execute({ clientId: request.clientId, ...item }, now))
         results.push({ mutationId: item.mutationId, outcome })
@@ -276,7 +277,7 @@ export const make = (options: { readonly pageSize: number }) => {
     history,
     executions,
     head: () => head,
-    ledgerEntry: (clientId: string, mutationId: number) => Option.fromNullishOr(ledger.get(clientId)?.get(mutationId)),
+    ledgerEntry: (clientId: string, mutationId: string) => Option.fromNullishOr(ledger.get(clientId)?.get(mutationId)),
     register: (clientId: string, principal: string) => principals.set(clientId, principal),
     writeDirect,
     push,
@@ -292,7 +293,7 @@ export const make = (options: { readonly pageSize: number }) => {
         for (const [id, entry] of entries) {
           if (entry.position > through) continue
           entries.delete(id)
-          ledgerFloor.set(clientId, Math.max(ledgerFloor.get(clientId) ?? 0, id))
+          ledgerFloor.set(clientId, Math.max(ledgerFloor.get(clientId) ?? 0, entry.seq))
         }
       }
     }

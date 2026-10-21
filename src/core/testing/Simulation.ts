@@ -146,14 +146,14 @@ export const makeStorage = (disk: Disk): Engine.SyncStorage<never> => ({
     Effect.sync(() => {
       disk.outbox = [...disk.outbox, entry]
     }),
-  setUndo: (mutationId, undo) =>
+  setUndo: (seq, undo) =>
     Effect.sync(() => {
-      disk.outbox = disk.outbox.map((e) => (e.envelope.mutationId === mutationId ? { ...e, undo } : e))
+      disk.outbox = disk.outbox.map((e) => (e.envelope.seq === seq ? { ...e, undo } : e))
     }),
   removePending: (ids) =>
     Effect.sync(() => {
       const gone = new Set(ids)
-      disk.outbox = disk.outbox.filter((e) => !gone.has(e.envelope.mutationId))
+      disk.outbox = disk.outbox.filter((e) => !gone.has(e.envelope.seq))
     }),
   staged: Effect.sync(() => disk.staged),
   stage: (page) =>
@@ -355,7 +355,7 @@ export const run = (options: Options) =>
             )
           }
         }
-        const seen = new Set<number>()
+        const seen = new Set<string>()
         for (const notice of client.disk.notices) {
           if (seen.has(notice.envelope.mutationId)) {
             return yield* violated(
@@ -441,7 +441,18 @@ export const run = (options: Options) =>
         if (roll < 40) {
           const { name, args } = randomMutation(client)
           note(`${client.clientId}: mutate ${name} ${JSON.stringify(args)}`)
-          yield* ignoreExpected(withClock(client, client.engine.mutate(name, args)))
+          // Caller-generated, unordered idempotency key (DESIGN §6); occasionally a retried
+          // enqueue of a still-pending id, which must not create a second intent.
+          const retry = client.disk.outbox.at(-1)
+          if (retry !== undefined && rng.chance(0.05)) {
+            note(`${client.clientId}: retry enqueue ${retry.envelope.mutationId}`)
+            const again = yield* client.engine.mutate(retry.envelope.mutationId, "increment", { id: "ignored", by: 99 })
+            if (again.seq !== retry.envelope.seq)
+              return yield* violated("enqueue is idempotent on mutationId", again.mutationId)
+            return
+          }
+          const mutationId = `m${rng.int(2 ** 30).toString(36)}-${client.clientId}-${client.disk.meta.lastSeq}`
+          yield* ignoreExpected(withClock(client, client.engine.mutate(mutationId, name, args)))
         } else if (roll < 60) {
           if (!client.online) return
           note(`${client.clientId}: push`)
@@ -471,7 +482,7 @@ export const run = (options: Options) =>
 
     const recordCommitted = (client: Client, before: number) => {
       for (const entry of client.disk.outbox) {
-        if (entry.envelope.mutationId > before) committed.push(entry.envelope)
+        if (entry.envelope.seq > before) committed.push(entry.envelope)
       }
     }
 
@@ -479,7 +490,7 @@ export const run = (options: Options) =>
       const roll = rng.int(100)
       if (roll < 85) {
         const client = Option.getOrThrow(rng.pick(clients))
-        const before = client.disk.meta.lastMutationId
+        const before = client.disk.meta.lastSeq
         yield* clientStep(client)
         recordCommitted(client, before)
         yield* checkClient(client)
@@ -532,7 +543,10 @@ export const run = (options: Options) =>
       const client = clients.find((c) => c.clientId === envelope.clientId)
       const notices = client?.disk.notices.filter((n) => n.envelope.mutationId === envelope.mutationId).length ?? 0
       const rejected = Option.isSome(ledger) && ledger.value.outcome._tag === "Rejected"
-      if (Option.isSome(ledger) && notices !== (rejected ? 1 : 0)) {
+      const unknown = client?.disk.notices.some(
+        (n) => n.envelope.mutationId === envelope.mutationId && n._tag === "OutcomeUnknown"
+      )
+      if (Option.isSome(ledger) && (notices !== (rejected ? 1 : 0) || unknown === true)) {
         return yield* violated(
           "rejections surface as exactly one notice",
           `${key}: ${notices} notices, rejected=${rejected}`
@@ -544,7 +558,7 @@ export const run = (options: Options) =>
       }
     }
     for (const client of clients) {
-      stats.expired += client.disk.notices.filter((n) => n.error._tag === "ClientExpired").length
+      stats.expired += client.disk.notices.filter((n) => n._tag === "OutcomeUnknown").length
     }
     stats.mutations = committed.length
     const result: Stats = stats
