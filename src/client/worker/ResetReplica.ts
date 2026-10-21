@@ -65,11 +65,14 @@ export const resetReplica = (
             profile: config.profile,
             discardPending: options.discardPending === true
           }
-          worker.addEventListener("message", onMessage)
-          worker.addEventListener("error", onError)
-          // A throwing postMessage is a failed reset, not a defect; interruption is never caught here.
+          // A throwing postMessage is a failed reset, not a defect; interruption is never caught here. The
+          // listeners are added inside the thunk, so the `ensuring` below is installed before they exist.
           return yield* Effect.try({
-            try: () => worker.postMessage(command, { transfer: [] }),
+            try: () => {
+              worker.addEventListener("message", onMessage)
+              worker.addEventListener("error", onError)
+              worker.postMessage(command, { transfer: [] })
+            },
             catch: (cause) => new ResetFailed({ message: `posting to the reset worker failed: ${String(cause)}` })
           }).pipe(
             Effect.andThen(Deferred.await(answered)),
