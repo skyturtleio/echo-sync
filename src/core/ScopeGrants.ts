@@ -17,10 +17,14 @@ export const grantId = (scopeId: AccessScopeId, principalId: PrincipalId): Scope
  * System table of scope grants (DESIGN §4). Replicated like any row (a grant lives in the scope
  * it grants), so clients can run optimistic role checks. Writes require `owner` on that scope.
  */
-export const ScopeGrants = SyncTable.make("scope_grants", {
-  id: ScopeGrantId,
-  accessScopeId: AccessScopeId,
-  principalId: PrincipalId,
-  role: Role,
-  grantedAt: Schema.DateTimeUtc
-})
+export const ScopeGrants = SyncTable.make(
+  "scope_grants",
+  {
+    id: ScopeGrantId,
+    accessScopeId: AccessScopeId,
+    principalId: PrincipalId,
+    role: Role,
+    grantedAt: Schema.DateTimeUtc
+  },
+  { unique: [["accessScopeId", "principalId"]] }
+)

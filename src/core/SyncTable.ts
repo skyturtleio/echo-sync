@@ -1,4 +1,4 @@
-import { DateTime, Predicate, Schema, SchemaAST, SchemaGetter, SchemaRepresentation, String as Str } from "effect"
+import { DateTime, Predicate, Schema, SchemaAST, SchemaGetter, String as Str } from "effect"
 import type { AccessScopeId } from "./AccessScope.ts"
 
 // ---------------------------------------------------------------------------------------------
@@ -68,15 +68,17 @@ export interface ColumnManifest {
   readonly name: string
   readonly kind: ColumnKind
   readonly nullable: boolean
-  /** The field schema's representation with annotations stripped. */
-  readonly shape: Schema.Json
 }
 
 export interface TableManifest {
   readonly name: string
   readonly columns: ReadonlyArray<ColumnManifest>
   readonly indexes: ReadonlyArray<{ readonly name: string; readonly columns: ReadonlyArray<string> }>
-  /** Hash of the data shape (name + columns). Changes ⇒ replica rebuild. Index-independent. */
+  /**
+   * Hash of the storage shape (table name; column names, kinds, nullability). Changes ⇒ replica
+   * rebuild. Refinements, brands and nested JSON schemas are validation, not storage, and do not
+   * contribute (DESIGN §5); neither do indexes.
+   */
   readonly dataHash: string
   /** Hash of the index set. Changing it must not force a replica re-download (DESIGN §11). */
   readonly indexHash: string
@@ -134,15 +136,19 @@ export type RequiredFields = {
 
 type FieldProblem<K, S extends Schema.Constraint> = S["~type.optionality"] extends "optional"
   ? "SyncTable: optional keys are not supported; use Schema.NullOr"
-  : [Exclude<S["Encoded"], null>] extends [never]
-    ? "SyncTable: a field cannot be only null"
-    : Exclude<S["Encoded"], null> extends bigint | symbol | undefined | Uint8Array
-      ? "SyncTable: unsupported leaf schema (bigint, symbol, undefined and binary have no column mapping)"
-      : K extends "id"
-        ? string extends S["Type"]
-          ? "SyncTable: id must be a branded string schema"
-          : never
-        : never
+  : S["~encoded.optionality"] extends "optional"
+    ? "SyncTable: encoded-side defaults and optional keys are not supported; use Schema.NullOr"
+    : [S["DecodingServices"] | S["EncodingServices"]] extends [never]
+      ? [Exclude<S["Encoded"], null>] extends [never]
+        ? "SyncTable: a field cannot be only null"
+        : Exclude<S["Encoded"], null> extends bigint | symbol | undefined | Uint8Array
+          ? "SyncTable: unsupported leaf schema (bigint, symbol, undefined and binary have no column mapping)"
+          : K extends "id"
+            ? string extends S["Type"]
+              ? "SyncTable: id must be a branded string schema"
+              : never
+            : never
+      : "SyncTable: field schemas must not require services (row codecs run with no context)"
 
 /** Maps each invalid field to an explanatory string literal so the declaration fails to compile. */
 export type ValidateFields<F extends TableFields> = {
@@ -239,17 +245,22 @@ const leaf = (ast: SchemaAST.AST): Leaf => {
 interface Classified {
   readonly kind: ColumnKind
   readonly nullable: boolean
-  /** The non-null part of the field's own AST (used to build the timestamp wire codec). */
-  readonly part: SchemaAST.AST
 }
 
+/**
+ * Classifies a field by its *encoded* side (what is stored), so a transformed field (branded,
+ * refined, or decoded into another type) maps by the column it actually occupies.
+ */
 const classify = (ast: SchemaAST.AST): Classified | string => {
-  if (SchemaAST.isOptional(ast)) return "optional keys are not supported; use Schema.NullOr"
   const encoded = SchemaAST.toEncoded(ast)
+  // Both sides: an encoded-side default or optional key would let a stored row omit the key.
+  if (SchemaAST.isOptional(ast) || SchemaAST.isOptional(encoded)) {
+    return "optional keys and encoded-side defaults are not supported; use Schema.NullOr"
+  }
   if (encoded._tag === "Null") return "a field cannot be only null"
   if (encoded._tag !== "Union") {
     const l = leaf(encoded)
-    return "problem" in l ? l.problem : { kind: l.kind, nullable: false, part: ast }
+    return "problem" in l ? l.problem : { kind: l.kind, nullable: false }
   }
   const members = encoded.types.filter((t) => t._tag !== "Null")
   const nullable = members.length !== encoded.types.length
@@ -257,37 +268,41 @@ const classify = (ast: SchemaAST.AST): Classified | string => {
   if (first === undefined) return "a field cannot be only null"
   if (rest.length === 0) {
     const l = leaf(first)
-    if ("problem" in l) return l.problem
-    if (l.kind !== "json" && ast._tag !== "Union") return "transformations over nullable leaves are not supported"
-    const part = ast._tag === "Union" ? (ast.types.find((t) => t._tag !== "Null") ?? ast) : ast
-    return { kind: l.kind, nullable, part }
+    return "problem" in l ? l.problem : { kind: l.kind, nullable }
   }
   const kinds = new Set(members.map((m) => (m._tag === "Literal" ? JSON.stringify(leaf(m)) : "structural")))
   const [only] = kinds
   if (kinds.size === 1 && only !== undefined && only !== "structural") {
     const l = leaf(first)
-    if ("problem" in l) return l.problem
-    return { kind: l.kind, nullable, part: ast }
+    return "problem" in l ? l.problem : { kind: l.kind, nullable }
   }
-  return { kind: "json", nullable, part: ast }
+  return { kind: "json", nullable }
 }
 
-const toMillis = (value: unknown): number =>
-  value instanceof globalThis.Date ? value.getTime() : DateTime.isDateTime(value) ? DateTime.toEpochMillis(value) : NaN
-
 const TimestampMillis = Schema.Int.check(Schema.isBetween({ minimum: minTimestampMillis, maximum: maxTimestampMillis }))
+const DateFromWire = TimestampMillis.pipe(
+  Schema.decodeTo(Schema.Date, {
+    decode: SchemaGetter.transform((ms: number) => new globalThis.Date(ms)),
+    encode: SchemaGetter.transform((d: globalThis.Date) => d.getTime())
+  })
+)
+const UtcFromWire = TimestampMillis.pipe(
+  Schema.decodeTo(Schema.DateTimeUtc, {
+    decode: SchemaGetter.transform((ms: number) => DateTime.makeUnsafe(ms)),
+    encode: SchemaGetter.transform((utc: DateTime.Utc) => DateTime.toEpochMillis(utc))
+  })
+)
 
+/**
+ * Field value ↔ wire value. The whole field schema stays the decoding target, so its own
+ * transformations and checks run unchanged; only its stored (encoded) end is mapped to JSON.
+ */
 const wireFor = (field: Schema.Constraint, c: Classified): Schema.Constraint => {
   if (c.kind !== "timestamp") return Schema.toCodecJson(field)
-  const part = Schema.make<Schema.Top>(c.part)
-  const utc = representationId(SchemaAST.toEncoded(c.part)) === "effect/schema/DateTimeUtc"
-  const millis = TimestampMillis.pipe(
-    Schema.decodeTo(part, {
-      decode: SchemaGetter.transform((ms: number) => (utc ? DateTime.makeUnsafe(ms) : new globalThis.Date(ms))),
-      encode: SchemaGetter.transform(toMillis)
-    })
-  )
-  return c.nullable ? Schema.NullOr(millis) : millis
+  const encoded = SchemaAST.toEncoded(field.ast)
+  const stored = encoded._tag === "Union" ? (encoded.types.find((t) => t._tag !== "Null") ?? encoded) : encoded
+  const millis = representationId(stored) === "effect/schema/DateTimeUtc" ? UtcFromWire : DateFromWire
+  return (c.nullable ? Schema.NullOr(millis) : millis).pipe(Schema.decodeTo(field))
 }
 
 const SqliteBoolean = Schema.Literals([0, 1]).pipe(
@@ -372,16 +387,6 @@ const derived = <T, E>(schema: Schema.Constraint): Schema.Codec<T, E> =>
   // oxlint-disable-next-line typescript/consistent-type-assertions -- derived-schema edge, see doc comment
   schema as unknown as Schema.Codec<T, E>
 
-const stripAnnotations = (json: Schema.Json): Schema.Json => {
-  if (Array.isArray(json)) return json.map(stripAnnotations)
-  if (json !== null && typeof json === "object") {
-    const out: { [key: string]: Schema.Json } = {}
-    for (const [key, value] of Object.entries(json)) if (key !== "annotations") out[key] = stripAnnotations(value)
-    return out
-  }
-  return json
-}
-
 /** Canonical JSON: object keys sorted, no whitespace. */
 export const canonicalJson = (json: Schema.Json): string => {
   if (Array.isArray(json)) return `[${json.map(canonicalJson).join(",")}]`
@@ -401,9 +406,6 @@ export const hash = (text: string): string => {
   return h.toString(16).padStart(16, "0")
 }
 
-const shapeOf = (ast: SchemaAST.AST): Schema.Json =>
-  stripAnnotations(SchemaRepresentation.toJson(SchemaRepresentation.toRepresentation(ast)))
-
 /**
  * Declares a synced table (DESIGN §5). Throws `SyncTableDeclarationError` for anything that
  * cannot be mapped unambiguously; the type parameters already reject the cases visible to
@@ -417,7 +419,11 @@ export const make = <
 >(
   name: Name,
   fields: F & ValidateFields<F>,
-  options?: { readonly indexes?: I }
+  options?: {
+    readonly indexes?: I
+    /** Column sets that must be unique (both dialects' DDL carry the constraint). */
+    readonly unique?: ReadonlyArray<readonly [keyof F & string, ...ReadonlyArray<keyof F & string>]>
+  }
 ): SyncTable<Name, F, I> => {
   const fail = (message: string): never => {
     throw new SyncTableDeclarationError(`SyncTable "${name}": ${message}`)
@@ -456,7 +462,7 @@ export const make = <
       postgres: derived(pg),
       sqlite: derived(sqlite)
     })
-    manifestColumns.push({ name: column, kind: c.kind, nullable: c.nullable, shape: shapeOf(schema.ast) })
+    manifestColumns.push({ name: column, kind: c.kind, nullable: c.nullable })
   }
 
   const columnOf = (field: string): Column => columns.find((c) => c.field === field) ?? fail(`unknown field "${field}"`)
@@ -479,15 +485,23 @@ export const make = <
     indexes[index] = { name: index, fields: indexFields, key: [...key, idColumn] }
   }
 
-  const pgColumns = columns.map(
-    (c) => `  ${quote(c.name)} ${pgType[c.kind]}${c.nullable ? "" : " NOT NULL"}${c === idColumn ? " PRIMARY KEY" : ""}`
-  )
-  const sqliteColumns = columns.map(
-    (c) =>
-      `  ${quote(c.name)} ${sqliteType[c.kind]}${c.nullable ? "" : " NOT NULL"}${c === idColumn ? " PRIMARY KEY" : ""}${
-        c.kind === "boolean" ? ` CHECK (${quote(c.name)} IN (0, 1))` : ""
-      }`
-  )
+  const uniques = (options?.unique ?? []).map((fs) => `  UNIQUE (${fs.map((f) => quote(columnOf(f).name)).join(", ")})`)
+  const pgColumns = [
+    ...columns.map(
+      (c) =>
+        `  ${quote(c.name)} ${pgType[c.kind]}${c.nullable ? "" : " NOT NULL"}${c === idColumn ? " PRIMARY KEY" : ""}`
+    ),
+    ...uniques
+  ]
+  const sqliteColumns = [
+    ...columns.map(
+      (c) =>
+        `  ${quote(c.name)} ${sqliteType[c.kind]}${c.nullable ? "" : " NOT NULL"}${c === idColumn ? " PRIMARY KEY" : ""}${
+          c.kind === "boolean" ? ` CHECK (${quote(c.name)} IN (0, 1))` : ""
+        }`
+    ),
+    ...uniques
+  ]
   const indexDdl = (unique: string) =>
     Object.values(indexes).map(
       (i) =>
@@ -507,10 +521,15 @@ export const make = <
     dataHash: hash(
       canonicalJson({
         name,
-        columns: sortedColumns.map((c) => ({ name: c.name, kind: c.kind, nullable: c.nullable, shape: c.shape }))
+        columns: sortedColumns.map((c) => ({ name: c.name, kind: c.kind, nullable: c.nullable }))
       })
     ),
-    indexHash: hash(canonicalJson(indexManifest.map((i) => ({ name: i.name, columns: [...i.columns] }))))
+    indexHash: hash(
+      canonicalJson({
+        indexes: indexManifest.map((i) => ({ name: i.name, columns: [...i.columns] })),
+        unique: uniques
+      })
+    )
   }
 
   const wire = Schema.Struct(wireFields).pipe(Schema.encodeKeys(keyMap))

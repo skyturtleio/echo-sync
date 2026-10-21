@@ -2,7 +2,7 @@
  * Compile-time contract: each `@ts-expect-error` below must stay an error, so `tsc --noEmit`
  * (part of `bun run check`) fails if a wrong usage starts compiling. Nothing here runs.
  */
-import { Schema } from "effect"
+import { Context, Effect, Schema, SchemaGetter } from "effect"
 import { AccessScopeId } from "./AccessScope.ts"
 import type { EchoStore } from "./Store.ts"
 import * as SyncTable from "./SyncTable.ts"
@@ -37,6 +37,14 @@ export const queries = (db: EchoStore) => [
   db.get(Todos, "plain string")
 ]
 
+class Clock extends Context.Service<Clock, { readonly now: number }>()("test/Clock") {}
+const NeedsService = Schema.String.pipe(
+  Schema.decodeTo(Schema.String, {
+    decode: SchemaGetter.transformEffect((s: string) => Effect.map(Effect.service(Clock), () => s)),
+    encode: SchemaGetter.transform((s: string) => s)
+  })
+)
+
 export const declarations = () => [
   // @ts-expect-error a table without accessScopeId
   SyncTable.make("a", { id: TodoId }),
@@ -44,6 +52,8 @@ export const declarations = () => [
   SyncTable.make("b", { id: Schema.String, accessScopeId: AccessScopeId }),
   // @ts-expect-error unsupported leaf schema (bigint)
   SyncTable.make("c", { id: TodoId, accessScopeId: AccessScopeId, n: Schema.BigInt }),
+  // @ts-expect-error field schemas must not require services (row codecs run with no context)
+  SyncTable.make("e", { id: TodoId, accessScopeId: AccessScopeId, x: NeedsService }),
   // @ts-expect-error accessScopeId must be AccessScopeId, not any string
   SyncTable.make("d", { id: TodoId, accessScopeId: Schema.String })
 ]

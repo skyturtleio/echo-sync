@@ -1,4 +1,4 @@
-import { type DateTime, Effect, Random, Schema } from "effect"
+import { Cause, type DateTime, Effect, Random, Schema } from "effect"
 import type { PrincipalId } from "./AccessScope.ts"
 import {
   InvalidRow,
@@ -129,6 +129,28 @@ export const make = <const Name extends string, A extends PureSchema, E extends 
     Schema.toCodecJson(options.args)
   )
   const encodeError = Schema.encodeUnknownEffect(Schema.toCodecJson(errorSchema))
+  /**
+   * Whole-cause classification (DESIGN §6). A defect or interruption anywhere dies with the
+   * full cause (failures turned into defects), never a Rejected outcome. A StoreUnavailable
+   * anywhere is transient. Only a cause made purely of permanent failures is a rejection.
+   */
+  const classify = (cause: Cause.Cause<unknown>): Effect.Effect<never, MutationRejection | StoreUnavailable> => {
+    const failures = cause.reasons.filter(Cause.isFailReason).map((r) => r.error)
+    const [first] = failures
+    if (first === undefined || failures.length !== cause.reasons.length) {
+      return Effect.failCause(
+        Cause.fromReasons(cause.reasons.map((r) => (Cause.isFailReason(r) ? Cause.makeDieReason(r.error) : r)))
+      )
+    }
+    const transient = failures.find((e) => e instanceof StoreUnavailable)
+    if (transient !== undefined) return Effect.fail(transient)
+    if (isStoreFailure(first)) return Effect.fail(first)
+    return encodeError(first).pipe(
+      // An undeclared or unencodable domain error is a bug in the mutation, not an outcome.
+      Effect.orDie,
+      Effect.flatMap((encoded) => Effect.fail(new DomainError({ mutation: name, error: encoded })))
+    )
+  }
   return {
     name,
     args: options.args,
@@ -138,15 +160,7 @@ export const make = <const Name extends string, A extends PureSchema, E extends 
       decodeArgs(args).pipe(
         Effect.mapError((e) => new ArgsDecodeFailed({ name, message: e.message })),
         Effect.flatMap((decoded) => options.handler(ctx, decoded)),
-        Effect.catch((e): Effect.Effect<never, MutationRejection | StoreUnavailable> =>
-          isStoreFailure(e)
-            ? Effect.fail(e)
-            : encodeError(e).pipe(
-                // An undeclared or unencodable domain error is a bug in the mutation, not an outcome.
-                Effect.orDie,
-                Effect.flatMap((encoded) => Effect.fail(new DomainError({ mutation: name, error: encoded })))
-              )
-        )
+        Effect.catchCause((cause) => classify(cause))
       )
   }
 }

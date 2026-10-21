@@ -1,4 +1,4 @@
-import { DateTime, Schema } from "effect"
+import { DateTime, Effect, Schema, SchemaGetter } from "effect"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { AccessScopeId } from "./AccessScope.ts"
 import * as Registry from "./Registry.ts"
@@ -13,7 +13,16 @@ const Shape = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("box"), at: Schema.Date })
 ])
 
-/** One column of every supported kind, each also in nullable form. */
+// A field whose decoded side is a string stored as a timestamp column (the reviewer's case).
+const IsoFromDate = Schema.NullOr(Schema.Date).pipe(
+  Schema.decodeTo(Schema.NullOr(Schema.String), {
+    decode: SchemaGetter.transform((d: Date | null) => (d === null ? null : d.toISOString())),
+    encode: SchemaGetter.transform((iso: string | null) => (iso === null ? null : new Date(iso)))
+  })
+)
+const Past = Schema.Date.check(Schema.isLessThanDate(new Date("2100-01-01T00:00:00Z"))).pipe(Schema.brand("Past"))
+
+/** One column of every supported kind, each also in nullable form, plus transformed leaves. */
 const Everything = SyncTable.make("everything", {
   id: ItemId,
   accessScopeId: AccessScopeId,
@@ -33,7 +42,12 @@ const Everything = SyncTable.make("everything", {
   utcN: Schema.NullOr(Schema.DateTimeUtc),
   doc: Schema.Struct({ tags: Schema.Array(Schema.String), when: Schema.Date }),
   docN: Schema.NullOr(Schema.Array(Schema.Int)),
-  shape: Shape
+  shape: Shape,
+  iso: IsoFromDate,
+  past: Schema.NullOr(Past),
+  utcMs: Schema.NullOr(Schema.DateTimeUtcFromMillis),
+  fin: Schema.NullOr(Schema.FiniteFromString),
+  big: Schema.NullOr(Schema.BigIntFromString)
 })
 
 type Row = typeof Everything.Row.Type
@@ -59,7 +73,12 @@ const rows: ReadonlyArray<Row> = [
     utcN: null,
     doc: { tags: [], when: new Date(-1) },
     docN: null,
-    shape: { kind: "circle", r: 0.1 }
+    shape: { kind: "circle", r: 0.1 },
+    iso: null,
+    past: null,
+    utcMs: null,
+    fin: null,
+    big: null
   },
   {
     id: ItemId.make("b"),
@@ -80,7 +99,12 @@ const rows: ReadonlyArray<Row> = [
     utcN: DateTime.makeUnsafe(-1),
     doc: { tags: ["", "😀"], when: new Date(1_700_000_000_123) },
     docN: [Number.MAX_SAFE_INTEGER, -1],
-    shape: { kind: "box", at: new Date(0) }
+    shape: { kind: "box", at: new Date(0) },
+    iso: "2001-02-03T04:05:06.789Z",
+    past: Past.make(new Date(-62_135_596_800_000)),
+    utcMs: DateTime.makeUnsafe(1),
+    fin: -0.25,
+    big: 12_345_678_901_234_567_890n
   }
 ]
 
@@ -95,6 +119,13 @@ const expectSameRows = (actual: ReadonlyArray<Row>) => {
 }
 
 describe("SyncTable codec round-trip", () => {
+  it("the wire form (JSON text, as sent over HTTP) returns every field unchanged", () => {
+    const back = rows.map((row) =>
+      Schema.decodeUnknownSync(Everything.wire)(JSON.parse(JSON.stringify(Schema.encodeSync(Everything.wire)(row))))
+    )
+    expect(back).toEqual(rows)
+  })
+
   it("SQLite stores and returns every supported leaf type unchanged (boundaries, nulls, empty strings)", async () => {
     const db = sqlite()
     try {
@@ -133,6 +164,11 @@ describe("SyncTable declaration-time rejection", () => {
     // @ts-expect-error binary has no column mapping
     expectRejected(() => SyncTable.make("t", { ...base, b: Schema.Uint8Array }), /field "b"/)
     expectRejected(() => SyncTable.make("t", { ...base, e: Schema.Enum({ A: "a" }) }), /field "e"/)
+    const encodedDefault = Schema.String.pipe(
+      Schema.withDecodingDefaultKey(Effect.succeed("d"), { encodingStrategy: "omit" })
+    )
+    // @ts-expect-error an encoded-side default lets a stored row omit the key (§11 key presence)
+    expectRejected(() => SyncTable.make("t", { ...base, x: encodedDefault }), /field "x".*encoded-side defaults/)
     // @ts-expect-error optional keys are not supported
     expectRejected(() => SyncTable.make("t", { ...base, o: Schema.optionalKey(Schema.String) }), /field "o".*optional/)
   })
@@ -180,14 +216,37 @@ describe("SyncTable manifest hash", () => {
     expect(b.manifest.dataHash).toBe(a.manifest.dataHash)
   })
 
-  it("changes when the data shape changes (nullability, type, refinement, nested JSON shape, name)", () => {
+  it("ignores refinements, brands and nested JSON schemas: validation is not storage (DESIGN §5)", () => {
+    const base = SyncTable.make("notes", fields).manifest.dataHash
+    const same = [
+      SyncTable.make("notes", { ...fields, title: Schema.NonEmptyString }),
+      SyncTable.make("notes", { ...fields, title: Schema.String.pipe(Schema.brand("Title")) }),
+      SyncTable.make("notes", { ...fields, at: Schema.Date.check(Schema.isGreaterThanDate(new Date(0))) })
+    ].map((t) => t.manifest.dataHash)
+    expect(same).toEqual([base, base, base])
+    const fin = SyncTable.make("n", { id: ItemId, accessScopeId: AccessScopeId, n: Schema.FiniteFromString })
+    const nonNeg = SyncTable.make("n", {
+      id: ItemId,
+      accessScopeId: AccessScopeId,
+      n: Schema.FiniteFromString.check(Schema.isGreaterThanOrEqualTo(0))
+    })
+    expect(nonNeg.manifest.dataHash).toBe(fin.manifest.dataHash)
+    const jsonA = SyncTable.make("n", {
+      id: ItemId,
+      accessScopeId: AccessScopeId,
+      j: Schema.Struct({ a: Schema.String })
+    })
+    const jsonB = SyncTable.make("n", { id: ItemId, accessScopeId: AccessScopeId, j: Schema.Struct({ a: Schema.Int }) })
+    expect(jsonB.manifest.dataHash).toBe(jsonA.manifest.dataHash)
+  })
+
+  it("changes when the storage shape changes (nullability, column kind, column set, table name)", () => {
     const base = SyncTable.make("notes", fields).manifest.dataHash
     const variants = [
       SyncTable.make("notes", { ...fields, title: Schema.NullOr(Schema.String) }),
-      SyncTable.make("notes", { ...fields, at: Schema.DateTimeUtc }),
-      SyncTable.make("notes", { ...fields, title: Schema.NonEmptyString }),
+      SyncTable.make("notes", { ...fields, title: Schema.Int }),
+      SyncTable.make("notes", { ...fields, at: Schema.NullOr(Schema.Date) }),
       SyncTable.make("notes", { ...fields, extra: Schema.Struct({ a: Schema.String }) }),
-      SyncTable.make("notes", { ...fields, extra: Schema.Struct({ a: Schema.Int }) }),
       SyncTable.make("notes2", fields)
     ].map((t) => t.manifest.dataHash)
     expect(new Set([base, ...variants]).size).toBe(variants.length + 1)

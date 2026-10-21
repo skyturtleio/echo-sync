@@ -1,6 +1,7 @@
 import { DateTime, Effect, Option, Schema } from "effect"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { AccessScopeId, PrincipalId, type Role } from "./AccessScope.ts"
+import { grantId, ScopeGrantId, ScopeGrants } from "./ScopeGrants.ts"
 import { ClientId, MutationId } from "./Ids.ts"
 import * as Mutation from "./Mutation.ts"
 import * as Store from "./Store.ts"
@@ -110,6 +111,35 @@ describe("index ordering is one definition across dialects (DESIGN §10)", () =>
   })
 })
 
+const grantRow = (id: string) =>
+  Schema.encodeSync(ScopeGrants.wire)({
+    id: ScopeGrantId.make(id),
+    accessScopeId: s1,
+    principalId: PrincipalId.make("bob"),
+    role: "reader",
+    grantedAt: DateTime.makeUnsafe(0)
+  })
+const rejectsDuplicate = (dialect: () => Promise<Dialect>) => {
+  it("a second row for the same pair under another id is refused by the database", async () => {
+    const db = await dialect()
+    try {
+      await db.create(ScopeGrants)
+      await db.insert(ScopeGrants, grantRow("fake-a"))
+      await expect(db.insert(ScopeGrants, grantRow("fake-b"))).rejects.toThrow(/unique|UNIQUE|duplicate|failed/i)
+    } finally {
+      await db.close()
+    }
+  })
+}
+describe("scope_grants DDL makes duplicate (scope, principal) grants unrepresentable in storage", () => {
+  describe("SQLite", () => {
+    rejectsDuplicate(async () => sqlite())
+  })
+  describe.skipIf(!pgAvailable)("Postgres", () => {
+    rejectsDuplicate(postgres)
+  })
+})
+
 /** Minimal RowStore over Maps, ordered by the reference definition. */
 const memoryRows = () => {
   const data = new Map<string, Map<string, SyncTable.EncodedRow>>()
@@ -179,6 +209,32 @@ describe("typed Store over a RowStore", () => {
     )
     expect(moved).toMatchObject({ _tag: "ScopeForbidden", scopeId: "s2", required: "writer", held: "reader" })
     expect(await Effect.runPromise(mover.touched)).toEqual([]) // nothing written, nothing to undo
+  })
+
+  it("two grants for one (scope, principal) cannot both be written, nor can a patch change the pair", async () => {
+    const mem = memoryRows()
+    const { store } = Store.make(mem.rows, roles({ s1: "owner" }))
+    const grant = (id: string, principal: string) => ({
+      id: ScopeGrantId.make(id),
+      accessScopeId: s1,
+      principalId: PrincipalId.make(principal),
+      role: "reader" as const,
+      grantedAt: DateTime.makeUnsafe(0)
+    })
+    for (const fake of ["fake-a", "fake-b"]) {
+      const err = await Effect.runPromise(Effect.flip(store.insert(ScopeGrants, grant(fake, "bob"))))
+      expect(err).toMatchObject({ _tag: "InvalidRow", table: "scope_grants" })
+    }
+    const canonical = grantId(s1, PrincipalId.make("bob"))
+    await Effect.runPromise(store.insert(ScopeGrants, grant(canonical, "bob")))
+    const again = await Effect.runPromise(Effect.flip(store.insert(ScopeGrants, grant(canonical, "bob"))))
+    expect(again).toMatchObject({ _tag: "RowAlreadyExists" })
+    const moved = await Effect.runPromise(
+      Effect.flip(store.patch(ScopeGrants, canonical, { principalId: PrincipalId.make("eve") }))
+    )
+    expect(moved).toMatchObject({ _tag: "InvalidRow" })
+    await Effect.runPromise(store.patch(ScopeGrants, canonical, { role: "writer" }))
+    expect([...(mem.data.get("scope_grants")?.keys() ?? [])]).toEqual([canonical])
   })
 
   it("queries skip rows in scopes the actor cannot read", async () => {

@@ -1,7 +1,13 @@
 import { Effect, Option, Schema } from "effect"
-import { type AccessScopeId, type Role, satisfies } from "./AccessScope.ts"
+import {
+  type AccessScopeId,
+  AccessScopeId as AccessScopeIdSchema,
+  PrincipalId as PrincipalIdSchema,
+  type Role,
+  satisfies
+} from "./AccessScope.ts"
 import { InvalidRow, RowAlreadyExists, RowNotFound, ScopeForbidden, type StoreUnavailable } from "./Errors.ts"
-import { ScopeGrants } from "./ScopeGrants.ts"
+import { grantId, ScopeGrants } from "./ScopeGrants.ts"
 import type { AnySyncTable, Column, EncodedRow, Index } from "./SyncTable.ts"
 
 // ---------------------------------------------------------------------------------------------
@@ -261,6 +267,26 @@ export interface StoreInstance {
   readonly touched: Effect.Effect<ReadonlyArray<UndoImage>>
 }
 
+/**
+ * Grant identity is derived (DESIGN §4): a scope_grants row whose id is not
+ * `grantId(accessScopeId, principalId)` is rejected, so two grants for one pair cannot both be
+ * written, and a patch that changes the pair (without changing the id) is rejected too.
+ */
+const checkGrantIdentity = (table: AnySyncTable, encoded: EncodedRow): Effect.Effect<void, InvalidRow> => {
+  if (table.name !== ScopeGrants.name) return Effect.void
+  const { id, access_scope_id, principal_id } = encoded
+  const valid =
+    typeof id === "string" &&
+    typeof access_scope_id === "string" &&
+    typeof principal_id === "string" &&
+    id === grantId(AccessScopeIdSchema.make(access_scope_id), PrincipalIdSchema.make(principal_id))
+  return valid
+    ? Effect.void
+    : Effect.fail(
+        new InvalidRow({ table: table.name, message: "scope_grants id must be grantId(accessScopeId, principalId)" })
+      )
+}
+
 const requiredRole = (table: AnySyncTable): Role => (table.name === ScopeGrants.name ? "owner" : "writer")
 
 const decode = <T extends AnySyncTable>(table: T, row: EncodedRow): Effect.Effect<RowOf<T>> =>
@@ -345,6 +371,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
     insert: (table, row) =>
       Effect.gen(function* () {
         const encoded = yield* encode(table, row)
+        yield* checkGrantIdentity(table, encoded)
         yield* authorize(row.accessScopeId, requiredRole(table))
         const existing = yield* rows.read(table, row.id)
         if (Option.isSome(existing)) return yield* new RowAlreadyExists({ table: table.name, id: row.id })
@@ -359,6 +386,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
         yield* authorize(current.accessScopeId, requiredRole(table))
         const next = { ...current, ...patch, id: current.id }
         const encoded = yield* encode(table, next)
+        yield* checkGrantIdentity(table, encoded)
         // A scope move needs the right on both the old and the new scope (DESIGN §4).
         if (next.accessScopeId !== current.accessScopeId) yield* authorize(next.accessScopeId, requiredRole(table))
         yield* write(table, id, found, Option.some(encoded))

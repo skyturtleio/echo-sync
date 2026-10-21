@@ -1,6 +1,7 @@
-import { DateTime, Effect, Option, Schema, SchemaGetter } from "effect"
+import { Cause, DateTime, Effect, Option, Schema, SchemaGetter } from "effect"
 import { describe, expect, it } from "vitest"
 import { AccessScopeId, PrincipalId } from "./AccessScope.ts"
+import { StoreUnavailable } from "./Errors.ts"
 import { ClientId, MutationId, Seq } from "./Ids.ts"
 import * as Mutation from "./Mutation.ts"
 import * as Protocol from "./Protocol.ts"
@@ -108,6 +109,47 @@ const draw = (c: string, m: string) => {
   const r = Mutation.seededRandom(ClientId.make(c), MutationId.make(m))
   return [r.nextDoubleUnsafe(), r.nextDoubleUnsafe()]
 }
+
+const ctx = () => ({
+  actor: PrincipalId.make("u"),
+  now: DateTime.makeUnsafe(0),
+  random: Mutation.seededRandom(ClientId.make("c"), MutationId.make("m")),
+  store: makeStore()
+})
+const Nope = Schema.Struct({ _tag: Schema.Literal("Nope") })
+const failing = (body: Effect.Effect<void, { readonly _tag: "Nope" } | StoreUnavailable>) =>
+  Mutation.makeRegistry([Mutation.make("x", { args: Schema.Struct({}), error: Nope, handler: () => body })])
+/** A cause holding a declared domain failure plus `other`, as a parallel handler can produce. */
+const compound = (other: Cause.Reason<{ readonly _tag: "Nope" } | StoreUnavailable>) =>
+  Effect.failCause(Cause.fromReasons([Cause.makeFailReason({ _tag: "Nope" as const }), other]))
+
+describe("mutation outcome classification over the whole cause (DESIGN §6)", () => {
+  it("a domain failure combined with a defect dies with the defect, never a Rejected outcome", async () => {
+    const exit = await Effect.runPromise(
+      Effect.exit(
+        Mutation.run(failing(compound(Cause.makeDieReason("programmer bug"))), { name: "x", args: {} }, ctx())
+      )
+    )
+    const cause = exit._tag === "Failure" ? exit.cause : Cause.empty
+    expect(exit._tag).toBe("Failure")
+    expect(Cause.hasFails(cause)).toBe(false)
+    expect(Cause.hasDies(cause)).toBe(true)
+    expect(Cause.squash(cause)).not.toMatchObject({ _tag: "DomainError" })
+  })
+
+  it("StoreUnavailable alongside a domain failure stays transient, never a permanent rejection", async () => {
+    const err = await Effect.runPromise(
+      Effect.flip(
+        Mutation.run(
+          failing(compound(Cause.makeFailReason(new StoreUnavailable({ message: "down" })))),
+          { name: "x", args: {} },
+          ctx()
+        )
+      )
+    )
+    expect(err._tag).toBe("StoreUnavailable")
+  })
+})
 
 describe("mutation registry and identity", () => {
   it("rejects two mutations with the same name at construction", () => {
