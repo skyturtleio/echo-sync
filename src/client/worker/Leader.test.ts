@@ -766,11 +766,14 @@ it.live(
       expect(recorded.size).toBe(1)
       const beforeAck = log.length
       yield* Queue.offer(pulls, ["m1"])
-      const released = yield* awaitStatus(emissions, (s) => s.pendingMutations === 0)
+      // The release and the cycle's timestamp may publish in either order: wait for both.
+      const released = yield* awaitStatus(
+        emissions,
+        (s) => s.pendingMutations === 0 && s.lastSyncedAt !== null && s.lastSyncedAt !== t1
+      )
       // Every status between the enqueue and the authoritative ack's install counted m1.
       expect(log.slice(from, beforeAck).map((s) => s.pendingMutations)).toEqual(log.slice(from, beforeAck).map(() => 1))
       expect(log.slice(from, beforeAck).every((s) => s.lastSyncedAt === t1)).toBe(true)
-      const done = released.lastSyncedAt ?? (yield* awaitStatus(emissions, (s) => s.lastSyncedAt !== t1)).lastSyncedAt
-      expect(done ?? 0).toBeGreaterThan(t1 ?? Number.POSITIVE_INFINITY)
+      expect(released.lastSyncedAt ?? 0).toBeGreaterThan(t1 ?? Number.POSITIVE_INFINITY)
     }).pipe(Effect.scoped)
 )
