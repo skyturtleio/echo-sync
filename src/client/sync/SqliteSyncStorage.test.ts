@@ -355,3 +355,38 @@ it.effect("after a rebuild, installing the null-cursor set replays pending on to
     expect((yield* storage.meta).cursor).toBe(9n)
   }).pipe(Effect.provide(Db))
 )
+
+it.effect("a database created by main's first outbox DDL migrates forward: undo column added, pending rows kept", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    // Verbatim from main 9c89ed5 Outbox.migrate, plus two rows written by that build.
+    yield* sql`CREATE TABLE echo_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`
+    yield* sql`CREATE TABLE echo_outbox (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        client_id TEXT NOT NULL,
+        mutation_id TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        args TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        released_at INTEGER
+      )`
+    yield* sql`INSERT INTO echo_meta (key, value) VALUES ('client_id', 'c')`
+    yield* sql`INSERT INTO echo_outbox (client_id, mutation_id, name, args, created_at, released_at)
+      VALUES ('c', 'old1', 't', '{"mutationId":"old1"}', 5, NULL), ('c', 'old2', 't', '{}', 6, 7)`
+
+    expect(yield* SqliteSyncStorage.migrate(registry)).toEqual({ rebuilt: false })
+    const { storage } = yield* makeStorage
+    const pending = yield* storage.transaction(storage.pending)
+    expect(pending.map((e) => [e.envelope.mutationId, e.envelope.seq, e.createdAt, e.undo])).toEqual([
+      ["old1", 1, 5, []]
+    ])
+    expect(Option.isSome(yield* storage.lookup(mid("old2")))).toBe(true)
+    // The new column works and the next seq continues after the old rows.
+    yield* storage.transaction(storage.setUndo(seqOf(1), [{ table: T, id: "x", before: Option.none() }]))
+    expect((yield* storage.pending)[0]?.undo).toEqual([{ table: T, id: "x", before: Option.none() }])
+    expect(yield* storage.transaction(storage.nextSeq)).toBe(3)
+    // Idempotent: running it again changes nothing.
+    expect(yield* SqliteSyncStorage.migrate(registry)).toEqual({ rebuilt: false })
+    expect((yield* storage.pending).map((e) => e.envelope.mutationId)).toEqual(["old1"])
+  }).pipe(Effect.provide(SqliteClient.layerMemory({})))
+)

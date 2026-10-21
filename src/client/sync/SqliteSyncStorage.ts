@@ -90,9 +90,8 @@ export const migrate = (
     const sql = yield* SqlClient.SqlClient
     return yield* sql.withTransaction(
       Effect.gen(function* () {
+        // Engine tables first (versioned forward steps), in this same transaction.
         yield* Outbox.migrate
-        yield* sql`CREATE TABLE IF NOT EXISTS echo_staged (ord INTEGER PRIMARY KEY AUTOINCREMENT, page TEXT NOT NULL) STRICT`
-        yield* sql`CREATE TABLE IF NOT EXISTS echo_notices (id INTEGER PRIMARY KEY AUTOINCREMENT, notice TEXT NOT NULL) STRICT`
         const meta = new Map(
           (yield* sql<{ readonly key: string; readonly value: string }>`
             SELECT key, value FROM echo_meta WHERE key IN ('replica_tables', 'replica_data_hash', 'replica_index_hash', 'replica_table_ddl')`).map(

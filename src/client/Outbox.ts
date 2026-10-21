@@ -63,23 +63,53 @@ const toEntries = (rows: ReadonlyArray<unknown>): Effect.Effect<ReadonlyArray<Ou
     )
   )
 
-/** Idempotent DDL for the engine-owned local tables. */
+/**
+ * Forward migrations of the engine-owned local tables (`echo_meta`, `echo_outbox`, `echo_staged`,
+ * `echo_notices`), in one transaction (joins the caller's). `echo_meta.engine_schema_version` records
+ * the last applied step; a database with no version is at 0, which includes one created by main's
+ * first outbox DDL (9c89ed5, no `undo` column). Every step is idempotent, so a database whose tables
+ * already have a step's shape (created by an unversioned development build) passes through it. A
+ * version above the newest known step means a newer build wrote this database: a defect, never a
+ * silent downgrade. The replica tables are not here: `SqliteSyncStorage.migrate` owns them.
+ */
+const steps: ReadonlyArray<Effect.Effect<void, SqlError, SqlClient.SqlClient>> = [
+  // 1: main 9c89ed5.
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`CREATE TABLE IF NOT EXISTS echo_outbox (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_id TEXT NOT NULL,
+      mutation_id TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      args TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      released_at INTEGER
+    )`
+  }),
+  // 2: reconciliation storage. `undo` holds the first-touch pre-images of the last optimistic run (JSON).
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const undo = yield* sql`SELECT 1 FROM pragma_table_info('echo_outbox') WHERE name = 'undo'`
+    if (undo.length === 0) yield* sql`ALTER TABLE echo_outbox ADD COLUMN undo TEXT NOT NULL DEFAULT '[]'`
+    yield* sql`CREATE TABLE IF NOT EXISTS echo_staged (ord INTEGER PRIMARY KEY AUTOINCREMENT, page TEXT NOT NULL) STRICT`
+    yield* sql`CREATE TABLE IF NOT EXISTS echo_notices (id INTEGER PRIMARY KEY AUTOINCREMENT, notice TEXT NOT NULL) STRICT`
+  })
+]
+
 export const migrate: Effect.Effect<void, SqlError, SqlClient.SqlClient> = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient
   yield* sql.withTransaction(
     Effect.gen(function* () {
       yield* sql`CREATE TABLE IF NOT EXISTS echo_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`
-      yield* sql`CREATE TABLE IF NOT EXISTS echo_outbox (
-        seq INTEGER PRIMARY KEY AUTOINCREMENT,
-        client_id TEXT NOT NULL,
-        mutation_id TEXT NOT NULL UNIQUE,
-        name TEXT NOT NULL,
-        args TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        released_at INTEGER,
-        -- First-touch pre-images of the last optimistic run (JSON); owned by the reconcile storage.
-        undo TEXT NOT NULL DEFAULT '[]'
-      )`
+      const stored = yield* sql<{ readonly value: string }>`
+        SELECT value FROM echo_meta WHERE key = 'engine_schema_version'`
+      const version = Number(stored[0]?.value ?? "0")
+      if (!Number.isInteger(version) || version < 0 || version > steps.length) {
+        return yield* Effect.die(new Error(`echo_meta: unknown engine_schema_version ${stored[0]?.value}`))
+      }
+      for (const step of steps.slice(version)) yield* step
+      yield* sql`INSERT INTO echo_meta (key, value) VALUES ('engine_schema_version', ${String(steps.length)})
+        ON CONFLICT (key) DO UPDATE SET value = excluded.value`
     })
   )
 })
