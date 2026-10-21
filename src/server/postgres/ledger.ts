@@ -181,10 +181,11 @@ export const registerClient = Effect.fnUntraced(function* (principalId: string, 
 /**
  * `registerClient` for the SERIALIZABLE ledger transaction: binds on first sight, then row-locks
  * the client until commit without modifying it. Concurrent submissions of one client serialize
- * on the lock, and because the row is only locked, a waiter is not failed with 40001 when the
- * holder commits; a duplicate then fails once on the ledger's unique key (40001 under
- * SERIALIZABLE) and its retry replays the recorded outcome. Updating the row here (as
- * `last_seen_at` does) would make every replay fail the remaining waiters again.
+ * on the lock, and because the row is only locked, the holder's commit does not by itself fail a
+ * waiter with 40001. A duplicate may still be rejected by SSI (at the ledger's unique key or
+ * earlier); its retry then replays the recorded outcome. Updating the row here (as
+ * `last_seen_at` does) would add a write conflict on every replay and cascade retries through
+ * the remaining waiters.
  */
 const lockClient = Effect.fnUntraced(function* (principalId: string, clientId: string) {
   const sql = yield* SqlClient

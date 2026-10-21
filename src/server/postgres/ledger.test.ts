@@ -105,6 +105,21 @@ describe.skipIf(!pgAvailable)("mutation ledger (§6)", () => {
     }).pipe(Effect.provide(TestDatabase))
   )
 
+  it.live("concurrent duplicates from an already-registered client commit one effect and one ledger row", () =>
+    Effect.gen(function* () {
+      // The client row exists before the race, so every duplicate goes straight to the row lock.
+      yield* runMutation(env("first", 1n), Effect.void)
+      const body = Effect.andThen(appendEffect("x"), Effect.sleep("20 millis"))
+      const results = yield* Effect.forEach(Array.from({ length: 8 }), () => runMutation(env("m", 2n), body), {
+        concurrency: "unbounded"
+      })
+      for (const result of results) assert.deepStrictEqual(result, results[0])
+      // Committed effect, not handler invocations: an SSI retry may re-run a body that rolls back.
+      assert.strictEqual(yield* counterBody, "x")
+      assert.deepStrictEqual(yield* ledgerIds, ["first", "m"])
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
   it.live("a rejected mutation records its outcome and leaves none of its writes behind", () =>
     Effect.gen(function* () {
       const rejected = yield* runMutation(
