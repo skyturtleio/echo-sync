@@ -316,6 +316,44 @@ const s = await stats(); const exp = await echo.exportPending()
 return { pass: halted === true && s.pushes === 2 && exp.ok && exp.value.map((x) => x.envelope.mutationId).join() === 'halt-me', s, exp }")"
 ab tab close "$B" >/dev/null
 
+# ── database path length (DESIGN §9): the OPFS pool, not wa-sqlite's default mxPathname, is the bound ──
+# A UUID-length profile (the HeyBabe trial's identity shape) opens and keeps a write across a reload.
+UUID_PROFILE=$(cat /proc/sys/kernel/random/uuid)
+T=$(open_tab "$BASE/?app=heybabe-trial&profile=$UUID_PROFILE")
+w=$(ev <<<'await echo.ready(); return await echo.enqueue({ mutationId: "uuid-profile-1", name: "t", args: {} })')
+ab reload >/dev/null
+check "a 36-character profile opens its replica and keeps a write across a reload" "$(ev <<<"await echo.ready()
+const r = await echo.exec(\"SELECT mutation_id FROM echo_outbox WHERE mutation_id = 'uuid-profile-1'\")
+const i = await echo.info()
+return { pass: $(jq '.ok' <<<"$w") && r.ok && r.value.length === 1 && i.ok, write: $w, rows: r, dbName: i.ok ? i.value.dbName : i }")"
+ab tab close "$T" >/dev/null
+
+# The bound, from the pinned AccessHandlePoolVFS: a stored path ("/" + SQLite's file name) must stay under
+# its 512-byte header, and the longest file name is "<db>-journal". So the longest db name is
+# 512 - 1 - 1 - 8 = 502 characters, i.e. appId + profile = 502 - len("echo-sync//.db") = 488.
+APP="bound-$RUN"
+PROFILE=$(printf 'p%.0s' $(seq 1 $((488 - ${#APP}))))
+T=$(open_tab "$BASE/?app=$APP&profile=$PROFILE")
+w=$(ev <<<'await echo.ready(); return await echo.enqueue({ mutationId: "longest-path-1", name: "t", args: {} })')
+ab reload >/dev/null
+longest=$(ev <<<"await echo.ready()
+const r = await echo.exec(\"SELECT mutation_id FROM echo_outbox WHERE mutation_id = 'longest-path-1'\")
+const i = await echo.info()
+return { ok: $(jq '.ok' <<<"$w") && r.ok && r.value.length === 1, dbNameLength: i.ok ? i.value.dbName.length : null }")
+ab tab close "$T" >/dev/null
+T=$(open_tab "$BASE/?app=$APP&profile=${PROFILE}p")
+over=$(ev <<<"const r = await echo.info(); const s = await echo.status()
+const root = await navigator.storage.getDirectory()
+const app = await root.getDirectoryHandle('echo-sync').then((d) => d.getDirectoryHandle('$APP')).catch(() => undefined)
+const names = []
+if (app !== undefined) for await (const name of app.keys()) names.push(name.length)
+return { mode: s.mode, reason: r.ok ? null : r.error.reason, message: r.ok ? null : r.error.message, poolNameLengths: names }")
+check "the longest database path the pool holds opens and round-trips; one character more is refused before OPFS is touched" "$(jq -nc --argjson l "$longest" --argjson o "$over" --arg p "${#PROFILE}" '
+  { pass: ($l.ok and $l.dbNameLength == 502 and $o.mode == "unsupported" and $o.reason == "Unsupported"
+          and ($o.message | contains("502")) and ($o.poolNameLengths | all(. == ($p | tonumber)))),
+    longest: $l, over: $o }')"
+ab tab close "$T" >/dev/null
+
 # ── identities that would escape the storage namespace are refused up front ──────────────────────────
 D=$(open_tab "$BASE/?app=.")
 check "identity '.' is refused with LeaderUnavailable{Unsupported}, nothing is opened" "$(ev <<<'const r = await echo.info(); const s = await echo.status()

@@ -63,3 +63,23 @@ it.live("identities with all-dot segments are rejected", () =>
     expect(Platform.validateIdentity({ appId: "a.b", profile: "p-1" })).toBeUndefined()
   })
 )
+
+// Derived from the pinned AccessHandlePoolVFS: it stores "/" + SQLite's file name and throws once the
+// UTF-8 path reaches HEADER_MAX_PATH_SIZE = 512 bytes; the longest file name is "<db>-journal".
+const stored = (identity: Platform.ReplicaIdentity) => `/${Platform.dbName(identity)}-journal`
+const fill = (n: number) => "p".repeat(n)
+
+it.live(
+  "the longest identity whose journal path fits the pool's 512-byte path header is accepted; one more character is not",
+  () =>
+    Effect.sync(() => {
+      const appId = "heybabe-trial"
+      const longest = { appId, profile: fill(511 - stored({ appId, profile: "" }).length) }
+      expect(new TextEncoder().encode(stored(longest)).length).toBe(511)
+      expect(Platform.validateIdentity(longest)).toBeUndefined()
+      const tooLong = { appId, profile: `${longest.profile}p` }
+      expect(Platform.validateIdentity(tooLong)).toContain(String(Platform.maxDbNameLength))
+      // The trial's identity (a UUID profile) is well inside the bound.
+      expect(Platform.validateIdentity({ appId, profile: crypto.randomUUID() })).toBeUndefined()
+    })
+)

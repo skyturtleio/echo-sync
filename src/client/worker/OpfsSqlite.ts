@@ -22,6 +22,7 @@ import { AccessHandlePoolVFS } from "@effect/wa-sqlite/src/examples/AccessHandle
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
+import * as Platform from "./platform.ts"
 
 const Param = Schema.Union([Schema.String, Schema.Number, Schema.Null, Schema.BigInt, Schema.Uint8Array])
 const Message = Schema.Union([
@@ -79,6 +80,9 @@ export const open = (
         catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause)))
       })
     }
+    // Platform edge: wa-sqlite reads `mxPathname` (a plain field on its VFS base class, default 64) when
+    // the VFS is registered. The pool's own header holds far longer paths; see `Platform.vfsMaxPathname`.
+    vfs.mxPathname = Platform.vfsMaxPathname
     sqlite3.vfs_register(vfs, false)
     const db = yield* Effect.acquireRelease(
       Effect.try({

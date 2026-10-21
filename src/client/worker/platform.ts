@@ -19,14 +19,39 @@ export interface ReplicaIdentity {
 // No all-dot segments: "." and ".." are path traversal in the OPFS directory walk.
 const segment = /^(?!\.+$)[A-Za-z0-9._-]+$/
 
-/** Rejects ids that would collide or escape the `echo-sync/<appId>/<profile>.db` / `echo:<appId>:*` namespaces. */
-export const validateIdentity = (identity: ReplicaIdentity): string | undefined =>
-  segment.test(identity.appId) && segment.test(identity.profile)
-    ? undefined
-    : `appId and profile must match ${segment.source} (got appId=${JSON.stringify(identity.appId)}, profile=${JSON.stringify(identity.profile)})`
-
 /** SQLite path inside the OPFS access-handle pool (DESIGN §9 naming). */
 export const dbName = ({ appId, profile }: ReplicaIdentity): string => `echo-sync/${appId}/${profile}.db`
+
+/**
+ * The longest `dbName` the OPFS pool can hold, in bytes (pinned `@effect/wa-sqlite` 0.1.2,
+ * `src/examples/AccessHandlePoolVFS.js`). The pool stores each file's path in a header of
+ * `HEADER_MAX_PATH_SIZE = 512` bytes and refuses a path whose UTF-8 encoding fills it (`written >= 512`),
+ * so a stored path is at most 511 bytes. The stored path is the URL pathname of SQLite's name: a leading
+ * "/" plus the name (the identity charset needs no percent-encoding), and the longest name SQLite derives
+ * from the database's is its rollback journal, `<db>-journal` (8 more bytes). 511 - 1 - 8 = 502.
+ */
+export const maxDbNameLength = 512 - 1 - 1 - "-journal".length
+
+/**
+ * The `mxPathname` the pool VFS is registered with. SQLite refuses to open a database whose full path
+ * plus 8 (room for its journal suffix) exceeds the VFS's `mxPathname`; wa-sqlite's default of 64 would
+ * reject a UUID-length profile, so the bound is raised to exactly what `maxDbNameLength` needs.
+ */
+export const vfsMaxPathname = maxDbNameLength + "-journal".length
+
+/**
+ * Rejects ids that would collide or escape the `echo-sync/<appId>/<profile>.db` / `echo:<appId>:*`
+ * namespaces, or whose database path the OPFS pool cannot hold (`maxDbNameLength`).
+ */
+export const validateIdentity = (identity: ReplicaIdentity): string | undefined => {
+  if (!segment.test(identity.appId) || !segment.test(identity.profile)) {
+    return `appId and profile must match ${segment.source} (got appId=${JSON.stringify(identity.appId)}, profile=${JSON.stringify(identity.profile)})`
+  }
+  const length = dbName(identity).length
+  return length > maxDbNameLength
+    ? `the database path echo-sync/<appId>/<profile>.db is ${length} characters; the OPFS pool holds at most ${maxDbNameLength}, so appId and profile together may have at most ${maxDbNameLength - dbName({ appId: "", profile: "" }).length}`
+    : undefined
+}
 
 /**
  * OPFS directory of this replica's access-handle pool. One pool per replica: the pool VFS holds an
