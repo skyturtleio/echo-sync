@@ -337,9 +337,11 @@ ab tab close "$T" >/dev/null
 
 # The bound, from the pinned AccessHandlePoolVFS: a stored path ("/" + SQLite's file name) must stay under
 # its 512-byte header, and the longest file name is "<db>-journal". So the longest db name is
-# 512 - 1 - 1 - 8 = 502 characters, i.e. appId + profile = 502 - len("echo-sync//.db") = 488.
-APP="bound-$RUN"
-PROFILE=$(printf 'p%.0s' $(seq 1 $((488 - ${#APP}))))
+# 512 - 1 - 1 - 8 = 502 characters, i.e. appId + profile = 502 - len("echo-sync//.db") = 488. Each of them is
+# also an OPFS directory name, at most 255 UTF-8 bytes (WebKit's limit, DESIGN §16 item 1): 233 + 255.
+pad() { printf '%s' "$1"; printf "${2}%.0s" $(seq 1 $(($3 - ${#1}))); }
+APP=$(pad "bound-$RUN" a 233)
+PROFILE=$(pad "" p 255)
 T=$(open_tab "$BASE/?app=$APP&profile=$PROFILE")
 w=$(ev <<<'await echo.ready(); return await echo.enqueue({ mutationId: "longest-path-1", name: "t", args: {} })')
 ab reload >/dev/null
@@ -348,18 +350,26 @@ const r = await echo.exec(\"SELECT mutation_id FROM echo_outbox WHERE mutation_i
 const i = await echo.info()
 return { ok: $(jq '.ok' <<<"$w") && r.ok && r.value.length === 1, dbNameLength: i.ok ? i.value.dbName.length : null }")
 ab tab close "$T" >/dev/null
-T=$(open_tab "$BASE/?app=$APP&profile=${PROFILE}p")
-over=$(ev <<<"const r = await echo.info(); const s = await echo.status()
+# A refused identity: its status, error, and whether echo-sync/<app> exists in OPFS at all.
+refused() {
+  ev <<<"const r = await echo.info(); const s = await echo.status()
 const root = await navigator.storage.getDirectory()
-const app = await root.getDirectoryHandle('echo-sync').then((d) => d.getDirectoryHandle('$APP')).catch(() => undefined)
-const names = []
-if (app !== undefined) for await (const name of app.keys()) names.push(name.length)
-return { mode: s.mode, reason: r.ok ? null : r.error.reason, message: r.ok ? null : r.error.message, poolNameLengths: names }")
-check "the longest database path the pool holds opens and round-trips; one character more is refused before OPFS is touched" "$(jq -nc --argjson l "$longest" --argjson o "$over" --arg p "${#PROFILE}" '
-  { pass: ($l.ok and $l.dbNameLength == 502 and $o.mode == "unsupported" and $o.reason == "Unsupported"
-          and ($o.message | contains("502")) and ($o.poolNameLengths | all(. == ($p | tonumber)))),
-    longest: $l, over: $o }')"
+const app = await root.getDirectoryHandle('echo-sync').then((d) => d.getDirectoryHandle('$1')).catch(() => undefined)
+return { mode: s.mode, reason: r.ok ? null : r.error.reason, message: r.ok ? null : r.error.message, appDirExists: app !== undefined }"
+}
+# One character over the combined bound (234 + 255), and a 256-byte profile whose whole path fits.
+T=$(open_tab "$BASE/?app=${APP}a&profile=$PROFILE")
+over=$(refused "${APP}a")
 ab tab close "$T" >/dev/null
+SEG_APP="seg-$RUN"
+T=$(open_tab "$BASE/?app=$SEG_APP&profile=${PROFILE}p")
+seg=$(refused "$SEG_APP")
+ab tab close "$T" >/dev/null
+check "the longest database path the pool holds (appId 233 + profile 255) opens and round-trips; one character more, or a 256-byte profile with a short path, is refused Unsupported before OPFS is touched" "$(jq -nc --argjson l "$longest" --argjson o "$over" --argjson g "$seg" '
+  { pass: ($l.ok and $l.dbNameLength == 502
+          and $o.mode == "unsupported" and $o.reason == "Unsupported" and ($o.message | contains("502")) and ($o.appDirExists | not)
+          and $g.mode == "unsupported" and $g.reason == "Unsupported" and ($g.message | contains("profile is 256 bytes")) and ($g.appDirExists | not)),
+    longest: $l, over: $o, segment: $g }')"
 
 # ── resetReplica (DESIGN §9.1): guarded by the leader lock and the outbox, deletes only its identity ──
 # Profile "a" syncs with the fake server, whose push always halts, so its entry stays pending. Profile "b"

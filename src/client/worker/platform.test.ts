@@ -64,6 +64,18 @@ it.live("identities with all-dot segments are rejected", () =>
   })
 )
 
+it.live(
+  "an appId or profile over 255 UTF-8 bytes is refused even when the whole path fits; 255 bytes is accepted",
+  () =>
+    Effect.sync(() => {
+      // 256 + 4 + 14 = 274 characters of path, far inside the pool's 502: only the per-name bound refuses.
+      expect(Platform.validateIdentity({ appId: "app", profile: "p".repeat(256) })).toContain("profile is 256 bytes")
+      expect(Platform.validateIdentity({ appId: "a".repeat(256), profile: "p" })).toContain("appId is 256 bytes")
+      expect(Platform.validateIdentity({ appId: "app", profile: "p".repeat(255) })).toBeUndefined()
+      expect(Platform.validateIdentity({ appId: "a".repeat(255), profile: "p" })).toBeUndefined()
+    })
+)
+
 // Derived from the pinned AccessHandlePoolVFS: it stores "/" + SQLite's file name and throws once the
 // UTF-8 path reaches HEADER_MAX_PATH_SIZE = 512 bytes; the longest file name is "<db>-journal".
 const stored = (identity: Platform.ReplicaIdentity) => `/${Platform.dbName(identity)}-journal`
@@ -73,13 +85,14 @@ it.live(
   "the longest identity whose journal path fits the pool's 512-byte path header is accepted; one more character is not",
   () =>
     Effect.sync(() => {
-      const appId = "heybabe-trial"
-      const longest = { appId, profile: fill(511 - stored({ appId, profile: "" }).length) }
+      // Split across both segments: each is also bounded by maxSegmentBytes.
+      const appId = "a".repeat(511 - stored({ appId: "", profile: fill(Platform.maxSegmentBytes) }).length)
+      const longest = { appId, profile: fill(Platform.maxSegmentBytes) }
       expect(new TextEncoder().encode(stored(longest)).length).toBe(511)
       expect(Platform.validateIdentity(longest)).toBeUndefined()
-      const tooLong = { appId, profile: `${longest.profile}p` }
+      const tooLong = { appId: `${appId}a`, profile: longest.profile }
       expect(Platform.validateIdentity(tooLong)).toContain(String(Platform.maxDbNameLength))
       // The trial's identity (a UUID profile) is well inside the bound.
-      expect(Platform.validateIdentity({ appId, profile: crypto.randomUUID() })).toBeUndefined()
+      expect(Platform.validateIdentity({ appId: "heybabe-trial", profile: crypto.randomUUID() })).toBeUndefined()
     })
 )

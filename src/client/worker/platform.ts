@@ -42,12 +42,29 @@ export const maxDbNameLength = 512 - 1 - 1 - "-journal".length
 export const vfsMaxPathname = maxDbNameLength + "-journal".length
 
 /**
+ * The longest OPFS entry name, in UTF-8 bytes, that every engine accepts: WebKit refuses a 256-byte
+ * directory or file name (`UnknownError`) where Chromium accepts far longer ones (DESIGN §16 item 1,
+ * WebKit smoke). `appId` and `profile` are each a directory name in `poolDirectory`.
+ */
+export const maxSegmentBytes = 255
+
+/**
  * Rejects ids that would collide or escape the `echo-sync/<appId>/<profile>.db` / `echo:<appId>:*`
- * namespaces, or whose database path the OPFS pool cannot hold (`maxDbNameLength`).
+ * namespaces, whose `appId` or `profile` is a longer OPFS name than `maxSegmentBytes`, or whose
+ * database path the OPFS pool cannot hold (`maxDbNameLength`).
  */
 export const validateIdentity = (identity: ReplicaIdentity): string | undefined => {
   if (!segment.test(identity.appId) || !segment.test(identity.profile)) {
     return `appId and profile must match ${segment.source} (got appId=${JSON.stringify(identity.appId)}, profile=${JSON.stringify(identity.profile)})`
+  }
+  for (const [name, value] of [
+    ["appId", identity.appId],
+    ["profile", identity.profile]
+  ] as const) {
+    const bytes = new TextEncoder().encode(value).length
+    if (bytes > maxSegmentBytes) {
+      return `${name} is ${bytes} bytes; an OPFS name holds at most ${maxSegmentBytes} (UTF-8)`
+    }
   }
   const length = dbName(identity).length
   return length > maxDbNameLength

@@ -68,7 +68,9 @@ reproduced with `?app=.`).
   (or before `awaitLockReleased` releases its shared grant) could, on interruption, leave a granted lock
   held until the agent dies. Making it scheduler-independent means keeping the grant's resolver for the
   interruption cleanup and returning immediately from the shared-watcher callback; deferred.
-- Identity segments that are all dots (`.`, `..`) are rejected in the tab before anything is spawned.
+- Identity segments that are all dots (`.`, `..`) are rejected in the tab before anything is spawned, and
+  so is an `appId` or `profile` over 255 UTF-8 bytes (the per-name OPFS limit on WebKit), as `Unsupported`.
+  The whole path `echo-sync/<appId>/<profile>.db` is also bounded by the pool (appId + profile ≤ 488).
 
 ## Stale announcements
 
@@ -263,7 +265,7 @@ needed to keep the invariant.
 | Chrome / Edge desktop | 69+ | yes | 102+ | `shared-worker` | Documentation (MDN / caniuse); not run here |
 | Chrome Android | yes | historically **no** | yes | `single-tab` | Documentation; the runtime check decides |
 | Firefox desktop | 96+ | yes | 111+ | `shared-worker` | Documentation; not run here |
-| WebKit (Playwright 1.64.1, WebKit 27.2, Linux GTK, headless) | yes | yes, **but dies with its creating tab** | yes (persistent context only) | `shared-worker` | **Run here**: scenarios 28/32, slice 11/12; see "WebKit smoke" |
+| WebKit (Playwright 1.64.1, WebKit 27.2, Linux GTK, headless) | yes | yes, **but dies with its creating tab** | yes (persistent context only) | `shared-worker` | **Run here**: scenarios 28/32, slice 11/12 at the smoke (the longest-path failure is fixed since); see "WebKit smoke" |
 | Safari macOS / iOS | 15.4+ | 16+ (re-added) | 15.2+ (`createSyncAccessHandle`), full sync API later | `shared-worker` expected | Documentation; desktop WebKit run above, not Safari itself |
 | Language runtime (ES2023: `Array.prototype.toSorted`, used by core) | — | — | — | — | Chrome/Edge 110+, Firefox 115+, Safari 16+ |
 
@@ -349,9 +351,11 @@ wasm survives `terminate()`) did not show up here.
    bug report found; the HTML spec says a shared worker lives while any document holds it ([MDN](https://developer.mozilla.org/en-US/docs/Web/API/SharedWorker)).
 2. **OPFS names are limited to 255 UTF-8 bytes per path segment** (`getDirectoryHandle`/`getFileHandle` with
    256 bytes fails `UnknownError`; 127 two-byte characters succeed, 128 fail). Chromium accepts 480. The
-   identity check bounds only the whole path (appId + profile ≤ 488), so on WebKit a profile of 256–488
-   bytes passes validation and the leader fails `LeaderFailed{UnknownError}` (closed, not hung). Expected on
-   Safari too (Apple file systems also cap a name at 255 bytes), unverified.
+   identity check bounded only the whole path (appId + profile ≤ 488), so on WebKit a profile of 256–488
+   bytes passed validation and the leader failed `LeaderFailed{UnknownError}` (closed, not hung). Expected on
+   Safari too (Apple file systems also cap a name at 255 bytes), unverified. **Fixed (ws/opfs-name-bound):**
+   identity validation also refuses an `appId` or `profile` over 255 UTF-8 bytes with `Unsupported` before
+   anything opens; the combined bound stays, so the longest accepted path is appId 233 + profile 255.
 
 ### Scenario results (scenarios.sh and slice.sh, `WEBKIT=1`)
 
@@ -373,7 +377,7 @@ wasm survives `terminate()`) did not show up here.
 | fallback without SharedWorker (fail closed, take over) | pass | |
 | sync: `MalformedEnvelope` halt; halt after handover | pass | |
 | 36-character profile | pass | |
-| longest database path the pool holds | **fail** | `LeaderFailed{UnknownError}`: finding 2 (the over-limit half passes) |
+| longest database path the pool holds | pass since ws/opfs-name-bound (run alone) | failed at the smoke with `LeaderFailed{UnknownError}` (finding 2); the scenario now uses appId 233 + profile 255 and checks a 256-byte profile is refused |
 | reset (7 checks) | pass | |
 | presence: entry while open; across handover | pass | |
 | identity `.` refused | pass | |
