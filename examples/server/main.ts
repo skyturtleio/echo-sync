@@ -123,7 +123,7 @@ const adminRoute = (url: URL): Effect.Effect<Response, unknown, SqlClient> =>
       case "/admin/stats":
         return json({
           rpcs: rpcCounts.get(q("clientId")) ?? {},
-          started: serverHooks.started.get(q("mutationId")) ?? 0
+          started: serverHooks.started.get(q("todo")) ?? 0
         })
       default:
         return new Response("not found", { status: 404 })
