@@ -1,13 +1,21 @@
 import { assert, describe, it } from "@effect/vitest"
 import type { Scheduler } from "effect/Scheduler"
 import { DateTime, Deferred, Effect, Fiber, Option, Schema } from "effect"
-import * as Engine from "../../client/sync/Engine.ts"
-import { Ids, Protocol, ScopeGrants } from "../index.ts"
-import type { SyncTable } from "../index.ts"
-import * as MemoryStore from "./MemoryStore.ts"
+import * as Engine from "../Engine.ts"
+import { Ids, Protocol, ScopeGrants } from "../../../core/index.ts"
+import type { SyncTable } from "../../../core/index.ts"
+import * as MemoryStore from "../../../core/testing/MemoryStore.ts"
 import * as MemorySyncStorage from "./MemorySyncStorage.ts"
-import * as RefServer from "./RefServer.ts"
-import { clientRegistry, CounterId, Counters, grantRow, mutations, principal, scope } from "./SimApp.ts"
+import * as RefServer from "../../../core/testing/RefServer.ts"
+import {
+  clientRegistry,
+  CounterId,
+  Counters,
+  grantRow,
+  mutations,
+  principal,
+  scope
+} from "../../../core/testing/SimApp.ts"
 import * as Simulation from "./Simulation.ts"
 
 // Reproduce a failure with SIM_SEED=<seed>; widen the sweep with SIM_SEEDS=<n>.

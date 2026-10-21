@@ -1,4 +1,4 @@
-import { Cause, type DateTime, Effect, Random, Schema } from "effect"
+import { Cause, DateTime, Effect, Option, Random, Schema } from "effect"
 import type { PrincipalId } from "./AccessScope.ts"
 import {
   InvalidRow,
@@ -9,6 +9,7 @@ import {
   type StoreError
 } from "./Errors.ts"
 import { ClientId, MutationId, Seq } from "./Ids.ts"
+import * as Store from "./Store.ts"
 import type { EchoStore } from "./Store.ts"
 
 /** Inputs of one handler run (DESIGN §6). `now` and `random` are fixed by the caller. */
@@ -282,4 +283,48 @@ export const decodeNotice = <Name extends string, A extends PureSchema, E extend
       Effect.mapError((e) => mismatch(`error: ${e.message}`))
     )
     return { _tag: "Rejected", envelope, error: { _tag: "DomainError", mutation: mutation.name, error } }
+  })
+
+// ---------------------------------------------------------------------------------------------
+// Running a handler against a row store (client replay and the reference server)
+// ---------------------------------------------------------------------------------------------
+
+export interface RunResult {
+  /** First-touch pre-images of every row the handler wrote, in write order. */
+  readonly undo: ReadonlyArray<Store.UndoImage>
+  readonly rejection: Option.Option<MutationRejection>
+}
+
+/**
+ * Runs `envelope`'s handler against `rows` as `actor` with `ctx.now = now` and `ctx.random`
+ * seeded from the mutation identity, so every rebase reproduces the same optimistic result.
+ * `claimScope` defaults to the replica's optimistic claim; the reference server passes its own.
+ * Writes go straight to `rows` (the caller owns the transaction); on rejection the partial
+ * writes remain and the caller restores them from `undo` (`Store.restore`). Transient failures
+ * propagate.
+ */
+export const runHandler = (
+  rows: Store.RowStore,
+  mutations: MutationRegistry,
+  actor: PrincipalId,
+  envelope: MutationEnvelope,
+  now: number,
+  claimScope: Store.StoreOptions["claimScope"] = Store.claimFromGrants(rows)
+): Effect.Effect<RunResult, StoreUnavailable> =>
+  Effect.gen(function* () {
+    const at = DateTime.makeUnsafe(now)
+    const instance = Store.make(rows, { actor, roleFor: Store.roleFromGrants(rows, actor), claimScope, now: at })
+    const ctx: MutationContext = {
+      actor,
+      now: at,
+      random: seededRandom(envelope.clientId, envelope.mutationId),
+      store: instance.store
+    }
+    const rejection = yield* run(mutations, envelope, ctx).pipe(
+      Effect.as(Option.none<MutationRejection>()),
+      Effect.catch((error) =>
+        error instanceof StoreUnavailable ? Effect.fail(error) : Effect.succeed(Option.some(error))
+      )
+    )
+    return { undo: yield* instance.touched, rejection }
   })

@@ -10,13 +10,12 @@
  *   every readable scope and then continues with the log.
  * - Log and ledger are independently GC-able; ledger GC keeps a per-client floor so
  *   resubmissions are answered `ClientExpired` instead of re-executed (§16.5).
- * - Mutations run through the same `Engine.runHandler` (core `Store.make` + `Mutation.run`)
+ * - Mutations run through the same `Mutation.runHandler` (core `Store.make` + `Mutation.run`)
  *   the client runs optimistically, against the server's rows and grants.
  *
  * `history` (state after every commit) and `executions` are observer-only, for invariants.
  */
 import { Array as Arr, Effect, Option, Order } from "effect"
-import * as Engine from "../../client/sync/Engine.ts"
 import { AccessScope, Ids, Mutation, Protocol, ScopeGrants, Store } from "../index.ts"
 import type { Errors, SyncTable } from "../index.ts"
 import * as MemoryStore from "./MemoryStore.ts"
@@ -144,10 +143,10 @@ export const make = (options: { readonly pageSize: number }) => {
             return true
           })
         // The in-memory store has no transient failures.
-        const run = yield* Effect.orDie(Engine.runHandler(store, mutations, principal, envelope, now, claimScope))
+        const run = yield* Effect.orDie(Mutation.runHandler(store, mutations, principal, envelope, now, claimScope))
         let outcome: MutationOutcome
         if (Option.isSome(run.rejection)) {
-          yield* Engine.restore(store, run.undo)
+          yield* Store.restore(store, run.undo)
           outcome = { _tag: "Rejected", error: run.rejection.value }
         } else {
           yield* logWrites(run.undo)

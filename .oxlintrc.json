@@ -63,6 +63,33 @@
           }
         ]
       }
+    },
+    {
+      "files": ["src/core/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "effect/schema",
+                "message": "Use the stable `effect/Schema` module."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["**/server", "**/server/**", "echo-sync/server"],
+                "message": "Browser/shared code must never import src/server."
+              },
+              {
+                "group": ["**/client", "**/client/**", "echo-sync/client"],
+                "allowTypeImports": true,
+                "message": "Core must not import src/client at runtime (DESIGN \u00a714); `import type` only. Engine-driving harnesses live in src/client/sync/testing."
+              }
+            ]
+          }
+        ]
+      }
     }
   ],
   "ignorePatterns": ["node_modules"]

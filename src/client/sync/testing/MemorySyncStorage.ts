@@ -11,10 +11,10 @@
  * nested, because nested finalizers can observe different exits and split the commit.
  */
 import { Effect, Option, Schema, Semaphore } from "effect"
-import * as Engine from "../../client/sync/Engine.ts"
-import { Ids } from "../index.ts"
-import type { Mutation, Protocol } from "../index.ts"
-import * as MemoryStore from "./MemoryStore.ts"
+import * as Engine from "../Engine.ts"
+import { Ids } from "../../../core/index.ts"
+import type { Mutation, Protocol } from "../../../core/index.ts"
+import * as MemoryStore from "../../../core/testing/MemoryStore.ts"
 
 export interface Disk {
   readonly replica: MemoryStore.MemoryStore

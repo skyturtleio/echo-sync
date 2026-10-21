@@ -24,12 +24,12 @@
  */
 import { Array as Arr, Clock, Deferred, Effect, Fiber, Option, Order, Schema } from "effect"
 import { TestClock } from "effect/testing"
-import * as Engine from "../../client/sync/Engine.ts"
-import { Ids, ScopeGrants } from "../index.ts"
-import type { AccessScope, Mutation, Protocol, SyncTable } from "../index.ts"
-import * as MemoryStore from "./MemoryStore.ts"
+import * as Engine from "../Engine.ts"
+import { Ids, ScopeGrants } from "../../../core/index.ts"
+import type { AccessScope, Mutation, Protocol, SyncTable } from "../../../core/index.ts"
+import * as MemoryStore from "../../../core/testing/MemoryStore.ts"
 import * as MemorySyncStorage from "./MemorySyncStorage.ts"
-import * as RefServer from "./RefServer.ts"
+import * as RefServer from "../../../core/testing/RefServer.ts"
 import {
   ANYONE,
   Counters,
@@ -39,7 +39,7 @@ import {
   mutations,
   principal as asPrincipal,
   scope
-} from "./SimApp.ts"
+} from "../../../core/testing/SimApp.ts"
 
 type EncodedRow = SyncTable.EncodedRow
 type MutationEnvelope = Mutation.MutationEnvelope

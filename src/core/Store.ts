@@ -1,4 +1,4 @@
-import { type DateTime, Effect, Option, Schema } from "effect"
+import { Array as Arr, type DateTime, Effect, Option, Schema } from "effect"
 import {
   type AccessScopeId,
   AccessScopeId as AccessScopeIdSchema,
@@ -6,7 +6,8 @@ import {
   type PrincipalId,
   PrincipalId as PrincipalIdSchema,
   type Role,
-  satisfies
+  satisfies,
+  strongest
 } from "./AccessScope.ts"
 import { InvalidRow, RowAlreadyExists, RowNotFound, ScopeForbidden, type StoreUnavailable } from "./Errors.ts"
 import { grantId, ScopeGrants } from "./ScopeGrants.ts"
@@ -401,6 +402,25 @@ export const claimFromGrants =
   (rows: RowStore) =>
   (scopeId: AccessScopeId): Effect.Effect<boolean, StoreUnavailable> =>
     Effect.map(rows.scan(ScopeGrants), (grants) => !grants.some((g) => g["access_scope_id"] === scopeId))
+
+/** `actor`'s effective role on a scope, read from the `scope_grants` rows in `rows` (§4). */
+export const roleFromGrants =
+  (rows: RowStore, actor: PrincipalId) =>
+  (scopeId: AccessScopeId): Effect.Effect<Option.Option<Role>, StoreUnavailable> =>
+    Effect.gen(function* () {
+      const roles: Array<Role> = []
+      for (const who of [actor, Everyone]) {
+        const row = yield* rows.read(ScopeGrants, grantId(scopeId, who))
+        if (Option.isNone(row)) continue
+        const grant = yield* Effect.orDie(Schema.decodeUnknownEffect(ScopeGrants.wire)(row.value))
+        roles.push(grant.role)
+      }
+      return Option.fromNullishOr(strongest(roles))
+    })
+
+/** Restores pre-images in reverse write order. */
+export const restore = (rows: RowStore, undo: ReadonlyArray<UndoImage>) =>
+  Effect.forEach(Arr.reverse(undo), (image) => rows.write(image.table, image.id, image.before), { discard: true })
 
 /** Build the typed store over `rows`. Create one instance per handler run. */
 export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {

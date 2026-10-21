@@ -14,9 +14,9 @@
  * would either expose a torn transaction or replay a pending mutation over a server row that
  * already contains it.
  */
-import { Array as Arr, Clock, DateTime, Effect, Option, Schema, Semaphore } from "effect"
-import { AccessScope, Errors, Mutation, Protocol, ScopeGrants, Store } from "../../core/index.ts"
-import type { Ids, Registry } from "../../core/index.ts"
+import { Array as Arr, Clock, Effect, Option, Schema, Semaphore } from "effect"
+import { Mutation, Protocol, Store } from "../../core/index.ts"
+import type { AccessScope, Errors, Ids, Registry } from "../../core/index.ts"
 
 type PullPage = typeof Protocol.PullPage.Type
 type PullDone = typeof Protocol.PullDone.Type
@@ -115,66 +115,13 @@ export class LocallyRejected extends Schema.TaggedError<LocallyRejected>()("Loca
 // Running a handler (shared with the reference server)
 // ---------------------------------------------------------------------------------------------
 
-/** `actor`'s effective role on a scope, read from the `scope_grants` rows in `rows` (§4). */
-export const roleFromGrants =
-  (rows: Store.RowStore, actor: AccessScope.PrincipalId) =>
-  (scopeId: AccessScope.AccessScopeId): Effect.Effect<Option.Option<AccessScope.Role>, StoreUnavailable> =>
-    Effect.gen(function* () {
-      const roles: Array<AccessScope.Role> = []
-      for (const who of [actor, AccessScope.Everyone]) {
-        const row = yield* rows.read(ScopeGrants.ScopeGrants, ScopeGrants.grantId(scopeId, who))
-        if (Option.isNone(row)) continue
-        const grant = yield* Effect.orDie(Schema.decodeUnknownEffect(ScopeGrants.ScopeGrants.wire)(row.value))
-        roles.push(grant.role)
-      }
-      return Option.fromNullishOr(AccessScope.strongest(roles))
-    })
-
-/** The replica's optimistic scope claim lives in core (`Store.claimFromGrants`); re-exported here. */
+// The handler runner, role lookup and restore live in core (DESIGN §14: the reference server
+// and the core harnesses use them without importing client code); re-exported here.
+export const roleFromGrants = Store.roleFromGrants
 export const claimFromGrants = Store.claimFromGrants
-
-export interface RunResult {
-  /** First-touch pre-images of every row the handler wrote, in write order. */
-  readonly undo: ReadonlyArray<Store.UndoImage>
-  readonly rejection: Option.Option<Mutation.MutationRejection>
-}
-
-/**
- * Runs `envelope`'s handler against `rows` as `actor` with `ctx.now = now` and `ctx.random`
- * seeded from the mutation identity, so every rebase reproduces the same optimistic result.
- * `claimScope` defaults to the replica's optimistic claim; the reference server passes its own.
- * Writes go straight to `rows` (the caller owns the transaction); on rejection the partial
- * writes remain and the caller restores them from `undo`. Transient failures propagate.
- */
-export const runHandler = (
-  rows: Store.RowStore,
-  mutations: Mutation.MutationRegistry,
-  actor: AccessScope.PrincipalId,
-  envelope: Mutation.MutationEnvelope,
-  now: number,
-  claimScope: Store.StoreOptions["claimScope"] = claimFromGrants(rows)
-): Effect.Effect<RunResult, StoreUnavailable> =>
-  Effect.gen(function* () {
-    const at = DateTime.makeUnsafe(now)
-    const instance = Store.make(rows, { actor, roleFor: roleFromGrants(rows, actor), claimScope, now: at })
-    const ctx: Mutation.MutationContext = {
-      actor,
-      now: at,
-      random: Mutation.seededRandom(envelope.clientId, envelope.mutationId),
-      store: instance.store
-    }
-    const rejection = yield* Mutation.run(mutations, envelope, ctx).pipe(
-      Effect.as(Option.none<Mutation.MutationRejection>()),
-      Effect.catch((error) =>
-        error instanceof Errors.StoreUnavailable ? Effect.fail(error) : Effect.succeed(Option.some(error))
-      )
-    )
-    return { undo: yield* instance.touched, rejection }
-  })
-
-/** Restores pre-images in reverse write order. */
-export const restore = (rows: Store.RowStore, undo: ReadonlyArray<Store.UndoImage>) =>
-  Effect.forEach(Arr.reverse(undo), (image) => rows.write(image.table, image.id, image.before), { discard: true })
+export type RunResult = Mutation.RunResult
+export const runHandler = Mutation.runHandler
+export const restore = Store.restore
 
 // ---------------------------------------------------------------------------------------------
 // Rebase and install
