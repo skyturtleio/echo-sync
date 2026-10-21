@@ -11,7 +11,10 @@ interface Handlers {
   ) => Effect.Effect<Protocol.PushResponse, Protocol.MalformedEnvelope | Protocol.Unauthorized>
   readonly pull?: (
     request: Protocol.PullRequest
-  ) => Effect.Effect<Protocol.PullResponse, Protocol.ResnapshotRequired | Protocol.Unauthorized>
+  ) => Effect.Effect<
+    Protocol.PullResponse,
+    Protocol.ResnapshotRequired | Protocol.ServerUnavailable | Protocol.Unauthorized
+  >
 }
 
 /**
@@ -202,7 +205,7 @@ it.effect("a processed push returns core's result; a rejection keeps its class a
 )
 
 it.effect(
-  "pull: core's ResnapshotRequired reaches the engine; protocol faults are transient failures, not defects",
+  "pull: core's ResnapshotRequired and ServerUnavailable reach the engine typed; protocol faults are transient failures, not defects",
   () =>
     Effect.gen(function* () {
       const request: Protocol.PullRequest = {
@@ -216,6 +219,15 @@ it.effect(
       )
       const error = failureOf(resnapshot.exit)
       expect(error).toEqual(new Protocol.ResnapshotRequired({ reason: "gcHorizon" }))
+
+      // The server's store is down: the engine sees core's typed ServerUnavailable, a transient pull failure.
+      const down = yield* harness(
+        serve({ pull: () => Effect.fail(new Protocol.ServerUnavailable({ message: "db down" })) }),
+        (t) => t.pull(request)
+      )
+      const unavailable = failureOf(down.exit)
+      expect(unavailable).toEqual(new Protocol.ServerUnavailable({ message: "db down" }))
+      expect(Transport.isFatalPush(unavailable)).toBe(false)
 
       const noId = yield* harness(skewedPull, (t) => t.pull(request))
       const dies = yield* harness(serve({ pull: () => Effect.die(new Error("bug")) }), (t) => t.pull(request))
