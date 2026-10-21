@@ -345,6 +345,15 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
 - On pull apply, in one SQLite transaction: undo pending optimistic effects (reverse order),
   apply server changes, drop acked mutations, re-run still-pending mutations. Rejected mutations
   are dropped and surfaced as typed notices (retained for inspection, not silently erased).
+  The re-run is unconditional and belongs to the install path (engine `rebase`), including after
+  a schema rebuild (§11 `dataHash` change): the rebuild empties the replica, nulls the cursor and
+  empties each pending entry's undo, so until the null-cursor set installs, pending effects are
+  deliberately invisible (replaying onto an empty replica would run handlers against missing
+  rows and the install discards the result anyway). On that install, `rebase` restores nothing
+  (undo is empty), installs the set, then replays every pending entry the set does not settle in
+  `seq` order and records fresh undo for each. Invariant: after any install, replica =
+  replay(pending, server@cursor) with every pending entry's undo recaptured; skipping the replay
+  after a rebuild leaves pending effects invisible until push.
 - Outbox idempotency must outlive release. `enqueue` is idempotent on `mutationId` so a retry
   after `LeaderLost` is safe, but the original may already have been pushed, acked, pulled and
   released in the retry window; a retry that then inserts a fresh row would replay the effect
