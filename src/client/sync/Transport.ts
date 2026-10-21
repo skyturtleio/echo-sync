@@ -83,14 +83,26 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
 })
 
 /**
- * RPC over HTTP POST with NDJSON framing, using the platform `fetch`, with `headers` on every request. The server must mount
+ * RPC over HTTP POST with NDJSON framing, using the platform `fetch`. The server must mount
  * `Protocol.SyncRpcs` with `RpcServer.layerHttp({ protocol: "http" })` and `RpcSerialization.layerNdjson`.
+ *
+ * `headers` (DESIGN §9.1 Credentials) is evaluated on every outgoing HTTP request: each push, each
+ * pull, and each (re)connect of a stream. It is applied to the HTTP client under the RPC protocol, so
+ * every RPC on this protocol (including streams added later, such as presence `room`) carries the
+ * credential current at the moment it is sent; nothing is cached across requests.
  */
-export const layerProtocolHttp = (url: string, headers?: Headers.Input): Layer.Layer<RpcClient.Protocol> =>
+export const layerProtocolHttp = (
+  url: string,
+  headers?: Effect.Effect<Headers.Input>
+): Layer.Layer<RpcClient.Protocol> =>
   RpcClient.layerProtocolHttp({
     url,
-    // Credentials for the server's `principalFor` (DESIGN §4): sent on every push, pull and pokes request.
     ...(headers === undefined
       ? {}
-      : { transformClient: (client) => HttpClient.mapRequest(client, HttpClientRequest.setHeaders(headers)) })
+      : {
+          transformClient: (client) =>
+            HttpClient.mapRequestEffect(client, (request) =>
+              Effect.map(headers, (current) => HttpClientRequest.setHeaders(request, current))
+            )
+        })
   }).pipe(Layer.provide([RpcSerialization.layerNdjson, FetchHttpClient.layer]))

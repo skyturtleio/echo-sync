@@ -42,7 +42,12 @@ the registry is skipped; its log entries arrive as tombstones, never as payloads
 and `Protocol.PresenceRpcs` (one merged group, one path, each group's handlers provided with
 `Layer.provide`) with `RpcServer.layerHttp({ protocol: "http" })` and `RpcSerialization.layerNdjson`, the
 transport the browser speaks. `principalFor(headers)` is the app's authentication; the principal
-is never read from the payload. `ClientForbidden` becomes `Unauthorized`.
+is never read from the payload. It runs on every push and pull, and once when a stream opens
+(`pokes`, presence `room`; `track` is a plain call and runs it too). A credential that expires
+while a stream is open is therefore not detected until that stream reconnects; the client's
+`idleTimeout` and the server's heartbeat bound how long a dead connection stays open, not how long
+an expired token is honoured on a live one. The client evaluates `syncHeaders` per request (DESIGN
+§9.1 Credentials), so a reconnect carries the renewed credential. `ClientForbidden` becomes `Unauthorized`.
 
 - push: one SERIALIZABLE ledger transaction per mutation (read-modify-write handlers would lose
   updates under READ COMMITTED; `40001` retries the whole attempt), `roleFor` read from `scope_grants` (own grant or

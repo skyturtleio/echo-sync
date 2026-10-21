@@ -136,7 +136,10 @@ job if you want a retention horizon (docs/server-substrate.md, GC).
 `principalFor(headers)` is app-owned (DESIGN §4). It authenticates the request and returns the
 `PrincipalId`, or fails with `Protocol.Unauthorized`. The server never takes the principal from the
 payload, and every pull and push is filtered by that principal's grants (or `*`). On the client,
-`LeaderOptions.syncHeaders(principal)` puts headers on every push, pull and pokes request.
+`LeaderOptions.syncHeaders(principal)` returns an `Effect` of headers that the transport runs for every
+request: each push, each pull, each stream (re)connect. Your app owns refresh: return the credential you
+want on the wire now (cache and renew it as you like). A renewed token is used by the next request with no
+leader restart; if a renewal fails, return what you have and the server's `Unauthorized` is retried.
 
 The example trusts an `x-echo-principal` header. **That is a dev shim with no authentication.** A
 real app verifies a session cookie or bearer token here.

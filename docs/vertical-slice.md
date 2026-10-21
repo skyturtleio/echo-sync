@@ -43,9 +43,10 @@ Drop it once: `DROP DATABASE echo_slice`.
 authentication. Only examples/server reads the header; nothing in `src/server` does. A real app
 authenticates the request (session cookie, bearer token) in its own `principalFor`.
 
-The leader sends credentials with `LeaderOptions.syncHeaders(principal)`. It is a `src/client` API:
-`Transport.layerProtocolHttp(url, headers)` puts the headers on every push, pull and pokes request,
-and a test in `Transport.test.ts` checks all three.
+The leader sends credentials with `LeaderOptions.syncHeaders(principal)`, an `Effect` of headers. It is
+a `src/client` API: `Transport.layerProtocolHttp(url, headers)` runs that Effect for every HTTP request
+(each push, pull and pokes (re)connect) and puts the result on it. Tests in `Transport.test.ts` check
+all three, renewal without a leader restart, and one evaluation per request.
 
 `/admin/*` exists only so the scenarios can drive and observe the server:
 

@@ -1,3 +1,4 @@
+import { Effect } from "effect"
 import { runLeaderWorker } from "../../src/client/worker/index.ts"
 import { clientMutations, principalHeader, registry } from "./app.ts"
 
@@ -42,5 +43,5 @@ runLeaderWorker(self, {
   mutations: clientMutations,
   // The harness's scenarios use raw `exec`; apps never set this (DESIGN §10.1).
   allowRawExec: true,
-  ...(syncUrl === null ? {} : { syncUrl, syncHeaders: (principal) => ({ [principalHeader]: principal }) })
+  ...(syncUrl === null ? {} : { syncUrl, syncHeaders: (principal) => Effect.succeed({ [principalHeader]: principal }) })
 })

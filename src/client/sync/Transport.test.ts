@@ -2,7 +2,9 @@ import { expect, it } from "@effect/vitest"
 import { Effect, Exit, Layer, Option, Schema, Stream } from "effect"
 import { FetchHttpClient, HttpRouter } from "effect/http"
 import { Rpc, RpcClient, RpcGroup, RpcSerialization, RpcServer } from "effect/rpc"
-import { Ids, Mutation, Protocol } from "echo-sync"
+import { AccessScope, Ids, Mutation, Protocol, Registry } from "echo-sync"
+import * as Engine from "./Engine.ts"
+import * as MemorySyncStorage from "./testing/MemorySyncStorage.ts"
 import * as Transport from "./Transport.ts"
 
 interface Handlers {
@@ -289,7 +291,9 @@ it.effect("a transport built with headers sends them on push, pull and the pokes
     // `FetchHttpClient` reads `Fetch` from the fiber that sends each request.
     yield* Effect.gen(function* () {
       const t = yield* Transport.make.pipe(
-        Effect.provide(Transport.layerProtocolHttp("http://echo.test/rpc", { "x-echo-principal": "alice" }))
+        Effect.provide(
+          Transport.layerProtocolHttp("http://echo.test/rpc", Effect.succeed({ "x-echo-principal": "alice" }))
+        )
       )
       yield* t.push(batch(1))
       yield* t.pull({ clientId: Ids.ClientId.make("c"), cursor: null, continuation: Option.none() })
@@ -297,4 +301,125 @@ it.effect("a transport built with headers sends them on push, pull and the pokes
     }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
     expect(seen).toEqual({ push: "alice", pull: "alice", pokes: "alice" })
   }).pipe(Effect.scoped)
+)
+
+/**
+ * A server that authenticates every request against the currently valid token (as an app's
+ * `principalFor` would) and records which token each push, pull and pokes connect carried, plus a
+ * transport whose `syncHeaders` Effect returns the client's current token and counts evaluations.
+ */
+const credentials = Effect.gen(function* () {
+  const state = { valid: "t1", client: "t1", evaluations: 0 }
+  const seen: Array<string> = []
+  const authenticate = (rpc: string, headers: Readonly<Record<string, string | undefined>>) =>
+    Effect.suspend(() => {
+      const token = headers["authorization"] ?? "none"
+      const ok = token === state.valid
+      seen.push(`${rpc}:${token}${ok ? "" : ":rejected"}`)
+      return ok ? Effect.void : Effect.fail(new Protocol.Unauthorized({ message: `stale ${token}` }))
+    })
+  const app = RpcServer.layerHttp({ group: Protocol.SyncRpcs, path: "/rpc", protocol: "http" }).pipe(
+    Layer.provide([
+      Protocol.SyncRpcs.toLayer({
+        push: (request, { headers }) =>
+          Effect.as(
+            authenticate(`push(${request.mutations.map((m) => `${m.mutationId}#${m.seq}`).join(",")})`, headers),
+            {
+              results: request.mutations.map((m) => ({
+                mutationId: m.mutationId,
+                position,
+                outcome: { _tag: "Applied" as const }
+              }))
+            }
+          ),
+        pull: (_, { headers }) =>
+          Effect.as(
+            authenticate("pull", headers),
+            Schema.decodeUnknownSync(Protocol.PullDone)({
+              _tag: "PullDone",
+              changes: [],
+              acks: [],
+              nextCursor: "1",
+              expiredThrough: 0
+            })
+          ),
+        pokes: (_, { headers }) =>
+          Stream.fromEffect(authenticate("pokes", headers)).pipe(Stream.as({ _tag: "poke" as const }))
+      }),
+      RpcSerialization.layerNdjson
+    ])
+  )
+  const web = HttpRouter.toWebHandler(app, { disableLogger: true })
+  yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
+  const fetch = Object.assign((input: URL | RequestInfo, init?: RequestInit) => web.handler(new Request(input, init)), {
+    preconnect: globalThis.fetch.preconnect
+  })
+  // The leader's `syncHeaders(principal)`: the app's current credential, renewed by setting `state.client`.
+  const syncHeaders = Effect.sync(() => {
+    state.evaluations++
+    return { authorization: state.client }
+  })
+  const transport = yield* Transport.make.pipe(
+    Effect.provide(Transport.layerProtocolHttp("http://echo.test/rpc", syncHeaders))
+  )
+  return { state, seen, transport, fetch }
+})
+
+const pullRequest = { clientId: Ids.ClientId.make("c"), cursor: null, continuation: Option.none() }
+
+it.effect(
+  "a token renewed after the transport was built is used by the next push, pull and pokes reconnect, and syncHeaders runs once per request",
+  () =>
+    Effect.gen(function* () {
+      const { state, seen, transport: t, fetch } = yield* credentials
+      yield* Effect.gen(function* () {
+        // Built once, like the leader's `connect`; each run is one (re)connect.
+        const pokes = t.pokes(Ids.ClientId.make("c"))
+        yield* t.push(batch(1))
+        yield* t.pull(pullRequest)
+        yield* Stream.runHead(pokes)
+        // The app renews: the old token is no longer accepted, and the client now returns the new one.
+        state.valid = "t2"
+        state.client = "t2"
+        yield* t.push(batch(1))
+        yield* t.pull(pullRequest)
+        yield* Stream.runHead(pokes)
+        yield* t.pull(pullRequest)
+      }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+      expect(seen).toEqual(["push(m1#1):t1", "pull:t1", "pokes:t1", "push(m1#1):t2", "pull:t2", "pokes:t2", "pull:t2"])
+      // Seven requests, seven evaluations: never cached for the leader's lifetime, never twice per request.
+      expect(state.evaluations).toBe(7)
+    }).pipe(Effect.scoped)
+)
+
+it.effect(
+  "an Unauthorized push followed by renewal succeeds on the retry with the new header and the same outbox entry",
+  () =>
+    Effect.gen(function* () {
+      const { state, seen, transport, fetch } = yield* credentials
+      const disk = MemorySyncStorage.makeDisk()
+      const engine = yield* Engine.make({
+        clientId: Ids.ClientId.make("c"),
+        actor: AccessScope.PrincipalId.make("p"),
+        storage: MemorySyncStorage.make(disk),
+        registry: Registry.make([]),
+        mutations: Mutation.makeRegistry([
+          Mutation.make("noop", { args: Schema.Struct({}), handler: () => Effect.void })
+        ]),
+        transport
+      })
+      yield* engine.mutate(Ids.MutationId.make("m1"), "noop", {})
+      // The token expired on the server before the client renewed it.
+      state.valid = "t2"
+      const refused = yield* Effect.exit(engine.push.pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)))
+      const error = failureOf(refused)
+      expect(error).toBeInstanceOf(Protocol.Unauthorized)
+      if (error instanceof Protocol.Unauthorized) expect(Transport.isFatalPush(error)).toBe(false)
+      expect(disk.outbox.map((p) => `${p.envelope.mutationId}#${p.envelope.seq}`)).toEqual(["m1#1"])
+      // The app renews; the loop's retry pushes the same entry, now with the new token.
+      state.client = "t2"
+      const retried = yield* engine.push.pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+      expect(retried.processed).toBe(1)
+      expect(seen).toEqual(["push(m1#1):t1:rejected", "push(m1#1):t2"])
+    }).pipe(Effect.scoped)
 )

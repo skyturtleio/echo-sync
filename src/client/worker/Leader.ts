@@ -287,11 +287,13 @@ export interface LeaderOptions {
   readonly syncUrl?: string
   /**
    * Request headers for the sync server, given the principal this replica acts as (its tab's
-   * `principal`): the credentials the server's `principalFor` authenticates (DESIGN §4). Called once, when
-   * this worker becomes leader; every request of that leader carries the same headers. Credentials that
-   * expire are refreshed only by a new leader (e.g. a reload), not per request.
+   * `principal`): the credentials the server's `principalFor` authenticates (DESIGN §4, §9.1
+   * Credentials). The Effect runs for every outgoing request (each push, each pull, each stream
+   * (re)connect), so a renewed credential is used by the next request without a leader restart. The
+   * app owns refresh: return what should be on the wire now; after a failed renewal return what you
+   * have, and the server's `Unauthorized` is retried.
    */
-  readonly syncHeaders?: (principal: AccessScope.PrincipalId) => Readonly<Record<string, string>>
+  readonly syncHeaders?: (principal: AccessScope.PrincipalId) => Effect.Effect<Readonly<Record<string, string>>>
   /**
    * A pokes stream with no element (poke or heartbeat) for this long is ended and reconnected
    * (DESIGN §6 Liveness). Default 45 s; must exceed the server's `heartbeatInterval` (default 15 s).
