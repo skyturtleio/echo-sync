@@ -726,10 +726,14 @@ const todosByProject = Query.make("todos.byProject", {
 
 - Shared contracts module: `RpcGroup`s with Schema payload/success/error.
   `SyncRpcs`: `push`, `pull`, `pokes` (stream). `PresenceRpcs` (user ruling, §16 item 12a):
-  `room({ room, tabId, state }): Stream<RoomSnapshot>` joins and observes; the entry keyed by
-  `(clientId, tabId)` lives exactly while that stream is open and is dropped when it ends for
-  any reason. `track({ room, tabId, state })` replaces that entry's state (no-op without an
-  entry). `room` is an `AccessScopeId`: the principal must hold a grant in that scope
+  `room({ clientId, room, tabId, state }): Stream<RoomSnapshot>` joins and observes; the entry
+  keyed by `(clientId, tabId)` lives exactly while that stream is open and is dropped when it
+  ends for any reason. `track({ clientId, room, tabId, state })` replaces that entry's state
+  (no-op without an entry). The payload carries `clientId` because it is part of the key
+  (ruling, ws/presence-server); the server's internal key also includes the principal, so
+  naming another principal's client id can neither replace nor end that principal's entry. A
+  rejoin with the same key replaces the entry, and the older stream's end does not remove the
+  newer one. `room` is an `AccessScopeId`: the principal must hold a grant in that scope
   (`roleFor`, same check as reads) or the call fails `Unauthorized`. `state` is `Schema.Json`;
   `RoomSnapshot` is `{ room, entries: ReadonlyArray<{ principalId, clientId, tabId, state }> }`,
   emitted on join and on every change (coalescing allowed). Server state is in-memory and
@@ -824,3 +828,4 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
 10. Credential refresh. `LeaderOptions.syncHeaders(principal)` is evaluated once per leader, so a renewed token takes effect only after a leader restart, while `Unauthorized` is retried (§6) and never fatal — a client with an expired token retries forever until the tab is reloaded. Lean: make `syncHeaders` an Effect evaluated per outgoing request (push, pull, pokes reconnect), with the app owning the refresh. Not scheduled; raise before any app relies on short-lived tokens.
 11. Replica reset on sign-out — **resolved (user: a)**, see §9.1 `resetReplica`: engine-owned, guarded by the leader lock (`ReplicaInUse`) and by the outbox (`PendingWrites { count }` unless `discardPending`), deletes only the identity's OPFS directory.
 12. Presence — **resolved (user: a)**, implement as designed: §12 `PresenceRpcs` (`room` stream joins and observes, `track` updates, entries keyed by `(clientId, tabId)`, scope-grant authorization, process-local in-memory state) and §9.1 `presence` / `track` on the tab client, leader-owned and handover-surviving. Multi-instance presence is a later item.
+13. Presence liveness and revocation (v1 gaps declared by ws/presence-server): a grant revoked while a `room` stream is open leaves the entry until that stream ends; presence streams carry no heartbeat, so a stream killed behind a proxy can leave a ghost entry until the connection is noticed dead. Lean: reuse the §6 Liveness shape (`heartbeat` element on `room` streams, client `idleTimeout`) once the tab client's `presence` exists; re-check the grant on each snapshot only if an app needs it. Not scheduled.
