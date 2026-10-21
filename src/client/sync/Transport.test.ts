@@ -226,6 +226,7 @@ it.effect(
         (t) => t.pull(request)
       )
       const unavailable = failureOf(down.exit)
+      expect(unavailable).toBeInstanceOf(Protocol.ServerUnavailable)
       expect(unavailable).toEqual(new Protocol.ServerUnavailable({ message: "db down" }))
       expect(Transport.isFatalPush(unavailable)).toBe(false)
 
