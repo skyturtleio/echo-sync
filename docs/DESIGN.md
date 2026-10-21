@@ -262,7 +262,15 @@ that `PubSub` first and emits its initial poke only after the subscription exist
 so a subscriber may coalesce (a sliding subscription of capacity 1 is enough). When the shared
 `LISTEN` connection is lost, every subscribed `pokes` stream ends (typed `ServerFailure`) and the
 listener re-establishes `LISTEN` with backoff; clients reconnect and the initial poke's pull
-covers the gap, exactly as for a single lost stream today. A change committed between the
+covers the gap, exactly as for a single lost stream today.
+**Liveness (user ruling, §16 item 9a):** the `pokes` stream element is a union `Poke | Heartbeat`
+(`Schema.TaggedStruct("poke")` / `("heartbeat")`; the initial element is a `Poke`). The server
+emits a `Heartbeat` on every stream after `heartbeatInterval` (server option, default 15 s)
+without any element, from the shared listener's clock. The client treats every element as proof
+of liveness, wakes the loop only on `Poke` (a heartbeat must never trigger a pull), and ends the
+stream itself when `idleTimeout` (client option, default 45 s, must exceed the server interval)
+passes with no element; the normal reconnect-with-backoff then applies, and the new stream's
+initial poke covers anything missed. Nothing else changes: pokes stay hints, no resync timer. A change committed between the
 client's last pull and the `LISTEN` is therefore covered by the pull that initial poke triggers,
 and a change committed after it produces a notification. The client must not rely on a pull
 issued *before* the stream is established to close a reconnect gap, and v1 adds no periodic
@@ -499,7 +507,23 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
   through the §9 idempotency rule and the §8 backstop; the engine neither drains nor freezes.
   An app that wants a "pending writes" exit gate builds it from `pendingMutations` /
   `exportPending` and its own approval UI; there is no global freeze primitive.
-- **Replica reset / sign-out purge** of an identity's local data: open, §16 item 11.
+- **`resetReplica(identity, options)`** (user ruling, §16 item 11a) is a static function of
+  `src/client` (not a tab-client method: it must run when no client is alive), returning
+  `Effect<void, ReplicaInUse | PendingWrites | ResetFailed>`. It acquires the identity's leader
+  lock with `ifAvailable` and fails `ReplicaInUse` if a leader holds it; the app is responsible
+  for closing its tab clients first (its own cross-tab sign-out tombstone). Under the lock it
+  opens the outbox through the same worker-hosted VFS path the leader uses (reuse the leader
+  worker startup in a reset mode; no second OPFS host), counts unreleased entries, and fails
+  `PendingWrites { count }` unless `options.discardPending === true`; then it closes the
+  database and pool and removes the OPFS directory `echo-sync/<appId>/<profile>` recursively,
+  releasing the lock last. A candidate that becomes leader afterwards finds no pool and creates
+  a fresh, empty replica, which is the correct state for a signed-out identity. Notices are part
+  of the replica and go with it; the outbox is the only guarded content.
+- **Presence** (user ruling, §16 item 12a): `presence(room, state)` is a `Stream<RoomSnapshot>`
+  on the tab client; this tab's entry exists exactly while the stream is open, and it survives
+  handover like `subscribe` (re-joined on the new leader). `track(room, state)` replaces this
+  tab's state in a room it has joined (no-op otherwise). Both are leader-owned like the sync
+  loop. Presence never touches the replica or the outbox (§3).
 - **Typed notice decoding** (ruling from the HeyBabe trial): a retained notice carries the
   envelope's `args` and a `DomainError.error` as `Schema.Json`, so a mutation's static types stop
   at the notice. The stored notice shape, `Notice = Rejected { envelope, error } |
@@ -701,7 +725,16 @@ const todosByProject = Query.make("todos.byProject", {
 ## 12. Transport
 
 - Shared contracts module: `RpcGroup`s with Schema payload/success/error.
-  `SyncRpcs`: `push`, `pull`, `pokes` (stream). `PresenceRpcs`: `track`, `room` (stream).
+  `SyncRpcs`: `push`, `pull`, `pokes` (stream). `PresenceRpcs` (user ruling, §16 item 12a):
+  `room({ room, tabId, state }): Stream<RoomSnapshot>` joins and observes; the entry keyed by
+  `(clientId, tabId)` lives exactly while that stream is open and is dropped when it ends for
+  any reason. `track({ room, tabId, state })` replaces that entry's state (no-op without an
+  entry). `room` is an `AccessScopeId`: the principal must hold a grant in that scope
+  (`roleFor`, same check as reads) or the call fails `Unauthorized`. `state` is `Schema.Json`;
+  `RoomSnapshot` is `{ room, entries: ReadonlyArray<{ principalId, clientId, tabId, state }> }`,
+  emitted on join and on every change (coalescing allowed). Server state is in-memory and
+  process-local (a `Ref` of rooms plus a `PubSub` per room); multi-instance presence is out of
+  scope for v1. The durable path is untouched, and presence shares no tables with sync.
 - Server: `RpcServer.layerProtocolHttp({ path: "/sync" })` initially; WebSocket is a `Layer`
   substitution. Handlers never know their transport. Use `Layer.provide`, not `provideMerge`,
   to keep each protocol private.
@@ -778,7 +811,7 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
 6. Local full-text search: the pinned wa-sqlite build lacks FTS5 (§10); decide custom build vs. non-FTS search when the search primitive is scheduled.
 7. Additive schema evolution across a deploy — **resolved in §11** (codecs drop excess keys, fail on missing; new columns nullable/defaulted; deploy server first). Remaining: a wire manifest/version gate so a newer client against an older server degrades cleanly instead of failing row decode; needed before clients can ship ahead of the server.
 8. Query `limit` pushdown through the scope filter — **resolved** (main 41b878a): `IndexRangePlan` carries `readableBy` (principals) and `limit`; every `RowStore` applies readability as a `scope_grants` semi-join on `(access_scope_id, principal_id)` and stops after `limit` readable rows; `Store.planResult` is the shared reference. Covered by the `Conformance.rowStore` invariant run by Memory, SQLite and PG. Integration rule still owed by `ws/query` at landing: a registered-query run must record `scope_grants` as read whenever the plan carries `readableBy`, so a revoke re-runs the query.
-9. Pokes liveness. An idle client's only wake source is the `pokes` stream (§6: no resync timer, client pulls on every poke), and the HTTP RPC transport has no heartbeat, so an intermediary that holds a dead response open (observed with Vite's dev proxy, `docs/vertical-slice.md`) leaves the client deaf until a local enqueue. **User decision**, since it touches `Protocol`: (a) server heartbeat element on `pokes` distinguishable from a poke, plus a client idle timeout that reconnects; (b) a capped `pokes` connection lifetime with reconnect, no heartbeat; (c) accept for v1 and document. Until ruled, the vertical slice breaks the proxied response in the harness only.
+9. Pokes liveness — **resolved (user: a)**, see §6 Liveness: `Poke | Heartbeat` stream element, server `heartbeatInterval` (default 15 s), client `idleTimeout` (default 45 s) that ends and reconnects the stream; heartbeats never wake the loop. The harness-only proxy workaround goes away once the client timeout exists.
 10. Credential refresh. `LeaderOptions.syncHeaders(principal)` is evaluated once per leader, so a renewed token takes effect only after a leader restart, while `Unauthorized` is retried (§6) and never fatal — a client with an expired token retries forever until the tab is reloaded. Lean: make `syncHeaders` an Effect evaluated per outgoing request (push, pull, pokes reconnect), with the app owning the refresh. Not scheduled; raise before any app relies on short-lived tokens.
-11. Replica reset on sign-out (HeyBabe trial). The public client has no way to delete an identity's local data (`echo-sync/<appId>/<profile>` on OPFS, replica + outbox + notices) after the app has signed the account out across tabs. **User decision**: (a) engine-owned `resetReplica` that acquires the identity's leader lock, refuses while a leader or tab client is alive (`ReplicaInUse`), deletes only that identity's directory, and drops the outbox only under an explicit flag; (b) engine-owned purge that deletes the whole identity directory when no leader exists, with the app responsible for warning on pending writes first; (c) no engine API in v1, the directory layout is documented and the app deletes it.
-12. Presence. §3 and §12 specify `PresenceRpcs` (`track`, `room` stream) as a separate in-memory, connection-scoped channel, but `src/core/Protocol.ts` exports only `SyncRpcs` and nothing implements presence; the HeyBabe trial cannot port partner-editing presence and an empty stream would not be an honest substitute. **User decision**: (a) implement as designed after the current branches (server: in-memory rooms keyed by scope, entries dropped when the connection ends; client: `presence(room)` Stream and `track(room, state)` on the tab client, leader-owned like the sync loop); (b) defer past v1 and strike `PresenceRpcs` from §12 until a second consumer needs it; (c) `room` stream only (observe), no `track`, with the app publishing via its own channel.
+11. Replica reset on sign-out — **resolved (user: a)**, see §9.1 `resetReplica`: engine-owned, guarded by the leader lock (`ReplicaInUse`) and by the outbox (`PendingWrites { count }` unless `discardPending`), deletes only the identity's OPFS directory.
+12. Presence — **resolved (user: a)**, implement as designed: §12 `PresenceRpcs` (`room` stream joins and observes, `track` updates, entries keyed by `(clientId, tabId)`, scope-grant authorization, process-local in-memory state) and §9.1 `presence` / `track` on the tab client, leader-owned and handover-surviving. Multi-instance presence is a later item.
