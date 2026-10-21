@@ -450,9 +450,9 @@ export const run = (options: Options) =>
           note(`${client.clientId}: mutate ${name} ${JSON.stringify(args)}`)
           // Caller-generated, unordered idempotency key (DESIGN §6); occasionally a retried
           // enqueue of a still-pending id, which must not create a second intent.
-          // Not combined with ledger expiry: a duplicate gets a fresh seq above the floor, so once
-          // the original's ledger row expires nothing can recognise it. Expiry is only safe with
-          // DESIGN §9 rule 1 (released-row markers) in place, i.e. no duplicates at all.
+          // Off with ledger expiry, modelling DESIGN §16.5: expiry is allowed only with §9 rule (1)
+          // (released-row markers), so no duplicate exists. A duplicate gets a fresh seq above the
+          // floor, so once its original's ledger row expired nothing could recognise it.
           const released =
             options.ledgerGc === true
               ? []

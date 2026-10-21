@@ -47,7 +47,9 @@ describe("reconciliation simulation", () => {
   )
 
   it.effect(
-    "ledger GC'd while a client is behind: processed intents are released by the floor, never re-executed",
+    // Late enqueue retries are off in this run: DESIGN §16.5 allows ledger expiry only with §9
+    // rule (1) in place (released-row markers), so no duplicate can exist when rows expire.
+    "ledger GC'd while a client is behind (no duplicates, per §16.5): processed intents are released by the floor, never re-executed",
     () =>
       Effect.gen(function* () {
         let expired = 0
