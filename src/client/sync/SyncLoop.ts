@@ -42,14 +42,18 @@ export type SyncPhase = typeof SyncPhase.Type
  * - `credentials`: `syncHeaders` raised; nothing was sent.
  * - `unauthorized`: the server rejected the credential (`Unauthorized`).
  * - `unavailable`: the server reported `ServerUnavailable`.
- * - `network`: the request failed before a server response (transport, HTTP, an RPC response that
- *   never arrived or could not be read).
- * - `server`: any other transient failure, the server stopping a push batch included.
+ * - `network`: no usable RPC result (transport, HTTP, or a response body that was empty, incomplete
+ *   or unreadable after an HTTP response arrived).
+ * - `server`: the fallback for any other transient failure: a stopped push batch, a pull defect, a
+ *   local `StoreUnavailable`.
  */
 export const SyncErrorKind = Schema.Literals(["credentials", "unauthorized", "unavailable", "network", "server"])
 export type SyncErrorKind = typeof SyncErrorKind.Type
 
-/** A transient failure: its kind and a readable description (never header values, bodies or tokens). */
+/**
+ * A transient failure: its kind and a library-controlled description of it (DESIGN §9.1). Never raw
+ * error text, so never header values, bodies, URLs or tokens; the leader logs the full cause.
+ */
 export const SyncError = Schema.Struct({ kind: SyncErrorKind, message: Schema.String })
 export type SyncError = typeof SyncError.Type
 
@@ -114,30 +118,37 @@ const kindOf = (error: unknown): SyncErrorKind => {
 }
 
 /**
- * Each link's name and the first line of its message, outermost first, so an outer `RpcClientError`
- * (whose own message is just `HttpError: `) never hides the inner text. Only `message` strings are
- * read: an object is never serialized (an HTTP error's `request` carries the request's headers).
+ * The public text for each kind (DESIGN §9.1, 418d688): library-controlled constants. No raw error
+ * message, name, unrecognized tag, string cause, URL or `Cause.pretty` ever reaches `syncStatus`, since
+ * any of them can carry a token, an echoed header or a request body. Detail goes to the leader's log.
  */
-const describe = (error: unknown): string =>
-  chain(error)
-    .flatMap((node) => {
-      if (Predicate.isString(node)) return [node]
-      if (!Predicate.isObject(node)) return [String(node)]
-      const label = tagOf(node) ?? (node instanceof Error ? node.name : undefined)
-      const raw = Predicate.hasProperty(node, "message") && Predicate.isString(node.message) ? node.message : ""
-      const line = (raw.split("\n")[0] ?? "").trim()
-      const text = line.endsWith(":") ? line.slice(0, -1).trim() : line
-      if (text === "" || text === label) return label === undefined ? [] : [label]
-      return [label === undefined || text.startsWith(label) ? text : `${label}: ${text}`]
-    })
-    // An outer message that only names the next link ("RpcClientError: HttpError") already says it.
-    .filter((part, i, parts) => i === 0 || !(parts[i - 1] ?? "").endsWith(`: ${part}`))
-    .join(" <- ")
+const messages: Record<SyncErrorKind, string> = {
+  credentials: "the app's syncHeaders failed; the request was not sent",
+  unauthorized: "the server rejected the credential",
+  unavailable: "the server is temporarily unavailable",
+  network: "the request produced no usable response",
+  server: "a transient failure; retrying"
+}
+
+const stoppedBatch: SyncError = { kind: "server", message: "the server stopped the push batch at a transient failure" }
+
+/** The `Halted` reason, by the innermost recognized tag; same constant-only rule as `lastError`. */
+const haltReason = (error: unknown): string => {
+  const nodes = chain(error)
+  if (nodes.some((n) => tagOf(n) === "MalformedEnvelope")) return "the server refused the push batch as malformed"
+  const integrity = nodes.find((n) => tagOf(n) === "PushIntegrityError")
+  if (Predicate.hasProperty(integrity, "reason") && integrity.reason === "invalidPayload") {
+    return "the outbox batch is not a valid push request"
+  }
+  if (integrity !== undefined) return "the server ended the push with a defect"
+  return "push failed with an integrity error"
+}
 
 /**
  * Classifies a whole failure `Cause` (DESIGN §6: defect > transient > rejection), never just its
  * first `Fail`: a defect anywhere halts push, even beside a transient failure, since an RPC request
  * decode failure arrives as an untagged defect. Interruption is re-raised (the loop is stopping).
+ * The returned strings are constants; the cause itself is only ever logged.
  */
 const classify = <E>(cause: Cause.Cause<E>, isFatal: ((error: E) => boolean) | undefined) =>
   Effect.gen(function* () {
@@ -146,11 +157,9 @@ const classify = <E>(cause: Cause.Cause<E>, isFatal: ((error: E) => boolean) | u
     const fatalFailure = isFatal === undefined ? undefined : failures.find(isFatal)
     const halts = isFatal !== undefined && (Cause.hasDies(cause) || fatalFailure !== undefined)
     const first = fatalFailure ?? failures[0]
-    const error: SyncError =
-      Cause.hasDies(cause) || first === undefined
-        ? { kind: "server", message: Cause.pretty(cause) }
-        : { kind: kindOf(first), message: describe(first) }
-    return { halts, error }
+    const kind: SyncErrorKind = Cause.hasDies(cause) || first === undefined ? "server" : kindOf(first)
+    const halt = fatalFailure !== undefined ? haltReason(fatalFailure) : "push failed with a defect"
+    return { halts, error: { kind, message: messages[kind] } satisfies SyncError, halt }
   })
 
 export const make = <TE>(options: {
@@ -195,16 +204,17 @@ export const make = <TE>(options: {
         yield* setPhase("pushing")
         const pushed = yield* Effect.exit(engine.push)
         if (Exit.isFailure(pushed)) {
-          const { halts, error } = yield* classify(pushed.cause, options.isFatalPush)
+          const { halts, error, halt } = yield* classify(pushed.cause, options.isFatalPush)
           if (halts) {
-            yield* Effect.logError(`echo-sync: push halted by an integrity error: ${error.message}`)
-            const halted: PushState = { _tag: "Halted", message: error.message }
+            yield* Effect.logError(`echo-sync: push halted by an integrity error: ${halt}`, pushed.cause)
+            const halted: PushState = { _tag: "Halted", message: halt }
             yield* SubscriptionRef.update(status, (s) => ({ ...s, push: halted }))
           } else {
+            yield* Effect.logWarning(`echo-sync: push failed (${error.kind}); retrying`, pushed.cause)
             transient = Option.some(error)
           }
         } else if (pushed.value.stopped) {
-          transient = Option.some({ kind: "server", message: "server stopped the push batch at a transient failure" })
+          transient = Option.some(stoppedBatch)
         } else {
           pushedCleanly = true
         }
@@ -214,6 +224,7 @@ export const make = <TE>(options: {
       const pulled = yield* Effect.exit(engine.pull)
       if (Exit.isFailure(pulled)) {
         const { error } = yield* classify(pulled.cause, undefined)
+        yield* Effect.logWarning(`echo-sync: pull failed (${error.kind}); retrying`, pulled.cause)
         if (Option.isNone(transient)) transient = Option.some(error)
       }
       // `engine.pull` succeeds only once a `PullDone` set is installed.

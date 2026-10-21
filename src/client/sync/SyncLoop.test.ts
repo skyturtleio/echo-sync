@@ -101,7 +101,10 @@ it.effect("an integrity error halts push for good while pull keeps running", () 
     const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations: noPending })
     yield* Effect.forkChild(loop.run)
     yield* settle
-    expect((yield* loop.status).push).toEqual({ _tag: "Halted", message: "MalformedEnvelope: bad envelope" })
+    expect((yield* loop.status).push).toEqual({
+      _tag: "Halted",
+      message: "the server refused the push batch as malformed"
+    })
     // A halt is not a failure: the halting cycle still pulled, and no backoff delays the next one.
     expect(calls.pull).toBe(1)
     expect((yield* loop.status).lastError).toBeNull()
@@ -191,8 +194,7 @@ it.effect(
       const status = yield* loop.status
       expect(status.push._tag).toBe("Halted")
       // The loop survived the pull defect and reports it as a transient failure.
-      expect(status.lastError).toMatchObject({ kind: "server" })
-      expect(status.lastError?.message).toContain("bad page")
+      expect(status.lastError?.kind).toBe("server")
       expect(fiber.pollUnsafe()).toBeUndefined()
       yield* TestClock.adjust("1 minute")
       yield* settle
@@ -244,8 +246,7 @@ it.effect("a pull that fails with MalformedChange is retried with backoff and ne
     yield* settle
     const failed = yield* loop.status
     expect(failed.push).toEqual({ _tag: "Active" })
-    expect(failed.lastError).toMatchObject({ kind: "server" })
-    expect(failed.lastError?.message).toContain("MalformedChange")
+    expect(failed.lastError?.kind).toBe("server")
     yield* TestClock.adjust("999 millis")
     yield* settle
     expect(calls.pull).toBe(1)

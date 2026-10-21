@@ -256,8 +256,9 @@ tables and replica schema, one transaction) and builds `Engine.make` over the SQ
   with `SyncDisabled`.
 - `syncStatus` is `{ push, lastError, pendingMutations, lastSyncedAt, phase, nextRetryAt }` (DESIGN §9.1).
   `lastError` is `null | { kind, message }`: `kind` is `credentials` (`syncHeaders` raised),
-  `unauthorized`, `unavailable` (`ServerUnavailable`), `network` (no server response) or `server`;
-  `message` walks the cause chain and reads only `message` strings, never header values or bodies.
+  `unauthorized`, `unavailable` (`ServerUnavailable`), `network` (no usable RPC result) or `server`
+  (the fallback, local `StoreUnavailable` included); `message` is a library constant per kind, never
+  raw error text, and the `Halted` reason follows the same rule. The full cause goes to the leader log.
   `pendingMutations` is a recount of unreleased `echo_outbox` rows taken under the storage permit after
   every write to that table (`SqliteSyncStorage.pendingCount`, reactive on the connection's update hook),
   so it follows each enqueue and release, not only cycle ends, and cannot drift. A leader publishes no
