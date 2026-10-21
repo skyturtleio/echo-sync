@@ -1,0 +1,1 @@
+{"tables":[{"columns":[{"kind":"text","name":"access_scope_id","nullable":false},{"kind":"text","name":"id","nullable":false},{"kind":"text","name":"title","nullable":false}],"dataHash":"a4e6e9dc6165205c","indexHash":"cd0e6abb0225ca58","indexes":[],"name":"todos","unique":[]}],"version":1}

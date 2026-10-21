@@ -3,6 +3,6 @@
   "compilerOptions": {
     "types": ["bun"]
   },
-  "include": ["*.ts", "../browser-spike/app.ts", "../../src/core", "../../src/server"],
+  "include": ["*.ts", "migrations/*.ts", "../browser-spike/app.ts", "../../src/core", "../../src/server"],
   "exclude": ["../../src/**/*.test.ts", "../../src/server/postgres/test-support.ts"]
 }

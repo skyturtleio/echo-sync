@@ -4,5 +4,5 @@
   "printWidth": 120,
   "trailingComma": "none",
   "arrowParens": "always",
-  "ignorePatterns": ["docs/**", "AGENTS.md", "bun.lock"]
+  "ignorePatterns": ["docs/**", "AGENTS.md", "bun.lock", "**/migrations/manifest.json"]
 }
