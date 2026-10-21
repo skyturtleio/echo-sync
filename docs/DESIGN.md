@@ -34,7 +34,12 @@ Goals
 - Structural sharing/security via first-class access scopes, enforced by the engine, not by
   ad-hoc `user_id` checks in every mutator.
 - General enough for private user data, shared group data (HeyBabe couples), and global
-  catalogs (SkyTime airports).
+  catalogs (SkyTime airports). **App-agnostic (user ruling):** the same engine serves at least
+  three app shapes — HeyBabe (couples sharing todos/notes), a Fasten-style personal records
+  app, and the SkyTime flight-time logbook — so nothing in `src/` may assume one app's tables,
+  identity shape, UI library, or domain rules. Consumer trials (the HeyBabe port) exist to
+  surface *generic* gaps; a trial finding becomes a ruling only when stated as an engine
+  property any of those apps would need.
 
 Non-goals (v1)
 
