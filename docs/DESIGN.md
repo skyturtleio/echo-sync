@@ -789,6 +789,15 @@ happens in between, and a rolled-back allocation is given back. A store that mer
 its counter violates the port, and the conformance suite keeps a check that calls `nextSeq`
 twice before appending so that peeking fails.
 
+**Test-harness placement (coordinator ruling):** `src/core/testing` holds only harnesses that
+need nothing from the client or the server at runtime: `Conformance`, `MemoryStore`, `SimApp`,
+`RefServer`, and the mutation-execution helpers they share (`runHandler`, `restore`,
+`initialMeta`, `roleFromGrants`, which live in core and are re-exported by the client engine).
+The reconciliation engine (`Engine.make`, `applyPageSet`) is client code and stays in
+`src/client/sync`; harnesses that drive it (`Simulation`, `MemorySyncStorage`, their tests)
+live in `src/client/sync/testing`. A lint rule forbids runtime imports of `src/client` or
+`src/server` from `src/core`; type-only imports are allowed.
+
 Use `@effect/vitest`, `effect/testing` (`TestClock`), and `Arbitrary` where they fit.
 
 ## 15. Prior art (for orientation only)
