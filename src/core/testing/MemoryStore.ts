@@ -5,7 +5,7 @@
  * TEMPORARY shapes: `RangePlan` and `compareValues` mirror what `src/core` will export
  * (`IndexRangePlan`, `compareKeys`); switch to those when ws/foundation lands.
  */
-import { Effect, Option } from "effect"
+import { Array as Arr, Effect, Option, Order } from "effect"
 import type { EncodedRow } from "../../client/sync/Wire.ts"
 
 export interface Bound {
@@ -26,7 +26,7 @@ export interface RangePlan {
 }
 
 /** Code-point order for text (not UTF-16 `<`), NULL lowest, numbers numeric, false < true. */
-export const compareValues = (a: unknown, b: unknown): number => {
+export const compareValues = (a: unknown, b: unknown): -1 | 0 | 1 => {
   if (a === b) return 0
   if (a === null || a === undefined) return -1
   if (b === null || b === undefined) return 1
@@ -39,11 +39,11 @@ export const compareValues = (a: unknown, b: unknown): number => {
       if (ca.done === true) return cb.done === true ? 0 : -1
       if (cb.done === true) return 1
       const d = (ca.value.codePointAt(0) ?? 0) - (cb.value.codePointAt(0) ?? 0)
-      if (d !== 0) return d
+      if (d !== 0) return d < 0 ? -1 : 1
     }
   }
   if (typeof a === "boolean" && typeof b === "boolean") return a ? 1 : -1
-  if (typeof a === "number" && typeof b === "number") return a - b
+  if (typeof a === "number" && typeof b === "number") return a < b ? -1 : 1
   // Mixed kinds cannot occur in one column of a declared schema.
   return 0
 }
@@ -99,14 +99,15 @@ export const make = (initial: Tables = new Map()): MemoryStore => {
         return true
       }
       const key = [...plan.columns, "id"]
-      const sign = plan.order === "asc" ? 1 : -1
-      const sorted = [...(tables.get(table)?.values() ?? [])].filter(matches).sort((a, b) => {
+      const byKey = Order.make((a: EncodedRow, b: EncodedRow) => {
         for (const column of key) {
           const d = compareValues(a[column] ?? null, b[column] ?? null)
-          if (d !== 0) return sign * d
+          if (d !== 0) return d
         }
         return 0
       })
+      const order = plan.order === "asc" ? byKey : Order.flip(byKey)
+      const sorted = Arr.sort([...(tables.get(table)?.values() ?? [])].filter(matches), order)
       return Option.isSome(plan.limit) ? sorted.slice(0, plan.limit.value) : sorted
     })
 

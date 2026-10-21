@@ -70,12 +70,20 @@ export interface PullDone {
   readonly changes: ReadonlyArray<Change>
   readonly acks: ReadonlyArray<Ack>
   readonly nextCursor: Position
+  /**
+   * PLANNED (DESIGN §16.5): highest mutationId of this client whose ledger row has expired.
+   * Every id ≤ it was processed and its effect is installed by this set, so a pending entry
+   * ≤ it with no ack leaves the replay set with a `ClientExpired` notice. 0 = nothing expired.
+   */
+  readonly expiredThrough: number
 }
 
 export type PullResponse = PullPage | PullDone
 
 /** The cursor is past log retention or the continuation is stale: restart from `null`. */
-export class ResnapshotRequired extends Schema.TaggedError<ResnapshotRequired>()("ResnapshotRequired", {}) {}
+export class ResnapshotRequired extends Schema.TaggedError<ResnapshotRequired>()("ResnapshotRequired", {
+  reason: Schema.Literals(["gcHorizon", "unknownCursor", "staleContinuation"])
+}) {}
 
 export interface PushRequest {
   readonly clientId: string

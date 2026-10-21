@@ -17,6 +17,7 @@ import { ResnapshotRequired } from "./Wire.ts"
 import type {
   Cursor,
   MutationEnvelope,
+  MutationOutcome,
   MutationRejection,
   PullDone,
   PullPage,
@@ -129,6 +130,12 @@ const replay = <E>(storage: SyncStorage<E>, executor: Executor<E>, entry: Pendin
     }
   })
 
+/** Outcome of a processed mutation whose ledger row expired before its ack was pulled. */
+const expired = (envelope: MutationEnvelope): MutationOutcome => ({
+  _tag: "Rejected",
+  error: { _tag: "ClientExpired", mutationId: envelope.mutationId }
+})
+
 /**
  * Installs a complete page set: the staged `PullPage`s followed by their `PullDone`. Must run
  * inside one storage transaction. A set that started from cursor `null` is a snapshot of every
@@ -169,7 +176,8 @@ export const applyPageSet = <E>(
     const acked: Array<number> = []
     const notices: Array<Notice> = []
     for (const entry of pending) {
-      const outcome = outcomes.get(entry.envelope.mutationId)
+      const id = entry.envelope.mutationId
+      const outcome = outcomes.get(id) ?? (id <= done.expiredThrough ? expired(entry.envelope) : undefined)
       if (outcome === undefined) {
         yield* replay(storage, executor, entry)
         continue
@@ -182,7 +190,7 @@ export const applyPageSet = <E>(
 
     // The server processes a client's mutations in order, so an ack for id k means every id
     // up to k has been processed.
-    const pushedThrough = Math.max(meta.pushedThrough, ...outcomes.keys())
+    const pushedThrough = Math.max(meta.pushedThrough, done.expiredThrough, ...outcomes.keys())
     yield* storage.setMeta({ ...meta, cursor: done.nextCursor, pushedThrough, resnapshot: false })
     yield* storage.clearStaged
   })

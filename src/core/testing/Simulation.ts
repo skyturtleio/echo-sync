@@ -18,7 +18,7 @@
  * replicas equal the server restricted to readable scopes, and each server rejection
  * surfaced as exactly one notice.
  */
-import { Clock, Effect, Option, Schema } from "effect"
+import { Array as Arr, Clock, Effect, Option, Order, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import * as Engine from "../../client/sync/Engine.ts"
 import type { EncodedRow, MutationEnvelope, PullDone, PullPage, PullResponse } from "../../client/sync/Wire.ts"
@@ -60,6 +60,8 @@ export interface Stats {
   readonly notices: number
   readonly transientStops: number
   readonly lostResponses: number
+  /** Pending mutations released by an expired ledger row rather than an ack. */
+  readonly expired: number
 }
 
 /** mulberry32: small, fast, good enough for schedules. */
@@ -83,13 +85,11 @@ const canonical = (tables: MemoryStore.Tables): string => {
   const lines: Array<string> = []
   for (const [table, rows] of tables) {
     for (const row of rows.values()) {
-      const sorted = Object.keys(row)
-        .sort()
-        .map((k) => `${k}=${JSON.stringify(row[k])}`)
+      const sorted = Arr.sort(Object.keys(row), Order.String).map((k) => `${k}=${JSON.stringify(row[k])}`)
       lines.push(`${table}/${row.id}{${sorted.join(",")}}`)
     }
   }
-  return lines.sort().join("\n")
+  return Arr.sort(lines, Order.String).join("\n")
 }
 
 const diff = (actual: string, expected: string) => {
@@ -115,7 +115,7 @@ const view = (tables: MemoryStore.Tables, principal: string) =>
     return out
   })
 
-interface Disk {
+export interface Disk {
   readonly replica: MemoryStore.MemoryStore
   meta: Engine.SyncMeta
   outbox: Array<Engine.PendingMutation>
@@ -123,7 +123,7 @@ interface Disk {
   notices: Array<Engine.Notice>
 }
 
-const makeStorage = (disk: Disk): Engine.SyncStorage<never> => ({
+export const makeStorage = (disk: Disk): Engine.SyncStorage<never> => ({
   transaction: (self) =>
     Effect.suspend(() => {
       const saved = { meta: disk.meta, outbox: disk.outbox, staged: disk.staged, notices: disk.notices }
@@ -195,7 +195,15 @@ export const run = (options: Options) =>
     const trace: Array<string> = []
     let step = 0
     let faults = true
-    const stats = { mutations: 0, resnapshots: 0, reloadsMidSet: 0, notices: 0, transientStops: 0, lostResponses: 0 }
+    const stats = {
+      mutations: 0,
+      resnapshots: 0,
+      reloadsMidSet: 0,
+      notices: 0,
+      transientStops: 0,
+      lostResponses: 0,
+      expired: 0
+    }
     const committed: Array<MutationEnvelope> = []
     const ids: Array<string> = []
 
@@ -301,7 +309,13 @@ export const run = (options: Options) =>
             const done: PullDone = page
             return yield* storage.transaction(Engine.applyPageSet(storage, executor, client.disk.staged, done))
           }
-          const early: PullDone = { _tag: "PullDone", changes: page.changes, acks: page.acks, nextCursor: from }
+          const early: PullDone = {
+            _tag: "PullDone",
+            changes: page.changes,
+            acks: page.acks,
+            nextCursor: from,
+            expiredThrough: 0
+          }
           yield* storage.transaction(
             Effect.gen(function* () {
               yield* Engine.applyPageSet(storage, executor, [], early)
@@ -525,6 +539,12 @@ export const run = (options: Options) =>
         )
       }
       if (rejected) stats.notices++
+      if (Option.isNone(ledger) && notices > 1) {
+        return yield* violated("an expired mutation surfaces as at most one notice", `${key}: ${notices}`)
+      }
+    }
+    for (const client of clients) {
+      stats.expired += client.disk.notices.filter((n) => n.error._tag === "ClientExpired").length
     }
     stats.mutations = committed.length
     const result: Stats = stats
