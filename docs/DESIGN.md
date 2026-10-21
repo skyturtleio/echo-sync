@@ -264,7 +264,7 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   per-identity pool directory `echo-sync/<appId>/<profile>`. The protocol is internal to that
   package: re-verify `OpfsSqlite.ts` on every `@effect/sql-sqlite-wasm` bump.
 - Leadership via Web Locks (`echo:<appId>:<profile>:leader`, plus per-incarnation and per-tab
-  locks for death detection; never timeouts). Tabs reach the leader through a `SharedWorker`
+  locks for death detection; never timeouts). Liveness invariant: a candidate that cannot serve (driver failed to open, OPFS unavailable) must release the leader and epoch locks so the next candidate is elected; every lock wait is cancellable. Tabs reach the leader through a `SharedWorker`
   router that holds the leader's control port and relinks a fresh `MessageChannel` per tab;
   tab↔leader traffic is Effect RPC over the worker transport. Handover: an in-flight request
   fails with `LeaderUnavailable{LeaderLost}` (the tab cannot know whether it committed; `enqueue`
