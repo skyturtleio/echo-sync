@@ -192,19 +192,25 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
 
 - Cursor-based, scope-filtered, paginated. Each page is read in its own `REPEATABLE READ`
   snapshot (a snapshot cannot span HTTP requests without holding a transaction open, which a
-  transaction pooler forbids). Response carries `{ changes, acks, nextCursor, more }` where
-  `changes` is an **ordered list** of upserts (row payload as of that page's snapshot),
-  tombstones, and `scopePurged`, applied strictly in order (so a purge precedes a re-grant's
-  upserts), and `acks` are ledger entries for this client with `position ∈ (cursor, nextCursor]`.
-- **A page set is consistent only at `more: false`.** A payload read at a later snapshot may
+  transaction pooler forbids). Request: `{ clientId, cursor, continuation: Option<PullContinuation> }`.
+  Response is a tagged union so "more but nothing to continue with" and "done but no position"
+  are unrepresentable: `PullPage { changes, acks, continuation }` (more to come) or
+  `PullDone { changes, acks, nextCursor: Position }` (page set complete). `PullContinuation` is
+  opaque to the client (resent verbatim) but a Schema'd value on the server (row-walk progress,
+  `head`, and the cursor it belongs to); a stale or invalid continuation fails with
+  `ResnapshotRequired`. `changes` is an **ordered list** of upserts (row payload as of that
+  page's snapshot), tombstones, and `scopePurged`, applied strictly in order (so a purge
+  precedes a re-grant's upserts); `acks` are ledger entries for this client with
+  `position ∈ (cursor, nextCursor]` across the set.
+- **A page set is consistent only at `PullDone`.** A payload read at a later snapshot may
   already include a change whose log entries arrive in a later page, so applying pages
   incrementally can expose a torn transaction across rows. The client therefore stages pages
   (in a SQLite staging table, not memory) and applies the whole set, acks included, in one
-  replica transaction when `more` is `false`. Because positions are commit-ordered (§7), every
+  replica transaction on `PullDone`. The continuation is persisted with the staged pages so a reload resumes the set; if it cannot (stale → `ResnapshotRequired`), the staged pages are discarded, never partially applied. Because positions are commit-ordered (§7), every
   change visible in any page's payload has a log entry `≤` the final `nextCursor`, so the
   installed state equals the server state at the last page's snapshot restricted to readable
   scopes. Known limitation: under sustained write load `more` may stay `true` for a long time;
-  mitigate with a large page size, not by applying early.
+  mitigate with a large page size, not by applying early. (Under this load `PullPage` keeps being returned; the client keeps staging.)
 - `Position` is a branded `bigint` in memory (native comparison; `number` loses precision and
   string comparison is lexicographic) and a decimal string on the wire and in structured clone.
 - **Invariant: a pending mutation leaves the client's optimistic replay set only when the
@@ -213,7 +219,7 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
 - Initial sync = pull from `null` cursor. The log may be GC'd, so it cannot be log-driven:
   the server keyset-paginates current rows of all readable scopes by `(table, id)` with
   per-page snapshots, records the max position `head` at the first page, then continues with
-  log entries `> head` until `more: false`. Same staging rule applies. A newly granted scope is
+  log entries `> head` until `PullDone`. Same staging rule applies. A newly granted scope is
   delivered the same way (row walk of that scope, then log) within the ordinary pull.
 - Realtime: a poke stream (RPC stream) says "something may have changed"; it is a hint, never
   data. Pull is the only truth.
