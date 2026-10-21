@@ -510,7 +510,8 @@ const todosByProject = Query.make("todos.byProject", {
     index (`indisvalid`, `indisready`, `indislive`) whose **key** columns (`indnkeyatts`, not
     `INCLUDE` payload) match in order, collation and `NULLS` placement; a unique set's expected
     shape is the one `SyncTable`'s DDL generates (`NULLS DISTINCT`, default placement), which
-    differs from query indexes (`NULLS FIRST`). Scope: registry tables including
+    differs from query indexes (`NULLS FIRST`). Reading `pg_index.indnullsnotdistinct` makes
+    **PostgreSQL 15 the server's minimum**; tests run on 17. Scope: registry tables including
     `scope_grants`; the engine's own tables are not checked. Compare the structured catalog (`pg_index.indkey`,
     `indoption`, `indcollation`, `pg_attribute`), never a string match against generated DDL.
     The result is one typed `Drift` error listing every mismatch; the server runs it after
