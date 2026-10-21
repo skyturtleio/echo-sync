@@ -209,7 +209,7 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   replica transaction on `PullDone`. The continuation is persisted with the staged pages so a reload resumes the set; if it cannot (stale → `ResnapshotRequired`), the staged pages are discarded, never partially applied. Because positions are commit-ordered (§7), every
   change visible in any page's payload has a log entry `≤` the final `nextCursor`, so the
   installed state equals the server state at the last page's snapshot restricted to readable
-  scopes. Known limitation: under sustained write load `more` may stay `true` for a long time;
+  scopes. Known limitation: under sustained write load the server may keep returning `PullPage` for a long time;
   mitigate with a large page size, not by applying early. (Under this load `PullPage` keeps being returned; the client keeps staging.)
 - `Position` is a branded `bigint` in memory (native comparison; `number` loses precision and
   string comparison is lexicographic) and a decimal string on the wire and in structured clone.
