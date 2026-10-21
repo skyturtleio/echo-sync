@@ -18,7 +18,7 @@
  * `PullProtocolError`, so a bad page never kills the loop's fiber; core's `ResnapshotRequired` passes through for the engine to handle.
  */
 import { Cause, Effect, Layer, Predicate, Schema, type Scope, type Stream } from "effect"
-import { FetchHttpClient } from "effect/http"
+import { FetchHttpClient, type Headers, HttpClient, HttpClientRequest } from "effect/http"
 import { RpcClient, type RpcClientError, RpcSerialization } from "effect/rpc"
 import { type Ids, Protocol } from "echo-sync"
 import type * as Engine from "./Engine.ts"
@@ -83,8 +83,14 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
 })
 
 /**
- * RPC over HTTP POST with NDJSON framing, using the platform `fetch`. The server must mount
+ * RPC over HTTP POST with NDJSON framing, using the platform `fetch`, with `headers` on every request. The server must mount
  * `Protocol.SyncRpcs` with `RpcServer.layerHttp({ protocol: "http" })` and `RpcSerialization.layerNdjson`.
  */
-export const layerProtocolHttp = (url: string): Layer.Layer<RpcClient.Protocol> =>
-  RpcClient.layerProtocolHttp({ url }).pipe(Layer.provide([RpcSerialization.layerNdjson, FetchHttpClient.layer]))
+export const layerProtocolHttp = (url: string, headers?: Headers.Input): Layer.Layer<RpcClient.Protocol> =>
+  RpcClient.layerProtocolHttp({
+    url,
+    // Credentials for the server's `principalFor` (DESIGN §4): sent on every push, pull and pokes request.
+    ...(headers === undefined
+      ? {}
+      : { transformClient: (client) => HttpClient.mapRequest(client, HttpClientRequest.setHeaders(headers)) })
+  }).pipe(Layer.provide([RpcSerialization.layerNdjson, FetchHttpClient.layer]))

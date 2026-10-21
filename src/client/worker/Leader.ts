@@ -158,6 +158,11 @@ export interface LeaderOptions {
    * still applies and persists, nothing is pushed or pulled.
    */
   readonly syncUrl?: string
+  /**
+   * Request headers for the sync server, given the principal this replica acts as (its tab's
+   * `principal`): the credentials the server's `principalFor` authenticates (DESIGN §4).
+   */
+  readonly syncHeaders?: (principal: AccessScope.PrincipalId) => Readonly<Record<string, string>>
 }
 
 const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: LeaderOptions) =>
@@ -190,7 +195,7 @@ const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: L
       engine = yield* Engine.make({ clientId, actor, storage, registry, mutations, transport: localOnly })
     } else {
       // The RPC protocol lives in this scope: it closes with the leader.
-      const protocol = yield* Layer.build(Transport.layerProtocolHttp(syncUrl))
+      const protocol = yield* Layer.build(Transport.layerProtocolHttp(syncUrl, options.syncHeaders?.(actor)))
       const transport = yield* Transport.make.pipe(Effect.provide(protocol))
       engine = yield* Engine.make({ clientId, actor, storage, registry, mutations, transport })
       const sync = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush })

@@ -239,3 +239,60 @@ it.effect(
       }
     }).pipe(Effect.scoped)
 )
+
+it.effect("a transport built with headers sends them on push, pull and the pokes subscription", () =>
+  Effect.gen(function* () {
+    // What the server's handlers saw in the header, per RPC: a missing header on pokes would be an
+    // unauthenticated subscription the client never notices.
+    const seen: Record<string, string | undefined> = {}
+    const app = RpcServer.layerHttp({ group: Protocol.SyncRpcs, path: "/rpc", protocol: "http" }).pipe(
+      Layer.provide([
+        Protocol.SyncRpcs.toLayer({
+          push: (request, { headers }) =>
+            Effect.sync(() => {
+              seen["push"] = headers["x-echo-principal"]
+              return {
+                results: request.mutations.map((m) => ({
+                  mutationId: m.mutationId,
+                  position,
+                  outcome: { _tag: "Applied" as const }
+                }))
+              }
+            }),
+          pull: (_, { headers }) =>
+            Effect.sync(() => {
+              seen["pull"] = headers["x-echo-principal"]
+              return Schema.decodeUnknownSync(Protocol.PullDone)({
+                _tag: "PullDone",
+                changes: [],
+                acks: [],
+                nextCursor: "1",
+                expiredThrough: 0
+              })
+            }),
+          pokes: (_, { headers }) =>
+            Stream.fromEffect(Effect.sync(() => (seen["pokes"] = headers["x-echo-principal"]))).pipe(Stream.as({}))
+        }),
+        RpcSerialization.layerNdjson
+      ])
+    )
+    const web = HttpRouter.toWebHandler(app, { disableLogger: true })
+    yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
+    const fetch = Object.assign(
+      (input: URL | RequestInfo, init?: RequestInit) => web.handler(new Request(input, init)),
+      {
+        preconnect: globalThis.fetch.preconnect
+      }
+    )
+    // `FetchHttpClient` reads `Fetch` from the fiber that sends each request.
+    yield* Effect.gen(function* () {
+      const t = yield* Transport.make.pipe(
+        Effect.provide(Transport.layerProtocolHttp("http://echo.test/rpc", { "x-echo-principal": "alice" }))
+      )
+      yield* t.push(batch(1))
+      yield* t.pull({ clientId: Ids.ClientId.make("c"), cursor: null, continuation: Option.none() })
+      yield* Stream.runHead(t.pokes(Ids.ClientId.make("c")))
+    }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+    expect(seen).toEqual({ push: "alice", pull: "alice", pokes: "alice" })
+  }).pipe(Effect.scoped)
+)
