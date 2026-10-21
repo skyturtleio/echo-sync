@@ -74,6 +74,8 @@ export interface TableManifest {
   readonly name: string
   readonly columns: ReadonlyArray<ColumnManifest>
   readonly indexes: ReadonlyArray<{ readonly name: string; readonly columns: ReadonlyArray<string> }>
+  /** Declared unique column sets (column names, in declaration order). Part of `indexHash`. */
+  readonly unique: ReadonlyArray<ReadonlyArray<string>>
   /**
    * Hash of the storage shape (table name; column names, kinds, nullability). Changes ⇒ replica
    * rebuild. Refinements, brands and nested JSON schemas are validation, not storage, and do not
@@ -372,7 +374,8 @@ const pgCodec = (kind: ColumnKind): Schema.Constraint => {
   }
 }
 
-const pgType: Record<ColumnKind, string> = {
+/** The Postgres column type for a column kind (text is `COLLATE "C"`, DESIGN §10). */
+export const pgType: Record<ColumnKind, string> = {
   text: 'text COLLATE "C"',
   integer: "bigint",
   double: "double precision",
@@ -499,7 +502,8 @@ export const make = <
     indexes[index] = { name: index, fields: indexFields, key: [...key, idColumn] }
   }
 
-  const uniques = (options?.unique ?? []).map((fs) => `  UNIQUE (${fs.map((f) => quote(columnOf(f).name)).join(", ")})`)
+  const uniqueSets = (options?.unique ?? []).map((fs) => fs.map((f) => columnOf(f).name))
+  const uniques = uniqueSets.map((cs) => `  UNIQUE (${cs.map(quote).join(", ")})`)
   const pgColumns = [
     ...columns.map(
       (c) =>
@@ -532,6 +536,7 @@ export const make = <
     name,
     columns: sortedColumns,
     indexes: indexManifest,
+    unique: uniqueSets,
     dataHash: hash(
       canonicalJson({
         name,

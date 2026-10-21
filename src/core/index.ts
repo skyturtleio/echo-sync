@@ -1,6 +1,7 @@
 export * as AccessScope from "./AccessScope.ts"
 export * as Errors from "./Errors.ts"
 export * as Ids from "./Ids.ts"
+export * as Migrate from "./migrate/Migrate.ts"
 export * as Mutation from "./Mutation.ts"
 export * as Protocol from "./Protocol.ts"
 export * as Registry from "./Registry.ts"
