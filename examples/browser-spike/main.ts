@@ -9,6 +9,7 @@ import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as LeaderClientModule from "../../src/client/worker/LeaderClient.ts"
 import type { OutboxEnvelope, QueryResult, SqlParams } from "../../src/client/worker/LeaderRpcs.ts"
+import type { ToRouter } from "../../src/client/worker/messages.ts"
 
 const params = new URLSearchParams(location.search)
 const appId = params.get("app") ?? "spike"
@@ -26,13 +27,21 @@ const log = (line: string) => {
   if (el) el.textContent = `${new Date().toISOString().slice(11, 23)} ${line}\n${el.textContent ?? ""}`
 }
 
+const spawnRouter = (name: string) =>
+  new SharedWorker(new URL("./router.worker.ts", import.meta.url), { type: "module", name })
+
 const scope = Effect.runSync(Scope.make())
 const client = await Effect.runPromise(
   LeaderClientModule.make({
     appId,
     profile,
-    spawnLeader: (name) => new Worker(new URL("./leader.worker.ts", import.meta.url), { type: "module", name }),
-    spawnRouter: (name) => new SharedWorker(new URL("./router.worker.ts", import.meta.url), { type: "module", name })
+    // Fault-injection flags (`crashAfterCommit`, `failOpen`) are forwarded to this tab's leader candidate only.
+    spawnLeader: (name) => {
+      const url = new URL("./leader.worker.ts", import.meta.url)
+      for (const flag of ["crashAfterCommit", "failOpen"]) if (params.has(flag)) url.searchParams.set(flag, "")
+      return new Worker(url, { type: "module", name })
+    },
+    spawnRouter
   }).pipe(Scope.provide(scope))
 )
 addEventListener("pagehide", () => Effect.runFork(Scope.close(scope, Exit.void)))
@@ -71,15 +80,57 @@ const echo = {
   exec: (sql: string, sqlParams: SqlParams = []) => run(client.exec(sql, sqlParams)),
   enqueue: (envelope: OutboxEnvelope) => run(client.enqueue(envelope)),
   /** Retry on LeaderUnavailable{LeaderLost} — safe because enqueue is idempotent on mutationId. */
-  enqueueRetrying: (envelope: OutboxEnvelope) =>
-    run(
-      client.enqueue(envelope).pipe(
+  /** Resolves `{ ok, value, attempts }`; `attempts > 1` means at least one try ended in `LeaderLost`. */
+  enqueueRetrying: async (envelope: OutboxEnvelope) => {
+    let attempts = 0
+    const outcome = await run(
+      Effect.suspend(() => {
+        attempts++
+        return client.enqueue(envelope)
+      }).pipe(
         Effect.retry({
           times: 50,
           while: (e) => e._tag === "LeaderUnavailable" && e.reason === "LeaderLost"
         })
       )
-    ),
+    )
+    return { ...outcome, attempts }
+  },
+  /** Poll `condition` until it is truthy; returns its value, or `undefined` after `timeoutMs`. */
+  until: async <A>(condition: () => A | Promise<A>, timeoutMs = 15_000): Promise<A | undefined> => {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const value = await condition()
+      if (value) return value
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    return undefined
+  },
+  /**
+   * Cross-tab start barrier: resolves when any other tab calls `release(name)`. BroadcastChannel delivery
+   * is not subject to background-tab timer throttling, unlike a shared wall-clock start time.
+   */
+  barrier: (name: string): Promise<void> =>
+    new Promise((resolve) => {
+      const channel = new BroadcastChannel(`echo-test:${name}`)
+      channel.addEventListener("message", () => {
+        channel.close()
+        resolve()
+      })
+    }),
+  /** Fault injection: replay a leader announcement for `leaderId` to the router, as a delayed relay would. */
+  forgeLeaderAnnouncement: (leaderId: string) => {
+    const router = spawnRouter(`echo:${appId}:${profile}:router`)
+    const channel = new MessageChannel()
+    const announcement: ToRouter = { _tag: "Leader", leaderId, port: channel.port2 }
+    router.port.postMessage(announcement, { transfer: [channel.port2] })
+  },
+  release: (name: string) => {
+    const channel = new BroadcastChannel(`echo-test:${name}`)
+    // oxlint-disable-next-line unicorn/require-post-message-target-origin -- BroadcastChannel has no target origin
+    channel.postMessage("go")
+    channel.close()
+  },
   /** Live query over `statements` (all read in one transaction per emission); collects emissions. */
   subscribe: (statements: ReadonlyArray<string>, tables: ReadonlyArray<string>): Subscription => {
     const sub: Subscription = { emissions: [], ended: undefined, cancel: () => Effect.runFork(Fiber.interrupt(fiber)) }

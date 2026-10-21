@@ -10,6 +10,10 @@ export default defineConfig({
     fs: { allow: [fileURLToPath(new URL("../..", import.meta.url))] }
   },
   // wa-sqlite resolves its .wasm relative to its own module URL; pre-bundling would break that.
-  optimizeDeps: { exclude: ["@effect/wa-sqlite", "@effect/sql-sqlite-wasm"] },
+  // Scan the workers too: otherwise deps first seen when a worker loads trigger a mid-run full page reload.
+  optimizeDeps: {
+    entries: ["index.html", "leader.worker.ts", "router.worker.ts"],
+    exclude: ["@effect/wa-sqlite", "@effect/sql-sqlite-wasm"]
+  },
   worker: { format: "es" }
 })

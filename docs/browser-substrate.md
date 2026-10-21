@@ -42,14 +42,42 @@ per-identity pool directory `echo-sync/<appId>/<profile>`. The protocol is inter
 re-verify `OpfsSqlite.ts` on every `@effect/sql-sqlite-wasm` bump.
 
 Before opening, a new leader waits until every file in its pool accepts a sync access handle: Chromium
-can release a dead worker's handles slightly after its locks.
+can release a dead worker's handles slightly after its locks. After opening the pool it tops it up to
+6 files: the VFS only adds capacity to an *empty* directory, so a candidate that died while creating
+its pool left the next leader with one file and `SQLITE_CANTOPEN` on its first write (found by the
+OPFS-startup-failure scenario).
+
+`OpfsSqlite.open` performs every fallible step (wasm load, pool, `open_v2`) before anything waits on the
+port protocol. `SqliteClient` waits for the host's "ready" uninterruptibly; with `OpfsWorker.run` a host
+that failed to open never sent it, so a failed leader hung forever holding its locks (review P1,
+reproduced with `?app=.`).
+
+## Liveness: a candidate that cannot serve (DESIGN §9)
+
+- Any startup failure (identity rejected, capability missing, pool or database cannot open, migration
+  fails) closes the candidate's scope, which releases the leader and epoch locks, reports `Failed` to its
+  tab, and then ends the worker (`self.close()`), so nothing a half-finished open acquired outside the
+  scope survives. The next queued candidate is elected.
+- Every lock wait is interruptible: `holdLock` aborts its queued Web Locks request on interruption, and a
+  grant that races with the abort is released immediately, so a cancelled waiter never ends up holding
+  the lock. Web Locks rejections surface as a typed `LockError` instead of being swallowed.
+- Identity segments that are all dots (`.`, `..`) are rejected in the tab before anything is spawned.
+
+## Stale announcements
+
+The router accepts a `Leader` announcement only if that leader's epoch lock is held when the
+announcement is processed, and processes announcements one at a time. A dead leader's announcement that
+arrives after its successor's (the relaying tab can be slow) is dropped instead of replacing the live
+route. On the tab side every connection is an object; its handshake and epoch watcher only act while it
+is still the active connection, and a displaced connection completes its `lost` signal (typed
+`LeaderLost` to every in-flight call) before its RPC scope is closed.
 
 ## Handover semantics (DESIGN §16 item 1)
 
 | What | Behavior | Why |
 |---|---|---|
 | Request in flight when the leader dies | Fails with `LeaderUnavailable{reason:"LeaderLost"}` | The tab cannot know whether it committed. |
-| `enqueue` retry after `LeaderLost` | Safe: idempotent on `mutationId` (returns the existing `seq`, allocates none) | Verified across a real handover. |
+| `enqueue` retry after `LeaderLost` | Safe: idempotent on `mutationId`, pending or released (returns the existing `seq`, allocates none) | Verified across a real handover and at the commit-before-lost-response crash point, with two tabs retrying the same id at once. |
 | `exec` retry | Only if the statement is idempotent | Raw SQL, harness/diagnostics only. |
 | Request issued while no leader is connected | Waits for the next leader | Leadership gaps are short (lock queue). |
 | Open `subscribe` stream | **Terminates** with `LeaderUnavailable{LeaderLost}`; the caller re-subscribes | See below. |
@@ -109,17 +137,35 @@ Reproduce: in the harness page, `await echo.exec("CREATE VIRTUAL TABLE t USING f
 
 ## Outbox (`echo_outbox`)
 
-`seq INTEGER PRIMARY KEY AUTOINCREMENT`, `mutation_id UNIQUE`, args as JSON text. Operations: `append`
-(joins the caller's transaction; idempotent on `mutationId`), `pending` (in `seq` order), `remove(seqs)`.
-`enqueue` returns only after the append's transaction has committed. All writes go through the one
-leader connection, so `seq` is total and gap-free across tabs; AUTOINCREMENT never reuses a removed seq.
+`seq INTEGER PRIMARY KEY AUTOINCREMENT`, `mutation_id UNIQUE`, args as JSON text, `released_at`.
+Operations: `append` (joins the caller's transaction; idempotent on `mutationId`), `pending` (unreleased
+rows in `seq` order, with `seq`), `markReleased(seqs)`, `pruneReleased(retention = 24 h)` (run at leader
+startup). `enqueue` returns only after the append's transaction has committed. All writes go through the
+one leader connection, so `seq` is total and gap-free across tabs; AUTOINCREMENT keeps its high-water
+mark in `sqlite_sequence`, so neither release nor pruning lets a seq be reused.
 
-Crash points: a kill before COMMIT leaves no row and no seq bump (journal rollback); a kill after COMMIT
-but before the response leaves the row, and the caller's retry returns it. Rows that fail to decode are
-treated as defects, not caller errors.
+Release marks rather than deletes (DESIGN §9): an `enqueue` retried after `LeaderLost` can arrive after
+the original was pushed, acked and released; the row is still there, so the retry returns the original
+`seq` and inserts nothing. Retries arriving after the retention window would be appended as new intents.
 
-Not yet here: the pull staging table (§8) and the SQLite `RowStore` with `clearAll` (§4, §8). Both depend
-on the `RowStore` interface and `SyncTable` registry from `src/core`, which are not on main yet.
+Crash points: a kill before COMMIT leaves no row and no seq bump (journal rollback; vitest); a kill after
+COMMIT but before the response leaves the row, and the caller's retry returns it (browser scenario with
+injected crash). Rows that fail to decode are treated as defects, not caller errors.
+
+Not yet here: the pull staging table (§8) and the SQLite `ReplicaRowStore` (`purgeScope`, `clearAll`).
+Both depend on the `RowStore`/`ReplicaRowStore` interfaces and the `SyncTable` registry from `src/core`,
+which are not on main yet.
+
+## Tests
+
+`bun run check` runs the vitest invariants (Node; wa-sqlite's memory VFS and Node's own Web Locks):
+
+- `src/client/Outbox.test.ts`: an enqueue retried after release returns the original seq and is not
+  pending; a rolled-back append leaves no row and no seq gap; pruning keeps pending rows and never
+  reuses a seq; rows inside the retention window survive pruning.
+- `src/client/worker/platform.test.ts`: an interrupted lock wait never acquires the lock afterwards (the
+  previous `acquireRelease` implementation hangs on this test); Web Locks rejections surface as
+  `LockError`; all-dot identities are rejected.
 
 ## Running the browser scenarios
 
@@ -129,19 +175,38 @@ bun run spike                          # Vite harness on http://127.0.0.1:5199 (
 examples/browser-spike/scenarios.sh    # drives Chromium with agent-browser; one PASS/FAIL per invariant, non-zero exit on failure
 ```
 
-Each scenario uses a fresh `appId`, so runs are independent. Invariants checked:
+Each scenario uses a fresh `appId`, so runs are independent. No assertion depends on a sleep: every
+check awaits the condition it asserts (`echo.until`), and concurrent phases start from a BroadcastChannel
+barrier (`echo.barrier` / `echo.release`). A wall-clock start time was not a rendezvous: background tabs'
+timers are throttled, so one tab could finish all its enqueues before the other started. Vite scans the
+worker entries up front (`optimizeDeps.entries`) so a cold server does not reload pages mid-run, and the
+script opens a warm-up page first.
+
+Harness-only fault injection (in `examples/browser-spike/leader.worker.ts`, enabled per tab by URL flag):
+`crashAfterCommit` ends that tab's leader worker instead of sending a committed `enqueue` response whose
+mutation id starts with `crash-after-commit`; `failOpen` makes OPFS startup fail when another tab posts on
+`echo-test:fail-open`. `echo.forgeLeaderAnnouncement(id)` replays a leader announcement to the router.
+
+Invariants checked:
 
 1. Single DB owner across 4 tabs (one leader id, exactly one leader tab, every tab served by it).
 2. Single owner after closing the leader tab (the remaining 3 agree on one *new* leader).
-3. Handover: in-flight request → `LeaderLost`; open subscription → `LeaderLost`; a retried `enqueue`
-   converges to exactly one outbox row; replica and outbox persist.
-4. Saved means durable: an enqueued entry is visible after reload; after hard-killing the only tab
+3. Handover: in-flight request → `LeaderLost`; open subscription → `LeaderLost`; an enqueue lost with the
+   leader is retried (≥ 2 attempts) and lands exactly once; replica and outbox persist.
+4. The router ignores a replayed announcement from the dead leader: every tab keeps its live route for 2 s.
+5. Crash after commit: the leader dies after committing an enqueue but before responding, while two tabs
+   enqueue that same `mutationId` simultaneously; both retries return the committed seq, there is one row,
+   and the next new intent gets seq + 1.
+6. OPFS startup failure: the first tab's candidate holds the leader lock while its open is blocked, a
+   second tab queues, the open fails; the second tab becomes leader and serves both.
+7. Saved means durable: an enqueued entry is visible after reload; after hard-killing the only tab
    mid-burst, every `enqueue` that had resolved is present, with contiguous seqs.
-5. Gap-free ordering: 2 tabs × 150 concurrent enqueues produce one contiguous seq range, keep each tab's
-   order, actually interleave (>10 tab switches), and re-enqueueing a `mutationId` returns its original seq.
-6. Reactivity: a live query in one tab re-emits after writes from another tab and converges to the
+8. Gap-free ordering: 2 tabs × 150 concurrent enqueues produce one contiguous seq range, keep each tab's
+   order, actually interleave (> 10 tab switches), and re-enqueueing a `mutationId` returns its original seq.
+9. Reactivity: a live query in one tab re-emits after writes from another tab and converges to the
    final value.
-7. Fallback: without SharedWorker the second tab fails closed; after the owner closes, it takes over.
+10. Fallback: without SharedWorker the second tab fails closed; after the owner closes, it takes over.
+11. Identity `.` is refused with `Unsupported` before anything is opened.
 
 Emission consistency: the invariant is "no write interleaves between the statements of one emission".
 It holds by construction: `subscribe` runs the statement batch in `withTransaction`, which leases the
@@ -151,5 +216,5 @@ by a trigger, but that check still passes with the transaction removed (the read
 already run back to back), so it is a sanity check only.
 
 `window.echo` in the harness page (`status`, `ready`, `info`, `exec`, `enqueue`, `enqueueRetrying`,
-`subscribe`) is the scripting surface; failures come back as values (`{ ok: false, error }`) so scripts
+`subscribe`, `until`, `barrier`, `release`, `forgeLeaderAnnouncement`) is the scripting surface; failures come back as values (`{ ok: false, error }`) so scripts
 can assert on `_tag` / `reason`.
