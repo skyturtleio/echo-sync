@@ -8,6 +8,7 @@ import {
   Effect,
   Layer,
   Option,
+  Predicate,
   PubSub,
   Queue,
   Ref,
@@ -21,7 +22,7 @@ import { RpcSerialization, RpcServer } from "effect/rpc"
 import { SqlClient } from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
 import { AccessScope, Ids, Mutation, Protocol, type Registry, Store } from "echo-sync"
-import { ClientForbidden, type LedgerOptions, registerClient, runBatch } from "./ledger.ts"
+import { type ClientForbidden, type LedgerOptions, registerClient, runBatch } from "./ledger.ts"
 import * as Presence from "./presence.ts"
 import { pull } from "./pull.ts"
 import * as RowStore from "./rowStore.ts"
@@ -97,6 +98,24 @@ const toServerFailure = <E>(
     : Effect.failCause<Exclude<E, SqlError>>(verdict.cause)
 }
 
+/** Matches by `_tag`, as `catchTag` does, so a `ClientForbidden` from another module instance matches too. */
+const isClientForbidden = <E>(e: E | ClientForbidden): e is ClientForbidden => Predicate.isTagged(e, "ClientForbidden")
+
+/**
+ * `ClientForbidden` ⇒ `Unauthorized` with `catchTag`'s semantics (the first failure; any other
+ * cause passes whole). `catchTag` itself does not typecheck over a generic `E`, so this is
+ * `catchFilter` with a tag filter that names the remainder.
+ */
+const mapForbidden = <A, E, R>(
+  self: Effect.Effect<A, E | ClientForbidden, R>
+): Effect.Effect<A, E | Protocol.Unauthorized, R> =>
+  Effect.catchFilter<A, E | ClientForbidden, R, ClientForbidden, never, Protocol.Unauthorized, never, E>(
+    self,
+    (e: E | ClientForbidden): Result.Result<ClientForbidden, E> =>
+      isClientForbidden(e) ? Result.succeed(e) : Result.fail(e),
+    (e: ClientForbidden) => Effect.fail(forbidden(e))
+  )
+
 /**
  * The pull/pokes failure mapping (DESIGN §6), for any transport: infrastructure (`SqlError`) ⇒
  * `ServerUnavailable`; a client id bound to another principal (`ClientForbidden`) ⇒
@@ -105,16 +124,31 @@ const toServerFailure = <E>(
 export const serverFailures = <A, E, R>(
   self: Effect.Effect<A, E | ClientForbidden | SqlError, R>
 ): Effect.Effect<A, Exclude<E, SqlError> | Protocol.ServerUnavailable | Protocol.Unauthorized, R> => {
-  type Rest = Exclude<E, SqlError> | Protocol.ServerUnavailable
-  const classified: Effect.Effect<A, Rest | ClientForbidden, R> = Effect.catchCause(self, toServerFailure)
-  // `catchFilter` has `catchTag`'s semantics (first failure; otherwise the whole cause passes),
-  // with a filter that names the remainder so the mapping stays generic.
-  return Effect.catchFilter<A, Rest | ClientForbidden, R, ClientForbidden, never, Protocol.Unauthorized, never, Rest>(
-    classified,
-    (e: Rest | ClientForbidden): Result.Result<ClientForbidden, Rest> =>
-      e instanceof ClientForbidden ? Result.succeed(e) : Result.fail(e),
-    (e: ClientForbidden) => Effect.fail(forbidden(e))
+  const classified: Effect.Effect<A, Exclude<E, SqlError> | Protocol.ServerUnavailable | ClientForbidden, R> =
+    Effect.catchCause(self, toServerFailure)
+  return mapForbidden(classified)
+}
+
+/**
+ * The push failure mapping (DESIGN §6), for any transport, applied over authentication and the
+ * batch together: infrastructure anywhere (a `SqlError` failure or defect, e.g. a session lookup
+ * in `principalFor`) is an empty results list, a transient stop; `ClientForbidden` ⇒
+ * `Unauthorized`; any other defect stays a defect (the client halts push on it). Idempotent, so
+ * it may wrap `executeBatch`, which already applies it.
+ */
+export const pushFailures = <E, R>(
+  self: Effect.Effect<Protocol.PushResponse, E | ClientForbidden | SqlError, R>
+): Effect.Effect<Protocol.PushResponse, Exclude<E, SqlError> | Protocol.Unauthorized, R> => {
+  const classified: Effect.Effect<Protocol.PushResponse, Exclude<E, SqlError> | ClientForbidden, R> = Effect.catchCause(
+    self,
+    (cause) => {
+      const verdict = classifyCause(cause)
+      return verdict._tag === "unavailable"
+        ? Effect.succeed<Protocol.PushResponse>({ results: [] })
+        : Effect.failCause(verdict.cause)
+    }
   )
+  return mapForbidden(classified)
 }
 
 const decodeRole = Schema.decodeUnknownOption(AccessScope.Role)
@@ -324,13 +358,7 @@ export const executeBatch = (
   }).pipe(
     // Infrastructure before the first mutation (catalog read): nothing processed, a
     // transient stop. runBatch already turns infrastructure failures inside it into one.
-    Effect.catchCause((cause) => {
-      const verdict = classifyCause(cause)
-      return verdict._tag === "unavailable"
-        ? Effect.succeed<Protocol.PushResponse>({ results: [] })
-        : Effect.failCause(verdict.cause)
-    }),
-    Effect.catchTag("ClientForbidden", (e) => Effect.fail(forbidden(e)))
+    pushFailures
   )
 
 /**
@@ -348,9 +376,10 @@ export const handlers = (options: SyncServerOptions) =>
       const pokes = yield* Notifications
       return Protocol.SyncRpcs.of({
         push: (request, { headers }) =>
-          Effect.flatMap(options.principalFor(headers), (actor) => executeBatch(options, actor, request)).pipe(
-            Effect.provideService(SqlClient, sql)
-          ),
+          Effect.gen(function* () {
+            const actor = yield* options.principalFor(headers)
+            return yield* executeBatch(options, actor, request)
+          }).pipe(pushFailures, Effect.provideService(SqlClient, sql)),
         pull: (request, { headers }) =>
           Effect.gen(function* () {
             const principalId = yield* options.principalFor(headers)
@@ -371,7 +400,8 @@ export const handlers = (options: SyncServerOptions) =>
             }).pipe(Effect.provideService(SqlClient, sql))
           ).pipe(
             // A lost LISTEN connection ends the stream typed; the client reconnects on any end (§6).
-            Stream.catchCause((cause) => Stream.fromEffect(serverFailures(Effect.failCause(cause))))
+            Stream.catchCause((cause) => Stream.fromEffect(toServerFailure(cause))),
+            Stream.catchTag("ClientForbidden", (e) => Stream.fail(forbidden(e)))
           )
       })
     })

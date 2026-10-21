@@ -22,6 +22,7 @@ export {
   Notifications,
   pokeChannel,
   presenceHandlers,
+  pushFailures,
   serverFailures,
   type SyncServerOptions
 } from "./rpc.ts"

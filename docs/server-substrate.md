@@ -14,7 +14,7 @@ unordered idempotency key, `seq` the client's outbox sequence.
 | `ledger.ts` | `runMutation`, `runBatch`, client↔principal binding |
 | `pull.ts` | `pull(registry, request)` (one page per call), the continuation |
 | `rowStore.ts` | core's `RowStore` on Postgres; declared-column projection and row codec |
-| `rpc.ts` | `handlers` / `presenceHandlers` / `layerHttp`: the RPC groups over HTTP POST + NDJSON, composed from transport-neutral steps: `principalFor` (authorize), `executeBatch` (push for an actor), `pull` (pull.ts), `serverFailures` (pull/pokes failure mapping) |
+| `rpc.ts` | `handlers` / `presenceHandlers` / `layerHttp`: the RPC groups over HTTP POST + NDJSON, composed from transport-neutral steps: `principalFor` (authorize), `executeBatch` (push for an actor), `pull` (pull.ts), `pushFailures` / `serverFailures` (push and pull failure mapping) |
 | `gc.ts` | `collectGarbage(retention)`, `expireLedger({ retention })` |
 
 For how a consumer app wires the server (registry, mutations, app migrations, `Startup.layer`,
@@ -49,16 +49,22 @@ while a stream is open is therefore not detected until that stream reconnects; t
 an expired token is honoured on a live one. The client evaluates `syncHeaders` per request (DESIGN
 §9.1 Credentials), so a reconnect carries the renewed credential. `ClientForbidden` becomes `Unauthorized`.
 
-Composing a transport: `handlers` is three exported seams in order, and another transport (or a
+Composing a transport: `handlers` is exported seams in order, and another transport (or a
 test) composes the same ones without the RPC layer. Authorize with `principalFor(headers)`
-(fails `Unauthorized`). Push is then `executeBatch(options, actor, request)`, failing only
-`Unauthorized | MalformedEnvelope` and never with infrastructure (a SQL failure is a short
-results list). Pull is `pull(registry, { principalId, clientId, cursor, continuation, limit })`
-piped through `serverFailures`, which maps the whole cause: any `SqlError` becomes
-`ServerUnavailable`, `ClientForbidden` becomes `Unauthorized`, `ResnapshotRequired` and
-interrupts pass through, and a non-SQL defect stays a defect. Pokes wraps its stream the same
-way (`Stream.catchCause` into `serverFailures(Effect.failCause(cause))`). All three require
-`SqlClient`.
+(fails `Unauthorized`; requires nothing). Push is `principalFor` then `executeBatch(options,
+actor, request)`, with `pushFailures` over both: it maps the whole cause, so infrastructure
+anywhere, including a `SqlError` from authentication, is an empty results list (a transient
+stop), `ClientForbidden` becomes `Unauthorized`, and a non-SQL defect stays a defect.
+`executeBatch` already applies it (it fails only `Unauthorized | MalformedEnvelope`, never with
+infrastructure), and it is idempotent. Pull is `pull(registry, { principalId, clientId, cursor,
+continuation, limit })` piped through `serverFailures`, which maps the whole cause: any
+`SqlError` becomes `ServerUnavailable`, `ClientForbidden` becomes `Unauthorized` (matched by
+`_tag`, first failure, as `catchTag`), `ResnapshotRequired` and interrupts pass through, and a
+non-SQL defect stays a defect. Pokes applies the same mapping with the Stream operators
+(`Stream.catchCause` into `toServerFailure`, then `Stream.catchTag("ClientForbidden", …)`),
+which, unlike `serverFailures`, reduce a composite typed cause to its first failure.
+`executeBatch` and `pull` require `SqlClient`; the two failure combinators keep their input's
+requirements.
 
 - push: one SERIALIZABLE ledger transaction per mutation (read-modify-write handlers would lose
   updates under READ COMMITTED; `40001` retries the whole attempt), `roleFor` read from `scope_grants` (own grant or

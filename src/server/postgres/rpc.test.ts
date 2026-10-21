@@ -49,12 +49,17 @@ const connectWith = (wrap: (sql: SqlClient) => SqlClient) =>
     return yield* connectTo(Context.add(db, SqlClient, wrap(sql)))
   })
 
-const connectTo = (db: Context.Context<SqlClient | PgClient.PgClient>, heartbeatInterval?: Duration.Input) =>
+const connectTo = (
+  db: Context.Context<SqlClient | PgClient.PgClient>,
+  heartbeatInterval?: Duration.Input,
+  principalFor: () => Effect.Effect<AccessScope.PrincipalId, Protocol.Unauthorized> = () =>
+    Effect.succeed(AccessScope.PrincipalId.make("p"))
+) =>
   Effect.gen(function* () {
     const app = layerHttp({
       registry,
       mutations,
-      principalFor: () => Effect.succeed(AccessScope.PrincipalId.make("p")),
+      principalFor,
       ledger: { conflictRetry: undefined },
       heartbeatInterval
     }).pipe(Layer.provide(Layer.succeedContext(db)))
@@ -164,6 +169,22 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (§6, §8)", () => {
         ledgered.map((r) => r.mutation_id),
         ["m1"]
       )
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
+  it.live("an infrastructure defect in principalFor is a transient stop (empty results), not a push failure", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      yield* writer
+      const db = yield* Effect.context<SqlClient | PgClient.PgClient>()
+      // A session lookup in Postgres whose connection is lost: the pinned client's orDie raises it as a defect.
+      const lost = new SqlError({ reason: new UnknownError({ cause: "session store unreachable" }) })
+      const client = yield* connectTo(db, undefined, () => Effect.die(lost))
+      const exit = yield* Effect.exit(client.push(push([["m1", "ok"]])))
+      if (!Exit.isSuccess(exit)) return assert.fail(`push failed: ${String(exit.cause)}`)
+      assert.deepStrictEqual(exit.value.results, [])
+      const ledgered = yield* sql<{ mutation_id: string }>`SELECT mutation_id FROM echo_sync.mutations`
+      assert.deepStrictEqual(ledgered, [])
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
