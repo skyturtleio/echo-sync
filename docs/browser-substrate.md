@@ -113,9 +113,13 @@ push in flight at that moment:
   reopens the same file.
 - The worker's HTTP push request is abandoned with it. The server may have committed it (ledger row, no
   ack delivered) or not (its transaction rolls back with the dropped connection, or never started).
-- The next leader pushes every unreleased entry. If the first push committed, the ledger answers the
-  repeat with the recorded outcome (§9 idempotency); otherwise it applies now. Either way the entry is
-  acked exactly once and released by the pull that carries the ack (§8 backstop).
+- The next leader resumes reconciliation from the persisted state: it pushes the unreleased entries
+  above `pushedThrough` (which only advances after a push response was received, so an entry whose
+  response was lost is pushed again). If the first push committed, the ledger answers the repeat with
+  the recorded outcome and position (§9 idempotency); otherwise it applies now. Execution on the server
+  is exactly once; ack delivery is not (the same outcome may arrive in a push response and in a pull).
+  The entry stays pending, and counted in `pendingMutations`, until the pull that installs its ack
+  releases it (§8 backstop).
 
 Evidence: slice scenario S5 (`slice.sh`, "leader closed while its push is held on the server") closes the
 owning tab while its push is parked at a server gate inside the ledger transaction. The successor sends
@@ -217,7 +221,9 @@ tables and replica schema, one transaction) and builds `Engine.make` over the SQ
 - `syncStatus` is `{ push, lastError, pendingMutations, lastSyncedAt, phase, nextRetryAt }` (DESIGN §9.1).
   `pendingMutations` is a recount of unreleased `echo_outbox` rows taken under the storage permit after
   every write to that table (`SqliteSyncStorage.pendingCount`, reactive on the connection's update hook),
-  so it follows each enqueue and release, not only cycle ends, and cannot drift. `lastSyncedAt` is set by a
+  so it follows each enqueue and release, not only cycle ends, and cannot drift. A leader publishes no
+  status until its first count has landed (a status before it could only claim 0 pending writes), so
+  across a handover the tab keeps the previous leader's last emission until the new leader has counted. `lastSyncedAt` is set by a
   cycle whose push finished cleanly and whose pull installed a `PullDone`; it is in memory, so a new leader
   starts at `null`. `phase` is set by the loop (`pushing`, `pulling`, `backoff` with `nextRetryAt`, `idle`).
   `requestSync` offers to the loop's sliding wake queue: during backoff it cuts the wait short, and it

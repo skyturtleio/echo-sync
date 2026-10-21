@@ -74,7 +74,11 @@ it.live("an enqueue cancelled while its COMMIT runs still wakes the loop: the en
       ...engine,
       pull: Effect.ensuring(engine.pull, Deferred.succeed(pulled, undefined))
     }
-    const loop = yield* SyncLoop.make({ engine: observed, isFatalPush: () => false })
+    const loop = yield* SyncLoop.make({
+      engine: observed,
+      isFatalPush: () => false,
+      pendingMutations: real.pendingCount
+    })
     yield* Effect.forkChild(loop.run)
     yield* Deferred.await(pulled)
 
@@ -518,7 +522,9 @@ const replicaDb = Effect.gen(function* () {
 const syncLeader = (
   db: Effect.Success<typeof replicaDb>,
   transport: Engine.Transport<Integrity | Offline>,
-  retryDelay: "1 second" | "1 hour" = "1 second"
+  retryDelay: "1 second" | "1 hour" = "1 second",
+  /** Holds back the first durable count (a slow or busy store) until it completes. */
+  countGate: Effect.Effect<void> = Effect.void
 ) =>
   Effect.gen(function* () {
     const storage = SqliteSyncStorage.make(db.sql, queryRegistry)
@@ -533,7 +539,7 @@ const syncLeader = (
     const loop = yield* SyncLoop.make({
       engine,
       isFatalPush: (e) => e instanceof Integrity,
-      pendingMutations: storage.pendingCount,
+      pendingMutations: Stream.unwrap(Effect.as(countGate, storage.pendingCount)),
       retryDelay,
       maxRetryDelay: "1 hour"
     })
@@ -645,10 +651,19 @@ it.live(
       // The tab sees the loss first (as LeaderClient's epoch watch reports it), then the leader's scope ends.
       yield* Deferred.succeed(lost, undefined)
       yield* Scope.close(first, Exit.void)
-      yield* Deferred.succeed(leader2, yield* syncLeader(db, transport))
+      yield* Effect.sleep("50 millis")
+      yield* Queue.clear(emissions)
+      // The successor's first durable count is slow. Until it lands, the tab must keep the old leader's
+      // last emission: a status from the new leader now could only claim 0 pending writes.
+      const counted = yield* Deferred.make<void>()
+      yield* Deferred.succeed(leader2, yield* syncLeader(db, transport, "1 second", Deferred.await(counted)))
+      yield* Effect.sleep("300 millis")
+      expect(yield* Queue.clear(emissions)).toEqual([])
+      expect(yield* Deferred.isDone(ended)).toBe(false)
+      yield* Deferred.succeed(counted, undefined)
       // The new leader's first status (lastSyncedAt null: nothing synced in this leader) counts m2.
-      const fresh = yield* awaitStatus(emissions, (s) => s.lastSyncedAt === null)
-      expect(fresh.pendingMutations).toBe(1)
+      const fresh = yield* Queue.take(emissions).pipe(Effect.timeout("5 seconds"))
+      expect([fresh.pendingMutations, fresh.lastSyncedAt]).toEqual([1, null])
       expect(opens).toBe(2)
       expect(yield* Deferred.isDone(ended)).toBe(false)
     }).pipe(Effect.scoped)
@@ -685,4 +700,77 @@ it.live("requestSync during backoff runs the next cycle at once and leaves a hal
     expect(after.push._tag).toBe("Halted")
     expect(calls.push).toBe(1)
   }).pipe(Effect.scoped)
+)
+
+it.live(
+  "a push whose response is lost keeps the entry pending until the pull installs its ack, and that cycle sets no lastSyncedAt",
+  () =>
+    Effect.gen(function* () {
+      const db = yield* replicaDb
+      const pulls = yield* Queue.unbounded<ReadonlyArray<string>>()
+      // The server: records each mutation once (ledger), answers a resubmission with the recorded position.
+      const recorded = new Map<string, number>()
+      let pushes = 0
+      let next = 100
+      let cursor = 1
+      const transport: Engine.Transport<Integrity | Offline> = {
+        push: (request) =>
+          Effect.suspend(() => {
+            pushes++
+            const results = request.mutations.map((m) => {
+              const at = recorded.get(m.mutationId) ?? ++next
+              recorded.set(m.mutationId, at)
+              return { mutationId: m.mutationId, position: String(at), outcome: { _tag: "Applied" } }
+            })
+            // The first push that carries a mutation commits on the server, then its response is lost.
+            return pushes === 1 ? Effect.fail(new Offline()) : Effect.succeed(decodePush({ results }))
+          }),
+        pull: () =>
+          Effect.map(Queue.take(pulls), (acked) => {
+            const acks = acked.map((id) => ({
+              mutationId: id,
+              position: String(recorded.get(id) ?? 0),
+              outcome: { _tag: "Applied" }
+            }))
+            cursor = Math.max(cursor, ...acked.map((id) => recorded.get(id) ?? 0))
+            return decodeDone({ _tag: "PullDone", changes: [], acks, nextCursor: String(cursor), expiredThrough: 0 })
+          })
+      }
+      const client = yield* syncLeader(db, transport)
+      const api = tabApi(passThrough(client))
+      const emissions = yield* Queue.unbounded<SyncLoop.SyncStatus>()
+      const log: Array<SyncLoop.SyncStatus> = []
+      yield* Effect.forkScoped(
+        Stream.runForEach(api.syncStatus, (s) =>
+          Effect.andThen(
+            Effect.sync(() => log.push(s)),
+            Queue.offer(emissions, s)
+          )
+        )
+      )
+      // Cycle 1 (empty outbox) syncs cleanly: lastSyncedAt T1.
+      yield* awaitStatus(emissions, (s) => s.phase === "pulling")
+      yield* Queue.offer(pulls, [])
+      const t1 = (yield* awaitStatus(emissions, (s) => s.lastSyncedAt !== null)).lastSyncedAt
+      yield* client.enqueue({
+        envelope: { mutationId: Ids.MutationId.make("m1"), name: "raw.add", args: { id: "m1" } }
+      })
+      // Cycle 2: the push reaches the server but its response is lost; the pull installs nothing for m1.
+      yield* awaitStatus(emissions, (s) => s.phase === "pulling" && s.pendingMutations === 1)
+      const from = log.findIndex((s) => s.pendingMutations === 1)
+      yield* Queue.offer(pulls, [])
+      const failed = yield* awaitStatus(emissions, (s) => s.phase === "backoff")
+      expect([failed.pendingMutations, failed.lastSyncedAt, failed.lastError === null]).toEqual([1, t1, false])
+      // Cycle 3 (after the backoff): the resubmission is answered from the ledger, still not installed.
+      yield* awaitStatus(emissions, (s) => s.phase === "pulling" && pushes === 2)
+      expect(recorded.size).toBe(1)
+      const beforeAck = log.length
+      yield* Queue.offer(pulls, ["m1"])
+      const released = yield* awaitStatus(emissions, (s) => s.pendingMutations === 0)
+      // Every status between the enqueue and the authoritative ack's install counted m1.
+      expect(log.slice(from, beforeAck).map((s) => s.pendingMutations)).toEqual(log.slice(from, beforeAck).map(() => 1))
+      expect(log.slice(from, beforeAck).every((s) => s.lastSyncedAt === t1)).toBe(true)
+      const done = released.lastSyncedAt ?? (yield* awaitStatus(emissions, (s) => s.lastSyncedAt !== t1)).lastSyncedAt
+      expect(done ?? 0).toBeGreaterThan(t1 ?? Number.POSITIVE_INFINITY)
+    }).pipe(Effect.scoped)
 )

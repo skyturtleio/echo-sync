@@ -1,8 +1,8 @@
 import { expect, it } from "@effect/vitest"
-import { Cause, Clock, Effect, Queue, Schema, Stream } from "effect"
+import { Cause, Clock, Deferred, Effect, Fiber, Queue, Schema, Stream } from "effect"
 import { RpcClientError } from "effect/rpc"
 import { TestClock } from "effect/testing"
-import { Ids, Protocol } from "echo-sync"
+import { Errors, Ids, Protocol } from "echo-sync"
 import * as Engine from "./Engine.ts"
 import * as SyncLoop from "./SyncLoop.ts"
 import * as Transport from "./Transport.ts"
@@ -37,10 +37,68 @@ const element = (tag: "poke" | "heartbeat"): typeof Protocol.PokesElement.Type =
 const poke = element("poke")
 const heartbeat = element("heartbeat")
 
+/** A pending count that is 0 and never changes. */
+const noPending = Stream.concat(Stream.make(0), Stream.never)
+
+it.effect(
+  "status and changes wait for the first real pending count; a failed first count emits nothing until a retry counts",
+  () =>
+    Effect.gen(function* () {
+      const { engine } = fakeEngine(() => undefined)
+      let attempts = 0
+      // The first count fails (as a busy store can); the retry, a second later, counts 3.
+      const pendingMutations = Stream.unwrap(
+        Effect.sync(() =>
+          ++attempts === 1
+            ? Stream.fail(new Errors.StoreUnavailable({ message: "busy" }))
+            : Stream.concat(Stream.make(3), Stream.never)
+        )
+      )
+      const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations })
+      const seen: Array<number> = []
+      yield* Effect.forkChild(
+        Stream.runForEach(loop.changes, (s) => Effect.sync(() => void seen.push(s.pendingMutations)))
+      )
+      const read = yield* Effect.forkChild(loop.status)
+      yield* Effect.forkChild(loop.run)
+      yield* settle
+      // A cycle has run, but nothing may claim a count yet: a reader would see "no pending writes".
+      expect(seen).toEqual([])
+      expect(read.pollUnsafe()).toBeUndefined()
+      yield* TestClock.adjust("1 second")
+      yield* settle
+      expect(seen).toEqual([3])
+      expect((yield* Fiber.join(read)).pendingMutations).toBe(3)
+    })
+)
+
+it.effect("a delayed first pending count holds back status and changes until it arrives; no seed 0 leaks", () =>
+  Effect.gen(function* () {
+    const { engine } = fakeEngine(() => undefined)
+    const gate = yield* Deferred.make<void>()
+    const pendingMutations = Stream.unwrap(Effect.as(Deferred.await(gate), Stream.concat(Stream.make(2), Stream.never)))
+    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations })
+    const seen: Array<number> = []
+    yield* Effect.forkChild(
+      Stream.runForEach(loop.changes, (s) => Effect.sync(() => void seen.push(s.pendingMutations)))
+    )
+    yield* Effect.forkChild(loop.run)
+    yield* settle
+    yield* TestClock.adjust("10 seconds")
+    yield* settle
+    // Cycles ran and moved the phase, but the count is unknown: nothing may be published.
+    expect(seen).toEqual([])
+    yield* Deferred.succeed(gate, undefined)
+    yield* settle
+    expect(seen).toEqual([2])
+    expect((yield* loop.status).pendingMutations).toBe(2)
+  })
+)
+
 it.effect("an integrity error halts push for good while pull keeps running", () =>
   Effect.gen(function* () {
     const { engine, calls } = fakeEngine(() => malformed())
-    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush })
+    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations: noPending })
     yield* Effect.forkChild(loop.run)
     yield* settle
     expect((yield* loop.status).push).toEqual({ _tag: "Halted", message: "MalformedEnvelope: bad envelope" })
@@ -66,7 +124,7 @@ it.effect("an integrity error halts push for good while pull keeps running", () 
 it.effect("a transient push failure is retried with backoff and clears once a cycle succeeds", () =>
   Effect.gen(function* () {
     const { engine, calls } = fakeEngine((attempt) => (attempt < 2 ? new Offline() : undefined))
-    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush })
+    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations: noPending })
     yield* Effect.forkChild(loop.run)
     yield* settle
     expect(calls.push).toBe(1)
@@ -95,7 +153,7 @@ it.effect("lastSyncedAt stays null after a cycle whose pull failed, and is set b
       pull: Effect.suspend(() => (++calls.pull === 1 ? Effect.fail(new Offline()) : Effect.void))
     }
     yield* TestClock.adjust("5 seconds")
-    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush })
+    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations: noPending })
     yield* Effect.forkChild(loop.run)
     yield* settle
     // The push completed but nothing was installed: not a sync.
@@ -127,7 +185,7 @@ it.effect(
           return Effect.die(new Error("bad page"))
         })
       }
-      const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush })
+      const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations: noPending })
       const fiber = yield* Effect.forkChild(loop.run)
       yield* settle
       const status = yield* loop.status
@@ -154,7 +212,7 @@ it.effect("a transient failure alone (RpcClientError) is retried, never halts", 
       }),
       pull: Effect.void
     }
-    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush })
+    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations: noPending })
     yield* Effect.forkChild(loop.run)
     yield* settle
     yield* TestClock.adjust("1 second")
@@ -180,7 +238,7 @@ it.effect("a pull that fails with MalformedChange is retried with backoff and ne
           : Effect.void
       })
     }
-    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush })
+    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations: noPending })
     yield* Effect.forkChild(loop.run)
     yield* settle
     const failed = yield* loop.status

@@ -9,7 +9,7 @@
  * exportable. The engine writes nothing durable when its transport fails, so classifying in the caller
  * (who owns the transport's error union) loses nothing.
  */
-import { Cause, Clock, Duration, Effect, Exit, Option, Queue, Schema, Stream, SubscriptionRef } from "effect"
+import { Cause, Clock, Deferred, Duration, Effect, Exit, Option, Queue, Schema, Stream, SubscriptionRef } from "effect"
 import type { Errors } from "echo-sync"
 import type * as Engine from "./Engine.ts"
 
@@ -77,10 +77,11 @@ export const make = <TE>(options: {
   readonly maxRetryDelay?: Duration.Input
   /**
    * The current count of unreleased outbox entries, then the count after every outbox write (the leader
-   * passes a reactive count over `echo_outbox`). Followed while `run` runs; a failure restarts it after
-   * a second. Without it `pendingMutations` stays 0.
+   * passes a reactive count over `echo_outbox`). Required. Followed while `run` runs; a failure restarts it after
+   * a second. `status` and `changes` wait for its first value: a status with an unknown count would tell
+   * a consumer there are no pending writes (DESIGN §9.1).
    */
-  readonly pendingMutations?: Stream.Stream<number, Errors.StoreUnavailable>
+  readonly pendingMutations: Stream.Stream<number, Errors.StoreUnavailable>
 }): Effect.Effect<SyncLoop> =>
   Effect.gen(function* () {
     const { engine } = options
@@ -97,6 +98,8 @@ export const make = <TE>(options: {
     const setPhase = (phase: SyncPhase, nextRetryAt: number | null = null) =>
       SubscriptionRef.update(status, (s) => ({ ...s, phase, nextRetryAt }))
     const wakes = yield* Queue.sliding<void>(1)
+    // Completed once `pendingMutations` holds a real count; nothing reads the status before that.
+    const counted = yield* Deferred.make<void>()
 
     /** One push+pull cycle; returns whether it hit a transient failure. */
     const cycle = Effect.gen(function* () {
@@ -138,16 +141,17 @@ export const make = <TE>(options: {
       return Option.isSome(transient)
     })
 
-    const followPending =
-      options.pendingMutations === undefined
-        ? Effect.void
-        : Stream.runForEach(options.pendingMutations, (n) =>
-            SubscriptionRef.update(status, (s) => ({ ...s, pendingMutations: n }))
-          ).pipe(
-            Effect.catchCause((cause) => Effect.logWarning("echo-sync: pending count failed; restarting", cause)),
-            Effect.andThen(Effect.sleep("1 second")),
-            Effect.forever
-          )
+    const followPending = Stream.runForEach(options.pendingMutations, (n) =>
+      // The count is in the ref before readers are let in, so their first (replayed) value carries it.
+      Effect.andThen(
+        SubscriptionRef.update(status, (s) => ({ ...s, pendingMutations: n })),
+        Deferred.succeed(counted, undefined)
+      )
+    ).pipe(
+      Effect.catchCause((cause) => Effect.logWarning("echo-sync: pending count failed; restarting", cause)),
+      Effect.andThen(Effect.sleep("1 second")),
+      Effect.forever
+    )
 
     const run = Effect.gen(function* () {
       yield* Effect.forkChild(followPending)
@@ -169,8 +173,9 @@ export const make = <TE>(options: {
 
     return {
       wake: Effect.asVoid(Queue.offer(wakes, undefined)),
-      status: SubscriptionRef.get(status),
-      changes: SubscriptionRef.changes(status),
+      // Both wait for the first count, which `run` produces: a reader before `run` waits, never deadlocks it.
+      status: Effect.andThen(Deferred.await(counted), SubscriptionRef.get(status)),
+      changes: Stream.unwrap(Effect.as(Deferred.await(counted), SubscriptionRef.changes(status))),
       run
     }
   })
