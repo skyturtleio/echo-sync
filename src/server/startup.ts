@@ -29,7 +29,10 @@ export const prepare = (options: Pick<StartupOptions, "registry" | "appMigration
       if (table === ScopeGrants.ScopeGrants) continue
       // A table the app migrations did not create is not attached here: attach would fail with a
       // bare SqlError. verify then reports it as "table does not exist" in the same Drift as
-      // every other mismatch.
+      // every other mismatch. The guard resolves the relation exactly as `attach(table)` without a
+      // schema does (schema.ts: `quote_ident(name)::regclass`) and as verify's unattached
+      // fallback does (`to_regclass(quote_ident(name))`): unqualified, through `search_path`,
+      // same quoting. `to_regclass` only returns NULL where `::regclass` raises.
       const [found] = yield* sql<{
         exists: boolean
       }>`SELECT to_regclass(quote_ident(${table.name})) IS NOT NULL AS exists`
