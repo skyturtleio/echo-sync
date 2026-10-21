@@ -1,18 +1,53 @@
 # Server substrate (Postgres)
 
-`src/server/postgres` implements DESIGN.md §4, §6, §7, §8 on plain Postgres. It does not depend
-on the core types yet. It works on table names and rows shaped
-`id text primary key, access_scope_id text not null, …`. A mutation body is an
-`Effect<void, MutationRejected | SqlError, R>`. The envelope is
+`src/server/postgres` implements DESIGN.md §4, §6, §7, §8 on plain Postgres, against core's types
+(`import { … } from "echo-sync"`). Synced tables are `SyncTable`s: the app creates each relation
+from `table.postgres.createTable` and calls `attach(table)`. A mutation body is an
+`Effect<void, MutationRejection | StoreUnavailable | SqlError, R>`; the RPC adapter builds it from
+`Mutation.run` over `Store.make(RowStore)`. The ledger envelope is
 `{ principalId, clientId, mutationId: string, seq: bigint }` (DESIGN §6): `mutationId` is the
 unordered idempotency key, `seq` the client's outbox sequence.
 
 | module | what it owns |
 |---|---|
-| `migrations/001_engine.ts`, `schema.ts` | engine schema (run via `PgMigrator`, history in `echo_sync.migrations`), `attach(table)`, catalog discovery of synced tables |
+| `migrations/001_engine.ts`, `schema.ts` | engine schema (run via `PgMigrator`, history in `echo_sync.migrations`), `attach(SyncTable)`, catalog discovery, `resolveTables(registry)` |
 | `ledger.ts` | `runMutation`, `runBatch`, client↔principal binding |
-| `pull.ts` | `pull` (one page per call), `PullContinuation` |
+| `pull.ts` | `pull(registry, request)` (one page per call), the continuation |
+| `rowStore.ts` | core's `RowStore` on Postgres; declared-column projection and row codec |
+| `rpc.ts` | `handlers` / `layerHttp`: `Protocol.SyncRpcs` over HTTP POST + NDJSON |
 | `gc.ts` | `collectGarbage(retention)` |
+
+## Wire rows: declared columns through the table's codec
+
+Every row that leaves the server, from a walk or from the log, is `SELECT <declared columns>`
+decoded through `table.postgres.row` (DESIGN §11). Its decoded side is the wire row: snake_case
+column keys, timestamps as epoch ms, int8 as a number, jsonb as is, every declared key present.
+A column the app added to the relation but not to the SyncTable never leaves the database, and
+there is one definition of the encoding (core's). Writes go the other way: each wire value is
+encoded through `column.postgres`, jsonb bound with `PgTypes.jsonb`. A stored row that fails to
+decode is a defect. Tested: a table with a timestamp and an undeclared column (walk and log
+paths), and `RowStore.range` against core's reference predicate and order (code-point text,
+NULLS FIRST ascending).
+
+Only registry tables that are attached are synced (`resolveTables`). A captured relation outside
+the registry is skipped; its log entries arrive as tombstones, never as payloads.
+
+## RPC adapter
+
+`layerHttp({ registry, mutations, principalFor, path = "/sync" })` mounts `Protocol.SyncRpcs`
+with `RpcServer.layerHttp({ protocol: "http" })` and `RpcSerialization.layerNdjson`, the
+transport the browser speaks. `principalFor(headers)` is the app's authentication; the principal
+is never read from the payload. `ClientForbidden` becomes `Unauthorized`.
+
+- push: one ledger transaction per mutation, `roleFor` read from `scope_grants` (own grant or
+  `*`) inside it, `now` from the Clock, `random` = `seededRandom(clientId, mutationId)`. Every
+  infrastructure failure (connection, pool, `40001` after the bounded retry, the catalog read
+  before the batch) is a short results list, never a defect: the client halts push on any
+  defect (§6). Tested with a real connection kill mid-batch over HTTP.
+- pull: the pull error union has no transient member, so an infrastructure failure there is a
+  defect (open question, see the report).
+- pokes: `LISTEN echo_sync`. `next_position()` runs `pg_notify('echo_sync', '')`, which Postgres
+  delivers at commit and coalesces per transaction. The stream carries no data.
 
 ## Engine state
 
@@ -37,9 +72,12 @@ unordered idempotency key, `seq` the client's outbox sequence.
 - `echo_sync_capture_changes()`: row trigger. A delete, a scope move, or a primary-key change
   writes a `delete` entry for the old identity and scope. An insert or update writes an `upsert`
   entry for the new one. A statement trigger makes `TRUNCATE` raise.
-- `scope_grants` is a synced table (DESIGN v0.2). Its id is derived by core from
-  `(access_scope_id, principal_id)`, which is also unique here. It has the same trigger as any
-  synced table, so a grant row is logged inside the scope it grants.
+- `scope_grants` is core's system SyncTable. Migration 001 creates it from
+  `ScopeGrants.postgres.createTable` / `createIndexes` (so `UNIQUE (access_scope_id,
+  principal_id)` has one definition) inside `echo_sync`, then adds what the SyncTable cannot
+  express: the FK to `access_scopes ON DELETE CASCADE`, a role CHECK, and a principal index. A
+  later change to ScopeGrants' storage shape needs its own migration, like any SyncTable. It has
+  the same trigger as any synced table, so a grant row is logged inside the scope it grants.
 - `engine_state.gc_horizon`: the only engine fact that cannot be derived from other tables.
 - `clients.expired_through` / `expired_position` (default 0): the §16.5 expiry floor and the
   position of the highest expired ledger row. No v1 job raises them.
@@ -58,30 +96,30 @@ returns, so that is a defect (tested). In one transaction:
    and then sees its ledger row. The body of a duplicate never runs, even in an aborted
    attempt, and an app-level unique violation in a duplicate's body can't mask the winner's
    outcome.
-2. `seq ≤ expired_through` ⇒ `Rejected{clientExpired}` at `expired_position`. The body is not
+2. `seq ≤ expired_through` ⇒ `Rejected{ClientExpired}` at `expired_position`. The body is not
    run, and nothing is recorded or allocated.
 3. A known `(client_id, mutation_id)` ⇒ the recorded outcome and its original position.
-4. Otherwise: run the body inside a savepoint, so a `MutationRejected` rolls back its writes;
+4. Otherwise: run the body inside a savepoint, so a rejection rolls back its writes;
    then insert the ledger row with `next_position()` `RETURNING position`; then commit. The
    ledger position is allocated after the body's log entries and under the same lock, so a
    mutation that writes nothing still gets an ack position.
 
 Lock order is client row, then engine lock, everywhere, so the two can't deadlock.
 
-`seq < 1` is a malformed envelope (`MalformedEnvelope`), checked before anything else: nothing
+`seq < 1` is a malformed envelope (core's `Protocol.MalformedEnvelope`), checked before anything else: nothing
 runs and nothing is recorded. `runBatch` checks every item first, so one bad item rejects the
 whole push. Without this guard, `seq ≤ 0` would fall under the default floor 0 and be answered
-`clientExpired` although it was never processed.
+`ClientExpired` although it was never processed. Core's `Seq` already refuses it on the wire.
 
 Failures are classified over the whole `Cause`, never by its first reason, with precedence
 defect > transient > rejection (DESIGN §6):
 - any defect or interruption anywhere ⇒ die with the full cause (typed failures turned into
   defects): never retried, never ledgered, never reported transient;
-- otherwise any SQL failure anywhere ⇒ transient. The transaction could not have committed, so
+- otherwise any SQL failure or `StoreUnavailable` anywhere ⇒ transient. The transaction could not have committed, so
   a rejection in the same cause is not trusted. A conflict (`40001`, deadlock) is retried; when
   the retries run out, or the failure is a connection error, the batch stops as
   `MutationTransient` with nothing ledgered;
-- a rejection is ledgered only when the body's cause consists solely of `MutationRejected`.
+- a rejection is ledgered only when the body's cause consists solely of `MutationRejection`s.
 
 One interpretation to note: a defect carrying a `SqlError` is the pinned `SqlClient`'s way of
 reporting a failed savepoint or rollback cleanup on a dead connection. It counts as transient,
@@ -133,13 +171,13 @@ to know which scopes the client already holds. It looks that up in `client_scope
 position. At each `PullDone` it records the set it just completed under `nextCursor`. Each page
 then:
 
-1. purges (`ScopePurged`) every held scope that is no longer readable;
+1. purges (`scopePurged`) every held scope that is no longer readable;
 2. starts a row walk for every readable scope that is not held. Initial sync is the same thing
    starting from an empty set, with the log position equal to `head` at the first page;
 3. continues outstanding walks, keyset-paged by `(table name, id::text COLLATE "C")`;
 4. once no walk is outstanding, reads log entries `> position` in readable scopes. Payloads
    come from the same snapshot. An entry whose row is gone, or whose row's current scope is not
-   readable, becomes a `Delete`, so no payload ever leaves a readable scope.
+   readable, becomes a `tombstone`, so no payload ever leaves a readable scope.
 
 Why not replay grant log entries? A replay has to reconstruct readability at the cursor from
 history, and history is lossy: the log stores identity only, GC deletes it, and a revoke plus a
@@ -271,7 +309,11 @@ done by hand while building this:
 | `attach` DDLs not in one transaction | incomplete-attach test |
 | `attach` accepts an ambient transaction / no READ COMMITTED | REPEATABLE READ attach test |
 | outer `catchTag` + `catchDefect` instead of whole-cause classification | compound-cause test |
-| `catchTag("MutationRejected")` on the body | rejection-plus-defect test |
+| `catchTag` on the body's rejection | rejection-plus-defect test |
 | no `seq ≥ 1` guard | malformed-envelope test |
 | retry only when every reason is a conflict | conflict-plus-rejection retry and exhaustion tests |
 | retry despite a defect in the cause | conflict-plus-defect test |
+| `SELECT t.*` / undecoded payloads | wire-form test, every scope test |
+| `ASC NULLS LAST`, or jsonb not bound as jsonb | RowStore range test |
+| a transient stop turned into a die | connection-lost-mid-batch RPC test |
+| SqlError cleanup defects treated as defects | connection-lost-mid-batch RPC test |
