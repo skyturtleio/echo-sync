@@ -63,9 +63,10 @@ export const Statement = Schema.Struct({ sql: Schema.String, params: SqlParams }
 export type Statement = typeof Statement.Type
 
 /**
- * A raw live query (DESIGN §10's escape hatch): a fixed list of read statements plus the tables they
- * depend on (table-level dependencies). The leader runs it with `PRAGMA query_only` on, so a statement
- * that writes fails and nothing commits. Registered queries (`subscribe`) are the normal read path.
+ * A raw live query, for the dev harness only (served only with `allowRawExec`, like `exec`): a fixed list
+ * of read statements plus the tables they depend on (table-level dependencies). The leader runs it with
+ * `PRAGMA query_only` on, which catches accidental writes but is no security boundary: caller SQL can
+ * switch it off. Registered queries (`subscribe`) are the read path for apps (DESIGN §10.1).
  */
 export const LiveQuery = Schema.Struct({
   statements: Schema.Array(Statement),

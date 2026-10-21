@@ -172,7 +172,8 @@ export const makeHandlers = ({
       liveRuns(reactivity, (watch) =>
         // One read transaction per run: the result and the tables it read are one replica version, and
         // the new dependency set is registered before any later write is admitted (DESIGN §10.1).
-        // Read-only: a handler is handed the full `EchoStore`, and a write must not commit outside the outbox.
+        // Read-only twice over: handlers only get a `ReadStore` projection, and `query_only` stops any write
+        // that reaches the connection anyway, so nothing commits outside the outbox.
         storage
           .transaction(
             readOnly(
@@ -251,8 +252,9 @@ export interface LeaderOptions {
   /** The app's registered queries (DESIGN §10.1); `subscribe` runs them by name. Defaults to none. */
   readonly queries?: Query.QueryRegistry
   /**
-   * Serve the raw `exec` RPC (writes outside the outbox, DESIGN §10.1). Dev harnesses and diagnostics
-   * only; apps never set it. Without it `exec` fails with `RawExecDisabled`.
+   * Serve the raw SQL RPCs, `exec` and `subscribeRaw` (DESIGN §10.1). Dev harnesses and diagnostics only;
+   * apps never set it: raw SQL can write outside the outbox (including by switching `query_only` off), so
+   * this flag, not `query_only`, is the boundary. Without it both fail with `RawExecDisabled`.
    */
   readonly allowRawExec?: boolean
   /**
