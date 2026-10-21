@@ -10,7 +10,7 @@
  * ```
  */
 import * as Effect from "effect/Effect"
-import { type FromRouter, isToRouter, type ToLeader } from "./messages.ts"
+import { type FromRouter, isToRouter, type RouterBroadcast, type ToLeader } from "./messages.ts"
 import * as Platform from "./platform.ts"
 
 export interface SharedWorkerScope {
@@ -21,6 +21,8 @@ export const runRouter = (self: SharedWorkerScope): void => {
   let identity: Platform.ReplicaIdentity | undefined
   let leader: { readonly leaderId: string; readonly port: MessagePort } | undefined
   const tabs = new Map<string, MessagePort>()
+  /** The leader each tab was last linked to (by this instance, or as the tab reported in `Hello`). */
+  const linked = new Map<string, string>()
 
   let announcements: Promise<void> = Promise.resolve()
 
@@ -57,7 +59,9 @@ export const runRouter = (self: SharedWorkerScope): void => {
     })
 
   const link = (tabId: string, tabPort: MessagePort) => {
-    if (leader === undefined) return
+    // A tab already connected to this leader keeps that connection: a second link would displace it.
+    if (leader === undefined || linked.get(tabId) === leader.leaderId) return
+    linked.set(tabId, leader.leaderId)
     const channel = new MessageChannel()
     const connect: ToLeader = { _tag: "Connect", tabId, port: channel.port1 }
     leader.port.postMessage(connect, { transfer: [channel.port1] })
@@ -73,12 +77,28 @@ export const runRouter = (self: SharedWorkerScope): void => {
       if (!isToRouter(data)) return
       switch (data._tag) {
         case "Hello": {
-          identity ??= { appId: data.appId, profile: data.profile }
+          if (identity === undefined) {
+            identity = { appId: data.appId, profile: data.profile }
+            // This instance starts empty: if a previous one died (WebKit ends a SharedWorker with its creating
+            // tab), its tabs still hold ports to it. Tell every tab to reconnect and the leader to re-announce.
+            const channel = new BroadcastChannel(Platform.routerName(identity))
+            const started: RouterBroadcast = { _tag: "RouterStarted" }
+            // oxlint-disable-next-line unicorn/require-post-message-target-origin -- BroadcastChannel has no target origin
+            channel.postMessage(started)
+            channel.close()
+          }
           tabs.set(data.tabId, tabPort)
           const tabId = data.tabId
+          if (data.connectedTo !== null && !linked.has(tabId)) linked.set(tabId, data.connectedTo)
           Effect.runFork(
             Platform.awaitLockReleased(Platform.tabLockName(identity, tabId)).pipe(
-              Effect.andThen(Effect.sync(() => tabs.get(tabId) === tabPort && tabs.delete(tabId))),
+              Effect.andThen(
+                Effect.sync(() => {
+                  if (tabs.get(tabId) !== tabPort) return
+                  tabs.delete(tabId)
+                  linked.delete(tabId)
+                })
+              ),
               Effect.catchCause((cause) => Effect.logError("echo router: watching tab failed", cause))
             )
           )

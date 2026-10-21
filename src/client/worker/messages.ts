@@ -51,7 +51,16 @@ export const isFromLeader = Schema.is(FromLeader)
 
 /** tab → router */
 export const ToRouter = Schema.Union([
-  Schema.TaggedStruct("Hello", { appId: Schema.String, profile: Schema.String, tabId: Schema.String }),
+  /**
+   * Sent on every (re)connect to a router instance. `connectedTo`: the leader this tab already has a live
+   * connection to, if any; the router does not link the tab to that leader again (re-Hello is idempotent).
+   */
+  Schema.TaggedStruct("Hello", {
+    appId: Schema.String,
+    profile: Schema.String,
+    tabId: Schema.String,
+    connectedTo: Schema.NullOr(Schema.String)
+  }),
   /** Sent by the tab whose worker was just elected: `port` reaches that worker. */
   Schema.TaggedStruct("Leader", { leaderId: Schema.String, port: Port })
 ])
@@ -62,6 +71,15 @@ export const isToRouter = Schema.is(ToRouter)
 export const FromRouter = Schema.TaggedStruct("Connected", { leaderId: Schema.String, port: Port })
 export type FromRouter = typeof FromRouter.Type
 export const isFromRouter = Schema.is(FromRouter)
+
+/**
+ * router → every tab, on the BroadcastChannel named `Platform.routerName(identity)`: a router instance
+ * received its first `Hello`. A browser may relaunch the SharedWorker empty (WebKit ends it with its creating
+ * tab), so every tab reconnects and re-sends `Hello`, and the tab whose worker leads re-announces `Leader`.
+ */
+export const RouterBroadcast = Schema.TaggedStruct("RouterStarted", {})
+export type RouterBroadcast = typeof RouterBroadcast.Type
+export const isRouterBroadcast = Schema.is(RouterBroadcast)
 
 /** Minimal shape shared by `MessagePort`, `Worker`, and a dedicated worker's global scope. */
 export interface Endpoint {

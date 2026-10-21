@@ -53,7 +53,7 @@ import {
   type SqlFailure,
   type SqlParams
 } from "./LeaderRpcs.ts"
-import { isFromLeader, isFromRouter, type ToLeader, type ToRouter } from "./messages.ts"
+import { isFromLeader, isFromRouter, isRouterBroadcast, type ToLeader, type ToRouter } from "./messages.ts"
 import * as Platform from "./platform.ts"
 
 export interface LeaderClientConfig extends TabApiOptions {
@@ -539,6 +539,9 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
                 publish(undefined)
               }
               displace(connection)
+              // The router may have died with that leader's tab (WebKit ends a SharedWorker with its creating
+              // tab); reconnecting relaunches it if so, and is a no-op re-Hello on a live router.
+              reconnectRouter()
             })
           ),
           Effect.catchCause((cause) => Effect.logError("echo: watching leader epoch failed", cause))
@@ -564,13 +567,49 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
       )
     }
 
-    const router =
-      mode === "shared-worker" ? config.spawnRouter(`echo:${config.appId}:${config.profile}:router`) : undefined
     const worker = config.spawnLeader(`echo:${config.appId}:${config.profile}:leader-candidate`)
     yield* Scope.addFinalizer(
       scope,
       Effect.sync(() => worker.terminate())
     )
+
+    // The current router SharedWorker; `undefined` in `single-tab` mode. Replaced by `reconnectRouter`.
+    let router: SharedWorker | undefined
+    const onRouterMessage = (event: MessageEvent) => {
+      const message: unknown = event.data
+      if (isFromRouter(message)) connect(message.leaderId, message.port)
+    }
+    /** Announce this tab's worker as leader `leaderId` to the current router, over a fresh port pair. */
+    const announce = (leaderId: string) => {
+      if (router === undefined) return
+      const channel = new MessageChannel()
+      const routerPort: ToLeader = { _tag: "RouterPort", port: channel.port1 }
+      worker.postMessage(routerPort, { transfer: [channel.port1] })
+      const leader: ToRouter = { _tag: "Leader", leaderId, port: channel.port2 }
+      router.port.postMessage(leader, { transfer: [channel.port2] })
+    }
+    /**
+     * (Re)connect to the router and register this tab; the tab whose worker leads re-announces it. Constructing
+     * the SharedWorker relaunches the router if the browser ended it. Idempotent on a live router: `Hello`
+     * names the leader this tab is already connected to, and the router's `accept` fences a re-announcement.
+     * Old router ports stay open: a `Connected` already in flight on one is still delivered.
+     */
+    const reconnectRouter = () => {
+      if (mode !== "shared-worker") return
+      const next = config.spawnRouter(Platform.routerName(identity))
+      next.port.addEventListener("message", onRouterMessage)
+      next.port.start()
+      router = next
+      const hello: ToRouter = {
+        _tag: "Hello",
+        appId: config.appId,
+        profile: config.profile,
+        tabId,
+        connectedTo: active?.leaderId ?? null
+      }
+      next.port.postMessage(hello, { transfer: [] })
+      if (localEpoch !== undefined) announce(localEpoch)
+    }
 
     worker.addEventListener("message", (event) => {
       const message: unknown = event.data
@@ -605,13 +644,10 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
               Effect.catchCause((cause) => Effect.logError("echo: watching this tab's leader epoch failed", cause))
             )
           )
-          const channel = new MessageChannel()
           if (router !== undefined) {
-            const routerPort: ToLeader = { _tag: "RouterPort", port: channel.port1 }
-            worker.postMessage(routerPort, { transfer: [channel.port1] })
-            const leader: ToRouter = { _tag: "Leader", leaderId: message.leaderId, port: channel.port2 }
-            router.port.postMessage(leader, { transfer: [channel.port2] })
+            announce(message.leaderId)
           } else {
+            const channel = new MessageChannel()
             const direct: ToLeader = { _tag: "Connect", tabId, port: channel.port1 }
             worker.postMessage(direct, { transfer: [channel.port1] })
             connect(message.leaderId, channel.port2)
@@ -630,14 +666,16 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
       }
     })
 
-    if (router !== undefined) {
-      router.port.addEventListener("message", (event) => {
-        const message: unknown = event.data
-        if (isFromRouter(message)) connect(message.leaderId, message.port)
+    if (mode === "shared-worker") {
+      const started = new BroadcastChannel(Platform.routerName(identity))
+      started.addEventListener("message", (event) => {
+        if (isRouterBroadcast(event.data)) reconnectRouter()
       })
-      router.port.start()
-      const hello: ToRouter = { _tag: "Hello", appId: config.appId, profile: config.profile, tabId }
-      router.port.postMessage(hello, { transfer: [] })
+      yield* Scope.addFinalizer(
+        scope,
+        Effect.sync(() => started.close())
+      )
+      reconnectRouter()
     }
     const init: ToLeader = { _tag: "Init", appId: config.appId, profile: config.profile, principal: config.principal }
     worker.postMessage(init, { transfer: [] })

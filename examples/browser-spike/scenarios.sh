@@ -489,6 +489,49 @@ return { newLeader: s?.leaderId ?? null, ok: ok === true, latest: latest(), hist
   for t in "$F" "$W"; do ab tab close "$t" >/dev/null; done
 fi
 
+# ── router killed while tabs are connected: every tab is served again ────────────────────────────────
+# WebKit ends the router SharedWorker with its creating tab, and the next `new SharedWorker` starts an empty
+# instance. Here Chromium's DevTools protocol ends it while two tabs are connected; a third tab then relaunches
+# it. The new instance broadcasts RouterStarted, every tab re-sends Hello and the leader tab re-announces.
+# WEBKIT=1 has no CDP; the WebKit handover scenarios (router creator = leader tab closes) cover it there.
+if [ "${WEBKIT:-0}" = 1 ]; then
+  echo "SKIP router killed while tabs connected (Chromium only: needs CDP to end the SharedWorker)"
+else
+  APP="router-kill-$RUN"
+  RA=$(open_tab "$BASE/?app=$APP")
+  ra=$(ev <<<"$SERVED")
+  RB=$(open_tab "$BASE/?app=$APP")
+  rb=$(ev <<<"$SERVED")
+  ev <<<"window.rsub = echo.subscribe(['SELECT 1 AS n'], []); await echo.until(() => rsub.emissions.length >= 1); return true" >/dev/null
+  killed=$(bun "$(dirname "$0")/cdp/kill-router.ts" "$(ab get cdp-url)" "echo:$APP:default:router")
+  RC=$(open_tab "$BASE/?app=$APP")
+  rc=$(ev <<<"$SERVED")
+  ab tab "$RB" >/dev/null
+  rb2=$(ev <<<"const s = await echo.status(); const i = await echo.info()
+return { ...s, served: i.ok ? i.value.leaderId : null, subEnded: rsub.ended ?? null, subEmissions: rsub.emissions.length }")
+  check "router killed while tabs connected: a new tab is served by the same leader; connected tabs keep their connection and open subscription" \
+    "$(jq -nc --argjson k "${killed:-null}" --argjson a "$ra" --argjson b "$rb" --argjson c "$rc" --argjson b2 "$rb2" '
+      { pass: ($k.killed > 0 and $k.left == 0 and $a.leaderId != null and $c.served == $a.leaderId
+               and $b2.leaderId == $a.leaderId and $b2.served == $a.leaderId and $b2.subEnded == null),
+        killed: $k, a: $a, b: $b, c: $c, bAfter: $b2 }')"
+  # Then the leader tab closes: the survivors (one of them the relaunched router's creator) agree on a new leader.
+  RL=$(jq -r --arg a "$RA" --arg b "$RB" 'if .isLeaderTab then $a else $b end' <<<"$ra")
+  ab tab close "$RL" >/dev/null
+  after="[]"
+  for t in "$RA" "$RB" "$RC"; do
+    [ "$t" = "$RL" ] && continue
+    ab tab "$t" >/dev/null
+    s=$(ev <<<"const old = $(jq '.leaderId' <<<"$ra")
+await echo.until(async () => { const s = await echo.status(); const i = await echo.info(); return s.leaderId !== undefined && s.leaderId !== old && i.ok && i.value.leaderId === s.leaderId })
+const s = await echo.status(); const i = await echo.info(); return { ...s, served: i.ok ? i.value.leaderId : null }")
+    after=$(jq -c --argjson s "$s" '. + [$s]' <<<"$after")
+  done
+  check "router killed, then the leader tab closes: both remaining tabs are served by one new leader" "$(jq -c --arg old "$(jq -r '.leaderId' <<<"$ra")" '
+    { pass: (((map(.leaderId) | unique) as $ids | ($ids | length) == 1 and $ids[0] != $old and $ids[0] != null)
+            and (map(select(.isLeaderTab)) | length) == 1 and all(.[]; .served == .leaderId)), statuses: . }' <<<"$after")"
+  for t in "$RA" "$RB" "$RC"; do [ "$t" = "$RL" ] || ab tab close "$t" >/dev/null; done
+fi
+
 # ── identities that would escape the storage namespace are refused up front ──────────────────────────
 D=$(open_tab "$BASE/?app=.")
 check "identity '.' is refused with LeaderUnavailable{Unsupported}, nothing is opened" "$(ev <<<'const r = await echo.info(); const s = await echo.status()

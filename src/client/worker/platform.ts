@@ -79,6 +79,9 @@ export const validateIdentity = (identity: ReplicaIdentity): string | undefined 
 export const poolDirectory = ({ appId, profile }: ReplicaIdentity): string => `echo-sync/${appId}/${profile}`
 
 /** Exclusive lock held by exactly one leader worker per replica for its whole lifetime. */
+/** Name of the router SharedWorker and of the BroadcastChannel its instances announce themselves on. */
+export const routerName = ({ appId, profile }: ReplicaIdentity): string => `echo:${appId}:${profile}:router`
+
 export const leaderLockName = ({ appId, profile }: ReplicaIdentity): string => `echo:${appId}:${profile}:leader`
 
 /** Held exclusively by one specific leader incarnation; acquiring it in shared mode == "that leader is gone". */
