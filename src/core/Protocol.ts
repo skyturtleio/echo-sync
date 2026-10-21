@@ -105,6 +105,14 @@ export class MalformedEnvelope extends Schema.TaggedError<MalformedEnvelope>()("
   message: Schema.String
 }) {}
 
+/**
+ * Transient server infrastructure failure on `pull` or `pokes` (DESIGN §6): retry with backoff.
+ * A defect from the server is always a bug; push reports this case as a short result list.
+ */
+export class ServerUnavailable extends Schema.TaggedError<ServerUnavailable>()("ServerUnavailable", {
+  message: Schema.String
+}) {}
+
 /** A hint that something may have changed; never data (DESIGN §8). */
 export const Poke = Schema.Struct({})
 
@@ -117,7 +125,12 @@ export const SyncRpcs = RpcGroup.make(
   Rpc.make("pull", {
     payload: PullRequest,
     success: PullResponse,
-    error: Schema.Union([ResnapshotRequired, Unauthorized])
+    error: Schema.Union([ResnapshotRequired, ServerUnavailable, Unauthorized])
   }),
-  Rpc.make("pokes", { payload: { clientId: ClientId }, success: Poke, error: Unauthorized, stream: true })
+  Rpc.make("pokes", {
+    payload: { clientId: ClientId },
+    success: Poke,
+    error: Schema.Union([ServerUnavailable, Unauthorized]),
+    stream: true
+  })
 )
