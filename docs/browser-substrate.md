@@ -170,6 +170,10 @@ whose database header is overwritten is refused with `ResetFailed` and left inta
 `presence(room, state)` on the tab client is a `Stream<RoomSnapshot>`. `track(room, state)` replaces this
 tab's state in a room it has joined; for a room it has not joined it does nothing.
 
+`LeaderClient.layer(config)` and `LeaderClient.make(config)` accept the optional `TabApiOptions` fields
+directly on config: `presenceSendTimeout` (default 45 s) and `presenceRetryDelay` (default 1 s, doubling
+up to 30 s). They tune only the tab-to-leader sender, not the leader's `idleTimeout` or server heartbeat.
+
 - **Leader-owned.** The leader opens one upstream `PresenceRpcs.room` stream per tab subscription
   (`src/client/sync/Presence.ts`), keyed on the server by `(principal, clientId, tabId)`. The tab id is the
   tab client's own. Presence uses no permit and no SQL, and never touches the replica or the outbox. A
