@@ -100,7 +100,12 @@ export interface PushRequest {
 
 export interface PushResponse {
   /** Outcomes for the processed prefix of the request, in request order. */
-  readonly results: ReadonlyArray<{ readonly mutationId: string; readonly outcome: MutationOutcome }>
+  readonly results: ReadonlyArray<{
+    readonly mutationId: string
+    readonly outcome: MutationOutcome
+    /** Ledger position the outcome was recorded at (§6); for ClientExpired, the expired floor's. */
+    readonly position: Position
+  }>
   /** Present when the server stopped at a transient failure; the rest was not processed. */
   readonly stopped: Option.Option<{ readonly reason: string }>
 }

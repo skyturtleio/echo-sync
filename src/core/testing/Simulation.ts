@@ -60,6 +60,8 @@ export interface Stats {
   readonly notices: number
   readonly transientStops: number
   readonly lostResponses: number
+  /** Enqueue retries that arrived after their original was released (duplicates). */
+  readonly lateRetries: number
   /** Pending mutations released by an expired ledger row rather than an ack. */
   readonly expired: number
 }
@@ -202,7 +204,8 @@ export const run = (options: Options) =>
       notices: 0,
       transientStops: 0,
       lostResponses: 0,
-      expired: 0
+      expired: 0,
+      lateRetries: 0
     }
     const committed: Array<MutationEnvelope> = []
     const ids: Array<string> = []
@@ -345,8 +348,12 @@ export const run = (options: Options) =>
         if (actual !== expected) {
           return yield* violated(`${client.clientId} replica = replay(pending, server@cursor)`, diff(actual, expected))
         }
-        const cursor = client.disk.meta.cursor
+        const { cursor, pushedThrough } = client.disk.meta
         for (const entry of client.disk.outbox) {
+          // Once the client has the outcome (seq ≤ pushedThrough), an outcome covered by the
+          // installed cursor must already have released the entry: by the pull that acked it,
+          // or by the push response itself when no pull can ever ack it (§8 corollary).
+          if (entry.envelope.seq > pushedThrough) continue
           const ledger = server.ledgerEntry(client.clientId, entry.envelope.mutationId)
           if (cursor !== null && Option.isSome(ledger) && ledger.value.position <= cursor) {
             return yield* violated(
@@ -355,15 +362,15 @@ export const run = (options: Options) =>
             )
           }
         }
-        const seen = new Set<string>()
+        const seen = new Set<number>()
         for (const notice of client.disk.notices) {
-          if (seen.has(notice.envelope.mutationId)) {
+          if (seen.has(notice.envelope.seq)) {
             return yield* violated(
               "a rejection becomes a notice once",
               `${client.clientId}#${notice.envelope.mutationId}`
             )
           }
-          seen.add(notice.envelope.mutationId)
+          seen.add(notice.envelope.seq)
         }
         for (const [key, count] of server.executions) {
           if (count > 1) return yield* violated("no intent applied twice on the server", `${key} executed ${count}×`)
@@ -443,6 +450,28 @@ export const run = (options: Options) =>
           note(`${client.clientId}: mutate ${name} ${JSON.stringify(args)}`)
           // Caller-generated, unordered idempotency key (DESIGN §6); occasionally a retried
           // enqueue of a still-pending id, which must not create a second intent.
+          // Not combined with ledger expiry: a duplicate gets a fresh seq above the floor, so once
+          // the original's ledger row expires nothing can recognise it. Expiry is only safe with
+          // DESIGN §9 rule 1 (released-row markers) in place, i.e. no duplicates at all.
+          const released =
+            options.ledgerGc === true
+              ? []
+              : committed.filter(
+                  (e) =>
+                    e.clientId === client.clientId &&
+                    !client.disk.outbox.some((p) => p.envelope.mutationId === e.mutationId)
+                )
+          const late = rng.pick(released)
+          if (Option.isSome(late) && rng.chance(0.05)) {
+            // Handover retry that lands after its original was pushed, acked, pulled and
+            // released, with no released-row marker (DESIGN §9 rule 1 deliberately absent here):
+            // the §8 position backstop must terminate the duplicate.
+            stats.lateRetries++
+            note(`${client.clientId}: retry enqueue of released ${late.value.mutationId}`)
+            return yield* ignoreExpected(
+              withClock(client, client.engine.mutate(late.value.mutationId, late.value.name, late.value.args))
+            )
+          }
           const retry = client.disk.outbox.at(-1)
           if (retry !== undefined && rng.chance(0.05)) {
             note(`${client.clientId}: retry enqueue ${retry.envelope.mutationId}`)
@@ -541,11 +570,9 @@ export const run = (options: Options) =>
         return yield* violated("every committed intent executes exactly once", `${key} executed ${count}×`)
       const ledger = server.ledgerEntry(envelope.clientId, envelope.mutationId)
       const client = clients.find((c) => c.clientId === envelope.clientId)
-      const notices = client?.disk.notices.filter((n) => n.envelope.mutationId === envelope.mutationId).length ?? 0
+      const notices = client?.disk.notices.filter((n) => n.envelope.seq === envelope.seq).length ?? 0
       const rejected = Option.isSome(ledger) && ledger.value.outcome._tag === "Rejected"
-      const unknown = client?.disk.notices.some(
-        (n) => n.envelope.mutationId === envelope.mutationId && n._tag === "OutcomeUnknown"
-      )
+      const unknown = client?.disk.notices.some((n) => n.envelope.seq === envelope.seq && n._tag === "OutcomeUnknown")
       if (Option.isSome(ledger) && (notices !== (rejected ? 1 : 0) || unknown === true)) {
         return yield* violated(
           "rejections surface as exactly one notice",

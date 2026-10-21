@@ -17,14 +17,17 @@ describe("reconciliation simulation", () => {
       Effect.gen(function* () {
         let midSetReloads = 0
         let resnapshots = 0
+        let lateRetries = 0
         for (const seed of seeds) {
           const stats = yield* Simulation.run({ seed, steps: 400 })
           midSetReloads += stats.reloadsMidSet
           resnapshots += stats.resnapshots
+          lateRetries += stats.lateRetries
         }
         // The schedule must actually reach the hard paths, or the sweep proves nothing.
         if (only === 0) assert.isAbove(midSetReloads, 0, "no reload mid-page-set happened")
         if (only === 0) assert.isAbove(resnapshots, 0, "no resnapshot happened")
+        if (only === 0) assert.isAbove(lateRetries, 0, "no enqueue was retried after its original was released")
       }),
     60_000
   )

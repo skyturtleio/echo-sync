@@ -74,7 +74,7 @@ export const make = (options: { readonly pageSize: number }) => {
   /** `client_scopes`: scopes held by a client as of each completed pull, by `nextCursor`. */
   const clientScopes = new Map<string, Map<Position, ReadonlySet<string>>>()
   /** Highest `seq` per client whose ledger row was GC'd (DESIGN §16.5 floor). */
-  const ledgerFloor = new Map<string, number>()
+  const ledgerFloor = new Map<string, { readonly seq: number; readonly position: Position }>()
   const continuations = new Map<string, Continuation>()
   const history = new Map<Position, MemoryStore.Tables>([[0n, new Map()]])
   const executions = new Map<string, number>()
@@ -136,7 +136,7 @@ export const make = (options: { readonly pageSize: number }) => {
         const key = `${envelope.clientId}#${envelope.mutationId}`
         executions.set(key, (executions.get(key) ?? 0) + 1)
         commit(head)
-        return outcome
+        return { outcome, position: head }
       })
     )
 
@@ -150,14 +150,18 @@ export const make = (options: { readonly pageSize: number }) => {
           return { results, stopped: Option.some({ reason: "SerializationFailure" }) }
         }
         const recorded = ledgerOf(request.clientId).get(item.mutationId)
+        const floor = ledgerFloor.get(request.clientId)
         // Clients push in seq order and every processed mutation is in the ledger, so a seq at
         // or below the floor was processed and its row is gone: answer terminally, never re-execute.
-        const outcome: MutationOutcome =
-          recorded?.outcome ??
-          (item.seq <= (ledgerFloor.get(request.clientId) ?? 0)
-            ? { _tag: "Rejected", error: { _tag: "ClientExpired", mutationId: item.mutationId } }
+        const result: { outcome: MutationOutcome; position: Position } =
+          recorded ??
+          (floor !== undefined && item.seq <= floor.seq
+            ? {
+                outcome: { _tag: "Rejected", error: { _tag: "ClientExpired", mutationId: item.mutationId } },
+                position: floor.position
+              }
             : yield* execute({ clientId: request.clientId, ...item }, now))
-        results.push({ mutationId: item.mutationId, outcome })
+        results.push({ mutationId: item.mutationId, ...result })
       }
       const response: PushResponse = { results, stopped: Option.none() }
       return response
@@ -267,7 +271,7 @@ export const make = (options: { readonly pageSize: number }) => {
         changes,
         acks,
         nextCursor: head,
-        expiredThrough: ledgerFloor.get(clientId) ?? 0
+        expiredThrough: ledgerFloor.get(clientId)?.seq ?? 0
       }
       return done
     })
@@ -293,7 +297,11 @@ export const make = (options: { readonly pageSize: number }) => {
         for (const [id, entry] of entries) {
           if (entry.position > through) continue
           entries.delete(id)
-          ledgerFloor.set(clientId, Math.max(ledgerFloor.get(clientId) ?? 0, entry.seq))
+          const floor = ledgerFloor.get(clientId)
+          ledgerFloor.set(clientId, {
+            seq: Math.max(floor?.seq ?? 0, entry.seq),
+            position: floor !== undefined && floor.position > entry.position ? floor.position : entry.position
+          })
         }
       }
     }

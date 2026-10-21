@@ -17,6 +17,7 @@ import { ResnapshotRequired } from "./Wire.ts"
 import type {
   Cursor,
   MutationEnvelope,
+  MutationOutcome,
   MutationRejection,
   PullDone,
   PullPage,
@@ -133,6 +134,46 @@ const replay = <E>(storage: SyncStorage<E>, executor: Executor<E>, entry: Pendin
     }
   })
 
+/** The notice a released mutation leaves behind, if any. */
+const noticeFor = (envelope: MutationEnvelope, outcome: MutationOutcome): Option.Option<Notice> => {
+  if (outcome._tag === "Applied") return Option.none()
+  // ClientExpired answers a resubmission whose ledger row expired: it was processed before.
+  if (outcome.error._tag === "ClientExpired") return Option.some({ _tag: "OutcomeUnknown", envelope })
+  return Option.some({ _tag: "Rejected", envelope, error: outcome.error })
+}
+
+/**
+ * The rebase every replay-set change goes through, inside the caller's transaction: undo all
+ * pending optimistic effects (reverse order), run `install` against the authoritative base,
+ * release the entries `settle` says are covered by that base (with their notices), and re-run
+ * the rest with fresh undo images. Returns the released seqs.
+ */
+const rebase = <E>(
+  storage: SyncStorage<E>,
+  executor: Executor<E>,
+  install: Effect.Effect<void, E>,
+  settle: (envelope: MutationEnvelope) => Option.Option<Option.Option<Notice>>
+) =>
+  Effect.gen(function* () {
+    const pending = yield* storage.pending
+    for (const entry of Arr.reverse(pending)) yield* restore(storage.rows, entry.undo)
+    yield* install
+    const released: Array<number> = []
+    const notices: Array<Notice> = []
+    for (const entry of pending) {
+      const settled = settle(entry.envelope)
+      if (Option.isNone(settled)) {
+        yield* replay(storage, executor, entry)
+        continue
+      }
+      released.push(entry.envelope.seq)
+      if (Option.isSome(settled.value)) notices.push(settled.value.value)
+    }
+    yield* storage.removePending(released)
+    yield* storage.addNotices(notices)
+    return released
+  })
+
 /**
  * Installs a complete page set: the staged `PullPage`s followed by their `PullDone`. Must run
  * inside one storage transaction. A set that started from cursor `null` is a snapshot of every
@@ -148,52 +189,39 @@ export const applyPageSet = <E>(
 ) =>
   Effect.gen(function* () {
     const meta = yield* storage.meta
-    const pending = yield* storage.pending
-    for (const entry of Arr.reverse(pending)) yield* restore(storage.rows, entry.undo)
-    if (pullFrom(meta) === null) yield* storage.rows.clearAll
-
     const set: ReadonlyArray<PullResponse> = [...pages, done]
-    for (const page of set) {
-      for (const change of page.changes) {
-        switch (change._tag) {
-          case "Upsert":
-            yield* storage.rows.write(change.table, change.row.id, Option.some(change.row))
-            break
-          case "Tombstone":
-            yield* storage.rows.write(change.table, change.id, Option.none())
-            break
-          case "ScopePurged":
-            yield* storage.rows.purgeScope(change.scopeId)
-            break
+    const install = Effect.gen(function* () {
+      if (pullFrom(meta) === null) yield* storage.rows.clearAll
+      for (const page of set) {
+        for (const change of page.changes) {
+          switch (change._tag) {
+            case "Upsert":
+              yield* storage.rows.write(change.table, change.row.id, Option.some(change.row))
+              break
+            case "Tombstone":
+              yield* storage.rows.write(change.table, change.id, Option.none())
+              break
+            case "ScopePurged":
+              yield* storage.rows.purgeScope(change.scopeId)
+              break
+          }
         }
       }
-    }
-
+    })
     const outcomes = new Map(set.flatMap((page) => page.acks.map((ack) => [ack.mutationId, ack.outcome])))
-    const released: Array<number> = []
-    const notices: Array<Notice> = []
-    for (const entry of pending) {
-      const { envelope } = entry
+    yield* rebase(storage, executor, install, (envelope) => {
       const outcome = outcomes.get(envelope.mutationId)
-      if (outcome !== undefined) {
-        released.push(envelope.seq)
-        if (outcome._tag === "Rejected") notices.push({ _tag: "Rejected", envelope, error: outcome.error })
-      } else if (envelope.seq <= done.expiredThrough) {
-        // Every seq ≤ the floor was processed (clients push in seq order) and the ledger row
-        // that would carry its ack is gone; the installed state already contains its effect.
-        released.push(envelope.seq)
-        notices.push({ _tag: "OutcomeUnknown", envelope })
-      } else {
-        yield* replay(storage, executor, entry)
-      }
-    }
-    yield* storage.removePending(released)
-    yield* storage.addNotices(notices)
-
-    // The server processes a client's mutations in seq order, so a released seq k means every
-    // seq up to k has been processed.
-    const pushedThrough = Math.max(meta.pushedThrough, ...released)
-    yield* storage.setMeta({ ...meta, cursor: done.nextCursor, pushedThrough, resnapshot: false })
+      if (outcome !== undefined) return Option.some(noticeFor(envelope, outcome))
+      // Every seq ≤ the floor was processed (clients push in seq order) and the ledger row
+      // that would carry its ack is gone; the installed state already contains its effect.
+      if (envelope.seq <= done.expiredThrough) return Option.some(Option.some({ _tag: "OutcomeUnknown", envelope }))
+      return Option.none()
+    })
+    // `pushedThrough` is deliberately not raised here: a pending entry below a released one was
+    // processed, but if its outcome is at a position ≤ the old cursor no pull will ever ack it
+    // (a duplicate enqueued after its original was released). It must be resent so the push
+    // response's position releases it (§8 corollary).
+    yield* storage.setMeta({ ...meta, cursor: done.nextCursor, resnapshot: false })
     yield* storage.clearStaged
   })
 
@@ -275,6 +303,21 @@ export const make = <E, TE>(options: {
             yield* storage.transaction(
               Effect.gen(function* () {
                 const current = yield* storage.meta
+                // §8 corollary: an outcome at a position ≤ the installed cursor is already in
+                // the replica, and no later pull will ack it (acks cover (cursor, nextCursor]).
+                // This is how a duplicate enqueued after its original was released terminates.
+                const cursor = current.cursor
+                const covered = new Map(
+                  response.results
+                    .filter((result) => cursor !== null && result.position <= cursor)
+                    .map((result) => [result.mutationId, result.outcome])
+                )
+                if (covered.size > 0) {
+                  yield* rebase(storage, executor, Effect.void, (envelope) => {
+                    const outcome = covered.get(envelope.mutationId)
+                    return outcome === undefined ? Option.none() : Option.some(noticeFor(envelope, outcome))
+                  })
+                }
                 yield* storage.setMeta({ ...current, pushedThrough: Math.max(current.pushedThrough, through) })
               })
             )
