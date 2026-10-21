@@ -141,21 +141,29 @@ own cross-tab sign-out signal.
   OPFS host (`openConnection` in `Leader.ts`), so there is no second OPFS host path. It does not migrate.
 - It takes the identity's leader lock with `ifAvailable`. If the lock is held, it fails `ReplicaInUse` and
   touches nothing. It never queues, so it cannot be granted ahead of or behind a waiting candidate.
-- Under the lock it counts unreleased `echo_outbox` rows. Unless `discardPending` is set, a count above 0
-  fails `PendingWrites { count }` and deletes nothing.
-- Otherwise it closes the database and the pool (releasing the access handles), removes the directory
+- Without `discardPending`, under the lock it opens the database and counts unreleased `echo_outbox` rows.
+  A count above 0 fails `PendingWrites { count }`. A database that does not open or an outbox that cannot be
+  read fails closed with `ResetFailed`. Either way nothing is deleted.
+- With `discardPending` it never opens the database (DESIGN §9.1, 5fcccb7): it only waits, as a new leader
+  does, for a predecessor's access handles to be released. So a corrupt or partially removed replica can
+  still be reset.
+- Then it closes whatever it opened (database and pool, releasing the access handles), removes the directory
   `echo-sync/<appId>/<profile>` recursively, and releases the lock last. A candidate queued meanwhile is
   elected only after the directory is gone, so it creates a fresh replica with a new `clientId`.
 - Sibling identities (`echo-sync/<appId>/<other profile>`) are untouched. A replica that never existed
   resets successfully.
 - Notices belong to the replica and go with it. The outbox is the only guarded content.
-- Any other failure (unsupported browser, invalid identity, an OPFS error) is `ResetFailed { message }`.
-  Interrupting the reset terminates its worker. The browser then releases the lock and handles; a removal
-  that had already begun may be partial, so retry the reset in that case.
+- Any other failure (unsupported browser, invalid identity, an OPFS error, a `spawnLeader` or
+  `postMessage` that throws) is `ResetFailed { message }`; interruption stays interruption.
+  Interrupting the reset terminates its worker, and the browser then releases the lock and handles. A
+  removal that had already begun may be partial. What a leader makes of such a directory is not
+  established; a reset with `discardPending` never opens it, so retry that.
 
 Evidence: `scenarios.sh` "reset …" checks (live leader → `ReplicaInUse` with the directory listing
 unchanged; one pending write → `PendingWrites{1}` unchanged; `discardPending` removes `a` and keeps `b`; the
-next leader for `a` has an empty outbox and a new `clientId`; `b` keeps its rows and `clientId`).
+next leader for `a` has an empty outbox and a new `clientId`; `b` keeps its rows and `clientId`; a replica
+whose database header is overwritten is refused with `ResetFailed` and left intact without
+`discardPending`, and removed with it; throwing `spawnLeader` and `postMessage` are `ResetFailed`).
 
 ## Fallback without SharedWorker
 

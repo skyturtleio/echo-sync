@@ -332,10 +332,11 @@ const countUnreleased = (sql: SqlClient.SqlClient) =>
 
 /**
  * `resetReplica`'s worker half (DESIGN §9.1). Takes the leader lock only if it is free, so it never queues
- * ahead of or behind a leader; under it, opens the database through the leader's own OPFS host (no
- * migration: a replica this build cannot migrate can still be reset), counts the outbox, closes the
- * database and the pool, removes `echo-sync/<appId>/<profile>`, and releases the lock last. A candidate
- * queued meanwhile is elected only after the directory is gone, so it creates a fresh replica.
+ * ahead of or behind a leader. Under it, without `discardPending`, it opens the database through the
+ * leader's own OPFS host (no migration), counts the outbox and closes the database and the pool; any
+ * failure there is `ResetFailed` with nothing removed. With `discardPending` it never opens the database.
+ * Then it removes `echo-sync/<appId>/<profile>` and releases the lock last. A candidate queued meanwhile
+ * is elected only after the directory is gone, so it creates a fresh replica.
  */
 const reset = (message: Reset): Effect.Effect<ResetOutcome> =>
   Effect.gen(function* () {
@@ -349,9 +350,18 @@ const reset = (message: Reset): Effect.Effect<ResetOutcome> =>
           return { _tag: "ReplicaInUse" } satisfies ResetOutcome
         }
         if ((yield* opfsDirectory(poolDirectory)) === undefined) return { _tag: "Done" } satisfies ResetOutcome
-        // The inner scope closes the database and the pool (its access handles) before anything is removed.
-        const count = yield* Effect.scoped(Effect.flatMap(openConnection(identity), ({ sql }) => countUnreleased(sql)))
-        if (count > 0 && !message.discardPending) return { _tag: "PendingWrites", count } satisfies ResetOutcome
+        if (message.discardPending) {
+          // Never opens the database (DESIGN §9.1): a corrupt or partially removed replica can still be reset.
+          // Only waits, as a new leader does, for a predecessor's access handles to be released.
+          yield* Platform.awaitOpfsPoolFree(poolDirectory)
+        } else {
+          // Fails closed: a database that does not open or an outbox that cannot be read is `ResetFailed`
+          // (below), never "0 pending". The inner scope closes the database and the pool before any removal.
+          const count = yield* Effect.scoped(
+            Effect.flatMap(openConnection(identity), ({ sql }) => countUnreleased(sql))
+          )
+          if (count > 0) return { _tag: "PendingWrites", count } satisfies ResetOutcome
+        }
         const parent = yield* opfsDirectory(`echo-sync/${identity.appId}`)
         if (parent !== undefined) {
           yield* Effect.tryPromise({

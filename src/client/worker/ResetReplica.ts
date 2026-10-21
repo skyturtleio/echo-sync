@@ -7,10 +7,11 @@
  * mode (the app's own `spawnLeader`), so the OPFS pool is opened through the same host the leader uses;
  * see `reset` in `Leader.ts`.
  *
- * Interrupting the reset terminates that worker. The browser then releases its lock and access handles;
- * a removal it had already begun may be partial, which leaves a replica that the next leader either opens
- * or rebuilds. Retry the reset in that case.
+ * Interrupting the reset terminates that worker, and the browser then releases its lock and access
+ * handles. A removal it had already begun may be partial; what a leader makes of such a directory is not
+ * established, but a reset with `discardPending` never opens the database, so it can be retried on it.
  */
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import { isFromLeader, type ResetOutcome, type ToLeader } from "./messages.ts"
@@ -39,28 +40,47 @@ export const resetReplica = (
     const invalid = Platform.validateIdentity(identity) ?? Platform.tabCapability().unsupported
     if (invalid !== undefined) return yield* new ResetFailed({ message: invalid })
     const outcome = yield* Effect.acquireUseRelease(
-      Effect.sync(() => config.spawnLeader(`echo:${config.appId}:${config.profile}:reset`)),
+      // A synchronous throw (a bad worker URL, a CSP refusal) is a failed reset, not a defect.
+      Effect.try({
+        try: () => config.spawnLeader(`echo:${config.appId}:${config.profile}:reset`),
+        catch: (cause) => new ResetFailed({ message: `spawnLeader failed: ${String(cause)}` })
+      }),
       (worker) =>
-        Effect.callback<ResetOutcome>((resume) => {
+        Effect.gen(function* () {
+          const answered = yield* Deferred.make<ResetOutcome>()
           const onMessage = (event: MessageEvent) => {
             const message: unknown = event.data
-            if (isFromLeader(message) && message._tag === "ResetOutcome") resume(Effect.succeed(message.outcome))
+            if (isFromLeader(message) && message._tag === "ResetOutcome") {
+              Deferred.doneUnsafe(answered, Effect.succeed(message.outcome))
+            }
           }
           const onError = (event: ErrorEvent) =>
-            resume(Effect.succeed({ _tag: "ResetFailed", message: `reset worker failed: ${event.message}` }))
-          worker.addEventListener("message", onMessage)
-          worker.addEventListener("error", onError)
+            Deferred.doneUnsafe(
+              answered,
+              Effect.succeed({ _tag: "ResetFailed", message: `reset worker failed: ${event.message}` })
+            )
           const command: ToLeader = {
             _tag: "Reset",
             appId: config.appId,
             profile: config.profile,
             discardPending: options.discardPending === true
           }
-          worker.postMessage(command, { transfer: [] })
-          return Effect.sync(() => {
-            worker.removeEventListener("message", onMessage)
-            worker.removeEventListener("error", onError)
-          })
+          worker.addEventListener("message", onMessage)
+          worker.addEventListener("error", onError)
+          // A throwing postMessage is a failed reset, not a defect; interruption is never caught here.
+          return yield* Effect.try({
+            try: () => worker.postMessage(command, { transfer: [] }),
+            catch: (cause) => new ResetFailed({ message: `posting to the reset worker failed: ${String(cause)}` })
+          }).pipe(
+            Effect.andThen(Deferred.await(answered)),
+            // On every exit (answer, failure, interruption), not only interruption.
+            Effect.ensuring(
+              Effect.sync(() => {
+                worker.removeEventListener("message", onMessage)
+                worker.removeEventListener("error", onError)
+              })
+            )
+          )
         }),
       (worker) => Effect.sync(() => worker.terminate())
     )

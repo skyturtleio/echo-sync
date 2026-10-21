@@ -405,6 +405,31 @@ const i = await echo.info(); const k = await echo.exec('SELECT v FROM keep')
 return { pass: i.ok && i.value.clientId === $(jq '.clientId' <<<"$b0") && k.ok && k.value[0]?.v === 'b-row', i, k }")"
 ab tab close "$B" >/dev/null
 
+# Profile "c": a replica with a pending write whose database no longer opens (header overwritten). Without
+# discardPending the outbox cannot be read, so the reset fails closed; with it, the database is never opened.
+C=$(open_tab "$BASE/?app=$APP&profile=c&syncUrl=$BASE/fake-sync/rpc")
+ev <<<'await echo.ready(); await echo.enqueue({ mutationId: "pending-c", name: "t", args: {} }); return true' >/dev/null
+ab tab close "$C" >/dev/null
+R=$(open_tab "$BASE/?app=resetter2-$RUN")
+TARGET_C="{ appId: '$APP', profile: 'c' }"
+RESET_C="const resetC = async (discard) => { let r; for (let i = 0; i < 100; i++) { r = await echo.resetReplica($TARGET_C, discard); if (r.ok || r.error._tag !== 'ReplicaInUse') return r; await new Promise((res) => setTimeout(res, 50)) } return r }"
+check "reset of a replica whose database does not open fails ResetFailed without discardPending and deletes nothing" "$(ev <<<"$RESET_C
+await echo.until(async () => !(await navigator.locks.query()).held.some((l) => l.name === 'echo:$APP:c:leader'))
+const corrupted = await echo.corruptReplica('$APP', 'c')
+const before = await echo.opfsList('echo-sync/$APP/c')
+const r = await resetC(false)
+const after = await echo.opfsList('echo-sync/$APP/c')
+return { pass: corrupted && !r.ok && r.error._tag === 'ResetFailed' && before !== null && JSON.stringify(after) === JSON.stringify(before), corrupted, r, before, after }")"
+check "reset with discardPending never opens the database: the unopenable replica is removed" "$(ev <<<"$RESET_C
+const r = await resetC(true)
+const app = await echo.opfsList('echo-sync/$APP')
+return { pass: r.ok && app !== null && !app.includes('c') && app.includes('b'), r, app }")"
+check "a spawnLeader or worker.postMessage that throws surfaces as ResetFailed, not a defect" "$(ev <<<"const s = await echo.resetReplica($TARGET_C, false, 'spawnThrows')
+const p = await echo.resetReplica($TARGET_C, false, 'postThrows')
+return { pass: !s.ok && s.error._tag === 'ResetFailed' && s.error.message.includes('injected spawnLeader failure')
+  && !p.ok && p.error._tag === 'ResetFailed' && p.error.message.includes('injected postMessage failure'), s, p }")"
+ab tab close "$R" >/dev/null
+
 # ── identities that would escape the storage namespace are refused up front ──────────────────────────
 D=$(open_tab "$BASE/?app=.")
 check "identity '.' is refused with LeaderUnavailable{Unsupported}, nothing is opened" "$(ev <<<'const r = await echo.info(); const s = await echo.status()

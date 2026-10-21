@@ -130,8 +130,56 @@ const echo = {
   },
   requestSync: () => run(client.requestSync),
   /** `resetReplica` for another identity (this tab's own client must not be for it). */
-  resetReplica: (target: { readonly appId: string; readonly profile: string }, discardPending = false) =>
-    run(resetReplica({ ...target, spawnLeader }, discardPending ? { discardPending: true } : {})),
+  resetReplica: (
+    target: { readonly appId: string; readonly profile: string },
+    discardPending = false,
+    fault: "spawnThrows" | "postThrows" | undefined = undefined
+  ) =>
+    run(
+      resetReplica(
+        {
+          ...target,
+          spawnLeader:
+            fault === "spawnThrows"
+              ? () => {
+                  throw new TypeError("injected spawnLeader failure")
+                }
+              : fault === "postThrows"
+                ? (name) => {
+                    const worker = spawnLeader(name)
+                    Object.defineProperty(worker, "postMessage", {
+                      value: () => {
+                        throw new DOMException("injected postMessage failure", "DataCloneError")
+                      }
+                    })
+                    return worker
+                  }
+                : spawnLeader
+        },
+        discardPending ? { discardPending: true } : {}
+      )
+    ),
+  /**
+   * Fault injection: overwrite the SQLite header of `<appId>/<profile>`'s database file in its pool (the
+   * pool keeps its own 4096-byte header per file, path first), so the database no longer opens.
+   */
+  corruptReplica: async (targetApp: string, targetProfile: string): Promise<boolean> => {
+    let dir = await navigator.storage.getDirectory()
+    for (const part of ["echo-sync", targetApp, targetProfile]) dir = await dir.getDirectoryHandle(part)
+    // oxlint-disable-next-line typescript/consistent-type-assertions -- platform edge: `values()` is not in TS's DOM lib
+    const iterable = dir as unknown as { values(): AsyncIterable<FileSystemHandle> }
+    for await (const handle of iterable.values()) {
+      if (!(handle instanceof FileSystemFileHandle)) continue
+      const header = new Uint8Array(await (await handle.getFile()).slice(0, 512).arrayBuffer())
+      const path = new TextDecoder().decode(header.subarray(0, Math.max(0, header.indexOf(0))))
+      if (!path.endsWith(`${targetProfile}.db`)) continue
+      const writable = await handle.createWritable({ keepExistingData: true })
+      await writable.write({ type: "write", position: 4096, data: new Uint8Array(100).fill(0x5a) })
+      await writable.close()
+      return true
+    }
+    return false
+  },
   /** Entry names in an OPFS directory (`a/b/c`), or `null` if it does not exist. */
   opfsList: async (path: string): Promise<Array<string> | null> => {
     let dir = await navigator.storage.getDirectory()
