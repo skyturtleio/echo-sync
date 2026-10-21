@@ -1,6 +1,6 @@
 # Echo Sync — Design Baseline
 
-Status: baseline v0.1 (2026-10-21). This document consolidates three design threads and is
+Status: baseline v0.2 (2026-10-21; v0.1 + foundation deltas: grants as SyncTable, per-page snapshots with staged apply, pinned index ordering, bigint Position, RowStore layering). This document consolidates three design threads and is
 the single source of truth for implementation. Changes to this document require sign-off in
 the coordinator thread. When implementation reveals a design error, propose the change,
 do not silently diverge.
@@ -79,7 +79,7 @@ Engine tables (Postgres schema `echo_sync`):
 | table | purpose |
 |---|---|
 | `access_scopes(id, created_at)` | scope identity (opaque id, app-generated) |
-| `scope_grants(scope_id, principal_id, role, granted_at)` | `role ∈ {reader, writer, owner}`; principal `*` = everyone (global catalogs) |
+| `scope_grants` | a **system `SyncTable`** (`id`, `accessScopeId` = the granted scope, `principalId`, `role`, `grantedAt`); `role ∈ {reader, writer, owner}`; principal `*` = everyone (global catalogs). Replicates like any row so clients can run optimistic role checks. v1 disclosure policy: anyone who can read a scope sees who else is granted on it. Writes require `owner` on that scope; the only exception is scope creation (engine primitive: insert `access_scopes` row + first `owner` grant for the actor, allowed for any principal on a fresh id). `(accessScopeId, principalId)` is unique — derive `id` from it so duplicates are structurally impossible. |
 | `clients(client_id, principal_id, cursor, last_seen_at, created_at)` | one row per client device/profile |
 | `mutations(client_id, mutation_id, position, outcome, received_at)` | ledger: exactly-once + ack delivery |
 | `log(position, table_name, row_id, access_scope_id, op, txid, committed_at)` | change identity, not payload |
@@ -91,8 +91,14 @@ entirely app-owned. Authorization:
 - Pull: engine filters log/rows to scopes the principal has any grant on.
 - Mutation writes through `ctx.store`: engine checks `role ∈ {writer, owner}` for the row's
   scope (both the old and the new scope on a move). Mutators add domain checks on top.
-- Grant management is itself done through mutations against `echo_sync.scope_grants` via a
-  small engine-provided API, so grant changes are captured in the log like any other change.
+- Grant management is itself done through mutations against the `scope_grants` system table via
+  a small engine-provided API, so grant changes are captured in the log like any other change.
+
+Store layering: the typed `Store` (`get/insert/patch/delete/query/scan`, codecs, scope-role
+checks, touched-row/undo capture) is written once in `src/core` over a small per-dialect
+`RowStore` (read / write / range / purgeScope over wire-encoded rows, called inside a
+transaction the substrate owns). Postgres, SQLite, and the in-memory reference implement
+`RowStore` only. All three must produce identical range ordering (§10).
 
 Scope move = `UPDATE ... SET access_scope_id = new`. The trigger emits a tombstone entry for
 the old scope and an upsert entry for the new scope. Revocation stops future delivery and
@@ -184,14 +190,31 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
 
 ## 8. Pull
 
-- Cursor-based, scope-filtered, paginated, consistent (`REPEATABLE READ` snapshot per page
-  set). Response carries `{ changes, acks, nextCursor, more }` where `changes` are upserts (with
-  current row payloads fetched at pull time) and tombstones, and `acks` are ledger entries for
-  this client with `position ∈ (cursor, nextCursor]`.
+- Cursor-based, scope-filtered, paginated. Each page is read in its own `REPEATABLE READ`
+  snapshot (a snapshot cannot span HTTP requests without holding a transaction open, which a
+  transaction pooler forbids). Response carries `{ changes, acks, nextCursor, more }` where
+  `changes` is an **ordered list** of upserts (row payload as of that page's snapshot),
+  tombstones, and `scopePurged`, applied strictly in order (so a purge precedes a re-grant's
+  upserts), and `acks` are ledger entries for this client with `position ∈ (cursor, nextCursor]`.
+- **A page set is consistent only at `more: false`.** A payload read at a later snapshot may
+  already include a change whose log entries arrive in a later page, so applying pages
+  incrementally can expose a torn transaction across rows. The client therefore stages pages
+  (in a SQLite staging table, not memory) and applies the whole set, acks included, in one
+  replica transaction when `more` is `false`. Because positions are commit-ordered (§7), every
+  change visible in any page's payload has a log entry `≤` the final `nextCursor`, so the
+  installed state equals the server state at the last page's snapshot restricted to readable
+  scopes. Known limitation: under sustained write load `more` may stay `true` for a long time;
+  mitigate with a large page size, not by applying early.
+- `Position` is a branded `bigint` in memory (native comparison; `number` loses precision and
+  string comparison is lexicographic) and a decimal string on the wire and in structured clone.
 - **Invariant: a pending mutation leaves the client's optimistic replay set only when the
   authoritative replica state covering its outcome has been installed**, i.e. when the pull
   that delivers its ack is applied. An ack alone never removes an optimistic mutation.
-- Initial sync = pull from `null` cursor = snapshot of all readable scopes at one position.
+- Initial sync = pull from `null` cursor. The log may be GC'd, so it cannot be log-driven:
+  the server keyset-paginates current rows of all readable scopes by `(table, id)` with
+  per-page snapshots, records the max position `head` at the first page, then continues with
+  log entries `> head` until `more: false`. Same staging rule applies. A newly granted scope is
+  delivered the same way (row walk of that scope, then log) within the ordinary pull.
 - Realtime: a poke stream (RPC stream) says "something may have changed"; it is a hint, never
   data. Pull is the only truth.
 
@@ -228,6 +251,15 @@ const todosByProject = Query.make("todos.byProject", {
 
 - `db.get(T, id)`, `db.query(T).withIndex(name, q => q.eq(...).gt(...)).order(...).take(n)/first()`,
   `db.scan(T)` for small tables. Joins/aggregates happen in ordinary typed code.
+- Index ordering is pinned so Postgres, SQLite, and the in-memory reference agree exactly:
+  order by the index fields, then `id`. `NULL` is the smallest value (`NULLS FIRST` ascending,
+  `NULLS LAST` descending, written explicitly in Postgres index DDL and `ORDER BY` so the index
+  serves the query and a backward scan gives `desc`). Range bounds (`gt/gte/lt/lte`) never match
+  `NULL`; `eq(null)` means `IS NULL`. Text orders by Unicode code point: Postgres text columns
+  are `COLLATE "C"`, SQLite uses `BINARY`, and the in-memory store must compare by code point —
+  **not** JS `<` on strings, which is UTF-16 code-unit order and disagrees above U+FFFF.
+  Timestamps must be order-preserving in every dialect (SQLite: integer epoch millis or
+  fixed-width UTC ISO). Locale-aware ordering for display is done in app code, not the index.
 - Reads record table-level dependencies; invalidation uses Effect's `Reactivity` service
   (`SqlClient.reactive`), keyed by table name. Local optimistic write or pull apply invalidates
   the touched tables; affected registered queries rerun and stream results to subscribers.
@@ -308,7 +340,7 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
 ## 16. Open items tracked by the coordinator
 
 1. Exact leader handover + RPC stream behavior across handover; browser support matrix.
-2. Grant-added snapshot delivery mechanics within paginated pull.
+2. Grant-added snapshot delivery mechanics within paginated pull — resolved in §8 (row walk then log); verify in the server substrate tests.
 3. Global catalog snapshot format (leaning NDJSON+gzip) — deferred past v1 vertical slice.
 4. Protocol conformance test suite for a future non-TS client.
 5. Ledger retention / client epoch expiry policy, separate from log GC.
