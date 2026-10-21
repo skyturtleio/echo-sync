@@ -1,2 +1,9 @@
-// Placeholder entry point for echo-sync/core; replace with real exports.
-export const placeholder = undefined
+export * as AccessScope from "./AccessScope.ts"
+export * as Errors from "./Errors.ts"
+export * as Ids from "./Ids.ts"
+export * as Mutation from "./Mutation.ts"
+export * as Protocol from "./Protocol.ts"
+export * as Registry from "./Registry.ts"
+export * as ScopeGrants from "./ScopeGrants.ts"
+export * as Store from "./Store.ts"
+export * as SyncTable from "./SyncTable.ts"
