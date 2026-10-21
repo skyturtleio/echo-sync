@@ -93,25 +93,33 @@ type AttemptError = SqlError | ClientForbidden | MutationRejected
 const isConflict = (error: unknown) =>
   isSqlError(error) && (error.reason._tag === "SerializationError" || error.reason._tag === "DeadlockError")
 
+/** A reason that makes the attempt a defect (DESIGN §6 precedence: defect > transient > rejection). */
+const isDefectReason = (r: Cause.Reason<unknown>) =>
+  Cause.isInterruptReason(r) ||
+  // The pinned SqlClient raises savepoint/rollback cleanup failures on a dead connection as
+  // defects carrying a SqlError; those are connection failures, i.e. transient.
+  (Cause.isDieReason(r) && !isSqlError(r.defect))
+
 /**
- * A failed attempt that must not be retried, carrying its whole cause. `Effect.retry` looks only
- * at the first typed failure, so a compound cause (a conflict plus anything else) is wrapped
- * here before retry sees it, and classified afterwards as a whole.
+ * A failed attempt with its whole cause. `Effect.retry` looks only at the first typed failure,
+ * so every failed attempt is wrapped here and retry decides on `retryable`, computed over the
+ * whole cause: no defect anywhere, and a conflict (`40001`, deadlock) anywhere. A rejection in
+ * the same cause does not block the retry: it was decided on a snapshot that could not commit.
  */
-class Settled {
+class FailedAttempt {
   readonly attempt: Cause.Cause<AttemptError>
+  readonly retryable: boolean
   constructor(attempt: Cause.Cause<AttemptError>) {
     this.attempt = attempt
+    this.retryable =
+      !attempt.reasons.some(Cause.isDieReason) &&
+      !attempt.reasons.some(isDefectReason) &&
+      attempt.reasons.some((r) => Cause.isFailReason(r) && isConflict(r.error))
   }
 }
 
-/** Only a cause made solely of conflict failures stays retryable. */
-const gateRetry = <A, R>(attempt: Effect.Effect<A, AttemptError, R>): Effect.Effect<A, AttemptError | Settled, R> =>
-  Effect.catchCause(attempt, (cause): Effect.Effect<never, AttemptError | Settled> =>
-    cause.reasons.length > 0 && cause.reasons.every((r) => Cause.isFailReason(r) && isConflict(r.error))
-      ? Effect.failCause(cause)
-      : Effect.fail(new Settled(cause))
-  )
+const wrapAttempt = <A, R>(attempt: Effect.Effect<A, AttemptError, R>): Effect.Effect<A, FailedAttempt, R> =>
+  Effect.catchCause(attempt, (cause) => Effect.fail(new FailedAttempt(cause)))
 
 /** The body failed with only `MutationRejected`: a permanent, recordable outcome. */
 const asRejection = (cause: Cause.Cause<MutationRejected | SqlError>): MutationOutcome | undefined => {
@@ -123,33 +131,39 @@ const asRejection = (cause: Cause.Cause<MutationRejected | SqlError>): MutationO
 }
 
 /**
- * Classifies the whole failure cause of a mutation attempt. Only a cause made entirely of SQL
- * failures (typed, or the pinned SqlClient's cleanup defects carrying a SqlError) and
- * `ClientForbidden` becomes a typed error. Anything else (a programmer defect, an interruption,
- * a stray typed error) is re-raised with every typed failure turned into a defect, so the whole
- * cause is preserved and no `catchTag` downstream can mistake it for a retryable transient.
+ * Classifies the whole failure cause of a mutation attempt, with precedence defect > transient >
+ * rejection (DESIGN §6):
+ * - any defect or interruption ⇒ die with the full cause (typed failures turned into defects), so
+ *   no `catchTag` downstream can mistake it for a retryable transient;
+ * - otherwise any SQL failure ⇒ `MutationTransient` (the transaction could not have committed, so
+ *   a rejection in the same cause is not trustworthy and is not ledgered);
+ * - otherwise `ClientForbidden`.
+ * A cause made solely of rejections never gets here: the body turns it into a ledgered outcome.
  */
 const classify = (
   envelope: Envelope,
-  cause: Cause.Cause<SqlError | ClientForbidden | MutationRejected>
+  cause: Cause.Cause<AttemptError>
 ): Effect.Effect<never, MutationTransient | ClientForbidden> => {
-  const expected = cause.reasons.every(
-    (r) =>
-      (Cause.isFailReason(r) && (isSqlError(r.error) || r.error instanceof ClientForbidden)) ||
-      (Cause.isDieReason(r) && isSqlError(r.defect))
+  const die = Effect.failCause(
+    Cause.fromReasons<never>(
+      cause.reasons.map((r) =>
+        Cause.isFailReason(r)
+          ? Cause.makeDieReason(r.error)
+          : Cause.isDieReason(r)
+            ? r
+            : Cause.makeInterruptReason(r.fiberId)
+      )
+    )
   )
-  if (expected) {
-    for (const r of cause.reasons) {
-      if (Cause.isFailReason(r) && r.error instanceof ClientForbidden) return Effect.fail(r.error)
-    }
-    const sqlError = cause.reasons
-      .map((r) => (Cause.isFailReason(r) ? r.error : Cause.isDieReason(r) ? r.defect : undefined))
-      .find(isSqlError)
-    if (sqlError !== undefined) return Effect.fail(transient(envelope, sqlError))
+  if (cause.reasons.some(isDefectReason)) return die
+  const sqlError = cause.reasons
+    .map((r) => (Cause.isFailReason(r) ? r.error : Cause.isDieReason(r) ? r.defect : undefined))
+    .find(isSqlError)
+  if (sqlError !== undefined) return Effect.fail(transient(envelope, sqlError))
+  for (const r of cause.reasons) {
+    if (Cause.isFailReason(r) && r.error instanceof ClientForbidden) return Effect.fail(r.error)
   }
-  return Effect.failCause(
-    Cause.fromReasons(cause.reasons.map((r) => (Cause.isFailReason(r) ? Cause.makeDieReason(r.error) : r)))
-  )
+  return die
 }
 
 /**
@@ -234,12 +248,9 @@ export const runMutation = <R>(
       })
     )
 
-    return yield* gateRetry(execute).pipe(
-      Effect.retry({ schedule: options?.conflictRetry ?? defaultConflictRetry, while: (e) => !(e instanceof Settled) }),
-      // Unwrap: a settled attempt keeps its whole cause; otherwise the conflicts ran out.
-      Effect.catch((error): Effect.Effect<never, AttemptError> =>
-        error instanceof Settled ? Effect.failCause(error.attempt) : Effect.fail(error)
-      ),
+    return yield* wrapAttempt(execute).pipe(
+      Effect.retry({ schedule: options?.conflictRetry ?? defaultConflictRetry, while: (e) => e.retryable }),
+      Effect.catch((e) => Effect.failCause(e.attempt)),
       Effect.catchCause((cause) => classify(envelope, cause))
     )
   })

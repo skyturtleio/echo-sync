@@ -43,6 +43,14 @@ const diedWithBug = (exit: Exit.Exit<unknown, unknown>) =>
   exit.cause.reasons.some((r) => Cause.isDieReason(r) && r.defect === programmerBug) &&
   !exit.cause.reasons.some(Cause.isFailReason)
 
+const rejection = new MutationRejected({ reason: "domain", message: "no" })
+
+/** Fails with a real SQLSTATE 40001 plus `other` in one compound cause. */
+const conflictAnd = (other: Cause.Reason<MutationRejected>) =>
+  Effect.flatMap(Effect.orDie(Effect.flip(serializationFailure)), (conflict) =>
+    Effect.failCause(Cause.fromReasons<SqlError | MutationRejected>([Cause.makeFailReason(conflict), other]))
+  )
+
 const env = (mutationId: string, seq: bigint) => ({ principalId: "p", clientId: "c1", mutationId, seq })
 const reject = (message: string) => Effect.fail(new MutationRejected({ reason: "domain", message }))
 
@@ -273,27 +281,59 @@ describe.skipIf(!pgAvailable)("mutation ledger (§6)", () => {
   )
 
   it.live(
-    "a conflict combined with a rejection is not retried and not ledgered (retry must not pick one failure)",
+    "a conflict combined with a rejection is retried, and the retry's outcome is ledgered (transient beats rejection)",
     () =>
       Effect.gen(function* () {
         let attempts = 0
-        // First attempt: a real SQLSTATE 40001 and a MutationRejected in one cause. Second would succeed.
-        const body = Effect.gen(function* () {
+        const body = Effect.suspend(() => {
           attempts++
-          if (attempts > 1) return yield* appendEffect("x")
-          const conflict = yield* Effect.orDie(Effect.flip(serializationFailure))
-          return yield* Effect.failCause(
-            Cause.fromReasons<SqlError | MutationRejected>([
-              Cause.makeFailReason(conflict),
-              Cause.makeFailReason(new MutationRejected({ reason: "domain", message: "no" }))
-            ])
-          )
+          return attempts > 1 ? appendEffect("x") : conflictAnd(Cause.makeFailReason(rejection))
         })
-        const exit = yield* Effect.exit(runMutation(env("m", 1n), body, fastRetry))
-        assert.strictEqual(attempts, 1)
-        assert.isTrue(Exit.isFailure(exit) && Cause.hasDies(exit.cause) && !exit.cause.reasons.some(Cause.isFailReason))
+        const result = yield* runMutation(env("m", 1n), body, fastRetry)
+        assert.strictEqual(attempts, 2)
+        assert.deepStrictEqual(result.outcome, { _tag: "Applied" })
+        assert.deepStrictEqual(yield* ledgerIds, ["m"])
+        assert.strictEqual(yield* counterBody, "x")
+      }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live(
+    "a conflict combined with a rejection on every attempt stops the batch as transient with nothing ledgered",
+    () =>
+      Effect.gen(function* () {
+        let attempts = 0
+        const body = Effect.suspend(() => {
+          attempts++
+          return Effect.andThen(appendEffect("x"), conflictAnd(Cause.makeFailReason(rejection)))
+        })
+        const result = yield* runBatch(
+          "p",
+          "c1",
+          [
+            { mutationId: "m", seq: 1n, body },
+            { mutationId: "n", seq: 2n, body: appendEffect("n") }
+          ],
+          fastRetry
+        )
+        assert.strictEqual(attempts, 3, "one attempt plus two retries")
+        assert.deepStrictEqual(result.processed, [])
+        assert.strictEqual(result.stopped?.mutationId, "m")
         assert.deepStrictEqual(yield* ledgerIds, [])
         assert.strictEqual(yield* counterBody, "")
       }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("a conflict combined with a programmer defect dies without retry (defect beats transient)", () =>
+    Effect.gen(function* () {
+      let attempts = 0
+      const body = Effect.suspend(() => {
+        attempts++
+        return conflictAnd(Cause.makeDieReason(programmerBug))
+      })
+      const exit = yield* Effect.exit(runMutation(env("m", 1n), body, fastRetry))
+      assert.strictEqual(attempts, 1)
+      assert.isTrue(diedWithBug(exit))
+      assert.deepStrictEqual(yield* ledgerIds, [])
+    }).pipe(Effect.provide(TestDatabase))
   )
 })

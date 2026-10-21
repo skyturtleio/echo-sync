@@ -73,21 +73,25 @@ runs and nothing is recorded. `runBatch` checks every item first, so one bad ite
 whole push. Without this guard, `seq ≤ 0` would fall under the default floor 0 and be answered
 `clientExpired` although it was never processed.
 
-Failures are classified over the whole `Cause`, never by its first reason:
-- the body counts as rejected only if its cause consists solely of `MutationRejected`; a
-  rejection combined with a defect (say, in a finalizer) is not ledgered;
-- the attempt becomes `MutationTransient` only if every reason is a SQL failure, either typed or
-  a cleanup defect carrying a `SqlError`;
-- anything else (a programmer defect, an interruption) is re-raised with the full cause, typed
-  failures turned into defects, so a bug never looks like a retryable transient.
+Failures are classified over the whole `Cause`, never by its first reason, with precedence
+defect > transient > rejection (DESIGN §6):
+- any defect or interruption anywhere ⇒ die with the full cause (typed failures turned into
+  defects): never retried, never ledgered, never reported transient;
+- otherwise any SQL failure anywhere ⇒ transient. The transaction could not have committed, so
+  a rejection in the same cause is not trusted. A conflict (`40001`, deadlock) is retried; when
+  the retries run out, or the failure is a connection error, the batch stops as
+  `MutationTransient` with nothing ledgered;
+- a rejection is ledgered only when the body's cause consists solely of `MutationRejected`.
 
-Both orderings of SQL defect and programmer defect are tested.
+One interpretation to note: a defect carrying a `SqlError` is the pinned `SqlClient`'s way of
+reporting a failed savepoint or rollback cleanup on a dead connection. It counts as transient,
+not as a defect, and it is not retried.
 
-Retry eligibility is decided over the whole cause too, before `Effect.retry` sees it.
-`Effect.retry` looks only at the first typed failure, so a cause made of a conflict plus a
-rejection would otherwise be retried. Only a cause consisting solely of conflict failures
-(`40001`, deadlock) is retried; anything else is classified once, unretried (tested with a real
-`40001` combined with `MutationRejected`).
+`Effect.retry` looks only at the first typed failure, so every failed attempt is wrapped with a
+`retryable` flag computed over the whole cause before retry sees it. Tests: a real `40001` plus a
+rejection retries and ledgers `Applied`; the same compound cause on every attempt stops the
+batch with nothing ledgered; a `40001` plus a programmer defect dies after one attempt; both
+orderings of SQL defect and programmer defect die.
 
 `40001` and deadlocks are retried with a `Schedule` (default: 4 retries, exponential from
 10 ms). Anything else becomes `MutationTransient`, which means *outcome unknown*, not "not
@@ -269,4 +273,5 @@ done by hand while building this:
 | outer `catchTag` + `catchDefect` instead of whole-cause classification | compound-cause test |
 | `catchTag("MutationRejected")` on the body | rejection-plus-defect test |
 | no `seq ≥ 1` guard | malformed-envelope test |
-| retry before whole-cause gating | conflict-plus-rejection test |
+| retry only when every reason is a conflict | conflict-plus-rejection retry and exhaustion tests |
+| retry despite a defect in the cause | conflict-plus-defect test |
