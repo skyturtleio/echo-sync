@@ -159,14 +159,19 @@ export const append = (input: AppendInput): Effect.Effect<OutboxEntry, SqlError,
   })
 
 /**
- * The seq the next append will get: one past AUTOINCREMENT's high-water mark in `sqlite_sequence`, not
- * `MAX(seq)`, so a seq whose row was pruned is never handed out again. Call inside the appending
- * transaction; a rollback rolls `sqlite_sequence` back with it, so the number is not lost.
+ * Allocates the next seq (the engine's `SyncStorage.nextSeq` contract: each call returns a new one):
+ * bumps AUTOINCREMENT's high-water mark in `sqlite_sequence`, never `MAX(seq)`, so a seq whose row was
+ * pruned is never handed out again. Call inside the appending transaction; a rollback rolls
+ * `sqlite_sequence` back with it, so an allocation that is not committed leaves no gap.
  */
 export const nextSeq: Effect.Effect<number, SqlError, SqlClient.SqlClient> = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient
+  // sqlite_sequence has no row for the table until its first insert; it is an ordinary table otherwise.
+  yield* sql`INSERT INTO sqlite_sequence (name, seq)
+    SELECT 'echo_outbox', 0 WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'echo_outbox')`
+  yield* sql`UPDATE sqlite_sequence SET seq = seq + 1 WHERE name = 'echo_outbox'`
   const rows = yield* sql<{ readonly seq: number }>`SELECT seq FROM sqlite_sequence WHERE name = 'echo_outbox'`
-  return (rows[0]?.seq ?? 0) + 1
+  return rows[0]?.seq ?? 1
 })
 
 /**
