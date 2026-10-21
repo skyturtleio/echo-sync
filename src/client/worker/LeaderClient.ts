@@ -92,8 +92,9 @@ export class LeaderClient extends Context.Service<
      */
     readonly mutate: MutateFn
     /**
-     * One attempt of the raw enqueue `mutate` is built on, with a caller-chosen `mutationId` (replay of an
-     * exported entry, tests). Resolves only after the outbox entry is committed in SQLite.
+     * The replay/test primitive under `mutate`: one attempt with a caller-chosen `mutationId` (replay of an
+     * exported entry, tests; DESIGN §9.1). Apps use `mutate`; UI adapters (`src/foldkit`) do not export this.
+     * Resolves only after the outbox entry is committed in SQLite.
      */
     readonly enqueue: (
       envelope: OutboxEnvelope
