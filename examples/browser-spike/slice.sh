@@ -2,7 +2,10 @@
 # Vertical-slice scenarios: the real browser leader against the real server (examples/server/main.ts on
 # Postgres), driven by agent-browser through the Vite harness. See docs/vertical-slice.md.
 #
-#   examples/browser-spike/slice.sh [base-url]
+#   [SLICE_ORDER="base offline conflict deleteedit"] [SLICE_CONTROL=<fault>] examples/browser-spike/slice.sh [base-url]
+#
+# SLICE_ORDER lists the sections to run, in order; SLICE_CONTROL injects one deliberate fault that must
+# make its check fail (both documented in docs/vertical-slice.md).
 #
 # Needs the slice server and the harness running. Scenario 5 stops and restarts the server with
 # $ECHO_SERVER_STOP / $ECHO_SERVER_START (default: the `echo-server` orb service).
@@ -31,6 +34,7 @@ const add = (id, title, s = scope) => echo.enqueue({ mutationId: id, name: 'todo
 const released = (id) => echo.until(async () => { const r = await echo.exec('SELECT released_at FROM echo_outbox WHERE mutation_id = ?', [id]); return r.ok && r.value[0]?.released_at != null }, 40000)
 const seen = (id) => sub.emissions.some((e) => e.results[0].some((r) => r.id === id))"
 
+section_base() {
 # ── (2) two clients on one scope: A's mutation reaches B through push, poke and pull ──────────────────
 A=$(open_tab "$BASE/?app=$APP&profile=a&principal=alice")
 ev <<<"$SERVED" >/dev/null
@@ -177,6 +181,281 @@ check "leader closed while its push is held on the server: the new leader sends 
           and ($l | length) == 1 and $l[0].client_id == $c1.clientId and $l[0].outcome._tag == "Applied"),
     pushesBeforeClose: $c1.pushes, serverHandlerStarts: $n, ledger: $l }')"
 ab tab close "$C2" >/dev/null
+
+}
+
+# ── Offline convergence (DESIGN §14, docs/vertical-slice.md): two independent clients, each its own profile
+# and client id, with the harness network gate (`echo.setOffline`: the leader's requests fail as an
+# unreachable server does and its open streams abort). Every wait is an awaited condition. SLICE_CONTROL
+# names one deliberate fault that must make exactly its check fail (see docs/vertical-slice.md).
+ctl() { [ "${SLICE_CONTROL:-}" = "$1" ]; }
+now() { date +%s%3N; }
+# Re-evaluates a JS body returning { ok, ... } in short evals until ok (one CDP evaluate cannot wait out a
+# reconnect backoff); prints the last result.
+evu() {
+  local body out
+  body=$(cat)
+  for _ in $(seq 1 "${1:-12}"); do
+    out=$(ev <<<"$body")
+    [ "$(jq -r .ok <<<"$out")" = true ] && break
+  done
+  echo "$out"
+}
+# JS prelude for scope $1: replica rows, the live query's latest rows, the server's rows, the ledger,
+# the gate, and waits on each.
+npre() {
+  echo "const scope = '$1'
+const cols = 'SELECT id, access_scope_id, title, note FROM todos WHERE access_scope_id = ? ORDER BY id'
+const rows = async () => { const r = await echo.exec(cols, [scope]); return r.ok ? r.value : ['error'] }
+const server = async () => (await fetch('/admin/todos?scope=' + scope)).json()
+const ledger = async (id) => (await fetch('/admin/ledger?mutationId=' + id)).json()
+const clientId = async () => (await echo.info()).value.clientId
+const mut = (mutationId, name, args) => echo.enqueue({ mutationId, name, args })
+const row = (id, title, note = null) => ({ id, access_scope_id: scope, title, note })
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b)
+const watch = () => { window.live = echo.subscribe([\"SELECT id, access_scope_id, title, note FROM todos WHERE access_scope_id = '$1' ORDER BY id\"], ['todos']); return echo.until(() => window.live.emissions.length >= 1) }
+const live = () => window.live.emissions.at(-1)?.results[0] ?? null
+const released = (id, ms = 5000) => echo.until(async () => { const r = await echo.exec('SELECT released_at FROM echo_outbox WHERE mutation_id = ?', [id]); return r.ok && r.value[0]?.released_at != null }, ms)
+const pending = async () => (await echo.exportPending()).value.map((x) => x.envelope.mutationId)
+const notice = (id) => echo.notices().then((n) => n.value.find((x) => x.notice.envelope.mutationId === id)?.notice ?? null)
+// Offline is in effect once a sync attempt fails with a network error (not a halted push).
+const offline = async () => (await echo.until(async () => { await echo.requestSync(); const s = await echo.syncStatus(); return s.ok && s.value.value.lastError?.kind === 'network' }, 15000)) === true
+const converged = (want, ms = 5000) => echo.until(async () => same(await rows(), want) && same(live(), want), ms)"
+}
+# Opens a tab for profile $1 as principal $2, served by its own leader; prints the tab id.
+client_tab() {
+  local tab
+  tab=$(open_tab "$BASE/?app=$APP&profile=$1&principal=$2")
+  ev <<<"$SERVED" >/dev/null
+  echo "$tab"
+}
+
+# ── S6 offline edit, reload while offline, reconnect: Postgres, A and B converge; A acked once ───────
+section_offline() {
+  local S="off-$RUN" t0 id="o1-$RUN" upd="upd-o1-$RUN" OA OB a0 a1 a2 a3 b ledger srv
+  for p in alice bob; do admin "grant?scope=$S&principal=$p&role=writer" >/dev/null; done
+  t0=$(now)
+  OA=$(client_tab oa alice)
+  OB=$(client_tab ob bob)
+  ab tab "$OB" >/dev/null
+  ev <<<"$(npre "$S")
+return await watch()" >/dev/null
+  ab tab "$OA" >/dev/null
+  a0=$(ev <<<"$(npre "$S")
+const e = await mut('$id', 'todos.add', { id: '$id', scope, title: 'before' })
+return { e: e.ok, released: (await released('$id', 30000)) === true, clientId: await clientId() }")
+  ab tab "$OB" >/dev/null
+  ev <<<"$(npre "$S")
+return await converged([row('$id', 'before')], 20000)" >/dev/null
+  ab tab "$OA" >/dev/null
+  ctl skip-offline || ev <<<"echo.setOffline(true); return true" >/dev/null
+  a1=$(ev <<<"$(npre "$S")
+const wentOffline = await offline()
+const e = await mut('$upd', 'todos.update', { id: '$id', title: 'edited offline' })
+// Wait for at least one more failed attempt with the entry pending, then check nothing reached the server.
+await offline()
+return { wentOffline, e: e.ok, optimistic: await rows(), pending: await pending(), ledgerWhileOffline: (await ledger('$upd')).length }")
+  # Control drop-outbox: a harness fault that loses the queued mutation across the reload.
+  ctl drop-outbox && ev <<<"return await echo.exec(\"DELETE FROM echo_outbox WHERE mutation_id = '$upd'\")" >/dev/null
+  ab reload >/dev/null
+  a2=$(ev <<<"$(npre "$S")
+await echo.ready()
+await watch()
+const stillOffline = await offline()
+return { stillOffline, afterReload: await rows(), live: live(), pending: await pending(), ledgerWhileOffline: (await ledger('$upd')).length }")
+  ctl stay-offline || ev <<<"echo.setOffline(false); return true" >/dev/null
+  a3=$(evu 12 <<<"$(npre "$S")
+const want = [row('$id', 'edited offline')]
+const ok = (await released('$upd')) === true && (await converged(want)) === true
+return { ok, rows: await rows(), live: live(), notice: await notice('$upd'), clientId: await clientId() }")
+  ab tab "$OB" >/dev/null
+  b=$(evu 6 <<<"$(npre "$S")
+const ok = (await converged([row('$id', 'edited offline')])) === true
+return { ok, rows: await rows(), live: live(), emissions: window.live.emissions.length, clientId: await clientId() }")
+  ledger=$(admin "ledger?mutationId=$upd")
+  srv=$(admin "todos?scope=$S")
+  check "offline edit survives a reload while offline and converges on reconnect: the queued todos.update and its optimistic row are still there after the reload, nothing reaches the server while offline, then Postgres, A's and B's live queries all hold the edited row and the ledger acks A exactly once" "$(jq -nc \
+    --argjson a0 "$a0" --argjson a1 "$a1" --argjson a2 "$a2" --argjson a3 "$a3" --argjson b "$b" --argjson l "$ledger" --argjson s "$srv" \
+    --arg id "$id" --arg upd "$upd" --arg S "$S" --argjson ms "$(($(now) - t0))" '
+    [{ id: $id, access_scope_id: $S, title: "edited offline", note: null }] as $want
+    | { pass: ($a0.e and $a0.released and $a1.wentOffline and $a1.e and $a1.optimistic == $want and $a1.pending == [$upd]
+            and $a1.ledgerWhileOffline == 0 and $a2.stillOffline and $a2.afterReload == $want and $a2.live == $want
+            and $a2.pending == [$upd] and $a2.ledgerWhileOffline == 0 and $a3.ok and $a3.notice == null
+            and $b.ok and $b.clientId != $a3.clientId and $s == $want
+            and ($l | length) == 1 and $l[0].client_id == $a3.clientId and $l[0].outcome._tag == "Applied"),
+        ms: $ms, offline: $a1, afterReload: $a2, a: $a3, b: $b, server: $s, ledger: $l }')"
+  ab tab close "$OA" >/dev/null
+  ab tab close "$OB" >/dev/null
+}
+
+# ── S7 same row, both offline: B reconnects first, then A; the server reruns B's then A's mutators ───
+section_conflict() {
+  local S="cf-$RUN" t0 CA CB a0 a1 b1 b2 a2 a3 b3 srv ledgers
+  local c1="c1-$RUN" c2="c2-$RUN" c3="c3-$RUN"
+  for p in alice bob; do admin "grant?scope=$S&principal=$p&role=writer" >/dev/null; done
+  t0=$(now)
+  CA=$(client_tab ca alice)
+  CB=$(client_tab cb bob)
+  ab tab "$CA" >/dev/null
+  a0=$(ev <<<"$(npre "$S")
+await watch()
+for (const [id, t] of [['$c1', 't1'], ['$c2', 't2'], ['$c3', 't3']]) await mut(id, 'todos.add', { id, scope, title: t })
+return { released: (await Promise.all(['$c1', '$c2', '$c3'].map((id) => released(id, 30000)))).every((x) => x === true) }")
+  ab tab "$CB" >/dev/null
+  ev <<<"$(npre "$S")
+await watch()
+return await converged([row('$c1', 't1'), row('$c2', 't2'), row('$c3', 't3')], 20000)" >/dev/null
+  # Both offline, both edit all three rows: c1 different fields, c2 the same field, c3 A's edit is one the
+  # server's real mutator rejects (blocked title; control no-reject: an ordinary title).
+  ab tab "$CB" >/dev/null
+  b1=$(ev <<<"$(npre "$S")
+echo.setOffline(true)
+const wentOffline = await offline()
+await mut('u-b-$c1', 'todos.update', { id: '$c1', title: 'title from B' })
+await mut('u-b-$c2', 'todos.update', { id: '$c2', title: 'B loses' })
+await mut('u-b-$c3', 'todos.update', { id: '$c3', title: 'B stays' })
+return { wentOffline, optimistic: await rows() }")
+  ab tab "$CA" >/dev/null
+  a1=$(ev <<<"$(npre "$S")
+echo.setOffline(true)
+const wentOffline = await offline()
+await mut('u-a-$c1', 'todos.update', { id: '$c1', note: 'note from A' })
+await mut('u-a-$c2', 'todos.update', { id: '$c2', title: 'A wins' })
+await mut('u-a-$c3', 'todos.update', { id: '$c3', title: '$(ctl no-reject && echo 'A plain' || echo 'server-rejects A')' })
+await offline()
+return { wentOffline, optimistic: await rows(), ledgers: (await Promise.all(['$c1', '$c2', '$c3'].map((c) => ledger('u-a-' + c)))).map((l) => l.length) }")
+  # Reconnect B first and wait until all its pushes are acknowledged, then A (control a-first: the reverse).
+  first=$CB second=$CA fp=b sp=a
+  if ctl a-first; then first=$CA second=$CB fp=a sp=b; fi
+  for pair in "$first:$fp" "$second:$sp"; do
+    ab tab "${pair%%:*}" >/dev/null
+    ev <<<"echo.setOffline(false); return true" >/dev/null
+    out=$(evu 12 <<<"$(npre "$S")
+const ok = (await Promise.all(['$c1', '$c2', '$c3'].map((c) => released('u-${pair##*:}-' + c)))).every((x) => x === true)
+return { ok }")
+    [ "${pair##*:}" = b ] && b2=$out || a2=$out
+    # Control b-offline-after-push: B drops off again once its own pushes are in, so it never pulls A's.
+    if [ "${pair##*:}" = b ] && ctl b-offline-after-push; then ev <<<"echo.setOffline(true); return true" >/dev/null; fi
+  done
+  ab tab "$CA" >/dev/null
+  a3=$(evu 6 <<<"$(npre "$S")
+const want = [row('$c1', 'title from B', 'note from A'), row('$c2', 'A wins'), row('$c3', 'B stays')]
+const ok = (await converged(want)) === true
+return { ok, rows: await rows(), live: live(), pending: await pending(), notice: await notice('u-a-$c3') }")
+  ab tab "$CB" >/dev/null
+  b3=$(evu 6 <<<"$(npre "$S")
+const want = [row('$c1', 'title from B', 'note from A'), row('$c2', 'A wins'), row('$c3', 'B stays')]
+const ok = (await converged(want)) === true
+return { ok, rows: await rows(), live: live(), pending: await pending(), notices: (await echo.notices()).value.length }")
+  srv=$(admin "todos?scope=$S")
+  ledgers='{}'
+  for who in a b; do
+    for c in c1 c2 c3; do
+      ledgers=$(jq -c --arg k "$who-$c" --argjson v "$(admin "ledger?mutationId=u-$who-$c-$RUN")" '. + { ($k): $v }' <<<"$ledgers")
+    done
+  done
+  ms=$(($(now) - t0))
+  common=(--argjson a1 "$a1" --argjson b1 "$b1" --argjson a3 "$a3" --argjson b3 "$b3" --argjson s "$srv" --argjson l "$ledgers" --arg S "$S" --argjson ms "$ms")
+  # $l keys: "b-c1", "a-c1", ... (mutation author and row). One ledger row each; B's position before A's.
+  check "same row, different fields, both offline: B then A reconnect and the server row carries B's title and A's note; Postgres and both live queries hold exactly that row, nothing pending" "$(jq -nc "${common[@]}" --arg id "$c1" '
+    [{ id: $id, access_scope_id: $S, title: "title from B", note: "note from A" }] as $want
+    | ([$s[] | select(.id == $id)]) as $srow
+    | { pass: ($a1.wentOffline and $b1.wentOffline and ($a1.ledgers | all(. == 0))
+            and ($a1.optimistic | map(select(.id == $id))) == [{ id: $id, access_scope_id: $S, title: "t1", note: "note from A" }]
+            and ($b1.optimistic | map(select(.id == $id))) == [{ id: $id, access_scope_id: $S, title: "title from B", note: null }]
+            and $srow == $want and ($a3.rows | map(select(.id == $id))) == $want and ($b3.rows | map(select(.id == $id))) == $want
+            and ($a3.live | map(select(.id == $id))) == $want and ($b3.live | map(select(.id == $id))) == $want
+            and $a3.pending == [] and $b3.pending == []
+            and ($l["b-c1"] | length) == 1 and ($l["a-c1"] | length) == 1 and ($l["b-c1"][0].position | tonumber) < ($l["a-c1"][0].position | tonumber)
+            and $l["b-c1"][0].outcome._tag == "Applied" and $l["a-c1"][0].outcome._tag == "Applied"),
+        ms: $ms, server: $srow, a: ($a3.rows | map(select(.id == $id))), b: ($b3.rows | map(select(.id == $id))), bLive: ($b3.live | map(select(.id == $id))) }')"
+  check "same row, same field, both offline: B then A reconnect, the server applies B's mutator then A's so A's title stands; B's replica and live query drop its own optimistic title (no residue) and match Postgres" "$(jq -nc "${common[@]}" --arg id "$c2" '
+    [{ id: $id, access_scope_id: $S, title: "A wins", note: null }] as $want
+    | ([$s[] | select(.id == $id)]) as $srow
+    | { pass: (($b1.optimistic | map(select(.id == $id) | .title)) == ["B loses"] and $srow == $want
+            and ($a3.rows | map(select(.id == $id))) == $want and ($b3.rows | map(select(.id == $id))) == $want
+            and ($a3.live | map(select(.id == $id))) == $want and ($b3.live | map(select(.id == $id))) == $want
+            and ($l["b-c2"] | length) == 1 and ($l["a-c2"] | length) == 1 and ($l["b-c2"][0].position | tonumber) < ($l["a-c2"][0].position | tonumber)),
+        ms: $ms, server: $srow, b: ($b3.rows | map(select(.id == $id))), positions: { b: $l["b-c2"][0].position, a: $l["a-c2"][0].position } }')"
+  check "same row, A's edit rejected by the real server mutator: A gets the typed Rejected{DomainError blocked-title} notice and its optimistic title is undone to B's, which stays in Postgres and both replicas" "$(jq -nc "${common[@]}" --arg id "$c3" '
+    [{ id: $id, access_scope_id: $S, title: "B stays", note: null }] as $want
+    | ([$s[] | select(.id == $id)]) as $srow
+    | { pass: (($a1.optimistic | map(select(.id == $id) | .title)) == ["server-rejects A"] and $srow == $want
+            and ($a3.rows | map(select(.id == $id))) == $want and ($b3.rows | map(select(.id == $id))) == $want
+            and ($a3.live | map(select(.id == $id))) == $want and ($b3.live | map(select(.id == $id))) == $want
+            and $a3.notice._tag == "Rejected" and $a3.notice.error._tag == "DomainError" and $a3.notice.error.error.reason == "blocked-title"
+            and $b3.notices == 0 and ($l["a-c3"] | length) == 1 and $l["a-c3"][0].outcome._tag == "Rejected" and $l["b-c3"][0].outcome._tag == "Applied"),
+        ms: $ms, server: $srow, a: ($a3.rows | map(select(.id == $id))), notice: $a3.notice }')"
+  ab tab close "$CA" >/dev/null
+  ab tab close "$CB" >/dev/null
+}
+
+# ── S8 offline delete vs online edit, and offline edit vs online delete: no phantom rows ────────────
+section_deleteedit() {
+  local S="de-$RUN" t0 DA DB a1 b1 a2 b2 srv l1 l2 d1="d1-$RUN" d2="d2-$RUN"
+  for p in alice bob; do admin "grant?scope=$S&principal=$p&role=writer" >/dev/null; done
+  t0=$(now)
+  DA=$(client_tab da alice)
+  DB=$(client_tab db bob)
+  ab tab "$DA" >/dev/null
+  ev <<<"$(npre "$S")
+await watch()
+for (const [id, t] of [['$d1', 't1'], ['$d2', 't2']]) await mut(id, 'todos.add', { id, scope, title: t })
+return (await Promise.all(['$d1', '$d2'].map((id) => released(id, 30000)))).every((x) => x === true)" >/dev/null
+  ab tab "$DB" >/dev/null
+  ev <<<"$(npre "$S")
+await watch()
+return await converged([row('$d1', 't1'), row('$d2', 't2')], 20000)" >/dev/null
+  # A, offline: deletes d1 and edits d2.
+  ab tab "$DA" >/dev/null
+  a1=$(ev <<<"$(npre "$S")
+echo.setOffline(true)
+const wentOffline = await offline()
+await mut('del-$d1', 'todos.delete', { id: '$d1' })
+await mut('upd-$d2', 'todos.update', { id: '$d2', title: 'A edit offline' })
+return { wentOffline, optimistic: await rows() }")
+  # B, online: edits d1 and deletes d2 (control skip-b-delete: B leaves d2 alone).
+  ab tab "$DB" >/dev/null
+  b1=$(ev <<<"$(npre "$S")
+await mut('upd-$d1', 'todos.update', { id: '$d1', title: 'B edit' })
+$(ctl skip-b-delete || echo "await mut('del-$d2', 'todos.delete', { id: '$d2' })")
+const ok = (await released('upd-$d1', 30000)) === true && $(ctl skip-b-delete && echo true || echo "(await released('del-$d2', 30000)) === true")
+return { ok, server: await server() }")
+  ab tab "$DA" >/dev/null
+  ctl a-stays-offline || ev <<<"echo.setOffline(false); return true" >/dev/null
+  a2=$(evu 12 <<<"$(npre "$S")
+const delReleased = (await released('del-$d1')) === true
+const ok = delReleased && (await released('upd-$d2')) === true && (await converged([])) === true
+return { ok, delReleased, rows: await rows(), live: live(), pending: await pending(), delNotice: await notice('del-$d1'), updNotice: await notice('upd-$d2') }")
+  ab tab "$DB" >/dev/null
+  b2=$(evu 6 <<<"$(npre "$S")
+const ok = (await echo.until(async () => (await rows()).length === 0 && live().length === 0)) === true
+return { ok, rows: await rows(), live: live(), sawEdit: window.live.emissions.some((e) => e.results[0].some((r) => r.id === '$d1' && r.title === 'B edit')) }")
+  srv=$(admin "todos?scope=$S")
+  l1=$(admin "ledger?mutationId=del-$d1")
+  l2=$(admin "ledger?mutationId=upd-$d2")
+  common=(--argjson a1 "$a1" --argjson b1 "$b1" --argjson a2 "$a2" --argjson b2 "$b2" --argjson s "$srv" --argjson ms "$(($(now) - t0))")
+  check "offline delete vs online edit: B's edit lands first, A's queued delete then removes the row; Postgres, A and B (whose live query showed the edit) all end without it, A gets no notice" "$(jq -nc "${common[@]}" --argjson l "$l1" --arg id "$d1" '
+    { pass: ($a1.wentOffline and ($a1.optimistic | map(.id) | index($id)) == null and $b1.ok
+            and ($b1.server | map(select(.id == $id) | .title)) == ["B edit"] and $a2.delReleased and $b2.sawEdit
+            and ($s | map(select(.id == $id))) == [] and ($a2.rows | map(select(.id == $id))) == [] and ($b2.rows | map(select(.id == $id))) == []
+            and ($a2.live | map(select(.id == $id))) == [] and ($b2.live | map(select(.id == $id))) == [] and $a2.delNotice == null
+            and ($l | length) == 1 and $l[0].outcome._tag == "Applied"),
+        ms: $ms, server: $s, a: $a2.rows, b: $b2.rows, ledger: $l }')"
+  check "offline edit vs online delete: A's queued todos.update of the row B deleted is rejected RowNotFound, and A's optimistic edit does not resurrect it: no phantom row in A, B or Postgres" "$(jq -nc "${common[@]}" --argjson l "$l2" --arg id "$d2" '
+    { pass: (($a1.optimistic | map(select(.id == $id) | .title)) == ["A edit offline"] and $a2.ok and $b2.ok
+            and ($s | map(select(.id == $id))) == [] and ($a2.rows | map(select(.id == $id))) == [] and ($b2.rows | map(select(.id == $id))) == []
+            and ($a2.live | map(select(.id == $id))) == [] and ($b2.live | map(select(.id == $id))) == [] and $a2.pending == []
+            and $a2.updNotice._tag == "Rejected" and $a2.updNotice.error._tag == "RowNotFound"
+            and ($l | length) == 1 and $l[0].outcome._tag == "Rejected"),
+        ms: $ms, server: $s, a: $a2.rows, notice: $a2.updNotice, ledger: $l }')"
+  ab tab close "$DA" >/dev/null
+  ab tab close "$DB" >/dev/null
+}
+
+for section in ${SLICE_ORDER:-base offline conflict deleteedit}; do
+  "section_$section"
+done
 
 ab close >/dev/null
 echo "$((total - fails))/$total passed"

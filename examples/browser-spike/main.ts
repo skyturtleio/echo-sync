@@ -51,6 +51,8 @@ const log = (line: string) => {
   if (el) el.textContent = `${new Date().toISOString().slice(11, 23)} ${line}\n${el.textContent ?? ""}`
 }
 
+const netKey = `${appId}/${profile}`
+
 const spawnRouter = (name: string) =>
   new SharedWorker(new URL("./router.worker.ts", import.meta.url), { type: "module", name })
 
@@ -60,6 +62,9 @@ const spawnLeader = (name: string) => {
   for (const flag of ["crashAfterCommit", "failOpen"]) if (params.has(flag)) url.searchParams.set(flag, "")
   const syncUrl = params.get("syncUrl")
   if (syncUrl !== null) url.searchParams.set("syncUrl", syncUrl)
+  // The harness network gate (`echo.setOffline`), per identity; the state outlives a reload.
+  url.searchParams.set("net", netKey)
+  if (localStorage.getItem(`echo-test:net:${netKey}`) === "offline") url.searchParams.set("offline", "")
   return new Worker(url, { type: "module", name })
 }
 
@@ -138,6 +143,20 @@ const echo = {
     return true
   },
   requestSync: () => run(client.requestSync),
+  /**
+   * Harness network gate for this identity (every tab and leader of `app`/`profile`): offline makes the
+   * leader's requests fail as an unreachable server does and aborts its open streams. Persists across
+   * reloads (localStorage) until set back.
+   */
+  setOffline: (offline: boolean) => {
+    const state = offline ? "offline" : "online"
+    localStorage.setItem(`echo-test:net:${netKey}`, state)
+    const channel = new BroadcastChannel(`echo-test:net:${netKey}`)
+    // oxlint-disable-next-line unicorn/require-post-message-target-origin -- BroadcastChannel has no target origin
+    channel.postMessage(state)
+    channel.close()
+    return true
+  },
   presence: presenceWatches,
   /** Open this tab's presence in `room` with `state`; snapshots go to `echo.presence.get(room)`. */
   presenceOpen: (room: string, state: string) => {
