@@ -21,7 +21,7 @@
  */
 import { Array as Arr, Cause, DateTime, Deferred, Effect, Exit, Fiber, Option, Schema, Scheduler } from "effect"
 import type { Scope } from "effect"
-import * as Engine from "../../client/sync/Engine.ts"
+import type * as Engine from "../../client/sync/Engine.ts"
 import { AccessScope, Ids, Protocol, ScopeGrants, Store, SyncTable } from "../index.ts"
 import { Errors } from "../index.ts"
 import type { Mutation } from "../index.ts"
@@ -34,7 +34,7 @@ import type { Mutation } from "../index.ts"
 export interface RowStoreSubject<S extends Store.RowStore = Store.RowStore> {
   readonly rows: S
   readonly transaction: <A, E, R>(self: Effect.Effect<A, E, R>) => Effect.Effect<A, E | Errors.StoreUnavailable, R>
-  /** The substrate's scope claim (DESIGN §4); default: a replica's (`Engine.claimFromGrants`). */
+  /** The substrate's scope claim (DESIGN §4); default: a replica's (`Store.claimFromGrants`). */
   readonly claimScope?: Store.StoreOptions["claimScope"] | undefined
 }
 
@@ -682,7 +682,7 @@ export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): R
       Effect.gen(function* () {
         const { rows, transaction } = subject
         const fail = violation("createScope")
-        const substrateClaim = subject.claimScope ?? Engine.claimFromGrants(rows)
+        const substrateClaim = subject.claimScope ?? Store.claimFromGrants(rows)
         const claims: Array<string> = []
         const instance = (actor: AccessScope.PrincipalId) =>
           Store.make(rows, {

@@ -141,14 +141,8 @@ export const roleFromGrants =
       return Option.fromNullishOr(AccessScope.strongest(roles))
     })
 
-/**
- * The replica's optimistic scope claim (DESIGN §4): fresh iff `rows` holds no `scope_grants` row
- * for the scope. The server's claim is authoritative; a rejection undoes the optimistic grant.
- */
-export const claimFromGrants =
-  (rows: Store.RowStore) =>
-  (scopeId: AccessScope.AccessScopeId): Effect.Effect<boolean, StoreUnavailable> =>
-    Effect.map(rows.scan(ScopeGrants.ScopeGrants), (grants) => !grants.some((g) => g["access_scope_id"] === scopeId))
+/** The replica's optimistic scope claim lives in core (`Store.claimFromGrants`); re-exported here. */
+export const claimFromGrants = Store.claimFromGrants
 
 export interface RunResult {
   /** First-touch pre-images of every row the handler wrote, in write order. */

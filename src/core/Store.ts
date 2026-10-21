@@ -393,6 +393,15 @@ const toKeyValue = (table: AnySyncTable, field: string, value: unknown) =>
     return encoded
   })
 
+/**
+ * A replica's optimistic scope claim (DESIGN §4): fresh iff `rows` holds no `scope_grants` row for
+ * the scope. The server's claim is authoritative; a rejection undoes the optimistic grant.
+ */
+export const claimFromGrants =
+  (rows: RowStore) =>
+  (scopeId: AccessScopeId): Effect.Effect<boolean, StoreUnavailable> =>
+    Effect.map(rows.scan(ScopeGrants), (grants) => !grants.some((g) => g["access_scope_id"] === scopeId))
+
 /** Build the typed store over `rows`. Create one instance per handler run. */
 export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
   const images: Array<UndoImage> = []
