@@ -251,8 +251,18 @@ treats a pull defect as transient anyway (below) as a safety net, not as the con
 `pokes` stream ending for any reason (failure, defect, clean end) is reconnected by the client
 with backoff; it is a hint stream and nothing is lost **because of the subscribe-then-poke
 guarantee**: the server emits one poke on every `pokes` stream immediately after its `LISTEN` is
-confirmed (the pinned `PgClient.listen` resolves only after PostgreSQL acknowledges `LISTEN`),
-before any notification, and the client pulls on every poke. A change committed between the
+confirmed, before any notification, and the client pulls on every poke. **The server holds one
+`LISTEN` per process, not one per stream** (coordinator ruling, HeyBabe trial): the pinned
+`PgClient.listen` reserves a pool connection for the life of its scope, so a `LISTEN` per `pokes`
+stream exhausts the pool at `poolSize` connected clients and then blocks every push and pull.
+A server-scoped listener (built with the handlers, started before the server listens) owns the
+single `LISTEN` and fans notifications out through a `PubSub`; a `pokes` stream subscribes to
+that `PubSub` first and emits its initial poke only after the subscription exists and the shared
+`LISTEN` is confirmed, which preserves subscribe-then-poke per stream. Pokes carry no payload,
+so a subscriber may coalesce (a sliding subscription of capacity 1 is enough). When the shared
+`LISTEN` connection is lost, every subscribed `pokes` stream ends (typed `ServerFailure`) and the
+listener re-establishes `LISTEN` with backoff; clients reconnect and the initial poke's pull
+covers the gap, exactly as for a single lost stream today. A change committed between the
 client's last pull and the `LISTEN` is therefore covered by the pull that initial poke triggers,
 and a change committed after it produces a notification. The client must not rely on a pull
 issued *before* the stream is established to close a reconnect gap, and v1 adds no periodic
