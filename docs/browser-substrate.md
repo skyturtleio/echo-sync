@@ -336,16 +336,17 @@ wasm survives `terminate()`) did not show up here.
 
 ### Findings
 
-1. **The router SharedWorker dies with the tab that created it.** With tabs A (first) and B connected, closing
+1. **The router SharedWorker dies with the tab that created it** (observed under Playwright WebKit on Linux
+   GTK; unconfirmed on Safari, needs a real iPhone or macOS Safari). With tabs A (first) and B connected, closing
    A terminates the SharedWorker although B is still connected; messages B posts are lost, and the next
    `new SharedWorker()` from any tab relaunches a fresh instance (B's old port is reattached to it, with
    none of its state). `webkit/sharedworker-lifetime.sh` isolates it (Chromium PASS, WebKit FAIL). In the
    substrate, the router loses its route and every tab's registration exactly when the leader tab is the
    router's creator, so the new leader's announcement is dropped: the successor holds the leader lock
    (`isLeaderTab: true`) but no tab is ever served. Handover with the creating tab still open works (the
-   worker-only crash, OPFS startup failure and presence/sync handover scenarios pass). Whether Safari's own
-   process model shares this is **unverified**: no WebKit bug report found; the HTML spec says a shared
-   worker lives while any document holds it ([MDN](https://developer.mozilla.org/en-US/docs/Web/API/SharedWorker)).
+   worker-only crash, OPFS startup failure and presence/sync handover scenarios pass). Safari's own process
+   model differs from the GTK port, so this is **unconfirmed on Safari** until checked on a device: no WebKit
+   bug report found; the HTML spec says a shared worker lives while any document holds it ([MDN](https://developer.mozilla.org/en-US/docs/Web/API/SharedWorker)).
 2. **OPFS names are limited to 255 UTF-8 bytes per path segment** (`getDirectoryHandle`/`getFileHandle` with
    256 bytes fails `UnknownError`; 127 two-byte characters succeed, 128 fail). Chromium accepts 480. The
    identity check bounds only the whole path (appId + profile ≤ 488), so on WebKit a profile of 256–488
