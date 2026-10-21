@@ -51,7 +51,6 @@ export class TableNameConflict extends Schema.TaggedError<TableNameConflict>()("
 export const attach = (table: SyncTable.AnySyncTable, options?: { readonly schema?: string | undefined }) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient
-    const relation = options?.schema === undefined ? sql(table.name) : sql`${sql(options.schema)}.${sql(table.name)}`
     if (Option.isSome(yield* Effect.serviceOption(sql.transactionService))) {
       return yield* Effect.die("attach must own its transaction; do not call it inside withTransaction")
     }
@@ -65,8 +64,14 @@ export const attach = (table: SyncTable.AnySyncTable, options?: { readonly schem
         const target = yield* sql<{ schema: string; name: string }>`
           SELECT n.nspname AS schema, c.relname AS name FROM pg_class c
           JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE c.oid = ${options?.schema === undefined ? table.name : `${options.schema}.${table.name}`}::regclass`
-        const clash = (yield* syncedTables).find((t) => t.name === target[0]?.name && t.schema !== target[0]?.schema)
+          WHERE c.oid = (CASE WHEN ${options?.schema ?? null}::text IS NULL THEN quote_ident(${table.name})
+                         ELSE quote_ident(${options?.schema ?? null}::text) || '.' || quote_ident(${table.name}) END)::regclass`
+        // The DDL targets the relation this lookup resolved, quoted from the catalog, so the
+        // name check and the triggers can never disagree on which relation is meant.
+        const resolved = target[0]
+        if (resolved === undefined) return yield* Effect.die(`attach: ${table.name} did not resolve`)
+        const relation = sql`${sql(resolved.schema)}.${sql(resolved.name)}`
+        const clash = (yield* syncedTables).find((t) => t.name === resolved.name && t.schema !== resolved.schema)
         if (clash !== undefined) {
           return yield* new TableNameConflict({ table: clash.name, existingSchema: clash.schema })
         }

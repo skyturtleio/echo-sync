@@ -73,6 +73,21 @@ describe.skipIf(!pgAvailable)("change capture (§7)", () => {
     }).pipe(Effect.provide(TestDatabase))
   )
 
+  it.live("attach with a schema name differing only in case from an attached one is refused, not installed twice", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      // public.items is attached; "Public".items is a distinct relation with the same table name.
+      yield* sql`CREATE SCHEMA "Public"`
+      yield* sql`CREATE TABLE "Public".items (id text PRIMARY KEY, access_scope_id text NOT NULL, body text)`
+      const failure = yield* Effect.flip(attach(Items, { schema: "Public" }))
+      assert.strictEqual(failure._tag, "TableNameConflict")
+      assert.deepStrictEqual(
+        (yield* syncedTables).filter((t) => t.name === "items").map((t) => t.schema),
+        ["public"]
+      )
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
   it.live("concurrent attaches of one table name from two schemas cannot both succeed", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient
