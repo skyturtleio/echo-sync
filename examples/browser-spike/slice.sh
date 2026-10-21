@@ -321,9 +321,11 @@ echo.setOffline(true)
 const wentOffline = await offline()
 await mut('u-a-$c1', 'todos.update', { id: '$c1', note: 'note from A' })
 await mut('u-a-$c2', 'todos.update', { id: '$c2', title: 'A wins' })
-await mut('u-a-$c3', 'todos.update', { id: '$c3', title: '$(ctl no-reject && echo 'A plain' || echo 'server-rejects A')' })
+await mut('u-a-$c3', 'todos.update', { id: '$c3', title: 'server-rejects A' })
 await offline()
 return { wentOffline, optimistic: await rows(), ledgers: (await Promise.all(['$c1', '$c2', '$c3'].map((c) => ledger('u-a-' + c)))).map((l) => l.length) }")
+  # Control no-reject: the server's blocked-title check is off, so A's unchanged edit is applied.
+  ctl no-reject && admin "rejections?enabled=0" >/dev/null
   # Reconnect B first and wait until all its pushes are acknowledged, then A (control a-first: the reverse).
   first=$CB second=$CA fp=b sp=a
   if ctl a-first; then first=$CA second=$CB fp=a sp=b; fi
@@ -342,11 +344,28 @@ return { ok }")
 const want = [row('$c1', 'title from B', 'note from A'), row('$c2', 'A wins'), row('$c3', 'B stays')]
 const ok = (await converged(want)) === true
 return { ok, rows: await rows(), live: live(), pending: await pending(), notice: await notice('u-a-$c3') }")
+  ctl no-reject && admin "rejections?enabled=1" >/dev/null
+  # Barrier: a marker committed after A's rejection. Once B's live query shows it, B has pulled past the
+  # rejection's ledger position, so its emission history covers everything the rejection could cause.
+  ev <<<"$(npre "$S")
+await mut('mk-$c3', 'todos.add', { id: 'mk-$c3', scope, title: 'after the rejection' })
+return await released('mk-$c3', 30000)" >/dev/null
   ab tab "$CB" >/dev/null
+  # Control transient-rejected: B's replica shows A's rejected title for one emission, then B's again, so
+  # B's final state is still correct.
+  ctl transient-rejected && ev <<<"$(npre "$S")
+const set = (t) => echo.exec('UPDATE todos SET title = ? WHERE id = ?', [t, '$c3'])
+await set('server-rejects A')
+await echo.until(() => live().some((r) => r.id === '$c3' && r.title === 'server-rejects A'))
+await set('B stays')
+return await echo.until(() => live().some((r) => r.id === '$c3' && r.title === 'B stays'))" >/dev/null
   b3=$(evu 6 <<<"$(npre "$S")
-const want = [row('$c1', 'title from B', 'note from A'), row('$c2', 'A wins'), row('$c3', 'B stays')]
+const want = [row('$c1', 'title from B', 'note from A'), row('$c2', 'A wins'), row('$c3', 'B stays'), row('mk-$c3', 'after the rejection')]
 const ok = (await converged(want)) === true
-return { ok, rows: await rows(), live: live(), pending: await pending(), notices: (await echo.notices()).value.length }")
+const has = (pred) => window.live.emissions.some((e) => e.results[0].some(pred))
+return { ok, rows: await rows(), live: live(), pending: await pending(), notices: (await echo.notices()).value.length,
+  emissions: window.live.emissions.length, sawMarker: has((r) => r.id === 'mk-$c3'),
+  sawRejected: has((r) => r.id === '$c3' && r.title === 'server-rejects A') }")
   srv=$(admin "todos?scope=$S")
   ledgers='{}'
   for who in a b; do
@@ -377,15 +396,17 @@ return { ok, rows: await rows(), live: live(), pending: await pending(), notices
             and ($a3.live | map(select(.id == $id))) == $want and ($b3.live | map(select(.id == $id))) == $want
             and ($l["b-c2"] | length) == 1 and ($l["a-c2"] | length) == 1 and ($l["b-c2"][0].position | tonumber) < ($l["a-c2"][0].position | tonumber)),
         ms: $ms, server: $srow, b: ($b3.rows | map(select(.id == $id))), positions: { b: $l["b-c2"][0].position, a: $l["a-c2"][0].position } }')"
-  check "same row, A's edit rejected by the real server mutator: A gets the typed Rejected{DomainError blocked-title} notice and its optimistic title is undone to B's, which stays in Postgres and both replicas" "$(jq -nc "${common[@]}" --arg id "$c3" '
+  check "same row, A's edit rejected by the real server mutator: A gets the typed Rejected{DomainError blocked-title} notice and its optimistic title is undone to B's, which stays in Postgres and both replicas; no emission of B's live query, through a marker committed after the rejection, ever shows A's rejected title" "$(jq -nc "${common[@]}" --arg id "$c3" '
     [{ id: $id, access_scope_id: $S, title: "B stays", note: null }] as $want
     | ([$s[] | select(.id == $id)]) as $srow
     | { pass: (($a1.optimistic | map(select(.id == $id) | .title)) == ["server-rejects A"] and $srow == $want
             and ($a3.rows | map(select(.id == $id))) == $want and ($b3.rows | map(select(.id == $id))) == $want
             and ($a3.live | map(select(.id == $id))) == $want and ($b3.live | map(select(.id == $id))) == $want
             and $a3.notice._tag == "Rejected" and $a3.notice.error._tag == "DomainError" and $a3.notice.error.error.reason == "blocked-title"
+            and $b3.sawMarker and ($b3.sawRejected | not)
             and $b3.notices == 0 and ($l["a-c3"] | length) == 1 and $l["a-c3"][0].outcome._tag == "Rejected" and $l["b-c3"][0].outcome._tag == "Applied"),
-        ms: $ms, server: $srow, a: ($a3.rows | map(select(.id == $id))), notice: $a3.notice }')"
+        ms: $ms, server: $srow, a: ($a3.rows | map(select(.id == $id))), notice: $a3.notice,
+        bEmissions: $b3.emissions, bSawMarker: $b3.sawMarker, bEverShowedRejected: $b3.sawRejected }')"
   ab tab close "$CA" >/dev/null
   ab tab close "$CB" >/dev/null
 }
