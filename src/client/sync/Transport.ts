@@ -17,8 +17,8 @@
  * response the RPC client cannot decode, which it raises as a defect) becomes the transient
  * `PullProtocolError`, so a bad page never kills the loop's fiber; core's `ResnapshotRequired` passes through for the engine to handle.
  */
-import { Cause, Effect, Layer, Predicate, Schema, type Scope, type Stream } from "effect"
-import { FetchHttpClient, type Headers, HttpClient, HttpClientRequest } from "effect/http"
+import { Cause, Context, Effect, Layer, Predicate, Schema, type Scope, Stream } from "effect"
+import { FetchHttpClient, type Headers, HttpClient, HttpClientError, HttpClientRequest } from "effect/http"
 import { RpcClient, type RpcClientError, RpcSerialization } from "effect/rpc"
 import { type Ids, Protocol } from "echo-sync"
 import type * as Engine from "./Engine.ts"
@@ -57,14 +57,51 @@ const defectsAs =
         : Effect.fail(onDefect(Cause.pretty(cause)))
     )
 
+/**
+ * `syncHeaders` raised (a defect: its error channel is `never`) while the leader was preparing a
+ * request (DESIGN §9.1 Credentials). Local and transient, like a network failure: nothing was sent.
+ */
+export class CredentialsUnavailable extends Schema.TaggedError<CredentialsUnavailable>()("CredentialsUnavailable", {
+  message: Schema.String
+}) {}
+
+/** The leader's `syncHeaders` for this protocol, provided by `layerProtocolHttp`; unset without one. */
+const SyncHeaders = Context.Reference<Effect.Effect<Headers.Input> | undefined>(
+  "echo-sync/client/Transport/SyncHeaders",
+  {
+    defaultValue: () => undefined
+  }
+)
+
+/**
+ * Headers a stream (re)connect already resolved before its request (DESIGN §6 Liveness): the HTTP
+ * layer uses them instead of evaluating `syncHeaders` again. Unset for push and pull.
+ */
+const PreparedHeaders = Context.Reference<Headers.Input | undefined>("echo-sync/client/Transport/PreparedHeaders", {
+  defaultValue: () => undefined
+})
+
+/** Runs `syncHeaders`; a defect becomes `CredentialsUnavailable`, interruption passes through. */
+const acquire = (headers: Effect.Effect<Headers.Input>) =>
+  Effect.catchDefect(headers, (defect) =>
+    Effect.fail(new CredentialsUnavailable({ message: `syncHeaders failed: ${String(defect)}` }))
+  )
+
 /** A `Transport` over an RPC client `Protocol` (see `layerProtocolHttp`). */
-/** The engine's transport plus the pokes stream, which the leader follows with `SyncLoop.followPokes`. */
+/**
+ * The engine's transport plus the pokes stream, which the leader follows with `SyncLoop.followPokes`.
+ * `pokes` is prepare-then-stream: the Effect resolves this connect's headers (before any `idleTimeout`
+ * clock, DESIGN §6 Liveness), and the stream it returns sends the request with exactly those.
+ */
 export interface SyncTransport extends Engine.Transport<TransportError> {
-  readonly pokes: (clientId: Ids.ClientId) => Stream.Stream<typeof Protocol.PokesElement.Type, unknown>
+  readonly pokes: (
+    clientId: Ids.ClientId
+  ) => Effect.Effect<Stream.Stream<typeof Protocol.PokesElement.Type, unknown>, CredentialsUnavailable>
 }
 
 export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scope.Scope> = Effect.gen(function* () {
   const client = yield* RpcClient.make(Protocol.SyncRpcs)
+  const headers = yield* SyncHeaders
   return {
     push: (request) =>
       Effect.gen(function* () {
@@ -78,7 +115,12 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
     pull: (request) => client.pull(request).pipe(defectsAs((message) => new PullProtocolError({ message }))),
 
     // Any end of this stream (failure, defect, completion) is handled by reconnecting (followPokes).
-    pokes: (clientId) => client.pokes({ clientId })
+    pokes: (clientId) =>
+      headers === undefined
+        ? Effect.succeed(client.pokes({ clientId }))
+        : Effect.map(acquire(headers), (prepared) =>
+            client.pokes({ clientId }).pipe(Stream.provideService(PreparedHeaders, prepared))
+          )
   }
 })
 
@@ -89,20 +131,46 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
  * `headers` (DESIGN §9.1 Credentials) is evaluated on every outgoing HTTP request: each push, each
  * pull, and each (re)connect of a stream. It is applied to the HTTP client under the RPC protocol, so
  * every RPC on this protocol (including streams added later, such as presence `room`) carries the
- * credential current at the moment it is sent; nothing is cached across requests.
+ * credential current at the moment it is sent; nothing is cached across requests. A stream's
+ * (re)connect resolves them first (`SyncTransport.pokes`) and its request uses that result.
+ *
+ * Anything `headers` raises is a local acquisition failure (DESIGN §9.1): the request is not sent
+ * and the call fails with a transport `RpcClientError` (an HTTP `TransportError` carrying
+ * `CredentialsUnavailable`), retried like a network failure and never a server defect.
  */
 export const layerProtocolHttp = (
   url: string,
   headers?: Effect.Effect<Headers.Input>
-): Layer.Layer<RpcClient.Protocol> =>
-  RpcClient.layerProtocolHttp({
-    url,
-    ...(headers === undefined
-      ? {}
-      : {
-          transformClient: (client) =>
-            HttpClient.mapRequestEffect(client, (request) =>
-              Effect.map(headers, (current) => HttpClientRequest.setHeaders(request, current))
-            )
-        })
-  }).pipe(Layer.provide([RpcSerialization.layerNdjson, FetchHttpClient.layer]))
+): Layer.Layer<RpcClient.Protocol> => {
+  // `RpcClient.layerProtocolHttp` with the request transform inlined: its `transformClient` option
+  // cannot add the HTTP error the credential step may raise.
+  const protocol = Layer.effect(RpcClient.Protocol)(
+    Effect.flatMap(HttpClient.HttpClient, (base) => {
+      const client = HttpClient.mapRequest(base, HttpClientRequest.prependUrl(url))
+      if (headers === undefined) return RpcClient.makeProtocolHttp(client)
+      return RpcClient.makeProtocolHttp(
+        HttpClient.mapRequestEffect(client, (request) =>
+          Effect.gen(function* () {
+            const prepared = yield* PreparedHeaders
+            const current =
+              prepared ??
+              (yield* acquire(headers).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new HttpClientError.HttpClientError({
+                      reason: new HttpClientError.TransportError({ request, cause, description: cause.message })
+                    })
+                )
+              ))
+            return HttpClientRequest.setHeaders(request, current)
+          })
+        )
+      )
+    })
+  )
+  return headers === undefined
+    ? protocol.pipe(Layer.provide([RpcSerialization.layerNdjson, FetchHttpClient.layer]))
+    : Layer.merge(protocol, Layer.succeed(SyncHeaders)(headers)).pipe(
+        Layer.provide([RpcSerialization.layerNdjson, FetchHttpClient.layer])
+      )
+}

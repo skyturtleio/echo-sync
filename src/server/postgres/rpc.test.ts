@@ -405,7 +405,9 @@ describe.skipIf(!pgAvailable)("pokes liveness (§6)", () => {
         const stream = client
           .pokes({ clientId: Ids.ClientId.make("d") })
           .pipe(Stream.tap((element) => Effect.sync(() => void seen.push({ tag: element._tag, at: Date.now() }))))
-        yield* Effect.forkChild(SyncLoop.followPokes({ connect: stream, wake: Effect.sync(() => void pulls.n++) }))
+        yield* Effect.forkChild(
+          SyncLoop.followPokes({ connect: Effect.succeed(stream), wake: Effect.sync(() => void pulls.n++) })
+        )
         yield* eventually(
           Effect.sync(() => seen.length >= 5),
           "an initial poke and four heartbeats"

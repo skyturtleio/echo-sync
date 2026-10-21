@@ -192,8 +192,12 @@ export const make = <TE>(options: {
  * right after LISTEN (DESIGN §6, aec6cd4), and that first element is what covers anything missed while
  * disconnected. Pokes are only hints (§8), so nothing here is fatal. Runs until interrupted.
  */
-export const followPokes = <E>(options: {
-  readonly connect: Stream.Stream<{ readonly _tag: "poke" | "heartbeat" }, E>
+export const followPokes = <E, EP>(options: {
+  /**
+   * One (re)connect: the Effect prepares it (resolves credentials, DESIGN §9.1) and the stream it
+   * returns sends the request when run. `idleTimeout` covers only the stream (DESIGN §6 Liveness).
+   */
+  readonly connect: Effect.Effect<Stream.Stream<{ readonly _tag: "poke" | "heartbeat" }, E>, EP>
   readonly wake: Effect.Effect<void>
   readonly retryDelay?: Duration.Input
   readonly maxRetryDelay?: Duration.Input
@@ -203,7 +207,10 @@ export const followPokes = <E>(options: {
   Effect.gen(function* () {
     const base = Duration.toMillis(Duration.fromInputUnsafe(options.retryDelay ?? "1 second"))
     const cap = Duration.toMillis(Duration.fromInputUnsafe(options.maxRetryDelay ?? "30 seconds"))
-    const connect = Stream.timeout(options.connect, options.idleTimeout ?? "45 seconds")
+    const idleTimeout = options.idleTimeout ?? "45 seconds"
+    // Preparation runs first and is never counted as silence; the clock starts when the stream is
+    // first pulled, which is when its request is sent, and bounds the first element and every gap.
+    const connect = Stream.unwrap(Effect.map(options.connect, (stream) => Stream.timeout(stream, idleTimeout)))
     let delay = base
     while (true) {
       const connection = { poked: false }

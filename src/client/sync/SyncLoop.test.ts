@@ -270,7 +270,9 @@ it.effect(
           return Stream.as(Stream.tick("15 seconds"), heartbeat) // live: heartbeats only
         })
       )
-      const fiber = yield* Effect.forkChild(SyncLoop.followPokes({ connect, wake: Effect.sync(() => void wakes.n++) }))
+      const fiber = yield* Effect.forkChild(
+        SyncLoop.followPokes({ connect: Effect.succeed(connect), wake: Effect.sync(() => void wakes.n++) })
+      )
       yield* settle
       expect(attempts).toEqual([0])
       expect(wakes.n).toBe(2)
@@ -304,7 +306,9 @@ it.effect("only stream elements wake: a stream with no initial poke wakes nothin
     const connect = Stream.unwrap(
       Effect.sync(() => (++connections.n === 1 ? Stream.empty : Stream.fromQueue(notifications)))
     )
-    yield* Effect.forkChild(SyncLoop.followPokes({ connect, wake: Effect.sync(() => void wakes.n++) }))
+    yield* Effect.forkChild(
+      SyncLoop.followPokes({ connect: Effect.succeed(connect), wake: Effect.sync(() => void wakes.n++) })
+    )
     yield* settle
     yield* TestClock.adjust("1 second")
     yield* settle
@@ -323,7 +327,9 @@ it.effect("the server's initial poke, the first element of each stream, wakes th
     const connect = Stream.unwrap(
       Effect.sync(() => (++connections.n === 1 ? Stream.make(poke) : Stream.concat(Stream.make(poke), Stream.never)))
     )
-    yield* Effect.forkChild(SyncLoop.followPokes({ connect, wake: Effect.sync(() => void wakes.n++) }))
+    yield* Effect.forkChild(
+      SyncLoop.followPokes({ connect: Effect.succeed(connect), wake: Effect.sync(() => void wakes.n++) })
+    )
     yield* settle
     expect([connections.n, wakes.n]).toEqual([1, 1])
     yield* TestClock.adjust("1 second")
@@ -347,7 +353,11 @@ it.effect(
         )
       )
       yield* Effect.forkChild(
-        SyncLoop.followPokes({ connect, wake: Effect.sync(() => void wakes.n++), idleTimeout: "45 seconds" })
+        SyncLoop.followPokes({
+          connect: Effect.succeed(connect),
+          wake: Effect.sync(() => void wakes.n++),
+          idleTimeout: "45 seconds"
+        })
       )
       yield* Queue.offer(first, poke)
       yield* settle

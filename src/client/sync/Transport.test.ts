@@ -5,6 +5,7 @@ import { Rpc, RpcClient, RpcGroup, RpcSerialization, RpcServer } from "effect/rp
 import { AccessScope, Ids, Mutation, Protocol, Registry } from "echo-sync"
 import * as Engine from "./Engine.ts"
 import * as MemorySyncStorage from "./testing/MemorySyncStorage.ts"
+import * as SyncLoop from "./SyncLoop.ts"
 import * as Transport from "./Transport.ts"
 
 interface Handlers {
@@ -297,7 +298,7 @@ it.effect("a transport built with headers sends them on push, pull and the pokes
       )
       yield* t.push(batch(1))
       yield* t.pull({ clientId: Ids.ClientId.make("c"), cursor: null, continuation: Option.none() })
-      yield* Stream.runHead(t.pokes(Ids.ClientId.make("c")))
+      yield* Stream.runHead(Stream.unwrap(t.pokes(Ids.ClientId.make("c"))))
     }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
     expect(seen).toEqual({ push: "alice", pull: "alice", pokes: "alice" })
   }).pipe(Effect.scoped)
@@ -309,7 +310,8 @@ it.effect("a transport built with headers sends them on push, pull and the pokes
  * transport whose `syncHeaders` Effect returns the client's current token and counts evaluations.
  */
 const credentials = Effect.gen(function* () {
-  const state = { valid: "t1", client: "t1", evaluations: 0 }
+  // `failNext`: that many next `syncHeaders` evaluations die (the app's token store throws).
+  const state = { valid: "t1", client: "t1", evaluations: 0, failNext: 0, fetches: 0 }
   const seen: Array<string> = []
   const authenticate = (rpc: string, headers: Readonly<Record<string, string | undefined>>) =>
     Effect.suspend(() => {
@@ -344,20 +346,32 @@ const credentials = Effect.gen(function* () {
             })
           ),
         pokes: (_, { headers }) =>
-          Stream.fromEffect(authenticate("pokes", headers)).pipe(Stream.as({ _tag: "poke" as const }))
+          // The initial poke, then silence (no heartbeat): only the client's idleTimeout ends it.
+          Stream.concat(
+            Stream.fromEffect(authenticate("pokes", headers)).pipe(Stream.as({ _tag: "poke" as const })),
+            Stream.never
+          )
       }),
       RpcSerialization.layerNdjson
     ])
   )
   const web = HttpRouter.toWebHandler(app, { disableLogger: true })
   yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
-  const fetch = Object.assign((input: URL | RequestInfo, init?: RequestInit) => web.handler(new Request(input, init)), {
-    preconnect: globalThis.fetch.preconnect
-  })
+  const fetch = Object.assign(
+    (input: URL | RequestInfo, init?: RequestInit) => {
+      state.fetches++
+      return web.handler(new Request(input, init))
+    },
+    { preconnect: globalThis.fetch.preconnect }
+  )
   // The leader's `syncHeaders(principal)`: the app's current credential, renewed by setting `state.client`.
-  const syncHeaders = Effect.sync(() => {
+  const syncHeaders = Effect.suspend(() => {
     state.evaluations++
-    return { authorization: state.client }
+    if (state.failNext > 0) {
+      state.failNext--
+      return Effect.die(new Error("token store unavailable"))
+    }
+    return Effect.succeed({ authorization: state.client })
   })
   const transport = yield* Transport.make.pipe(
     Effect.provide(Transport.layerProtocolHttp("http://echo.test/rpc", syncHeaders))
@@ -374,7 +388,7 @@ it.effect(
       const { state, seen, transport: t, fetch } = yield* credentials
       yield* Effect.gen(function* () {
         // Built once, like the leader's `connect`; each run is one (re)connect.
-        const pokes = t.pokes(Ids.ClientId.make("c"))
+        const pokes = Stream.unwrap(t.pokes(Ids.ClientId.make("c")))
         yield* t.push(batch(1))
         yield* t.pull(pullRequest)
         yield* Stream.runHead(pokes)
@@ -392,34 +406,119 @@ it.effect(
     }).pipe(Effect.scoped)
 )
 
-it.effect(
-  "an Unauthorized push followed by renewal succeeds on the retry with the new header and the same outbox entry",
+/** A real Engine (memory storage) holding one pending mutation, `m1#1`, and the real sync loop over `transport`. */
+const loopOver = (transport: Effect.Success<typeof Transport.make>) =>
+  Effect.gen(function* () {
+    const engine = yield* Engine.make({
+      clientId: Ids.ClientId.make("c"),
+      actor: AccessScope.PrincipalId.make("p"),
+      storage: MemorySyncStorage.make(MemorySyncStorage.makeDisk()),
+      registry: Registry.make([]),
+      mutations: Mutation.makeRegistry([
+        Mutation.make("noop", { args: Schema.Struct({}), handler: () => Effect.void })
+      ]),
+      transport
+    })
+    yield* engine.mutate(Ids.MutationId.make("m1"), "noop", {})
+    const loop = yield* SyncLoop.make({
+      engine,
+      isFatalPush: Transport.isFatalPush,
+      pendingMutations: Stream.concat(Stream.make(1), Stream.never),
+      retryDelay: "10 millis",
+      maxRetryDelay: "40 millis"
+    })
+    const statuses: Array<SyncLoop.SyncStatus> = []
+    yield* Effect.forkChild(Stream.runForEach(loop.changes, (status) => Effect.sync(() => void statuses.push(status))))
+    return { loop, statuses }
+  })
+
+/** Real time: polls `check` every 10 ms for up to 5 s. */
+const eventually = (check: () => boolean, what: string) =>
+  Effect.gen(function* () {
+    for (let i = 0; i < 500; i++) {
+      if (check()) return
+      yield* Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 10)))
+    }
+    return yield* Effect.die(`timed out waiting for ${what}`)
+  })
+
+it.live(
+  "an Unauthorized push followed by renewal succeeds on the loop's retry with the new header and the same outbox entry, never halting",
   () =>
     Effect.gen(function* () {
       const { state, seen, transport, fetch } = yield* credentials
-      const disk = MemorySyncStorage.makeDisk()
-      const engine = yield* Engine.make({
-        clientId: Ids.ClientId.make("c"),
-        actor: AccessScope.PrincipalId.make("p"),
-        storage: MemorySyncStorage.make(disk),
-        registry: Registry.make([]),
-        mutations: Mutation.makeRegistry([
-          Mutation.make("noop", { args: Schema.Struct({}), handler: () => Effect.void })
-        ]),
-        transport
-      })
-      yield* engine.mutate(Ids.MutationId.make("m1"), "noop", {})
       // The token expired on the server before the client renewed it.
       state.valid = "t2"
-      const refused = yield* Effect.exit(engine.push.pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)))
-      const error = failureOf(refused)
-      expect(error).toBeInstanceOf(Protocol.Unauthorized)
-      if (error instanceof Protocol.Unauthorized) expect(Transport.isFatalPush(error)).toBe(false)
-      expect(disk.outbox.map((p) => `${p.envelope.mutationId}#${p.envelope.seq}`)).toEqual(["m1#1"])
-      // The app renews; the loop's retry pushes the same entry, now with the new token.
+      const { loop, statuses } = yield* loopOver(transport)
+      yield* Effect.forkChild(loop.run.pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)))
+      yield* eventually(() => seen.includes("push(m1#1):t1:rejected"), "a rejected push")
+      // The app renews; the loop's next retry carries it.
       state.client = "t2"
-      const retried = yield* engine.push.pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
-      expect(retried.processed).toBe(1)
-      expect(seen).toEqual(["push(m1#1):t1:rejected", "push(m1#1):t2"])
-    }).pipe(Effect.scoped)
+      yield* eventually(() => seen.includes("push(m1#1):t2"), "the renewed push")
+      const pushes = seen.filter((e) => e.startsWith("push"))
+      const accepted = pushes.indexOf("push(m1#1):t2")
+      expect(pushes.slice(0, accepted).every((e) => e === "push(m1#1):t1:rejected")).toBe(true)
+      expect(accepted).toBeGreaterThan(0)
+      expect(statuses.some((s) => s.lastError !== null)).toBe(true)
+      expect(statuses.map((s) => s.push._tag)).not.toContain("Halted")
+    }).pipe(Effect.scoped),
+  15_000
+)
+
+it.live(
+  "a syncHeaders Effect that dies is a transient local failure: nothing is sent, the loop retries the same entry, and push never halts",
+  () =>
+    Effect.gen(function* () {
+      const { state, seen, transport, fetch } = yield* credentials
+      state.failNext = 1
+      const { loop, statuses } = yield* loopOver(transport)
+      yield* Effect.forkChild(loop.run.pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)))
+      yield* eventually(() => seen.includes("push(m1#1):t1"), "the push after the failed acquisition")
+      // The first push never reached the server; the retry sent the same entry once.
+      expect(seen.filter((e) => e.startsWith("push"))).toEqual(["push(m1#1):t1"])
+      expect(statuses.some((s) => s.lastError !== null)).toBe(true)
+      expect(statuses.map((s) => s.push._tag)).not.toContain("Halted")
+    }).pipe(Effect.scoped),
+  15_000
+)
+
+it.live(
+  "a pokes reconnect whose syncHeaders takes longer than idleTimeout evaluates them once, then sends once; silence after the send still ends the stream",
+  () =>
+    Effect.gen(function* () {
+      const { state, fetch } = yield* credentials
+      // Slow headers (300 ms) on a short idleTimeout (100 ms): preparation is not stream silence.
+      const slow = Transport.make.pipe(
+        Effect.provide(
+          Transport.layerProtocolHttp(
+            "http://echo.test/rpc",
+            Effect.andThen(
+              Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 300))),
+              Effect.sync(() => {
+                state.evaluations++
+                return { authorization: state.client }
+              })
+            )
+          )
+        )
+      )
+      const t = yield* slow
+      const wakes = { n: 0 }
+      yield* Effect.forkChild(
+        SyncLoop.followPokes({
+          connect: t.pokes(Ids.ClientId.make("c")),
+          wake: Effect.sync(() => void wakes.n++),
+          idleTimeout: "100 millis",
+          retryDelay: "1 second"
+        }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+      )
+      // The connect's request went out once, with the headers of its one evaluation, and delivered its poke.
+      yield* eventually(() => wakes.n === 1, "the initial poke")
+      expect([state.evaluations, state.fetches]).toEqual([1, 1])
+      // The server then sends nothing: 100 ms later the stream ends, and after the 1 s backoff the
+      // follower prepares and sends a second connect.
+      yield* eventually(() => state.fetches === 2, "the reconnect after post-send silence")
+      expect(state.evaluations).toBe(2)
+    }).pipe(Effect.scoped),
+  15_000
 )
