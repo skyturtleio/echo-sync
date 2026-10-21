@@ -318,6 +318,13 @@ until commit**, so a transaction that touches a synced table early and then does
 holds every other synced writer. Keep such transactions short. Scale-out path (xid-horizon /
 commit-ordered cursors) is documented, not built.
 
+Tested (main b6acbf5, ws/ordering-control-determinism): a deterministic Deferred-sequenced
+interleaving (A inserts and holds, B inserts and commits, reader pulls, A commits, reader syncs)
+is the primary check, with the pull barriered on B being committed or queued on the advisory lock
+in `pg_locks`; its twin without the lock asserts exactly A is missed, so each test discriminates
+the trigger; the 40-writer random race stays as the stress case. The held writers are owned by
+the helper's scope so a failure mid-interleaving cannot deadlock pool teardown.
+
 `TRUNCATE` does not fire row triggers: unsupported on synced tables in v1 (statement-level
 trigger raises). Retention: `echo_sync.log` is GC'd past a configurable horizon; a client whose
 cursor is older than the horizon receives a typed `ResnapshotRequired` and re-snapshots.
