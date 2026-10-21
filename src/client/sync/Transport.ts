@@ -21,6 +21,7 @@ import { Cause, Context, Effect, Layer, Predicate, Schema, type Scope, Stream } 
 import { FetchHttpClient, type Headers, HttpClient, HttpClientError, HttpClientRequest } from "effect/http"
 import { RpcClient, type RpcClientError, RpcSerialization } from "effect/rpc"
 import { type Ids, Protocol } from "echo-sync"
+import type * as Presence from "./Presence.ts"
 import type * as Engine from "./Engine.ts"
 
 /** The push batch cannot be sent as is, or the server ended it with a defect. Fatal. */
@@ -98,11 +99,20 @@ export interface SyncTransport extends Engine.Transport<TransportError> {
   readonly pokes: (
     clientId: Ids.ClientId
   ) => Effect.Effect<Stream.Stream<typeof Protocol.PokesElement.Type, unknown>, CredentialsUnavailable>
+  /** `Protocol.PresenceRpcs` on the same mount (the server merges both groups, DESIGN §12). */
+  readonly presence: (clientId: Ids.ClientId) => Presence.Upstream<PresenceError>
 }
+
+export type PresenceError = RpcClientError.RpcClientError | Protocol.Unauthorized | Protocol.ServerUnavailable
+
+/** Only a missing grant ends a presence subscription; everything else is rejoined. */
+export const isFatalPresence = (error: PresenceError): error is Protocol.Unauthorized =>
+  Predicate.isTagged(error, "Unauthorized")
 
 export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scope.Scope> = Effect.gen(function* () {
   const client = yield* RpcClient.make(Protocol.SyncRpcs)
   const headers = yield* SyncHeaders
+  const presenceClient = yield* RpcClient.make(Protocol.PresenceRpcs)
   return {
     push: (request) =>
       Effect.gen(function* () {
@@ -121,7 +131,12 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
         ? Effect.succeed(client.pokes({ clientId }))
         : Effect.map(acquire(headers), (prepared) =>
             client.pokes({ clientId }).pipe(Stream.provideService(PreparedHeaders, prepared))
-          )
+          ),
+
+    presence: (clientId) => ({
+      room: (payload) => presenceClient.room({ clientId, ...payload }),
+      track: (payload) => presenceClient.track({ clientId, ...payload })
+    })
   }
 })
 

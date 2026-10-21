@@ -12,6 +12,8 @@
  * - `subscribe` (registered queries) and `notices` re-subscribe to the next leader on `LeaderLost`; the
  *   stream emits nothing in between, so a consumer keeps the last emission until a fresh one arrives.
  * - `syncStatus` also re-subscribes on `LeaderLost` (DESIGN §9.1); `requestSync` retries it like `mutate`.
+ * - `presence` re-joins the next leader on `LeaderLost` with this tab's latest tracked state; `track`
+ *   updates that state (DESIGN §9.1 Presence). See `tabApi`.
  * - Raw `subscribeRaw` streams terminate with `LeaderUnavailable { reason: "LeaderLost" }`;
  *   the caller re-subscribes and receives a fresh full result from the new leader.
  */
@@ -23,11 +25,12 @@ import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Schedule from "effect/Schedule"
+import * as Semaphore from "effect/Semaphore"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
-import { type Errors, Ids, type Mutation, type Query } from "echo-sync"
+import { type AccessScope, type Errors, Ids, type Mutation, Protocol, type Query } from "echo-sync"
 import { RpcClient } from "effect/rpc"
 import { RpcClientError } from "effect/rpc/RpcClientError"
 import type { LocallyRejected } from "../sync/Engine.ts"
@@ -38,6 +41,7 @@ import {
   type LeaderInfo,
   LeaderRpcs,
   type PendingExport,
+  PresenceAlreadyOpen,
   type StoredNotice,
   type SyncDisabled,
   LeaderUnavailable,
@@ -121,6 +125,13 @@ export class LeaderClient extends Context.Service<
      * no network success and never clears a halted push; retried across `LeaderLost`.
      */
     readonly requestSync: Effect.Effect<void, SyncDisabled | LeaderUnavailable>
+    /**
+     * This tab's presence in `room` (DESIGN §9.1): its entry exists exactly while the stream runs. Emits the
+     * room's snapshots; survives handover (re-joined on the new leader with the latest `track`ed state).
+     */
+    readonly presence: PresenceFn
+    /** Replace this tab's state in a room it has joined through `presence`; a no-op otherwise. */
+    readonly track: TrackFn
     /** Retained notices, current list then every change; survives handover. */
     readonly notices: Stream.Stream<ReadonlyArray<StoredNotice>, SqlFailure | LeaderUnavailable>
     /** The only way a notice is removed (DESIGN §9.1). Idempotent, so retried across `LeaderLost`. */
@@ -137,6 +148,15 @@ type MutateFn = <A extends Mutation.PureSchema, E extends Mutation.PureSchema>(
   args: A["Type"],
   options?: { readonly mutationId?: Ids.MutationId }
 ) => Effect.Effect<Enqueued, SqlFailure | LocallyRejected | LeaderUnavailable>
+
+type PresenceFn = (
+  room: AccessScope.AccessScopeId,
+  state: Schema.Json
+) => Stream.Stream<Protocol.RoomSnapshot, PresenceError>
+type TrackFn = (room: AccessScope.AccessScopeId, state: Schema.Json) => Effect.Effect<void, SyncDisabled>
+
+/** `Unauthorized`: no grant in the room's scope. `PresenceAlreadyOpen`: one stream per room per tab. */
+export type PresenceError = SyncDisabled | Protocol.Unauthorized | PresenceAlreadyOpen | LeaderUnavailable
 
 /** Errors a registered query's stream can end with (a run's `ReadError`s, minus the transient one). */
 export type SubscribeError =
@@ -185,6 +205,15 @@ export interface LeaderCalls {
   readonly dismissNotices: (ids: ReadonlyArray<number>) => Effect.Effect<void, SqlFailure | LeaderUnavailable>
   readonly syncStatus: Stream.Stream<SyncStatus, SyncDisabled | LeaderUnavailable>
   readonly requestSync: Effect.Effect<void, SyncDisabled | LeaderUnavailable>
+  /** `room`/`track` with this tab's id filled in. */
+  readonly presence: (
+    room: AccessScope.AccessScopeId,
+    state: Schema.Json
+  ) => Stream.Stream<Protocol.RoomSnapshot, SyncDisabled | Protocol.Unauthorized | LeaderUnavailable>
+  readonly track: (
+    room: AccessScope.AccessScopeId,
+    state: Schema.Json
+  ) => Effect.Effect<void, SyncDisabled | LeaderUnavailable>
 }
 
 /**
@@ -217,9 +246,58 @@ export const tabApi = (calls: LeaderCalls) => {
         )
       })
     )
+  /**
+   * The latest desired state per joined room, kept in the tab: a new leader knows nothing of the old one's.
+   * Each (re)join reads it; after the first snapshot of each, a state tracked since that read is sent
+   * again (a `track` racing a join may be a no-op on the leader or the server). `track` and that catch-up
+   * are serialized, so the leader sees this tab's states in order.
+   */
+  const joined = new Map<string, { state: Schema.Json; version: number; readonly lock: Semaphore.Semaphore }>()
+  const presence: PresenceFn = (room, state) =>
+    Stream.unwrap(
+      Effect.gen(function* () {
+        if (joined.has(room)) return Stream.fail<PresenceError>(new PresenceAlreadyOpen({ room }))
+        const cell = { state, version: 0, lock: yield* Semaphore.make(1) }
+        joined.set(room, cell)
+        const open = Stream.suspend(() => {
+          const read = cell.version
+          let first = true
+          return calls.presence(room, cell.state).pipe(
+            Stream.tap(() =>
+              first
+                ? Effect.suspend(() => {
+                    first = false
+                    return cell.lock.withPermit(
+                      Effect.suspend(() =>
+                        cell.version === read ? Effect.void : Effect.ignore(calls.track(room, cell.state))
+                      )
+                    )
+                  })
+                : Effect.void
+            )
+          )
+        })
+        return resubscribing(open).pipe(Stream.ensuring(Effect.sync(() => joined.delete(room))))
+      })
+    )
+  const track: TrackFn = (room, state) =>
+    Effect.suspend(() => {
+      const cell = joined.get(room)
+      if (cell === undefined) return Effect.void
+      return cell.lock.withPermit(
+        Effect.suspend(() => {
+          cell.state = state
+          cell.version++
+          // A lost leader is fine: the next join carries `state`.
+          return calls.track(room, state).pipe(Effect.catchIf(isLeaderLost, () => Effect.void))
+        })
+      )
+    })
   return {
     mutate,
     subscribe,
+    presence,
+    track,
     notices: resubscribing(calls.notices),
     syncStatus: resubscribing(calls.syncStatus),
     requestSync: calls.requestSync.pipe(Effect.retry({ while: isLeaderLost, schedule: lostBackoff })),
@@ -340,7 +418,10 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
         notices: streamWithLeader((client) => client.notices()),
         dismissNotices: (ids) => withLeader((client) => client.dismissNotices({ ids })),
         syncStatus: streamWithLeader((client) => client.syncStatus()),
-        requestSync: withLeader((client) => client.requestSync())
+        requestSync: withLeader((client) => client.requestSync()),
+        presence: (room, state) =>
+          streamWithLeader((client) => client.presence({ room, tabId: Protocol.TabId.make(tabId), state })),
+        track: (room, state) => withLeader((client) => client.track({ room, tabId: Protocol.TabId.make(tabId), state }))
       }),
       leaderInfo: withLeader((client) => client.leaderInfo()),
       subscribeRaw: (query) => streamWithLeader((client) => client.subscribeRaw({ query })),

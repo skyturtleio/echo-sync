@@ -13,6 +13,7 @@ import type { OutboxEnvelope, QueryResult, SqlParams } from "../../src/client/wo
 import type { ToRouter } from "../../src/client/worker/messages.ts"
 import type { SyncStatus } from "../../src/client/sync/SyncLoop.ts"
 import { resetReplica } from "../../src/client/worker/ResetReplica.ts"
+import { AccessScope } from "../../src/core/index.ts"
 
 const params = new URLSearchParams(location.search)
 const appId = params.get("app") ?? "spike"
@@ -106,6 +107,14 @@ const statusLog: Array<LeaderClientModule.Status> = []
 const syncStatusLog: Array<{ readonly afterStatus: number; readonly value: SyncStatus }> = []
 const syncWatch: { ended: unknown } = { ended: undefined }
 
+/** Open `presence` streams by room: every snapshot's entries (as `tabId=state`), how it ended, and a closer. */
+interface PresenceWatch {
+  readonly snapshots: Array<ReadonlyArray<string>>
+  ended: unknown
+  readonly close: () => void
+}
+const presenceWatches = new Map<string, PresenceWatch>()
+
 const echo = {
   statusLog,
   /** Lets the epoch-lock callbacks held by `?holdEpochWatch` run. */
@@ -129,6 +138,30 @@ const echo = {
     return true
   },
   requestSync: () => run(client.requestSync),
+  presence: presenceWatches,
+  /** Open this tab's presence in `room` with `state`; snapshots go to `echo.presence.get(room)`. */
+  presenceOpen: (room: string, state: string) => {
+    const watch: PresenceWatch = {
+      snapshots: [],
+      ended: undefined,
+      close: () => Effect.runFork(Fiber.interrupt(fiber))
+    }
+    const fiber = Effect.runFork(
+      Stream.runForEach(client.presence(AccessScope.AccessScopeId.make(room), state), (snapshot) =>
+        Effect.sync(
+          () => void watch.snapshots.push(snapshot.entries.map((e) => `${e.tabId}=${JSON.stringify(e.state)}`))
+        )
+      ).pipe(
+        Effect.exit,
+        Effect.map((exit) => {
+          watch.ended = Exit.isFailure(exit) ? JSON.parse(JSON.stringify(exit.cause)) : "completed"
+        })
+      )
+    )
+    presenceWatches.set(room, watch)
+    return true
+  },
+  track: (room: string, state: string) => run(client.track(AccessScope.AccessScopeId.make(room), state)),
   /** `resetReplica` for another identity (this tab's own client must not be for it). */
   resetReplica: (
     target: { readonly appId: string; readonly profile: string },

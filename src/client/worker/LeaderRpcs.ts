@@ -5,7 +5,7 @@
  */
 import * as Schema from "effect/Schema"
 import { Rpc, RpcGroup } from "effect/rpc"
-import { Errors, Ids, Mutation, Query } from "echo-sync"
+import { AccessScope, Errors, Ids, Mutation, Protocol, Query } from "echo-sync"
 import { LocallyRejected } from "../sync/Engine.ts"
 import { Notice } from "../sync/SqliteSyncStorage.ts"
 import { SyncStatus } from "../sync/SyncLoop.ts"
@@ -39,6 +39,18 @@ export class RawExecDisabled extends Schema.TaggedError<RawExecDisabled>()("RawE
 
 /** This leader was started without a `syncUrl`: a local-only replica, nothing syncs. */
 export class SyncDisabled extends Schema.TaggedError<SyncDisabled>()("SyncDisabled", {}) {}
+
+/** This tab already has an open `presence` stream for the room (one entry per tab per room, DESIGN §12). */
+export class PresenceAlreadyOpen extends Schema.TaggedError<PresenceAlreadyOpen>()("PresenceAlreadyOpen", {
+  room: Schema.String
+}) {}
+
+/** A tab's presence in one room (DESIGN §9.1): the tab id is the server's entry key with the clientId. */
+export const PresencePayload = Schema.Struct({
+  room: AccessScope.AccessScopeId,
+  tabId: Protocol.TabId,
+  state: Schema.Json
+})
 
 /**
  * What a tab hands to `enqueue`. `mutationId` is the idempotency key chosen by the caller (unique per
@@ -147,6 +159,19 @@ export class LeaderRpcs extends RpcGroup.make(
   Rpc.make("syncStatus", { success: SyncStatus, error: SyncDisabled, stream: true }),
   /** Wake the sync loop (coalesced); completes once the wake is queued, never clears a halted push. */
   Rpc.make("requestSync", { error: SyncDisabled }),
+  /**
+   * Join `room` as this tab and observe it (DESIGN §9.1 Presence): room snapshots only (heartbeats stay on
+   * the leader). The leader keeps the upstream stream up (idle timeout, rejoin with the latest tracked
+   * state); the entry lives exactly while this stream is open. `Unauthorized`: no grant in the room's scope.
+   */
+  Rpc.make("presence", {
+    payload: PresencePayload,
+    success: Protocol.RoomSnapshot,
+    error: Schema.Union([SyncDisabled, Protocol.Unauthorized]),
+    stream: true
+  }),
+  /** Replace this tab's state in `room`; a no-op unless its `presence` stream is open on this leader. */
+  Rpc.make("track", { payload: PresencePayload, error: SyncDisabled }),
   /**
    * Retained notices (rejected / outcome-unknown mutations), oldest first: the current list, then the
    * list after every change to `echo_notices`. The engine never removes one; only `dismissNotices` does.

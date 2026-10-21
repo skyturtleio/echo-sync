@@ -32,9 +32,10 @@ import * as SqlClient from "effect/sql/SqlClient"
 import type { Row } from "effect/sql/SqlConnection"
 import type { SqlError } from "effect/sql/SqlError"
 import { type Rpc, type RpcGroup, RpcServer } from "effect/rpc"
-import { AccessScope, type Errors, Ids, type Mutation, Query, type Registry, Store } from "echo-sync"
+import { AccessScope, type Errors, Ids, type Mutation, type Protocol, Query, type Registry, Store } from "echo-sync"
 import * as Outbox from "../Outbox.ts"
 import * as Engine from "../sync/Engine.ts"
+import * as Presence from "../sync/Presence.ts"
 import * as SqliteSyncStorage from "../sync/SqliteSyncStorage.ts"
 import * as SyncLoop from "../sync/SyncLoop.ts"
 import * as Transport from "../sync/Transport.ts"
@@ -142,6 +143,8 @@ export interface HandlerOptions {
   readonly storage: SqliteSyncStorage.SqliteSyncStorage
   readonly engine: Engine.Engine<unknown>
   readonly loop: SyncLoop.SyncLoop | undefined
+  /** The leader's presence (DESIGN §9.1); `undefined` on a local-only replica, like `loop`. */
+  readonly presence: Presence.Presence<Protocol.Unauthorized> | undefined
   readonly actor: AccessScope.PrincipalId
   readonly queries: Query.QueryRegistry
   readonly allowRawExec: boolean
@@ -155,6 +158,7 @@ export const makeHandlers = ({
   storage,
   engine,
   loop,
+  presence,
   actor,
   queries,
   allowRawExec,
@@ -234,6 +238,9 @@ export const makeHandlers = ({
     leaderInfo: () => Effect.succeed(info),
     syncStatus: () => (loop === undefined ? Stream.fail(new SyncDisabled()) : loop.changes),
     requestSync: () => (loop === undefined ? Effect.fail(new SyncDisabled()) : loop.wake),
+    // Never touches the replica or the outbox (DESIGN §3): no permit, no SQL.
+    presence: (payload) => (presence === undefined ? Stream.fail(new SyncDisabled()) : presence.join(payload)),
+    track: (payload) => (presence === undefined ? Effect.fail(new SyncDisabled()) : presence.track(payload)),
     notices: () =>
       sql.reactive(["echo_notices"], storage.admit(SqliteSyncStorage.notices(sql)).pipe(Effect.mapError(unavailable))),
     dismissNotices: ({ ids }) =>
@@ -403,6 +410,7 @@ const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: L
     )
     const storage = SqliteSyncStorage.make(sql, registry)
     let loop: SyncLoop.SyncLoop | undefined
+    let presence: Presence.Presence<Protocol.Unauthorized> | undefined
     let engine: Engine.Engine<unknown>
     if (syncUrl === undefined) {
       engine = yield* Engine.make({ clientId, actor, storage, registry, mutations, transport: localOnly })
@@ -422,6 +430,11 @@ const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: L
       )
       yield* sync.wake
       loop = sync
+      presence = Presence.make({
+        upstream: transport.presence(clientId),
+        isFatal: Transport.isFatalPresence,
+        idleTimeout: options.idleTimeout
+      })
     }
     const handlers = yield* makeHandlers({
       sql,
@@ -429,6 +442,7 @@ const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: L
       storage,
       engine,
       loop,
+      presence,
       actor,
       queries: options.queries ?? Query.makeRegistry([]),
       allowRawExec: options.allowRawExec ?? false,

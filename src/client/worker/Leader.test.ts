@@ -211,6 +211,7 @@ const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
       storage,
       engine,
       loop: undefined,
+      presence: undefined,
       actor: me,
       queries: Query.makeRegistry([pick, pair, flip, docs]),
       allowRawExec: options.allowRawExec,
@@ -382,7 +383,9 @@ const passThrough = (client: Effect.Success<ReturnType<typeof leaderRpc>>["clien
   notices: client.notices(),
   dismissNotices: (ids) => client.dismissNotices({ ids }),
   syncStatus: client.syncStatus(),
-  requestSync: client.requestSync()
+  requestSync: client.requestSync(),
+  presence: (room, state) => client.presence({ room, tabId: Protocol.TabId.make("tab"), state }),
+  track: (room, state) => client.track({ room, tabId: Protocol.TabId.make("tab"), state })
 })
 
 it.live("mutate retried across LeaderLost after the lost leader committed leaves exactly one outbox row", () =>
@@ -550,6 +553,7 @@ const syncLeader = (
       storage,
       engine,
       loop,
+      presence: undefined,
       actor: me,
       queries: Query.makeRegistry([]),
       allowRawExec: false,
@@ -775,5 +779,112 @@ it.live(
       expect(log.slice(from, beforeAck).map((s) => s.pendingMutations)).toEqual(log.slice(from, beforeAck).map(() => 1))
       expect(log.slice(from, beforeAck).every((s) => s.lastSyncedAt === t1)).toBe(true)
       expect(released.lastSyncedAt ?? 0).toBeGreaterThan(t1 ?? Number.POSITIVE_INFINITY)
+    }).pipe(Effect.scoped)
+)
+
+it.live(
+  "presence across handover re-joins the next leader with the latest tracked state and keeps the stream open",
+  () =>
+    Effect.gen(function* () {
+      const room = AccessScope.AccessScopeId.make("room-1")
+      const snap = (state: Schema.Json): Protocol.RoomSnapshot => ({
+        _tag: "snapshot",
+        room,
+        entries: [{ principalId: me, clientId: Ids.ClientId.make("c"), tabId: Protocol.TabId.make("tab"), state }]
+      })
+      const joins: Array<Schema.Json> = []
+      const tracks: Array<Schema.Json> = []
+      // This tab's entry state as each leader's server would hold it (a join sets it, a track replaces it).
+      const held: Array<Schema.Json | undefined> = [undefined, undefined, undefined]
+      const lost = yield* Deferred.make<void>()
+      const elected = yield* Deferred.make<void>()
+      let leader = 1
+      const calls: LeaderCalls = {
+        ...passThrough((yield* leaderRpc({ allowRawExec: false })).client),
+        // Leader 1 answers once, then is lost; leader 2 answers once elected. Each join echoes its state.
+        presence: (_room, state) =>
+          Stream.suspend(() => {
+            joins.push(state)
+            held[leader] = state
+            return leader === 1
+              ? Stream.concat(Stream.make(snap(state)), Stream.never).pipe(
+                  Stream.interruptWhen(Effect.andThen(Deferred.await(lost), Effect.fail(leaderLost)))
+                )
+              : Stream.unwrap(Effect.as(Deferred.await(elected), Stream.concat(Stream.make(snap(state)), Stream.never)))
+          }),
+        // While no leader serves this tab, a track is lost with it.
+        track: (_room, state) =>
+          Effect.suspend(() =>
+            Deferred.isDoneUnsafe(lost) && !Deferred.isDoneUnsafe(elected)
+              ? Effect.fail(leaderLost)
+              : Effect.sync(() => {
+                  tracks.push(state)
+                  held[leader] = state
+                })
+          )
+      }
+      const api = tabApi(calls)
+      const emissions = yield* Queue.unbounded<Protocol.RoomSnapshot>()
+      const ended = yield* Deferred.make<void>()
+      yield* Effect.forkScoped(
+        Stream.runForEach(api.presence(room, "s0"), (s) => Queue.offer(emissions, s)).pipe(
+          Effect.ensuring(Deferred.succeed(ended, undefined))
+        )
+      )
+      const next = Queue.take(emissions).pipe(Effect.timeout("5 seconds"))
+      expect((yield* next).entries[0]?.state).toBe("s0")
+      yield* api.track(room, "s1")
+      yield* Deferred.succeed(lost, undefined)
+      leader = 2
+      yield* Effect.sleep("150 millis")
+      // Tracked while no leader serves the tab: the track is lost with the leader, and the stream stays open.
+      yield* api.track(room, "s2")
+      expect(yield* Deferred.isDone(ended)).toBe(false)
+      yield* Deferred.succeed(elected, undefined)
+      yield* next
+      // The rejoin was read before s2 (whose track was lost with the leader): it carries the latest state at
+      // that point, never the opening s0, and the catch-up after its first snapshot brings the new leader to s2.
+      expect(joins).toEqual(["s0", "s1"])
+      expect(held[2]).toBe("s2")
+      expect(yield* Deferred.isDone(ended)).toBe(false)
+      // track on a room this tab has not joined is a no-op.
+      const before = tracks.length
+      yield* api.track(AccessScope.AccessScopeId.make("other"), "x")
+      expect(tracks.length).toBe(before)
+    }).pipe(Effect.scoped)
+)
+
+it.live(
+  "presence entry is dropped when the tab stream closes: a later track is a no-op and the room can be re-joined",
+  () =>
+    Effect.gen(function* () {
+      const room = AccessScope.AccessScopeId.make("room-1")
+      const open = new Set<string>()
+      const tracks: Array<Schema.Json> = []
+      const calls: LeaderCalls = {
+        ...passThrough((yield* leaderRpc({ allowRawExec: false })).client),
+        presence: (r) => {
+          const empty: Protocol.RoomSnapshot = { _tag: "snapshot", room: r, entries: [] }
+          return Stream.concat(Stream.make(empty), Stream.never).pipe(
+            Stream.onStart(Effect.sync(() => open.add(r))),
+            Stream.ensuring(Effect.sync(() => open.delete(r)))
+          )
+        },
+        track: (_r, state) => Effect.sync(() => void tracks.push(state))
+      }
+      const api = tabApi(calls)
+      const first = yield* Stream.runHead(api.presence(room, "a"))
+      expect(Option.isSome(first)).toBe(true)
+      // runHead closed the stream: the leader-side stream ended with it, and track is a no-op.
+      expect(open.size).toBe(0)
+      yield* api.track(room, "b")
+      expect(tracks).toEqual([])
+      // A second open of the same room while one is open is refused; after it closes, joining again works.
+      const holder = yield* Effect.forkScoped(Stream.runDrain(api.presence(room, "c")))
+      yield* Effect.sleep("50 millis")
+      const second = yield* Effect.flip(Stream.runDrain(api.presence(room, "d")))
+      expect(second._tag).toBe("PresenceAlreadyOpen")
+      yield* Fiber.interrupt(holder)
+      expect(Option.isSome(yield* Stream.runHead(api.presence(room, "e")))).toBe(true)
     }).pipe(Effect.scoped)
 )

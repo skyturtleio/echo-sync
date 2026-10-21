@@ -430,6 +430,55 @@ return { pass: !s.ok && s.error._tag === 'ResetFailed' && s.error.message.includ
   && !p.ok && p.error._tag === 'ResetFailed' && p.error.message.includes('injected postMessage failure'), s, p }")"
 ab tab close "$R" >/dev/null
 
+# ── presence (DESIGN §9.1, §12): entry exactly while the tab stream is open; survives handover ────────
+# Needs the real server (PresenceRpcs is mounted with SyncRpcs on /sync). L is the leader tab; F and W follow.
+if [ "$SYNC_MODE" = real ]; then
+  APP="presence-$RUN"
+  ROOM="room-$RUN"
+  curl -sf "$BASE/admin/grant?scope=$ROOM&principal=spike-user&role=writer" >/dev/null
+  L=$(open_tab "$BASE/?app=$APP")
+  l=$(ev <<<"$SERVED")
+  F=$(open_tab "$BASE/?app=$APP")
+  ftab=$(ev <<<"$SERVED" | jq -r .tabId)
+  W=$(open_tab "$BASE/?app=$APP")
+  ev <<<"$SERVED" >/dev/null
+  LATEST="const latest = () => echo.presence.get('$ROOM')?.snapshots.at(-1) ?? []"
+  ev <<<"echo.presenceOpen('$ROOM', 'w'); return true" >/dev/null
+  ab tab "$F" >/dev/null
+  ev <<<"echo.presenceOpen('$ROOM', 'f0'); await echo.until(() => (echo.presence.get('$ROOM')?.snapshots.length ?? 0) > 0); return (await echo.track('$ROOM', 'f1')).ok" >/dev/null
+  ab tab "$W" >/dev/null
+  shown=$(ev <<<"$LATEST
+return (await echo.until(() => latest().includes('$ftab=\"f1\"'), 15000)) === true")
+  ab tab "$F" >/dev/null
+  ev <<<"echo.presence.get('$ROOM').close(); return true" >/dev/null
+  ab tab "$W" >/dev/null
+  gone=$(ev <<<"$LATEST
+return (await echo.until(() => echo.presence.get('$ROOM').snapshots.length > 0 && !latest().some((e) => e.startsWith('$ftab=')), 15000)) === true")
+  check "presence: a tab's entry is listed while its stream is open (with its tracked state) and gone once it closes" \
+    "$(jq -nc --argjson s "$shown" --argjson g "$gone" '{ pass: ($s and $g), shown: $s, gone: $g }')"
+
+  # F joins again and tracks f3; then the leader tab closes. The new leader re-joins F with f3 (not f2).
+  ab tab "$F" >/dev/null
+  ev <<<"echo.presenceOpen('$ROOM', 'f2'); await echo.until(() => (echo.presence.get('$ROOM')?.snapshots.length ?? 0) > 0); return (await echo.track('$ROOM', 'f3')).ok" >/dev/null
+  ab tab "$W" >/dev/null
+  ev <<<"$LATEST
+await echo.until(() => latest().includes('$ftab=\"f3\"'), 15000); window.beforeHandover = echo.presence.get('$ROOM').snapshots.length; return true" >/dev/null
+  ab tab close "$L" >/dev/null
+  ab tab "$W" >/dev/null
+  after=$(ev <<<"$LATEST
+const old = $(jq '.leaderId' <<<"$l")
+const s = await echo.until(async () => { const s = await echo.status(); const i = await echo.info(); return s.leaderId !== undefined && s.leaderId !== old && i.ok && i.value.leaderId === s.leaderId ? s : undefined }, 20000)
+const n = window.beforeHandover
+// A snapshot produced after the handover (the re-joins on the new leader) still lists F with f3, and W itself.
+const ok = await echo.until(() => echo.presence.get('$ROOM').snapshots.length > n && latest().includes('$ftab=\"f3\"') && latest().some((e) => e.endsWith('=\"w\"')), 20000)
+return { newLeader: s?.leaderId ?? null, ok: ok === true, latest: latest(), hist: echo.presence.get('$ROOM').snapshots.slice(n - 1), ended: echo.presence.get('$ROOM').ended ?? null }")
+  ab tab "$F" >/dev/null
+  fend=$(ev <<<"return echo.presence.get('$ROOM').ended ?? null")
+  check "presence across handover: both streams stay open and the new leader re-joins F with its latest tracked state" \
+    "$(jq -nc --argjson a "$after" --argjson f "$fend" '{ pass: ($a.ok and $a.newLeader != null and $a.ended == null and $f == null), after: $a, fEnded: $f }')"
+  for t in "$F" "$W"; do ab tab close "$t" >/dev/null; done
+fi
+
 # ── identities that would escape the storage namespace are refused up front ──────────────────────────
 D=$(open_tab "$BASE/?app=.")
 check "identity '.' is refused with LeaderUnavailable{Unsupported}, nothing is opened" "$(ev <<<'const r = await echo.info(); const s = await echo.status()

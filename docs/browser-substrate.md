@@ -165,6 +165,39 @@ next leader for `a` has an empty outbox and a new `clientId`; `b` keeps its rows
 whose database header is overwritten is refused with `ResetFailed` and left intact without
 `discardPending`, and removed with it; throwing `spawnLeader` and `postMessage` are `ResetFailed`).
 
+### Presence (`presence` / `track`, DESIGN §9.1, §12, §16 item 13)
+
+`presence(room, state)` on the tab client is a `Stream<RoomSnapshot>`. `track(room, state)` replaces this
+tab's state in a room it has joined; for a room it has not joined it does nothing.
+
+- **Leader-owned.** The leader opens one upstream `PresenceRpcs.room` stream per tab subscription
+  (`src/client/sync/Presence.ts`), keyed on the server by `(principal, clientId, tabId)`. The tab id is the
+  tab client's own. Presence uses no permit and no SQL, and never touches the replica or the outbox. A
+  local-only leader (no `syncUrl`) fails `SyncDisabled`.
+- **Entry lifetime.** The entry exists exactly while the tab's stream runs. Closing it interrupts the RPC
+  stream, which ends the leader's upstream stream, and the server drops the entry. A second `presence` for
+  a room this tab already has open fails `PresenceAlreadyOpen`.
+- **Liveness.** Heartbeats stay on the leader and only snapshots reach the tab. No element at all for
+  `idleTimeout` (the `LeaderOptions` value that `followPokes` uses, 45 s by default) ends the upstream
+  stream, and so does any failure or clean end. The leader then rejoins after a backoff, and the tab
+  stream does not end. Only `Unauthorized` (no grant in the room's scope) ends it.
+- **Latest desired state.** `track` cannot confirm that it was applied: one that races a join can be a no-op
+  on the server, or land on an entry the join then replaces. So every join carries the latest tracked state,
+  and after the first snapshot of each join, a state tracked since the join was read is sent again. That
+  holds on the leader (idle and reconnect rejoins) and in the tab (handover rejoins: a new leader knows
+  nothing of the old one's state). `track` and that catch-up are serialized, so states arrive in order.
+- **Handover.** Like `subscribe`, the stream re-joins on the next leader and emits nothing in between. A
+  same-key rejoin ends the older server stream (DESIGN §12), which is expected. Other tabs see this tab's
+  entry disappear for at most the reconnect gap.
+
+Evidence:
+- `Presence.test.ts`: heartbeats are filtered, a silent connection is rejoined with the latest state while
+  the stream stays open, a racing track is re-sent, and only a fatal error ends the subscription.
+- `Leader.test.ts`: the tab re-joins with the latest state across handover, and closing the stream drops
+  the room.
+- `scenarios.sh` (real server): an entry is listed only while its stream is open, and after the leader tab
+  closes, the new leader re-joins F with its last tracked state.
+
 ## Fallback without SharedWorker
 
 Capability-tested in the tab (`typeof SharedWorker === "function"`). Without it, mode is `single-tab`:
