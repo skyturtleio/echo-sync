@@ -95,11 +95,25 @@ export class Unauthorized extends Schema.TaggedError<Unauthorized>()("Unauthoriz
   message: Schema.String
 }) {}
 
+/**
+ * Request-level push rejection (DESIGN §6): an envelope in the batch is malformed (e.g.
+ * `seq < 1`), so the whole push is refused; nothing is executed or ledgered.
+ */
+export class MalformedEnvelope extends Schema.TaggedError<MalformedEnvelope>()("MalformedEnvelope", {
+  clientId: ClientId,
+  mutationId: MutationId,
+  message: Schema.String
+}) {}
+
 /** A hint that something may have changed; never data (DESIGN §8). */
 export const Poke = Schema.Struct({})
 
 export const SyncRpcs = RpcGroup.make(
-  Rpc.make("push", { payload: PushRequest, success: PushResponse, error: Unauthorized }),
+  Rpc.make("push", {
+    payload: PushRequest,
+    success: PushResponse,
+    error: Schema.Union([MalformedEnvelope, Unauthorized])
+  }),
   Rpc.make("pull", {
     payload: PullRequest,
     success: PullResponse,
