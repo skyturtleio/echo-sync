@@ -32,7 +32,7 @@ const mid = Ids.MutationId.make
 
 describe.skipIf(!pgAvailable)("expiry floor (DESIGN §16.5) against the real server", () => {
   it.live(
-    "a pending, never-acked mutation at or below the server's raised floor becomes OutcomeUnknown on the next pull: released, not re-pushed, no ledger row",
+    "a pending, never-acked mutation at or below the server's raised floor becomes OutcomeUnknown on the next pull (released, not re-pushed, no ledger row); one above the floor stays pending and pushes",
     () =>
       Effect.gen(function* () {
         const pg = yield* SqlClient
@@ -92,7 +92,9 @@ describe.skipIf(!pgAvailable)("expiry floor (DESIGN §16.5) against the real ser
           yield* engine.pull
           const m2 = yield* engine.mutate(mid("m2"), "items.add", { id: "i2", body: "expired" })
           assert.strictEqual(m2.seq, 2)
-          assert.deepStrictEqual(yield* items, ["i1", "i2"]) // i2 is optimistic
+          // m3 (seq 3) is above the floor: it must survive the expiry and push afterwards.
+          yield* engine.mutate(mid("m3"), "items.add", { id: "i3", body: "above the floor" })
+          assert.deepStrictEqual(yield* items, ["i1", "i2", "i3"]) // i2 and i3 are optimistic
 
           // The operator raises the floor past m2, as expiry would once m2's ledger row is gone.
           yield* pg`UPDATE echo_sync.clients SET expired_through = 2,
@@ -101,7 +103,11 @@ describe.skipIf(!pgAvailable)("expiry floor (DESIGN §16.5) against the real ser
           yield* engine.pull
 
           // The pull alone settled m2: OutcomeUnknown, released, its optimistic effect gone with the rebase.
-          assert.deepStrictEqual(yield* storage.transaction(storage.pending), [])
+          // m3, above the floor, is untouched: still pending, still applied optimistically.
+          assert.deepStrictEqual(
+            (yield* storage.transaction(storage.pending)).map((e) => e.envelope.mutationId),
+            ["m3"]
+          )
           const notices = yield* SqliteSyncStorage.notices(sqlite)
           assert.deepStrictEqual(
             notices.map(({ notice }) => [notice._tag, notice.envelope.mutationId, notice.envelope.seq]),
@@ -111,14 +117,22 @@ describe.skipIf(!pgAvailable)("expiry floor (DESIGN §16.5) against the real ser
             sqlite<{ released_at: number | null }>`SELECT released_at FROM echo_outbox WHERE mutation_id = 'm2'`
           )
           assert.isTrue(outbox.length === 1 && outbox[0]?.released_at != null, "m2's outbox row is released")
-          assert.deepStrictEqual(yield* items, ["i1"])
+          assert.deepStrictEqual(yield* items, ["i1", "i3"])
 
-          // Nothing is left to push, and the server never saw m2.
+          // The next push sends m3 alone (the server never sees m2), and the server applies it.
           const before = sent.push
-          assert.strictEqual((yield* engine.push).processed, 0)
-          assert.strictEqual(sent.push, before)
+          assert.strictEqual((yield* engine.push).processed, 1)
+          assert.strictEqual(sent.push, before + 1)
+          yield* engine.pull
+          assert.deepStrictEqual(yield* storage.transaction(storage.pending), [])
+          assert.deepStrictEqual(yield* items, ["i1", "i3"])
           assert.deepStrictEqual(yield* ledger("m2"), [])
-          assert.strictEqual((yield* ledger("m1")).length, 1)
+          assert.deepStrictEqual((yield* ledger("m1")).length, 1)
+          assert.deepStrictEqual(
+            (yield* ledger("m3")).map((r) => Number(r.seq)),
+            [3]
+          )
+          assert.strictEqual((yield* SqliteSyncStorage.notices(sqlite)).length, 1)
           assert.isTrue(Option.isSome(yield* storage.transaction(storage.lookup(mid("m2")))))
         }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
