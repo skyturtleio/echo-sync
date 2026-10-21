@@ -73,13 +73,13 @@ export const revoke = (principalId: string, scopeId: string) =>
  */
 export class Replica {
   readonly rows = new Map<string, { readonly scopeId: string; readonly row: unknown }>()
-  readonly acked = new Set<number>()
+  readonly acked = new Set<string>()
   cursor: bigint | null = null
   continuation: Option.Option<string> = Option.none()
   /** Every change ever received, for leak checks. */
   readonly received: Array<Change> = []
   private staged: Array<Change> = []
-  private stagedAcks: Array<number> = []
+  private stagedAcks: Array<string> = []
 
   constructor(
     readonly principalId: string,

@@ -48,6 +48,10 @@ export default Effect.gen(function* () {
       client_id text PRIMARY KEY,
       principal_id text NOT NULL,
       cursor bigint,
+      -- §16.5 expiry floor: seq ≤ expired_through is answered Rejected{clientExpired} at
+      -- expired_position (the highest expired ledger row). No v1 job raises them.
+      expired_through bigint NOT NULL DEFAULT 0,
+      expired_position bigint NOT NULL DEFAULT 0,
       last_seen_at timestamptz NOT NULL DEFAULT now(),
       created_at timestamptz NOT NULL DEFAULT now()
     )`
@@ -66,7 +70,8 @@ export default Effect.gen(function* () {
   yield* sql`
     CREATE TABLE echo_sync.mutations (
       client_id text NOT NULL REFERENCES echo_sync.clients (client_id),
-      mutation_id bigint NOT NULL,
+      mutation_id text NOT NULL,
+      seq bigint NOT NULL,
       position bigint NOT NULL UNIQUE,
       outcome jsonb NOT NULL,
       received_at timestamptz NOT NULL DEFAULT now(),

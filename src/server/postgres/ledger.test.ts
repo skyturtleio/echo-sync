@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Schedule } from "effect"
+import { Effect, Exit, Schedule } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { MutationRejected, runBatch, runMutation } from "./ledger.ts"
 import { pgAvailable, Replica, TestDatabase } from "./test-support.ts"
@@ -21,120 +21,152 @@ const counterBody = Effect.gen(function* () {
   return rows[0]?.body ?? ""
 })
 
+const ledgerIds = Effect.gen(function* () {
+  const sql = yield* SqlClient
+  const rows = yield* sql<{ mutation_id: string }>`SELECT mutation_id FROM echo_sync.mutations ORDER BY position`
+  return rows.map((r) => r.mutation_id)
+})
+
 /** A real Postgres serialization failure (SQLSTATE 40001). */
 const serializationFailure = Effect.gen(function* () {
   const sql = yield* SqlClient
   yield* sql`DO $$ BEGIN RAISE EXCEPTION 'conflict' USING ERRCODE = '40001'; END $$`
 })
 
+const env = (mutationId: string, seq: bigint) => ({ principalId: "p", clientId: "c1", mutationId, seq })
+const reject = (message: string) => Effect.fail(new MutationRejected({ reason: "domain", message }))
+
 describe.skipIf(!pgAvailable)("mutation ledger (§6)", () => {
-  it.live("a resubmitted envelope (lost response) returns the recorded outcome without re-executing", () =>
+  it.live("a resubmitted envelope (lost response) returns the recorded outcome and position without re-executing", () =>
     Effect.gen(function* () {
-      const envelope = { principalId: "p", clientId: "c1", mutationId: 1 }
-      const first = yield* runMutation(envelope, appendEffect("x"))
+      const first = yield* runMutation(env("6f1c…uuid", 1n), appendEffect("x"))
       // The client never saw `first` and retries the same identity, possibly with a body that
       // would now behave differently: it must not run.
-      const second = yield* runMutation(
-        envelope,
-        Effect.fail(new MutationRejected({ reason: "domain", message: "no" }))
-      )
+      const second = yield* runMutation(env("6f1c…uuid", 1n), reject("no"))
       assert.deepStrictEqual(second, first)
       assert.strictEqual(yield* counterBody, "x")
     }).pipe(Effect.provide(TestDatabase))
   )
 
-  it.live("concurrent submissions of one envelope commit its effects once and agree on the outcome", () =>
+  it.live("concurrent submissions of one envelope run the body once and agree on outcome and position", () =>
     Effect.gen(function* () {
-      const envelope = { principalId: "p", clientId: "c1", mutationId: 7 }
-      const outcomes = yield* Effect.forEach(
-        Array.from({ length: 8 }),
-        () => runMutation(envelope, Effect.andThen(appendEffect("x"), Effect.sleep("20 millis"))),
-        { concurrency: "unbounded" }
+      let executions = 0
+      const body = Effect.andThen(
+        Effect.sync(() => executions++),
+        Effect.andThen(appendEffect("x"), Effect.sleep("20 millis"))
       )
-      for (const outcome of outcomes) assert.deepStrictEqual(outcome, { _tag: "Applied" })
+      const results = yield* Effect.forEach(Array.from({ length: 8 }), () => runMutation(env("m", 1n), body), {
+        concurrency: "unbounded"
+      })
+      assert.strictEqual(executions, 1)
+      for (const result of results) assert.deepStrictEqual(result, results[0])
       assert.strictEqual(yield* counterBody, "x")
     }).pipe(Effect.provide(TestDatabase))
   )
 
   it.live("a rejected mutation records its outcome and leaves none of its writes behind", () =>
     Effect.gen(function* () {
-      const envelope = { principalId: "p", clientId: "c1", mutationId: 1 }
-      const outcome = yield* runMutation(
-        envelope,
+      const rejected = yield* runMutation(
+        env("m", 1n),
         Effect.andThen(appendEffect("x"), Effect.fail(new MutationRejected({ reason: "forbidden", message: "nope" })))
       )
-      assert.deepStrictEqual(outcome, { _tag: "Rejected", reason: "forbidden", message: "nope" })
+      assert.deepStrictEqual(rejected.outcome, { _tag: "Rejected", reason: "forbidden", message: "nope" })
       assert.strictEqual(yield* counterBody, "")
       // Recorded: a retry returns the same rejection without running the (now succeeding) body.
-      assert.deepStrictEqual(yield* runMutation(envelope, appendEffect("y")), outcome)
+      assert.deepStrictEqual(yield* runMutation(env("m", 1n), appendEffect("y")), rejected)
       assert.strictEqual(yield* counterBody, "")
     }).pipe(Effect.provide(TestDatabase))
   )
 
-  it.live(
-    "a batch stops unrecorded at a transient failure and its resubmission continues in client order",
-    () =>
-      Effect.gen(function* () {
-        const sql = yield* SqlClient
-        let attempts = 0
-        const flaky = Effect.andThen(
-          Effect.sync(() => attempts++),
-          serializationFailure
-        )
-        const m1 = { mutationId: 1, body: appendEffect("1") }
-        const m2 = { mutationId: 2, body: Effect.fail(new MutationRejected({ reason: "domain", message: "bad" })) }
-        const m4 = { mutationId: 4, body: appendEffect("4") }
-        const first = yield* runBatch("p", "c1", [m1, m2, { mutationId: 3, body: flaky }, m4], fastRetry)
-        assert.deepStrictEqual(
-          first.processed.map((p) => [p.mutationId, p.outcome._tag]),
-          [
-            [1, "Applied"],
-            [2, "Rejected"]
-          ]
-        )
-        assert.strictEqual(first.stopped?.mutationId, 3)
-        assert.strictEqual(attempts, 3, "bounded retry: one attempt plus two retries")
-        // Nothing for ≥ k: neither 3 nor 4 is recorded or applied.
-        const recorded = yield* sql<{ mutation_id: bigint }>`
-          SELECT mutation_id FROM echo_sync.mutations WHERE client_id = 'c1' ORDER BY position`
-        assert.deepStrictEqual(
-          recorded.map((r) => Number(r.mutation_id)),
-          [1, 2]
-        )
-        assert.strictEqual(yield* counterBody, "1")
+  it.live("a batch stops at a transient failure without recording it, and its resubmission continues in order", () =>
+    Effect.gen(function* () {
+      let attempts = 0
+      const flaky = Effect.andThen(
+        Effect.sync(() => attempts++),
+        serializationFailure
+      )
+      const m1 = { mutationId: "a", seq: 1n, body: appendEffect("1") }
+      const m2 = { mutationId: "b", seq: 2n, body: reject("bad") }
+      const m4 = { mutationId: "d", seq: 4n, body: appendEffect("4") }
+      const first = yield* runBatch("p", "c1", [m1, m2, { mutationId: "c", seq: 3n, body: flaky }, m4], fastRetry)
+      assert.deepStrictEqual(
+        first.processed.map((p) => [p.mutationId, p.outcome._tag]),
+        [
+          ["a", "Applied"],
+          ["b", "Rejected"]
+        ]
+      )
+      assert.strictEqual(first.stopped?.mutationId, "c")
+      assert.strictEqual(attempts, 3, "bounded retry: one attempt plus two retries")
+      // Nothing for ≥ k: neither c nor d is recorded or applied.
+      assert.deepStrictEqual(yield* ledgerIds, ["a", "b"])
+      assert.strictEqual(yield* counterBody, "1")
 
-        // The client resubmits the whole unacknowledged batch; the conflict is gone now.
-        const second = yield* runBatch("p", "c1", [m1, m2, { mutationId: 3, body: appendEffect("3") }, m4], fastRetry)
-        assert.strictEqual(second.stopped, null)
-        assert.deepStrictEqual(
-          second.processed.map((p) => p.outcome._tag),
-          ["Applied", "Rejected", "Applied", "Applied"]
-        )
-        assert.strictEqual(yield* counterBody, "134")
+      // The client resubmits the whole unacknowledged batch; the conflict is gone now.
+      const second = yield* runBatch("p", "c1", [m1, m2, { mutationId: "c", seq: 3n, body: appendEffect("3") }, m4])
+      assert.strictEqual(second.stopped, null)
+      assert.deepStrictEqual(
+        second.processed.map((p) => p.outcome._tag),
+        ["Applied", "Rejected", "Applied", "Applied"]
+      )
+      // Replayed outcomes carry their original positions; new ones come after them.
+      assert.deepStrictEqual(second.processed.slice(0, 2), first.processed)
+      const positions = second.processed.map((p) => p.position)
+      assert.isTrue(positions.every((position, i) => i === 0 || (positions[i - 1] ?? position) < position))
+      assert.strictEqual(yield* counterBody, "134")
 
-        // Acks arrive by pull, in client order, each exactly once.
-        const replica = new Replica("p", "c1")
-        yield* replica.sync()
-        assert.deepStrictEqual([...replica.acked], [1, 2, 3, 4])
-      }).pipe(Effect.provide(TestDatabase)),
-    30_000
+      // Acks arrive by pull, in client order, each exactly once.
+      const replica = new Replica("p", "c1")
+      yield* replica.sync()
+      assert.deepStrictEqual([...replica.acked], ["a", "b", "c", "d"])
+    }).pipe(Effect.provide(TestDatabase))
   )
 
   it.live("a server crash mid-mutation records nothing, keeps none of its writes, and the retry applies once", () =>
     Effect.gen(function* () {
-      const envelope = { principalId: "p", clientId: "c1", mutationId: 1 }
-      // The backend dies after the body wrote and before the ledger row: the closest a test can
-      // get to the process crashing between "handler done" and "commit".
+      // The backend dies after the body wrote and before the ledger row.
       const crashing = Effect.andThen(
         appendEffect("x"),
         Effect.flatMap(SqlClient, (sql) => sql`SELECT pg_terminate_backend(pg_backend_pid())`)
       )
-      const result = yield* Effect.flip(runMutation(envelope, crashing))
+      const result = yield* Effect.flip(runMutation(env("m", 1n), crashing))
       assert.strictEqual(result._tag, "MutationTransient")
       assert.strictEqual(yield* counterBody, "")
-      assert.deepStrictEqual(yield* runMutation(envelope, appendEffect("x")), { _tag: "Applied" })
-      assert.deepStrictEqual(yield* runMutation(envelope, appendEffect("x")), { _tag: "Applied" })
+      const applied = yield* runMutation(env("m", 1n), appendEffect("x"))
+      assert.deepStrictEqual(yield* runMutation(env("m", 1n), appendEffect("x")), applied)
       assert.strictEqual(yield* counterBody, "x")
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live(
+    "a connection lost after the body succeeded (savepoint cleanup fails) is a typed transient, not a defect",
+    () =>
+      Effect.gen(function* () {
+        // The body finishes normally, but another connection kills its backend, so RELEASE
+        // SAVEPOINT fails. The pinned SqlClient raises that as a defect.
+        const killedAfterwards = Effect.gen(function* () {
+          const sql = yield* SqlClient
+          yield* appendEffect("x")
+          const [self] = yield* sql<{ pid: number }>`SELECT pg_backend_pid() AS pid`
+          yield* Effect.scoped(
+            Effect.flatMap(sql.reserve, (other) =>
+              other.execute("SELECT pg_terminate_backend($1)", [self?.pid], undefined)
+            )
+          )
+        })
+        const result = yield* Effect.flip(runMutation(env("m", 1n), killedAfterwards))
+        assert.strictEqual(result._tag, "MutationTransient")
+        assert.deepStrictEqual(yield* ledgerIds, [])
+        assert.strictEqual(yield* counterBody, "")
+      }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("runMutation inside a caller's transaction is refused (its outcome would not be committed)", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      const exit = yield* Effect.exit(sql.withTransaction(runMutation(env("m", 1n), appendEffect("x"))))
+      assert.isTrue(Exit.hasDies(exit))
+      assert.deepStrictEqual(yield* ledgerIds, [])
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -142,17 +174,39 @@ describe.skipIf(!pgAvailable)("mutation ledger (§6)", () => {
     Effect.gen(function* () {
       const replica = new Replica("p", "c1")
       yield* replica.sync()
-      yield* runMutation({ principalId: "p", clientId: "c1", mutationId: 1 }, Effect.void)
+      yield* runMutation(env("m", 1n), Effect.void)
       yield* replica.sync()
-      assert.deepStrictEqual([...replica.acked], [1])
+      assert.deepStrictEqual([...replica.acked], ["m"])
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("a seq at or below the client's expiry floor is not executed and returns the expired position", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      yield* runMutation(env("m1", 1n), Effect.void)
+      // No v1 job raises the floor (§16.5); raise it by hand.
+      yield* sql`UPDATE echo_sync.clients SET expired_through = 2, expired_position = 41 WHERE client_id = 'c1'`
+      const expired = yield* runMutation(env("m2", 2n), appendEffect("x"))
+      assert.deepStrictEqual(expired, {
+        outcome: { _tag: "Rejected", reason: "clientExpired", message: "ledger expired for this seq" },
+        position: 41n
+      })
+      assert.strictEqual(yield* counterBody, "")
+      assert.deepStrictEqual(yield* ledgerIds, ["m1"])
+      const next = yield* runMutation(env("m3", 3n), appendEffect("y"))
+      assert.strictEqual(next.outcome._tag, "Applied")
+
+      const replica = new Replica("p", "c1")
+      const done = yield* replica.pullOnce(100)
+      assert.deepStrictEqual(done._tag === "PullDone" && done.expiredThrough, 2n)
     }).pipe(Effect.provide(TestDatabase))
   )
 
   it.live("a client id registered to one principal is refused to another", () =>
     Effect.gen(function* () {
-      yield* runMutation({ principalId: "alice", clientId: "c1", mutationId: 1 }, Effect.void)
+      yield* runMutation(env("m", 1n), Effect.void)
       const result = yield* Effect.flip(
-        runMutation({ principalId: "mallory", clientId: "c1", mutationId: 1 }, Effect.void)
+        runMutation({ principalId: "mallory", clientId: "c1", mutationId: "m", seq: 1n }, Effect.void)
       )
       assert.strictEqual(result._tag, "ClientForbidden")
     }).pipe(Effect.provide(TestDatabase))

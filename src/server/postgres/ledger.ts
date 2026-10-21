@@ -1,6 +1,6 @@
-import { Effect, Schedule, Schema } from "effect"
+import { Effect, Option, Schedule, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
-import type { SqlError } from "effect/sql/SqlError"
+import { isSqlError, type SqlError } from "effect/sql/SqlError"
 
 /**
  * A permanent failure of a mutation body (DESIGN.md §6). Recorded in the ledger as the
@@ -11,24 +11,33 @@ export class MutationRejected extends Schema.TaggedError<MutationRejected>()("Mu
   message: Schema.String
 }) {}
 
-/** The recorded result of a processed mutation. Identical on every resubmission. */
+/**
+ * The result of a processed mutation. Identical on every resubmission. `clientExpired` is never
+ * recorded: it is answered from the client's expiry floor (§16.5).
+ */
 export const MutationOutcome = Schema.Union([
   Schema.TaggedStruct("Applied", {}),
   Schema.TaggedStruct("Rejected", {
-    reason: Schema.Literals(["decode", "forbidden", "domain"]),
+    reason: Schema.Literals(["decode", "forbidden", "domain", "clientExpired"]),
     message: Schema.String
   })
 ])
 export type MutationOutcome = typeof MutationOutcome.Type
 
+/** A push outcome and the ledger position it was recorded at (§6). */
+export interface Processed {
+  readonly outcome: MutationOutcome
+  readonly position: bigint
+}
+
 /**
- * A failure that says nothing about the mutation itself (serialization conflict after retries,
- * lost connection, unclassified database error). Nothing is recorded; the client retries from
- * this mutation, so order is preserved.
+ * The mutation's fate is unknown to the server's caller: serialization conflict after retries,
+ * lost connection, unclassified database error, or a COMMIT whose reply was lost (in which case
+ * it may in fact be recorded). The client resubmits from this mutation; dedup makes that safe.
  */
 export class MutationTransient extends Schema.TaggedError<MutationTransient>()("MutationTransient", {
   clientId: Schema.String,
-  mutationId: Schema.Number,
+  mutationId: Schema.String,
   message: Schema.String
 }) {}
 
@@ -40,12 +49,15 @@ export class ClientForbidden extends Schema.TaggedError<ClientForbidden>()("Clie
 export interface Envelope {
   readonly principalId: string
   readonly clientId: string
-  readonly mutationId: number
+  /** Idempotency key, unordered (e.g. a UUID). */
+  readonly mutationId: string
+  /** Client outbox sequence: per-client monotone, gap-free, starting at 1. */
+  readonly seq: bigint
 }
 
 export interface LedgerOptions {
   /** Retry policy for serialization failures and deadlocks. Default: 4 retries, exponential from 10ms. */
-  readonly conflictRetry?: Schedule.Schedule<unknown, SqlError> | undefined
+  readonly conflictRetry?: Schedule.Schedule<unknown> | undefined
 }
 
 const defaultConflictRetry = Schedule.exponential("10 millis").pipe(Schedule.upTo({ times: 4 }))
@@ -60,92 +72,108 @@ const transient = (envelope: Envelope, error: SqlError) =>
     message: `${error.reason._tag}: ${error.message}`
   })
 
-const isConflict = (error: SqlError) =>
-  error.reason._tag === "SerializationError" || error.reason._tag === "DeadlockError"
+const isConflict = (error: SqlError | ClientForbidden) =>
+  error._tag === "SqlError" && (error.reason._tag === "SerializationError" || error.reason._tag === "DeadlockError")
 
 /**
  * Binds a client id to its principal on first sight and refuses it to any other principal, so
- * one principal can never read another's acks or replay another's mutation ids.
+ * one principal can never read another's acks or replay another's mutation ids. Inside a
+ * transaction the upsert also row-locks the client until commit.
  */
 export const registerClient = Effect.fnUntraced(function* (principalId: string, clientId: string) {
   const sql = yield* SqlClient
-  const rows = yield* sql<{ principal_id: string }>`
+  const rows = yield* sql<{ principal_id: string; expired_through: bigint; expired_position: bigint }>`
     INSERT INTO echo_sync.clients (client_id, principal_id) VALUES (${clientId}, ${principalId})
     ON CONFLICT (client_id) DO UPDATE SET last_seen_at = now()
-    RETURNING principal_id`
-  if (rows[0]?.principal_id !== principalId) {
+    RETURNING principal_id, expired_through, expired_position`
+  const row = rows[0]
+  if (row === undefined || row.principal_id !== principalId) {
     return yield* new ClientForbidden({ clientId })
   }
-})
-
-const lookup = Effect.fnUntraced(function* (envelope: Envelope) {
-  const sql = yield* SqlClient
-  const rows = yield* sql<{ outcome: unknown }>`
-    SELECT outcome FROM echo_sync.mutations
-    WHERE client_id = ${envelope.clientId} AND mutation_id = ${envelope.mutationId}`
-  const row = rows[0]
-  return row === undefined ? undefined : yield* Effect.orDie(decodeOutcome(row.outcome))
+  return row
 })
 
 /**
- * Executes one mutation exactly once (DESIGN.md §6).
+ * Executes one mutation at most once with committed effects (DESIGN.md §6), in a transaction it
+ * owns: calling it inside an ambient `withTransaction` would turn it into a savepoint whose
+ * outcome is not committed when returned, so that is a defect.
  *
- * Known identity ⇒ the recorded outcome, without re-executing. Otherwise one transaction:
- * body (in a savepoint, so a permanent failure discards its writes) → ledger row whose position
- * is allocated under the engine lock, after the body's log entries → commit. A mutation that
- * writes nothing still gets an orderable position, so its ack is delivered by pull.
+ * One transaction: lock the client row (concurrent submissions of one client serialize here,
+ * so a duplicate waits and then sees the winner's row) → `seq ≤ expired_through` ⇒
+ * `Rejected{clientExpired}` at `expired_position`, body untouched → known identity ⇒ recorded
+ * outcome → else body in a savepoint (a permanent failure discards its writes) → ledger row
+ * whose position is allocated under the engine lock after the body's log entries → commit.
+ * A mutation that writes nothing still gets an orderable position, so pull delivers its ack.
  */
 export const runMutation = <R>(
   envelope: Envelope,
   body: Effect.Effect<void, MutationRejected | SqlError, R>,
   options?: LedgerOptions
-): Effect.Effect<MutationOutcome, MutationTransient | ClientForbidden, R | SqlClient> =>
+): Effect.Effect<Processed, MutationTransient | ClientForbidden, R | SqlClient> =>
   Effect.gen(function* () {
     const sql = yield* SqlClient
+    if (Option.isSome(yield* Effect.serviceOption(sql.transactionService))) {
+      return yield* Effect.die("runMutation must own its transaction; do not call it inside withTransaction")
+    }
 
     const execute = sql.withTransaction(
       Effect.gen(function* () {
+        const client = yield* registerClient(envelope.principalId, envelope.clientId)
+        if (envelope.seq <= client.expired_through) {
+          const expired: Processed = {
+            outcome: { _tag: "Rejected", reason: "clientExpired", message: "ledger expired for this seq" },
+            position: client.expired_position
+          }
+          return expired
+        }
+        const recorded = yield* sql<{ outcome: unknown; position: bigint }>`
+          SELECT outcome, position FROM echo_sync.mutations
+          WHERE client_id = ${envelope.clientId} AND mutation_id = ${envelope.mutationId}`
+        const row = recorded[0]
+        if (row !== undefined) {
+          const replay: Processed = { outcome: yield* Effect.orDie(decodeOutcome(row.outcome)), position: row.position }
+          return replay
+        }
+
         const outcome: MutationOutcome = yield* sql.withTransaction(body).pipe(
           Effect.as<MutationOutcome>({ _tag: "Applied" }),
           Effect.catchTag("MutationRejected", (e) =>
             Effect.succeed<MutationOutcome>({ _tag: "Rejected", reason: e.reason, message: e.message })
           )
         )
-        yield* sql`
-          INSERT INTO echo_sync.mutations (client_id, mutation_id, position, outcome)
-          VALUES (${envelope.clientId}, ${envelope.mutationId}, echo_sync.next_position(),
-                  ${JSON.stringify(encodeOutcome(outcome))}::jsonb)`
-        return outcome
+        const inserted = yield* sql<{ position: bigint }>`
+          INSERT INTO echo_sync.mutations (client_id, mutation_id, seq, position, outcome)
+          VALUES (${envelope.clientId}, ${envelope.mutationId}, ${envelope.seq}, echo_sync.next_position(),
+                  ${JSON.stringify(encodeOutcome(outcome))}::jsonb)
+          RETURNING position`
+        const position = inserted[0]?.position
+        if (position === undefined) return yield* Effect.die("INSERT … RETURNING returned no row")
+        const processed: Processed = { outcome, position }
+        return processed
       })
     )
 
-    return yield* Effect.gen(function* () {
-      yield* registerClient(envelope.principalId, envelope.clientId)
-      const recorded = yield* lookup(envelope)
-      if (recorded !== undefined) return recorded
-      return yield* execute.pipe(
-        Effect.retry({ schedule: options?.conflictRetry ?? defaultConflictRetry, while: isConflict }),
-        Effect.catchTag("SqlError", (error) =>
-          // A concurrent submission of the same envelope committed first: its outcome is the outcome.
-          error.reason._tag === "UniqueViolation" && error.reason.constraint === "mutations_pkey"
-            ? Effect.flatMap(lookup(envelope), (outcome) =>
-                outcome === undefined ? Effect.fail(error) : Effect.succeed(outcome)
-              )
-            : Effect.fail(error)
-        )
+    return yield* execute.pipe(
+      Effect.retry({ schedule: options?.conflictRetry ?? defaultConflictRetry, while: isConflict }),
+      Effect.catchTag("SqlError", (error) => Effect.fail(transient(envelope, error))),
+      // The pinned SqlClient turns savepoint/rollback cleanup failures (a dead connection) into
+      // defects carrying the SqlError; they are as transient as the failure that caused them.
+      Effect.catchDefect((defect) =>
+        isSqlError(defect) ? Effect.fail(transient(envelope, defect)) : Effect.die(defect)
       )
-    }).pipe(Effect.catchTag("SqlError", (error) => Effect.fail(transient(envelope, error))))
+    )
   })
 
 export interface BatchItem<R> {
-  readonly mutationId: number
+  readonly mutationId: string
+  readonly seq: bigint
   readonly body: Effect.Effect<void, MutationRejected | SqlError, R>
 }
 
 export interface BatchResult {
   /** Outcomes for the processed prefix, in client order. */
-  readonly processed: ReadonlyArray<{ readonly mutationId: number; readonly outcome: MutationOutcome }>
-  /** The mutation the batch stopped at, unrecorded; the client resubmits from here. */
+  readonly processed: ReadonlyArray<Processed & { readonly mutationId: string }>
+  /** The mutation the batch stopped at, outcome unknown; the client resubmits from here. */
   readonly stopped: MutationTransient | null
 }
 
@@ -161,15 +189,15 @@ export const runBatch = <R>(
   options?: LedgerOptions
 ): Effect.Effect<BatchResult, ClientForbidden, R | SqlClient> =>
   Effect.gen(function* () {
-    const processed: Array<{ mutationId: number; outcome: MutationOutcome }> = []
+    const processed: Array<Processed & { mutationId: string }> = []
     for (const item of items) {
       const result = yield* runMutation(
-        { principalId, clientId, mutationId: item.mutationId },
+        { principalId, clientId, mutationId: item.mutationId, seq: item.seq },
         item.body,
         options
       ).pipe(Effect.catchTag("MutationTransient", (error) => Effect.succeed(error)))
       if (result instanceof MutationTransient) return { processed, stopped: result }
-      processed.push({ mutationId: item.mutationId, outcome: result })
+      processed.push({ mutationId: item.mutationId, ...result })
     }
     return { processed, stopped: null }
   })
