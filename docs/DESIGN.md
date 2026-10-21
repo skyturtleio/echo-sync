@@ -539,8 +539,11 @@ Conformance suites (`src/core/testing/Conformance.ts`, run against every `RowSto
 from the subject's own reads: "before reopen equals after reopen" is not an assertion, because a
 subject that drops every write satisfies it. A no-op subject must fail every conformance check,
 and that stub is kept as a test so the rule stays true. The suite is core-only (no runtime
-import of `src/client` or `src/server`), scopes each case separately, and pairs every `nextSeq`
-with its `appendPending`, since real stores reserve a seq only on insert.
+import of `src/client` or `src/server`) and scopes each case separately. `SyncStorage.nextSeq`
+**allocates**: two calls in one transaction return distinct seqs whether or not an append
+happens in between, and a rolled-back allocation is given back. A store that merely peeks at
+its counter violates the port, and the conformance suite keeps a check that calls `nextSeq`
+twice before appending so that peeking fails.
 
 Use `@effect/vitest`, `effect/testing` (`TestClock`), and `Arbitrary` where they fit.
 
