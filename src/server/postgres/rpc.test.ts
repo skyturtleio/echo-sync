@@ -4,6 +4,7 @@ import {
   Array as Arr,
   Cause,
   Context,
+  Duration,
   Effect,
   Exit,
   Fiber,
@@ -457,7 +458,16 @@ describe.skipIf(!pgAvailable)("re-establishing the shared LISTEN (§6)", () => {
       Effect.gen(function* () {
         let failing = false
         const { pg, calls } = yield* steeredPool(() => failing)
-        yield* sharedPokes(pg)
+        // Each backoff reports its delay right before its sleep starts: the clock is advanced only
+        // once the sleep it should release is about to be registered, never on an attempt count
+        // (which moves before the attempt's asynchronous reservation has failed).
+        const delays: Array<number> = []
+        yield* sharedPokes(pg, { onBackoff: (d) => Effect.sync(() => void delays.push(Duration.toMillis(d))) })
+        const backoffs = (n: number) =>
+          eventually(
+            Effect.sync(() => delays.length === n),
+            `backoff ${n}`
+          )
         const attemptsAre = (n: number) =>
           eventually(
             Effect.sync(() => calls.attempts === n),
@@ -477,6 +487,7 @@ describe.skipIf(!pgAvailable)("re-establishing the shared LISTEN (§6)", () => {
 
         // An established LISTEN lost: no reconnect until the first backoff (50 ms) has passed.
         yield* killListener
+        yield* backoffs(1)
         yield* stillAt(1)
         yield* TestClock.adjust("49 millis")
         yield* stillAt(1)
@@ -487,19 +498,23 @@ describe.skipIf(!pgAvailable)("re-establishing the shared LISTEN (§6)", () => {
         // Lost again, then failed attempts: 50 ms (reset), then 100 ms, then 200 ms.
         failing = true
         yield* killListener
+        yield* backoffs(2)
         yield* stillAt(2)
         yield* TestClock.adjust("50 millis")
-        yield* attemptsAre(3)
+        yield* backoffs(3)
+        assert.strictEqual(calls.attempts, 3)
         yield* TestClock.adjust("99 millis")
         yield* stillAt(3)
         yield* TestClock.adjust("1 millis")
-        yield* attemptsAre(4)
+        yield* backoffs(4)
+        assert.strictEqual(calls.attempts, 4)
         failing = false
         yield* TestClock.adjust("199 millis")
         yield* stillAt(4)
         yield* TestClock.adjust("1 millis")
         yield* attemptsAre(5)
         yield* listening
+        assert.deepStrictEqual(delays, [50, 50, 100, 200])
       }).pipe(Effect.provide(TestDatabase)),
     60_000
   )

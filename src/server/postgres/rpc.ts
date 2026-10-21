@@ -139,7 +139,13 @@ const listenBackoff = (attempt: number) => Duration.millis(Math.min(50 * 2 ** at
  * it is covered by the pull the poke triggers (subscribe-then-poke). Without a confirmed `LISTEN`
  * it fails `ServerUnavailable` and the client reconnects with backoff.
  */
-export const sharedPokes = (pg: PgClient.PgClient) =>
+export const sharedPokes = (
+  pg: PgClient.PgClient,
+  options?: {
+    /** Runs with each backoff delay just before its sleep starts (tests synchronize their clock on it). */
+    readonly onBackoff?: ((delay: Duration.Duration) => Effect.Effect<void>) | undefined
+  }
+) =>
   Effect.gen(function* () {
     const current = yield* Ref.make(Option.none<ListenSession>())
     const ready = yield* Deferred.make<void>()
@@ -164,7 +170,9 @@ export const sharedPokes = (pg: PgClient.PgClient) =>
     )
     const backoff = Effect.gen(function* () {
       yield* Deferred.succeed(ready, undefined)
-      yield* Effect.sleep(listenBackoff(yield* Ref.getAndUpdate(attempts, (n) => n + 1)))
+      const delay = listenBackoff(yield* Ref.getAndUpdate(attempts, (n) => n + 1))
+      if (options?.onBackoff !== undefined) yield* options.onBackoff(delay)
+      yield* Effect.sleep(delay)
     })
     yield* Effect.forkScoped(Effect.forever(Effect.catch(session, () => backoff)))
     yield* Deferred.await(ready)
