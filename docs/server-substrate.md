@@ -17,6 +17,9 @@ unordered idempotency key, `seq` the client's outbox sequence.
 | `rpc.ts` | `handlers` / `layerHttp`: `Protocol.SyncRpcs` over HTTP POST + NDJSON |
 | `gc.ts` | `collectGarbage(retention)` |
 
+For how a consumer app wires the server (registry, mutations, app migrations, `Startup.layer`,
+principal, Drift), see [getting-started.md](getting-started.md).
+
 ## Wire rows: declared columns through the table's codec
 
 Every row that leaves the server, from a walk or from the log, is `SELECT <declared columns>`
