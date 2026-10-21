@@ -3,6 +3,7 @@ import * as PgMigrator from "@effect/sql-pg/PgMigrator"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { Registry, SyncTable } from "echo-sync"
 import engine from "./migrations/001_engine.ts"
+import grantIdCheck from "./migrations/002_grant_id_check.ts"
 
 /** Migrator history table (DESIGN.md §4). */
 export const migrationsTable = "echo_sync.migrations"
@@ -25,7 +26,7 @@ export const migrate = Effect.gen(function* () {
     Effect.andThen(sql`SELECT pg_advisory_xact_lock(7305797848413072997)`, sql`CREATE SCHEMA IF NOT EXISTS echo_sync`)
   )
   return yield* PgMigrator.make({})({
-    loader: PgMigrator.fromRecord({ "001_engine": engine }),
+    loader: PgMigrator.fromRecord({ "001_engine": engine, "002_grant_id_check": grantIdCheck }),
     table: migrationsTable
   })
 })

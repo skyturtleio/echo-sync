@@ -10,7 +10,7 @@ unordered idempotency key, `seq` the client's outbox sequence.
 
 | module | what it owns |
 |---|---|
-| `migrations/001_engine.ts`, `schema.ts` | engine schema (run via `PgMigrator`, history in `echo_sync.migrations`), `attach(SyncTable)`, catalog discovery, `resolveTables(registry)` |
+| `migrations/001_engine.ts`, `002_grant_id_check.ts`, `schema.ts` | engine schema (run via `PgMigrator`, history in `echo_sync.migrations`), `attach(SyncTable)`, catalog discovery, `resolveTables(registry)` |
 | `ledger.ts` | `runMutation`, `runBatch`, client↔principal binding |
 | `pull.ts` | `pull(registry, request)` (one page per call), the continuation |
 | `rowStore.ts` | core's `RowStore` on Postgres; declared-column projection and row codec |
@@ -96,6 +96,21 @@ is never read from the payload. `ClientForbidden` becomes `Unauthorized`.
   position of the highest expired ledger row. No v1 job raises them.
 - `client_scopes(client_id, position, scope_ids)`: the set of scopes a client holds as of a
   completed pull. The reason this table exists is under "Pull" below.
+
+### `scope_grants` id CHECK
+
+Migration 002 adds `scope_grants_id_derived`: `id = char_length(access_scope_id) || ':' ||
+access_scope_id || ':' || principal_id`, and `access_scope_id` has no character above U+FFFF
+(DESIGN §4). core's `grantId` prefixes the JS length (UTF-16 code units); for BMP-only text that
+equals `char_length`, so the CHECK accepts exactly the ids core derives and rejects non-BMP scope
+ids instead of mis-deriving them. The constraint is validated, so a database holding a
+non-derived grant fails 002 (23514) and startup stops until the row is repaired.
+
+`Migrate.verify` does not check that the constraint exists. It compares the catalog with the
+registry's manifests, which carry no CHECKs, and `scope_grants`' other engine constraints (the
+`access_scopes` FK, the role CHECK) are not verified either: engine-internal DDL is guaranteed by
+the engine migration history (002 and its constraint commit in one transaction). Its only
+undo is a hand-written `DROP CONSTRAINT`.
 
 ## Mutation ledger
 
