@@ -44,10 +44,13 @@ is never read from the payload. `ClientForbidden` becomes `Unauthorized`.
   infrastructure failure (connection, pool, `40001` after the bounded retry, the catalog read
   before the batch) is a short results list, never a defect: the client halts push on any
   defect (§6). Tested with a real connection kill mid-batch over HTTP.
-- pull: the pull error union has no transient member, so an infrastructure failure there is a
-  defect (open question, see the report).
+- pull: an infrastructure failure (`SqlError`) is `Protocol.ServerUnavailable`, a typed
+  transient, so a defect from the server always means a bug (§6). Tested by injecting a SqlError
+  under pull over HTTP; the old `die` mapping fails the test.
 - pokes: `LISTEN echo_sync`. `next_position()` runs `pg_notify('echo_sync', '')`, which Postgres
-  delivers at commit and coalesces per transaction. The stream carries no data.
+  delivers at commit and coalesces per transaction. The stream carries no data. A lost LISTEN
+  connection ends it with `ServerUnavailable` (tested by terminating the listener's backend); the
+  client reconnects on any end.
 
 ## Engine state
 

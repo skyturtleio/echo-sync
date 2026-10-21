@@ -4,6 +4,7 @@ import type { Headers } from "effect/http/Headers"
 import type * as HttpRouter from "effect/http/HttpRouter"
 import { RpcSerialization, RpcServer } from "effect/rpc"
 import { SqlClient } from "effect/sql/SqlClient"
+import type { SqlError } from "effect/sql/SqlError"
 import { AccessScope, Ids, Mutation, Protocol, type Registry, Store } from "echo-sync"
 import { type ClientForbidden, type LedgerOptions, registerClient, runBatch } from "./ledger.ts"
 import { pull } from "./pull.ts"
@@ -26,6 +27,9 @@ export const pokeChannel = "echo_sync"
 const forbidden = (error: ClientForbidden) =>
   new Protocol.Unauthorized({ message: `client ${error.clientId} belongs to another principal` })
 
+const serverUnavailable = (error: SqlError) =>
+  new Protocol.ServerUnavailable({ message: `${error.reason._tag}: ${error.message}` })
+
 const decodeRole = Schema.decodeUnknownOption(AccessScope.Role)
 
 /**
@@ -45,6 +49,7 @@ const roleFor = (sql: SqlClient, actor: string) => (scopeId: AccessScope.AccessS
 /**
  * Handlers for `Protocol.SyncRpcs` over Postgres (DESIGN §6, §8).
  *
+ * Pull and pokes report infrastructure failures as `ServerUnavailable`.
  * Push never fails with an infrastructure error: every SQL failure (connection, pool, `40001`
  * after the bounded retry) stops the batch as a short results list, so the client only ever sees
  * a defect for a server bug (the client halts push on any defect, §6).
@@ -100,8 +105,8 @@ export const handlers = (options: SyncServerOptions) =>
             })
           }).pipe(
             Effect.catchTag("ClientForbidden", (e) => Effect.fail(forbidden(e))),
-            // The pull error union has no transient member: an infrastructure failure is a defect.
-            Effect.catchTag("SqlError", (e) => Effect.die(e)),
+            // Infrastructure failure: typed transient, so a defect always means a bug (§6).
+            Effect.catchTag("SqlError", (e) => Effect.fail(serverUnavailable(e))),
             Effect.provideService(SqlClient, sql)
           ),
         pokes: ({ clientId }, { headers }) =>
@@ -116,8 +121,8 @@ export const handlers = (options: SyncServerOptions) =>
               Effect.provideService(SqlClient, sql)
             )
           ).pipe(
-            // A hint stream: a lost listener connection is a defect the client reconnects from.
-            Stream.catchTag("SqlError", (e) => Stream.die(e))
+            // A lost LISTEN connection ends the stream typed; the client reconnects on any end (§6).
+            Stream.catchTag("SqlError", (e) => Stream.fail(serverUnavailable(e)))
           )
       })
     })

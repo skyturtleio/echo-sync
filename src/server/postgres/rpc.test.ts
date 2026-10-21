@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import type * as PgClient from "@effect/sql-pg/PgClient"
-import { Array as Arr, Effect, Exit, Layer, Option, Schema } from "effect"
+import { Array as Arr, Cause, Effect, Exit, Fiber, Layer, Option, Schedule, Schema, Stream } from "effect"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
 import { RpcClient, RpcSerialization } from "effect/rpc"
@@ -119,4 +119,45 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (§6, §8)", () => {
       )
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
+
+  it.live("a database failure under pull reaches the client as a typed ServerUnavailable, not a defect", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      yield* grant("p", "s1")
+      const client = yield* connect
+      // Injected SqlError: every pull reads engine_state first.
+      yield* sql`ALTER TABLE echo_sync.engine_state RENAME TO engine_state_gone`
+      const exit = yield* Effect.exit(
+        client.pull({ clientId: Ids.ClientId.make("d"), cursor: null, continuation: Option.none() })
+      )
+      assert.deepStrictEqual(failureTag(exit), "ServerUnavailable")
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
+  it.live("a lost LISTEN connection ends the poke stream with ServerUnavailable, not a defect", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      const client = yield* connect
+      const stream = yield* Effect.forkChild(
+        Effect.exit(Stream.runDrain(client.pokes({ clientId: Ids.ClientId.make("d") })))
+      )
+      // Wait for the listener's backend, then kill it: a real connection loss.
+      const killed = sql<{ killed: boolean }>`
+        SELECT pg_terminate_backend(pid) AS killed FROM pg_stat_activity
+        WHERE datname = current_database() AND query ILIKE 'listen%'`.pipe(
+        Effect.flatMap((rows) => (rows.some((r) => r.killed) ? Effect.void : Effect.fail("no listener yet"))),
+        Effect.retry(Schedule.spaced("20 millis").pipe(Schedule.upTo({ times: 100 })))
+      )
+      yield* killed
+      const exit = yield* Fiber.join(stream)
+      assert.deepStrictEqual(failureTag(exit), "ServerUnavailable")
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
 })
+
+/** The tag of the exit's sole typed failure, or a description of why there is none. */
+const failureTag = (exit: Exit.Exit<unknown, { readonly _tag: string }>) => {
+  if (Exit.isSuccess(exit)) return "success"
+  if (exit.cause.reasons.some((r) => !Cause.isFailReason(r))) return `not a typed failure: ${String(exit.cause)}`
+  return exit.cause.reasons.map((r) => (Cause.isFailReason(r) ? r.error._tag : "")).join(",")
+}
