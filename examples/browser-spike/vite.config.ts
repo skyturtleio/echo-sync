@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url"
 import { defineConfig } from "vite"
+import { middleware } from "./fakeSync.ts"
 
 export default defineConfig({
   root: fileURLToPath(new URL(".", import.meta.url)),
@@ -15,5 +16,6 @@ export default defineConfig({
     entries: ["index.html", "leader.worker.ts", "router.worker.ts"],
     exclude: ["@effect/wa-sqlite", "@effect/sql-sqlite-wasm"]
   },
-  worker: { format: "es" }
+  worker: { format: "es" },
+  plugins: [{ name: "echo-fake-sync", configureServer: (server) => void server.middlewares.use(middleware) }]
 })

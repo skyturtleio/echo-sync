@@ -1,5 +1,5 @@
 import { expect, it } from "@effect/vitest"
-import { Cause, Effect, Schema } from "effect"
+import { Cause, Clock, Effect, Schema, Stream } from "effect"
 import { RpcClientError } from "effect/rpc"
 import { TestClock } from "effect/testing"
 import { Ids, Protocol } from "echo-sync"
@@ -170,4 +170,42 @@ it.effect("a pull that fails with MalformedChange is retried with backoff and ne
     expect(calls).toEqual({ push: 2, pull: 2 })
     expect(yield* loop.status).toEqual({ push: { _tag: "Active" }, lastError: null })
   })
+)
+
+it.effect(
+  "the pokes stream is reconnected with backoff after a clean end, a failure and a defect; every poke wakes",
+  () =>
+    Effect.gen(function* () {
+      const attempts: Array<number> = []
+      const wakes = { n: 0 }
+      const connect = Stream.unwrap(
+        Effect.gen(function* () {
+          const attempt = attempts.length + 1
+          attempts.push(Number(yield* Clock.currentTimeMillis))
+          if (attempt === 1) return Stream.make({}, {}) // two pokes, then a clean end
+          if (attempt === 2) return Stream.fail(new Offline())
+          if (attempt === 3) return Stream.die(new Error("bad frame"))
+          return Stream.never
+        })
+      )
+      const fiber = yield* Effect.forkChild(SyncLoop.followPokes({ connect, wake: Effect.sync(() => void wakes.n++) }))
+      yield* settle
+      expect(attempts).toEqual([0])
+      expect(wakes.n).toBe(2)
+      // Attempt 1 delivered pokes: base delay 1 s. Attempts 2 and 3 delivered none: 2 s, then 4 s.
+      for (const ms of [1000, 2000, 4000]) {
+        yield* TestClock.adjust(ms - 1)
+        yield* settle
+        const before = attempts.length
+        yield* TestClock.adjust(1)
+        yield* settle
+        expect(attempts.length).toBe(before + 1)
+      }
+      expect(attempts).toEqual([0, 1000, 3000, 7000])
+      expect(wakes.n).toBe(5) // two pokes + one wake per reconnect
+      expect(fiber.pollUnsafe()).toBeUndefined()
+      yield* TestClock.adjust("1 hour")
+      yield* settle
+      expect(attempts.length).toBe(4) // a live connection is not replaced
+    })
 )

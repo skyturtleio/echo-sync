@@ -5,6 +5,10 @@
  */
 import * as Schema from "effect/Schema"
 import { Rpc, RpcGroup } from "effect/rpc"
+import { Ids, Mutation } from "echo-sync"
+import { LocallyRejected } from "../sync/Engine.ts"
+import { Notice } from "../sync/SqliteSyncStorage.ts"
+import { SyncStatus } from "../sync/SyncLoop.ts"
 
 /** A SQLite statement failed inside the leader. The transaction (if any) was rolled back. */
 export class SqlFailure extends Schema.TaggedError<SqlFailure>()("SqlFailure", {
@@ -27,13 +31,16 @@ export type SqlParams = typeof SqlParams.Type
 export const Rows = Schema.Array(Schema.Record(Schema.String, Schema.Unknown))
 export type Rows = typeof Rows.Type
 
+/** This leader was started without a `syncUrl`: a local-only replica, nothing syncs. */
+export class SyncDisabled extends Schema.TaggedError<SyncDisabled>()("SyncDisabled", {}) {}
+
 /**
  * What a tab hands to `enqueue`. `mutationId` is the idempotency key chosen by the caller (unique per
- * client); `args` is the already-encoded mutation args. The leader stamps the client id and the local
- * sequence number.
+ * client); `name` is a mutation in the leader's registry and `args` its encoded args. The leader runs the
+ * handler optimistically, stamps the client id and the local sequence number.
  */
 export const OutboxEnvelope = Schema.Struct({
-  mutationId: Schema.String,
+  mutationId: Ids.MutationId,
   name: Schema.String,
   args: Schema.Json
 })
@@ -63,6 +70,22 @@ export type LiveQuery = typeof LiveQuery.Type
 export const QueryResult = Schema.Struct({ results: Schema.Array(Rows) })
 export type QueryResult = typeof QueryResult.Type
 
+/** One pending outbox entry, as exported for recovery (DESIGN §9). */
+export const PendingExport = Schema.Struct({ envelope: Mutation.MutationEnvelope, createdAt: Schema.Int })
+export type PendingExport = typeof PendingExport.Type
+
+export const StoredNotice = Schema.Struct({ id: Schema.Int, notice: Notice })
+export type StoredNotice = typeof StoredNotice.Type
+
+export const LeaderInfo = Schema.Struct({
+  leaderId: Schema.String,
+  clientId: Schema.String,
+  dbName: Schema.String,
+  /** Whether this leader runs a sync loop (it was given a `syncUrl`). */
+  syncing: Schema.Boolean
+})
+export type LeaderInfo = typeof LeaderInfo.Type
+
 export class LeaderRpcs extends RpcGroup.make(
   /** Raw statement execution for the dev harness and diagnostics. */
   Rpc.make("exec", {
@@ -70,11 +93,16 @@ export class LeaderRpcs extends RpcGroup.make(
     success: Rows,
     error: SqlFailure
   }),
-  /** Durably append an intent to the outbox. Resolves only after the SQLite transaction committed. */
+  /**
+   * Run a mutation optimistically and durably append it to the outbox, in one SQLite transaction
+   * (DESIGN §9). Resolves only after that transaction committed. A known `mutationId` (pending or
+   * released) returns its original seq and runs nothing. `LocallyRejected`: the handler rejected it
+   * against the local replica; nothing was saved.
+   */
   Rpc.make("enqueue", {
     payload: { envelope: OutboxEnvelope },
     success: Enqueued,
-    error: SqlFailure
+    error: Schema.Union([SqlFailure, LocallyRejected])
   }),
   /** Live query: emits the current result, then a fresh result after every write to `tables`. */
   Rpc.make("subscribe", {
@@ -84,7 +112,11 @@ export class LeaderRpcs extends RpcGroup.make(
     stream: true
   }),
   /** Identity of the serving leader (diagnostics / tests). */
-  Rpc.make("leaderInfo", {
-    success: Schema.Struct({ leaderId: Schema.String, clientId: Schema.String, dbName: Schema.String })
-  })
+  Rpc.make("leaderInfo", { success: LeaderInfo }),
+  /** The sync loop's status: the current value, then every change (push halted, last transient error). */
+  Rpc.make("syncStatus", { success: SyncStatus, error: SyncDisabled, stream: true }),
+  /** Retained notices (rejected / outcome-unknown mutations), oldest first. */
+  Rpc.make("notices", { success: Schema.Array(StoredNotice), error: SqlFailure }),
+  /** Every pending outbox entry in seq order. Always available, also while push is halted (DESIGN §6). */
+  Rpc.make("exportPending", { success: Schema.Array(PendingExport), error: SqlFailure })
 ) {}

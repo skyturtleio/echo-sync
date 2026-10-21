@@ -163,9 +163,32 @@ Crash points: a kill before COMMIT leaves no row and no seq bump (journal rollba
 COMMIT but before the response leaves the row, and the caller's retry returns it (browser scenario with
 injected crash). Rows that fail to decode are treated as defects, not caller errors.
 
-Not yet here: the pull staging table (§8) and the SQLite `ReplicaRowStore` (`purgeScope`, `clearAll`).
-Both depend on the `RowStore`/`ReplicaRowStore` interfaces and the `SyncTable` registry from `src/core`,
-which are not on main yet.
+The pull staging table (`echo_staged`), notices (`echo_notices`) and the SQLite `ReplicaRowStore` live in
+`src/client/sync/SqliteSyncStorage.ts` and `src/client/SqliteRowStore.ts`; engine tables migrate forward by
+`echo_meta.engine_schema_version`.
+
+## Leader wiring: engine, sync loop, pokes
+
+The app's leader worker entry calls `runLeaderWorker(self, { registry, mutations, syncUrl? })`; each tab
+passes its `principal` to `LeaderClient.make` (one principal per `profile`; the leader acts as the
+principal its own tab sent). At startup the leader runs `SqliteSyncStorage.migrate(registry)` (engine
+tables and replica schema, one transaction) and builds `Engine.make` over the SQLite storage.
+
+- `enqueue` is `Engine.mutate`: the handler runs optimistically and the outbox row commits in the same
+  transaction; a known `mutationId` returns its original seq without running anything; a local rejection
+  fails with `LocallyRejected` and saves nothing. Each successful enqueue wakes the sync loop.
+- With `syncUrl`, the leader runs `SyncLoop` (push then pull per cycle, one backoff 1 s → 30 s; any defect
+  or `MalformedEnvelope` in a push halts push for this leader's lifetime, pull keeps running, nothing is
+  released) and `SyncLoop.followPokes`, which wakes the loop on every poke and reconnects the pokes stream
+  after any end (failure, defect, clean completion) with the same backoff, waking once per reconnect.
+  A new leader starts a fresh loop, so a halt re-trips on its first push (DESIGN §6).
+- Without `syncUrl` the replica is local-only: enqueue still applies and persists; `syncStatus` fails
+  with `SyncDisabled`.
+- `syncStatus` (stream, ends with `LeaderLost` on handover like `subscribe`), `notices` and
+  `exportPending` (pending outbox in seq order; reads storage only, so it is available while push is
+  halted) are RPCs on `LeaderRpcs`.
+- `RpcClient.layerProtocolHttp({ url })` posts to `<url>/` (trailing slash): the server route must accept
+  it. The harness's fake server normalizes it.
 
 ## Tests
 
@@ -197,6 +220,10 @@ Harness-only fault injection (in `examples/browser-spike/leader.worker.ts`, enab
 `crashAfterCommit` ends that tab's leader worker instead of sending a committed `enqueue` response whose
 mutation id starts with `crash-after-commit`; `failOpen` makes OPFS startup fail when another tab posts on
 `echo-test:fail-open`. `echo.forgeLeaderAnnouncement(id)` replays a leader announcement to the router.
+`?syncUrl=<url>` gives that tab's leader a sync loop; `examples/browser-spike/fakeSync.ts` mounts a fake
+`SyncRpcs` server at `/fake-sync/rpc` (Vite middleware) whose push always fails with `MalformedEnvelope`,
+whose pull answers an empty `PullDone` and whose pokes stream ends after one poke, with per-client
+counters at `/fake-sync/stats?clientId=…`. The two `sync:` scenarios use it.
 
 Invariants checked:
 

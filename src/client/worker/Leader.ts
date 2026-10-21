@@ -7,8 +7,13 @@
  *
  * ```ts
  * import { runLeaderWorker } from "echo-sync/client/worker"
- * runLeaderWorker(self)
+ * runLeaderWorker(self, { registry, mutations, syncUrl: "/sync" })
  * ```
+ *
+ * The leader owns the reconciliation engine (DESIGN §8, §9): `enqueue` runs `Engine.mutate` (optimistic
+ * apply + outbox append in one transaction), and with a `syncUrl` it runs the sync loop (push/pull with
+ * backoff, the §6 fatal-push halt) and follows the server's pokes stream, reconnecting on any end. A
+ * new leader starts a fresh loop: a push halt is in memory and re-trips on that leader's first push.
  */
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner"
@@ -16,13 +21,19 @@ import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
+import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as SqlClient from "effect/sql/SqlClient"
 import type { Row } from "effect/sql/SqlConnection"
 import type { SqlError } from "effect/sql/SqlError"
 import { type Rpc, type RpcGroup, RpcServer } from "effect/rpc"
+import { AccessScope, type Errors, Ids, type Mutation, type Registry } from "echo-sync"
 import * as Outbox from "../Outbox.ts"
-import { LeaderRpcs, SqlFailure } from "./LeaderRpcs.ts"
+import * as Engine from "../sync/Engine.ts"
+import * as SqliteSyncStorage from "../sync/SqliteSyncStorage.ts"
+import * as SyncLoop from "../sync/SyncLoop.ts"
+import * as Transport from "../sync/Transport.ts"
+import { LeaderRpcs, SqlFailure, SyncDisabled } from "./LeaderRpcs.ts"
 import { type Endpoint, type FromLeader, isToLeader, type ToLeader } from "./messages.ts"
 import * as OpfsSqlite from "./OpfsSqlite.ts"
 import * as Platform from "./platform.ts"
@@ -38,10 +49,12 @@ const causeMessage = (cause: unknown): string =>
 const toFailure = (error: SqlError): SqlFailure =>
   new SqlFailure({ message: `${error.message}: ${causeMessage(error.reason.cause)}` })
 
+const unavailable = (error: Errors.StoreUnavailable) => new SqlFailure({ message: error.message })
+
 const send = (endpoint: Endpoint, message: FromLeader) => endpoint.postMessage(message, { transfer: [] })
 
 /** Open the database: the OPFS host on one end of a channel, the Effect SQL client on the other. */
-const openDatabase = (identity: Platform.ReplicaIdentity) =>
+const openDatabase = (identity: Platform.ReplicaIdentity, registry: Registry.SyncRegistry) =>
   Effect.gen(function* () {
     const poolDirectory = Platform.poolDirectory(identity)
     yield* Platform.awaitOpfsPoolFree(poolDirectory)
@@ -53,18 +66,33 @@ const openDatabase = (identity: Platform.ReplicaIdentity) =>
       SqliteClient.layer({ worker: Effect.succeed(channel.port2), installReactivityHooks: true })
     )
     const sql = Context.get(context, SqlClient.SqlClient)
-    yield* Effect.andThen(Outbox.migrate, Outbox.pruneReleased()).pipe(Effect.provideService(SqlClient.SqlClient, sql))
+    // Engine tables and the replica schema in one transaction (a manifest change rebuilds the replica).
+    yield* Effect.andThen(SqliteSyncStorage.migrate(registry), Outbox.pruneReleased()).pipe(
+      Effect.provideService(SqlClient.SqlClient, sql)
+    )
     return sql
   })
 
-const makeHandlers = (sql: SqlClient.SqlClient, info: { leaderId: string; clientId: string; dbName: string }) =>
+/** A replica without `syncUrl`: the engine never calls its transport, because no loop runs. */
+const localOnly: Engine.Transport<never> = {
+  push: () => Effect.die(new Error("echo-sync: local-only replica has no transport")),
+  pull: () => Effect.die(new Error("echo-sync: local-only replica has no transport"))
+}
+
+const makeHandlers = (
+  sql: SqlClient.SqlClient,
+  storage: Engine.SyncStorage,
+  engine: Engine.Engine<unknown>,
+  loop: SyncLoop.SyncLoop | undefined,
+  info: { leaderId: string; clientId: string; dbName: string; syncing: boolean }
+) =>
   LeaderRpcs.toHandlers({
     exec: ({ sql: text, params }) => sql.unsafe<Row>(text, params).pipe(Effect.mapError(toFailure)),
     enqueue: ({ envelope }) =>
-      Outbox.append({ clientId: info.clientId, ...envelope }).pipe(
+      engine.mutate(envelope.mutationId, envelope.name, envelope.args).pipe(
+        Effect.tap(() => loop?.wake ?? Effect.void),
         Effect.map(({ clientId, mutationId, seq }) => ({ clientId, mutationId, seq })),
-        Effect.provideService(SqlClient.SqlClient, sql),
-        Effect.mapError(toFailure)
+        Effect.catchTag("StoreUnavailable", (error) => Effect.fail(unavailable(error)))
       ),
     subscribe: ({ query }) =>
       sql
@@ -77,7 +105,15 @@ const makeHandlers = (sql: SqlClient.SqlClient, info: { leaderId: string; client
           Stream.map((results) => ({ results })),
           Stream.mapError(toFailure)
         ),
-    leaderInfo: () => Effect.succeed(info)
+    leaderInfo: () => Effect.succeed(info),
+    syncStatus: () => (loop === undefined ? Stream.fail(new SyncDisabled()) : loop.changes),
+    notices: () => SqliteSyncStorage.notices(sql).pipe(Effect.mapError(unavailable)),
+    // Reads the outbox only: never depends on push state, so a halted push cannot block recovery.
+    exportPending: () =>
+      storage.transaction(storage.pending).pipe(
+        Effect.map((pending) => pending.map(({ envelope, createdAt }) => ({ envelope, createdAt }))),
+        Effect.mapError(unavailable)
+      )
   })
 
 const serveTab = (
@@ -99,13 +135,27 @@ export interface WorkerScope extends Endpoint {
   close(): void
 }
 
-const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>) =>
+/** What the app's leader worker entry provides. */
+export interface LeaderOptions {
+  /** The app's synced tables (the client registry). */
+  readonly registry: Registry.SyncRegistry
+  /** The app's mutations; `enqueue` runs them optimistically. */
+  readonly mutations: Mutation.MutationRegistry
+  /**
+   * Where `Protocol.SyncRpcs` is mounted (HTTP, NDJSON). Omit for a local-only replica: `enqueue`
+   * still applies and persists, nothing is pushed or pulled.
+   */
+  readonly syncUrl?: string
+}
+
+const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: LeaderOptions) =>
   Effect.gen(function* () {
     let init = yield* Queue.take(inbox)
     while (init._tag !== "Init") init = yield* Queue.take(inbox)
     const identity: Platform.ReplicaIdentity = { appId: init.appId, profile: init.profile }
     const invalid = Platform.validateIdentity(identity) ?? Platform.leaderHostCapability()
     if (invalid !== undefined) return yield* Effect.fail(new Error(invalid))
+    const actor = yield* Schema.decodeUnknownEffect(AccessScope.PrincipalId)(init.principal)
 
     if (!(yield* Platform.tryHoldLock(Platform.leaderLockName(identity)))) {
       send(endpoint, { _tag: "Waiting" })
@@ -115,9 +165,34 @@ const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>) =>
     const leaderId = crypto.randomUUID()
     yield* Platform.holdLock(Platform.leaderEpochLockName(identity, leaderId))
     const dbName = Platform.dbName(identity)
-    const sql = yield* openDatabase(identity)
-    const clientId = yield* Outbox.clientId.pipe(Effect.provideService(SqlClient.SqlClient, sql))
-    const handlers = yield* makeHandlers(sql, { leaderId, clientId, dbName })
+    const { registry, mutations, syncUrl } = options
+    const sql = yield* openDatabase(identity, registry)
+    const clientId = yield* Outbox.clientId.pipe(
+      Effect.provideService(SqlClient.SqlClient, sql),
+      Effect.flatMap(Schema.decodeUnknownEffect(Ids.ClientId))
+    )
+    const storage = SqliteSyncStorage.make(sql, registry)
+    let loop: SyncLoop.SyncLoop | undefined
+    let engine: Engine.Engine<unknown>
+    if (syncUrl === undefined) {
+      engine = yield* Engine.make({ clientId, actor, storage, registry, mutations, transport: localOnly })
+    } else {
+      // The RPC protocol lives in this scope: it closes with the leader.
+      const protocol = yield* Layer.build(Transport.layerProtocolHttp(syncUrl))
+      const transport = yield* Transport.make.pipe(Effect.provide(protocol))
+      engine = yield* Engine.make({ clientId, actor, storage, registry, mutations, transport })
+      const sync = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush })
+      yield* Effect.forkScoped(sync.run)
+      yield* Effect.forkScoped(SyncLoop.followPokes({ connect: transport.pokes(clientId), wake: sync.wake }))
+      yield* sync.wake
+      loop = sync
+    }
+    const handlers = yield* makeHandlers(sql, storage, engine, loop, {
+      leaderId,
+      clientId,
+      dbName,
+      syncing: loop !== undefined
+    })
     send(endpoint, { _tag: "Elected", leaderId })
 
     while (true) {
@@ -162,8 +237,8 @@ const listen = (
 }
 
 /** Entry point for the leader-candidate dedicated worker. Pass the worker's global `self`. */
-export const runLeaderWorker = (self: WorkerScope): void => {
+export const runLeaderWorker = (self: WorkerScope, options: LeaderOptions): void => {
   const inbox = Effect.runSync(Queue.unbounded<ToLeader>())
   listen(self, inbox)
-  Effect.runFork(program(self, inbox))
+  Effect.runFork(program(self, inbox, options))
 }

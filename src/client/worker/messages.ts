@@ -9,7 +9,8 @@ const Port = Schema.instanceOf(MessagePort)
 
 /** tab → its own leader-candidate worker */
 export const ToLeader = Schema.Union([
-  Schema.TaggedStruct("Init", { appId: Schema.String, profile: Schema.String }),
+  /** `principal`: who this replica acts as (optimistic role checks). One principal per profile. */
+  Schema.TaggedStruct("Init", { appId: Schema.String, profile: Schema.String, principal: Schema.String }),
   /** Serve LeaderRpcs to `tabId` on `port` until that tab's lock is released. */
   Schema.TaggedStruct("Connect", { tabId: Schema.String, port: Port }),
   /** A port to the router; the router sends `Connect` messages on it. */

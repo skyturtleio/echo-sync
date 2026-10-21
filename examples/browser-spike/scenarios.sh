@@ -287,6 +287,37 @@ check "fallback: after the owning tab closes, the waiting tab takes over the sam
 return { pass: s.isLeaderTab && r.ok && r.value.length === 1, s, r }')"
 ab tab close "$B" >/dev/null
 
+# ── sync loop: a fatal push halts push only; export stays available; a new leader re-trips once ────────
+# The harness's fake SyncRpcs server (fakeSync.ts) refuses every push with MalformedEnvelope, answers pull
+# with an empty PullDone, and ends its pokes stream after one poke. Counters are per client id.
+APP="sync-$RUN"
+SYNC="syncUrl=$BASE/fake-sync/rpc"
+A=$(open_tab "$BASE/?app=$APP&$SYNC")
+HALTED='await echo.until(async () => { const s = await echo.syncStatus(); return s.ok && s.value._tag === "Some" && s.value.value.push._tag === "Halted" })'
+STATS='const stats = async () => fetch("/fake-sync/stats?clientId=" + (await echo.info()).value.clientId).then((r) => r.json())'
+check "sync: MalformedEnvelope halts push; pull and pokes reconnects continue; pending export unaffected" "$(ev <<<"await echo.ready()
+const e = await echo.enqueue({ mutationId: 'halt-me', name: 't', args: {} })
+const halted = $HALTED
+$STATS
+const at = await stats()
+// Two more pokes connections means two more wakes, so two more pull cycles; no further push.
+const later = await echo.until(async () => { const s = await stats(); return s.pokes >= at.pokes + 2 && s.pulls > at.pulls ? s : undefined })
+const exp = await echo.exportPending()
+const status = await echo.syncStatus()
+return { pass: e.ok && halted === true && later !== undefined && later.pushes === 1 && at.pushes === 1
+  && exp.ok && exp.value.map((x) => x.envelope.mutationId).join() === 'halt-me' && status.value.value.lastError === null,
+  at, later, exp: exp.ok ? exp.value.length : exp, status }")"
+B=$(open_tab "$BASE/?app=$APP&$SYNC")
+before=$(ev <<<"$SERVED")
+ab tab close "$A" >/dev/null
+ab tab "$B" >/dev/null
+check "sync: after handover the new leader pushes once, halts again, and still exports the entry" "$(ev <<<"await echo.until(async () => { const s = await echo.status(); return s.isLeaderTab && s.leaderId !== $(jq '.leaderId' <<<"$before") })
+const halted = $HALTED
+$STATS
+const s = await stats(); const exp = await echo.exportPending()
+return { pass: halted === true && s.pushes === 2 && exp.ok && exp.value.map((x) => x.envelope.mutationId).join() === 'halt-me', s, exp }")"
+ab tab close "$B" >/dev/null
+
 # ── identities that would escape the storage namespace are refused up front ──────────────────────────
 D=$(open_tab "$BASE/?app=.")
 check "identity '.' is refused with LeaderUnavailable{Unsupported}, nothing is opened" "$(ev <<<'const r = await echo.info(); const s = await echo.status()

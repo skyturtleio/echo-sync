@@ -17,10 +17,10 @@
  * response the RPC client cannot decode, which it raises as a defect) becomes the transient
  * `PullProtocolError`, so a bad page never kills the loop's fiber; core's `ResnapshotRequired` passes through for the engine to handle.
  */
-import { Cause, Effect, Layer, Predicate, Schema, type Scope } from "effect"
+import { Cause, Effect, Layer, Predicate, Schema, type Scope, type Stream } from "effect"
 import { FetchHttpClient } from "effect/http"
 import { RpcClient, type RpcClientError, RpcSerialization } from "effect/rpc"
-import { Protocol } from "echo-sync"
+import { type Ids, Protocol } from "echo-sync"
 import type * as Engine from "./Engine.ts"
 
 /** The push batch cannot be sent as is, or the server ended it with a defect. Fatal. */
@@ -58,11 +58,12 @@ const defectsAs =
     )
 
 /** A `Transport` over an RPC client `Protocol` (see `layerProtocolHttp`). */
-export const make: Effect.Effect<
-  Engine.Transport<TransportError>,
-  never,
-  RpcClient.Protocol | Scope.Scope
-> = Effect.gen(function* () {
+/** The engine's transport plus the pokes stream, which the leader follows with `SyncLoop.followPokes`. */
+export interface SyncTransport extends Engine.Transport<TransportError> {
+  readonly pokes: (clientId: Ids.ClientId) => Stream.Stream<typeof Protocol.Poke.Type, unknown>
+}
+
+export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scope.Scope> = Effect.gen(function* () {
   const client = yield* RpcClient.make(Protocol.SyncRpcs)
   return {
     push: (request) =>
@@ -74,7 +75,10 @@ export const make: Effect.Effect<
       }).pipe(defectsAs((message) => new PushIntegrityError({ reason: "serverDefect", message }))),
 
     // The request is built by the engine from core types; the response is decoded by the RPC client.
-    pull: (request) => client.pull(request).pipe(defectsAs((message) => new PullProtocolError({ message })))
+    pull: (request) => client.pull(request).pipe(defectsAs((message) => new PullProtocolError({ message }))),
+
+    // Any end of this stream (failure, defect, completion) is handled by reconnecting (followPokes).
+    pokes: (clientId) => client.pokes({ clientId })
   }
 })
 

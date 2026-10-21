@@ -1,6 +1,6 @@
 /**
  * The leader's sync loop (DESIGN §8, §9): runs `Engine.push` then `Engine.pull` whenever woken (local
- * enqueue, poke, timer) and retries transient failures with backoff.
+ * enqueue, poke) and retries transient failures with backoff; `followPokes` keeps the pokes stream up.
  *
  * Fatal push (DESIGN §6, a68a727): a push error the caller's `isFatalPush` classifies as an integrity
  * failure (`MalformedEnvelope`, or the server failing to decode the push payload) halts pushing for the
@@ -9,7 +9,7 @@
  * exportable. The engine writes nothing durable when its transport fails, so classifying in the caller
  * (who owns the transport's error union) loses nothing.
  */
-import { Cause, Duration, Effect, Exit, Option, Queue, Schema, type Stream, SubscriptionRef } from "effect"
+import { Cause, Duration, Effect, Exit, Option, Queue, Schema, Stream, SubscriptionRef } from "effect"
 import type { Errors } from "echo-sync"
 import type * as Engine from "./Engine.ts"
 
@@ -117,5 +117,42 @@ export const make = <TE>(options: {
       status: SubscriptionRef.get(status),
       changes: SubscriptionRef.changes(status),
       run
+    }
+  })
+
+/**
+ * Follows the server's pokes stream (DESIGN §6, §8, 81a07db): every poke wakes the loop, and the
+ * stream is reconnected after ANY end (failure, defect or clean completion) following a backoff that
+ * starts at `retryDelay`, doubles up to `maxRetryDelay`, and resets once a connection delivered a poke.
+ * Each reconnect also wakes the loop, since pokes sent while disconnected were missed. Pokes are only
+ * hints (§8), so nothing here is fatal. Runs until interrupted.
+ */
+export const followPokes = <E>(options: {
+  readonly connect: Stream.Stream<unknown, E>
+  readonly wake: Effect.Effect<void>
+  readonly retryDelay?: Duration.Input
+  readonly maxRetryDelay?: Duration.Input
+}): Effect.Effect<never> =>
+  Effect.gen(function* () {
+    const base = Duration.toMillis(Duration.fromInputUnsafe(options.retryDelay ?? "1 second"))
+    const cap = Duration.toMillis(Duration.fromInputUnsafe(options.maxRetryDelay ?? "30 seconds"))
+    let delay = base
+    while (true) {
+      const connection = { poked: false }
+      const ended = yield* Effect.exit(
+        Stream.runForEach(options.connect, () =>
+          Effect.andThen(
+            Effect.sync(() => (connection.poked = true)),
+            options.wake
+          )
+        )
+      )
+      if (connection.poked) delay = base
+      yield* Effect.logDebug(
+        `echo-sync: pokes stream ended (${Exit.isSuccess(ended) ? "completed" : Cause.pretty(ended.cause)}); reconnecting in ${delay} ms`
+      )
+      yield* Effect.sleep(Duration.millis(delay))
+      delay = Math.min(delay * 2, cap)
+      yield* options.wake
     }
   })

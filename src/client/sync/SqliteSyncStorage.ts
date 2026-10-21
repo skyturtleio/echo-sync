@@ -16,7 +16,7 @@
 import { Effect, Option, Schema, Semaphore } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
-import { Ids, Mutation, Protocol, type Registry, type Store, SyncTable } from "echo-sync"
+import { type Errors, Ids, Mutation, Protocol, type Registry, type Store, SyncTable } from "echo-sync"
 import * as Outbox from "../Outbox.ts"
 import * as SqliteRowStore from "../SqliteRowStore.ts"
 import type * as Engine from "./Engine.ts"
@@ -31,12 +31,12 @@ const StoredUndo = Schema.fromJsonString(
     })
   )
 )
-const StoredNotice = Schema.fromJsonString(
-  Schema.Union([
-    Schema.TaggedStruct("Rejected", { envelope: Mutation.MutationEnvelope, error: Mutation.MutationRejection }),
-    Schema.TaggedStruct("OutcomeUnknown", { envelope: Mutation.MutationEnvelope })
-  ])
-)
+/** A stored notice (DESIGN §9): the engine's `Notice` as a Schema, so it can also cross the tab RPC. */
+export const Notice = Schema.Union([
+  Schema.TaggedStruct("Rejected", { envelope: Mutation.MutationEnvelope, error: Mutation.MutationRejection }),
+  Schema.TaggedStruct("OutcomeUnknown", { envelope: Mutation.MutationEnvelope })
+])
+const StoredNotice = Schema.fromJsonString(Notice)
 const StoredMeta = Schema.fromJsonString(
   Schema.Struct({ cursor: Ids.Cursor, pushedThrough: Schema.Int, resnapshot: Schema.Boolean })
 )
@@ -57,6 +57,7 @@ const decodeEnvelope = Schema.decodeUnknownEffect(Mutation.MutationEnvelope)
 const decodeSeq = Schema.decodeUnknownEffect(Ids.Seq)
 const encodeUndo = encode(StoredUndo)
 const encodeNotice = encode(StoredNotice)
+const decodeNotice = decode(StoredNotice)
 const decodeMeta = decode(StoredMeta)
 const encodeMeta = encode(StoredMeta)
 
@@ -264,3 +265,17 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
       )
   }
 }
+
+/** Every retained notice, oldest first, with its id (DESIGN §9: retained for inspection). */
+export const notices = (
+  sql: SqlClient.SqlClient
+): Effect.Effect<
+  ReadonlyArray<{ readonly id: number; readonly notice: typeof Notice.Type }>,
+  Errors.StoreUnavailable
+> =>
+  SqliteRowStore.unavailable(sql<{ readonly id: number; readonly notice: string }>`
+    SELECT id, notice FROM echo_notices ORDER BY id`).pipe(
+    Effect.flatMap((rows) =>
+      Effect.forEach(rows, (row) => Effect.map(decodeNotice(row.notice), (notice) => ({ id: row.id, notice })))
+    )
+  )

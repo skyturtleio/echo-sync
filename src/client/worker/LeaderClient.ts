@@ -21,9 +21,15 @@ import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import { RpcClient } from "effect/rpc"
 import { RpcClientError } from "effect/rpc/RpcClientError"
+import type { LocallyRejected } from "../sync/Engine.ts"
+import type { SyncStatus } from "../sync/SyncLoop.ts"
 import {
   type Enqueued,
+  type LeaderInfo,
   LeaderRpcs,
+  type PendingExport,
+  type StoredNotice,
+  type SyncDisabled,
   LeaderUnavailable,
   type LiveQuery,
   type OutboxEnvelope,
@@ -38,6 +44,8 @@ import * as Platform from "./platform.ts"
 export interface LeaderClientConfig {
   readonly appId: string
   readonly profile: string
+  /** The principal this replica acts as (DESIGN §4). One profile belongs to one principal. */
+  readonly principal: string
   /** e.g. `(name) => new Worker(new URL("./leader.worker.ts", import.meta.url), { type: "module", name })` */
   readonly spawnLeader: (name: string) => Worker
   /** e.g. `(name) => new SharedWorker(new URL("./router.worker.ts", import.meta.url), { type: "module", name })` */
@@ -64,13 +72,17 @@ export class LeaderClient extends Context.Service<
   LeaderClient,
   {
     readonly exec: (sql: string, params?: SqlParams) => Effect.Effect<Rows, SqlFailure | LeaderUnavailable>
-    /** Resolves only after the outbox entry is committed in SQLite. */
-    readonly enqueue: (envelope: OutboxEnvelope) => Effect.Effect<Enqueued, SqlFailure | LeaderUnavailable>
+    /** Runs the mutation optimistically; resolves only after the outbox entry is committed in SQLite. */
+    readonly enqueue: (
+      envelope: OutboxEnvelope
+    ) => Effect.Effect<Enqueued, SqlFailure | LocallyRejected | LeaderUnavailable>
     readonly subscribe: (query: LiveQuery) => Stream.Stream<QueryResult, SqlFailure | LeaderUnavailable>
-    readonly leaderInfo: Effect.Effect<
-      { readonly leaderId: string; readonly clientId: string; readonly dbName: string },
-      LeaderUnavailable
-    >
+    readonly leaderInfo: Effect.Effect<LeaderInfo, LeaderUnavailable>
+    /** The leader's sync status; ends with `LeaderLost` on handover (re-subscribe, like `subscribe`). */
+    readonly syncStatus: Stream.Stream<SyncStatus, SyncDisabled | LeaderUnavailable>
+    readonly notices: Effect.Effect<ReadonlyArray<StoredNotice>, SqlFailure | LeaderUnavailable>
+    /** Pending outbox entries for export (DESIGN §9); available while push is halted. */
+    readonly exportPending: Effect.Effect<ReadonlyArray<PendingExport>, SqlFailure | LeaderUnavailable>
     readonly status: Effect.Effect<Status>
   }
 >()("echo-sync/client/LeaderClient") {}
@@ -137,25 +149,33 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
         )
       )
 
+    /** A stream from the current leader that ends with `LeaderLost` when that leader goes away. */
+    const streamWithLeader = <A, E>(
+      f: (client: Client) => Stream.Stream<A, E | RpcClientError>
+    ): Stream.Stream<A, Exclude<E, RpcClientError> | LeaderUnavailable> =>
+      Stream.unwrap(
+        Effect.suspend(() => Deferred.await(current)).pipe(
+          Effect.map((connection) =>
+            connection._tag === "Unavailable"
+              ? Stream.fail(connection.error)
+              : f(connection.client).pipe(
+                  Stream.catchIf(isRpcClientError, (e) => Stream.fail(lostError(connection.leaderId, e.message))),
+                  Stream.interruptWhen(
+                    Deferred.await(connection.lost).pipe(Effect.andThen(Effect.fail(lostError(connection.leaderId))))
+                  )
+                )
+          )
+        )
+      )
+
     const service = LeaderClient.of({
       exec: (sql, params = []) => withLeader((client) => client.exec({ sql, params })),
       enqueue: (envelope) => withLeader((client) => client.enqueue({ envelope })),
       leaderInfo: withLeader((client) => client.leaderInfo()),
-      subscribe: (query) =>
-        Stream.unwrap(
-          Effect.suspend(() => Deferred.await(current)).pipe(
-            Effect.map((connection) =>
-              connection._tag === "Unavailable"
-                ? Stream.fail(connection.error)
-                : connection.client.subscribe({ query }).pipe(
-                    Stream.mapError((e) => (isRpcClientError(e) ? lostError(connection.leaderId, e.message) : e)),
-                    Stream.interruptWhen(
-                      Deferred.await(connection.lost).pipe(Effect.andThen(Effect.fail(lostError(connection.leaderId))))
-                    )
-                  )
-            )
-          )
-        ),
+      subscribe: (query) => streamWithLeader((client) => client.subscribe({ query })),
+      syncStatus: streamWithLeader((client) => client.syncStatus()),
+      notices: withLeader((client) => client.notices()),
+      exportPending: withLeader((client) => client.exportPending()),
       status: Effect.sync(() => ({ mode, tabId, isLeaderTab, leaderId: active?.leaderId }))
     })
 
@@ -284,7 +304,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
       const hello: ToRouter = { _tag: "Hello", appId: config.appId, profile: config.profile, tabId }
       router.port.postMessage(hello, { transfer: [] })
     }
-    const init: ToLeader = { _tag: "Init", appId: config.appId, profile: config.profile }
+    const init: ToLeader = { _tag: "Init", appId: config.appId, profile: config.profile, principal: config.principal }
     worker.postMessage(init, { transfer: [] })
 
     return service

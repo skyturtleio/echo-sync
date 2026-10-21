@@ -35,10 +35,13 @@ const client = await Effect.runPromise(
   LeaderClientModule.make({
     appId,
     profile,
+    principal: params.get("principal") ?? "spike-user",
     // Fault-injection flags (`crashAfterCommit`, `failOpen`) are forwarded to this tab's leader candidate only.
     spawnLeader: (name) => {
       const url = new URL("./leader.worker.ts", import.meta.url)
       for (const flag of ["crashAfterCommit", "failOpen"]) if (params.has(flag)) url.searchParams.set(flag, "")
+      const syncUrl = params.get("syncUrl")
+      if (syncUrl !== null) url.searchParams.set("syncUrl", syncUrl)
       return new Worker(url, { type: "module", name })
     },
     spawnRouter
@@ -77,6 +80,10 @@ const echo = {
     return status
   },
   info: () => run(client.leaderInfo),
+  notices: () => run(client.notices),
+  exportPending: () => run(client.exportPending),
+  /** First sync status emission (or the `SyncDisabled` error on a local-only leader). */
+  syncStatus: () => run(Stream.runHead(client.syncStatus)),
   exec: (sql: string, sqlParams: SqlParams = []) => run(client.exec(sql, sqlParams)),
   enqueue: (envelope: OutboxEnvelope) => run(client.enqueue(envelope)),
   /** Retry on LeaderUnavailable{LeaderLost} — safe because enqueue is idempotent on mutationId. */
