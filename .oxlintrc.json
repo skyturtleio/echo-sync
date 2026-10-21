@@ -27,7 +27,13 @@
         ]
       }
     ],
-    "no-underscore-dangle": "off"
+    "no-underscore-dangle": "off",
+    "vitest/no-standalone-expect": [
+      "error",
+      {
+        "additionalTestBlockFunctions": ["it.effect", "it.live", "it.scoped", "it.scopedLive", "it.layer"]
+      }
+    ]
   },
   "overrides": [
     {
