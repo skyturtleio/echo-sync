@@ -155,7 +155,11 @@ const setCompleted = Mutation.make("todos.setCompleted", {
 - `ctx` = `{ actor, now, random, store }`. `now` and `random` are deterministic inputs fixed by
   the engine (server uses its clock; client's optimistic result is transient). IDs should be
   generated in args, not inside handlers.
-- Mutation identity: `{ clientId, mutationId }`. Envelope: `{ clientId, mutationId, name, args }`.
+- Mutation identity: `{ clientId, mutationId }` (the idempotency key; `mutationId` is generated
+  by the caller before enqueue so an enqueue retry across leader handover is idempotent, hence it
+  is **not** ordered). Envelope: `{ clientId, mutationId, seq, name, args }` where `seq` is the
+  client's outbox sequence: per-client monotone, gap-free, never reused. Clients push in `seq`
+  order; `seq` is the only field the ledger-expiry floor (§16.5) compares against.
 - **Version the mutation args, never the rows.** Rows are always at current server schema. Arg
   evolution uses Schema unions/transforms with upcast; old queued intents must still decode.
 - No network, filesystem, secrets, raw SQL, or wall-clock reads inside handlers. Anything that
@@ -199,7 +203,7 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   transaction pooler forbids). Request: `{ clientId, cursor, continuation: Option<PullContinuation> }`.
   Response is a tagged union so "more but nothing to continue with" and "done but no position"
   are unrepresentable: `PullPage { changes, acks, continuation }` (more to come) or
-  `PullDone { changes, acks, nextCursor: Position }` (page set complete). `PullContinuation` is
+  `PullDone { changes, acks, nextCursor: Position, expiredThrough }` (page set complete; `expiredThrough` per §16.5). `PullContinuation` is
   opaque to the client (resent verbatim) but a Schema'd value on the server (row-walk progress,
   `head`, and the cursor it belongs to); a stale or invalid continuation fails with
   `ResnapshotRequired`. `changes` is an **ordered list** of upserts (row payload as of that
@@ -210,7 +214,7 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   already include a change whose log entries arrive in a later page, so applying pages
   incrementally can expose a torn transaction across rows. The client therefore stages pages
   (in a SQLite staging table, not memory) and applies the whole set, acks included, in one
-  replica transaction on `PullDone`. The continuation is persisted with the staged pages so a reload resumes the set; if it cannot (stale → `ResnapshotRequired`), the staged pages are discarded, never partially applied. Because positions are commit-ordered (§7), every
+  replica transaction on `PullDone`. The continuation is persisted with the staged pages so a reload resumes the set; if it cannot (stale → `ResnapshotRequired`), the staged pages are discarded, never partially applied. On `ResnapshotRequired` the client does **not** null its persisted cursor: it sets a durable resnapshot flag and keeps serving the installed replica, which remains authoritative at the old cursor (replica = replay(pending, server@cursor)) until the null-cursor set replaces it. Because positions are commit-ordered (§7), every
   change visible in any page's payload has a log entry `≤` the final `nextCursor`, so the
   installed state equals the server state at the last page's snapshot restricted to readable
   scopes. Known limitation: under sustained write load the server may keep returning `PullPage` for a long time;
@@ -394,5 +398,8 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
 2. Grant-added snapshot delivery — resolved in §8 (state diff + row walk then log), covered by the server substrate's grant / random grant-revoke tests.
 3. Global catalog snapshot format (leaning NDJSON+gzip) — deferred past v1 vertical slice.
 4. Protocol conformance test suite for a future non-TS client.
-5. Ledger retention / client epoch expiry policy, separate from log GC. v1: `collectGarbage` never touches the ledger or `client_scopes`. **Constraint on any future expiry:** a resnapshot acks only ledger rows that still exist, so if a client's ledger rows are expired while it still holds pending mutations, it re-pushes them and the server executes them again (double apply). Expiry must therefore forget the `clientId` binding and reject that client's later submissions as a terminal `ClientExpired` (client drops pending mutations with a notice) rather than treating them as new.
+5. Ledger retention, separate from log GC. **Confirmed hole** (reconcile simulation: with ledger GC and no handling, 34/40 seeds double-apply or never release). Mechanism, in the protocol from v1 so it needs no later wire change; the v1 server runs no expiry job (its floor stays 0 and `collectGarbage` never touches the ledger, `clients`, or `client_scopes`):
+   - Server keeps a per-client **floor** = highest `seq` (§6) whose ledger row was expired. Push answers any `seq ≤ floor` with the terminal outcome `Rejected{ClientExpired}` instead of executing it. Because clients push in `seq` order and the ledger records every processed mutation, every `seq ≤ floor` was processed; a never-pushed mutation always has `seq >` floor and is accepted normally.
+   - `PullDone` carries `expiredThrough` (the floor). Inside the install transaction, a pending mutation with `seq ≤ expiredThrough` and no ack leaves the replay set with a notice whose meaning is "processed, outcome unknown, effect (if any) is in the installed replica" — not "rejected". Needed in addition to the push rule: a client that pushed and lost the ack would otherwise hold the intent forever, since a resnapshot acks only surviving ledger rows.
+   - Expiry policy (when to raise the floor) is the remaining open question; it must never expire rows newer than the client's last presented cursor.
 6. Local full-text search: the pinned wa-sqlite build lacks FTS5 (§10); decide custom build vs. non-FTS search when the search primitive is scheduled.
