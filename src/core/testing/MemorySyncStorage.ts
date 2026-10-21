@@ -6,6 +6,9 @@
  * `Disk` is what survives a reload; the engine and everything in memory may be rebuilt over it.
  * Transactions are serialized: the snapshot of the whole disk, the body and the rollback run
  * under one permit, so a failed or interrupted transaction restores exactly its own writes.
+ * Rows, outbox, seq counter, meta, staging and notices share ONE commit/rollback decision taken
+ * from the body's exit (like SQLite's BEGIN/COMMIT); the replica's own `transaction` is not
+ * nested, because nested finalizers can observe different exits and split the commit.
  */
 import { Effect, Option, Schema, Semaphore } from "effect"
 import * as Engine from "../../client/sync/Engine.ts"
@@ -61,23 +64,28 @@ export const make = (disk: Disk): Engine.SyncStorage<never> => {
   return {
     transaction: (self) =>
       lock.withPermit(
-        Effect.suspend(() => {
-          const saved = {
-            meta: disk.meta,
-            lastSeq: disk.lastSeq,
-            outbox: disk.outbox,
-            released: new Map(disk.released),
-            staged: disk.staged,
-            notices: disk.notices
-          }
-          return disk.replica.transaction(self).pipe(
-            Effect.onExit((exit) =>
-              Effect.sync(() => {
-                if (exit._tag === "Failure") Object.assign(disk, saved)
-              })
+        Effect.uninterruptibleMask((restore) =>
+          Effect.suspend(() => {
+            const rows = MemoryStore.cloneTables(disk.replica.tables())
+            const saved = {
+              meta: disk.meta,
+              lastSeq: disk.lastSeq,
+              outbox: disk.outbox,
+              released: new Map(disk.released),
+              staged: disk.staged,
+              notices: disk.notices
+            }
+            return restore(self).pipe(
+              Effect.onExit((exit) =>
+                Effect.sync(() => {
+                  if (exit._tag === "Success") return
+                  disk.replica.replace(rows)
+                  Object.assign(disk, saved)
+                })
+              )
             )
-          )
-        })
+          })
+        )
       ),
     rows: {
       write: (table, id, row) => Effect.andThen(crashPoint, disk.replica.write(table, id, row)),

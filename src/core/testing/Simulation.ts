@@ -65,6 +65,11 @@ export interface Options {
   readonly pageSize?: number
   /** Deliberately wrong client that applies `PullPage`s as they arrive (proof the check bites). */
   readonly pullMode?: "staged" | "incremental"
+  /**
+   * Deliberately wrong seq allocator (proof the duplicate-seq check bites): next seq from the
+   * highest pending entry, so a seq is reused once its holder is released.
+   */
+  readonly seqFromPending?: boolean
   /** GC the ledger together with the log ("ledger GC'd while client offline"). */
   readonly ledgerGc?: boolean
 }
@@ -76,13 +81,15 @@ export interface Stats {
   readonly notices: number
   readonly transientStops: number
   readonly lostResponses: number
-  /** Enqueue retries after release whose marker was pruned: a duplicate the backstop ends. */
+  /** Duplicates (pruned-marker retries) released by a push response's position (§8 corollary). */
+  readonly backstopReleases: number
+  /** Enqueue retries after release whose marker was pruned that enqueued a duplicate. */
   readonly lateRetries: number
   /** Enqueue retries after release answered by the released-row marker (no new intent). */
   readonly markerHits: number
   /** Server writes to a table absent from the clients' registry. */
   readonly unknownTableWrites: number
-  /** Crashes injected in the middle of a storage transaction. */
+  /** Crashes that actually happened in the middle of a storage transaction. */
   readonly crashes: number
   /** Local mutations/pushes run while a pull was suspended on the network. */
   readonly interleaved: number
@@ -155,6 +162,8 @@ const skewed = (base: Clock.Clock, ms: number): Clock.Clock => ({
   sleep: (duration) => base.sleep(duration)
 })
 
+const dupKey = (clientId: string, seq: number) => `${clientId}#${seq}`
+
 const SCOPES = ["s0", "s1", "s2", "s3"]
 const PRINCIPALS = ["alice", "bob"]
 const CLIENTS: ReadonlyArray<readonly [string, string]> = [
@@ -181,6 +190,7 @@ export const run = (options: Options) =>
       expired: 0,
       lateRetries: 0,
       markerHits: 0,
+      backstopReleases: 0,
       unknownTableWrites: 0,
       crashes: 0,
       interleaved: 0
@@ -209,7 +219,11 @@ export const run = (options: Options) =>
       Effect.gen(function* () {
         server.register(clientId, principal)
         const disk = MemorySyncStorage.makeDisk()
-        const storage = MemorySyncStorage.make(disk)
+        const reference = MemorySyncStorage.make(disk)
+        const storage: Engine.SyncStorage<never> =
+          options.seqFromPending === true
+            ? { ...reference, nextSeq: Effect.sync(() => (disk.outbox.at(-1)?.envelope.seq ?? 0) + 1) }
+            : reference
         // Set by the interleaving step: the next pull request announces itself and waits.
         const ctl: { gate: Option.Option<{ arrived: Deferred.Deferred<void>; release: Deferred.Deferred<void> }> } = {
           gate: Option.none()
@@ -440,10 +454,34 @@ export const run = (options: Options) =>
       ])
     })
 
-    /** Records an intent the caller was told is saved, independently of the outbox. */
+    /**
+     * Records an intent the caller was told is saved, independently of the outbox. A seq already
+     * recorded for a different mutationId is a reused seq (DESIGN §6: never reused).
+     */
     const record = (envelope: MutationEnvelope) =>
-      Effect.sync(() => {
-        if (!committed.some((e) => e.clientId === envelope.clientId && e.seq === envelope.seq)) committed.push(envelope)
+      Effect.gen(function* () {
+        const same = committed.find((e) => e.clientId === envelope.clientId && e.seq === envelope.seq)
+        if (same === undefined) return committed.push(envelope)
+        if (same.mutationId !== envelope.mutationId) {
+          return yield* violated(
+            "a seq is never reused",
+            `${envelope.clientId} seq ${envelope.seq}: ${same.mutationId} and ${envelope.mutationId}`
+          )
+        }
+      })
+
+    /** Duplicates enqueued after their original's marker was pruned, by clientId#seq. */
+    const duplicates = new Set<string>()
+    /** Runs a push and counts duplicates its response released (only the backstop can). */
+    const countingBackstop = <A, E, R>(client: Client, self: Effect.Effect<A, E, R>) =>
+      Effect.gen(function* () {
+        const pendingBefore = client.disk.outbox
+          .map((p) => dupKey(client.clientId, p.envelope.seq))
+          .filter((key) => duplicates.has(key))
+        const result = yield* self
+        const pendingAfter = new Set(client.disk.outbox.map((p) => dupKey(client.clientId, p.envelope.seq)))
+        stats.backstopReleases += pendingBefore.filter((key) => !pendingAfter.has(key)).length
+        return result
       })
 
     const reload = (client: Client) =>
@@ -484,12 +522,19 @@ export const run = (options: Options) =>
           // the released-row retention window, so no such duplicate exists when rows expire (a
           // duplicate's fresh seq is above the floor, and nothing could recognise it).
           if (options.ledgerGc !== true) {
-            stats.lateRetries++
             note(`${client.clientId}: retry enqueue of released ${original.mutationId} (pruned)`)
             return yield* ignoreExpected(
               withClock(
                 client,
-                client.engine.mutate(original.mutationId, original.name, original.args).pipe(Effect.tap(record))
+                client.engine.mutate(original.mutationId, original.name, original.args).pipe(
+                  Effect.tap(record),
+                  Effect.tap((dup) =>
+                    Effect.sync(() => {
+                      stats.lateRetries++
+                      duplicates.add(dupKey(dup.clientId, dup.seq))
+                    })
+                  )
+                )
               )
             )
           }
@@ -513,7 +558,7 @@ export const run = (options: Options) =>
       Effect.gen(function* () {
         if (!client.online) return
         note(`${client.clientId}: push`)
-        yield* ignoreExpected(client.engine.push)
+        yield* ignoreExpected(countingBackstop(client, client.engine.push))
       })
 
     const pullStep = (client: Client) =>
@@ -550,14 +595,16 @@ export const run = (options: Options) =>
     const crashStep = (client: Client) =>
       Effect.gen(function* () {
         if (!client.online) return
-        stats.crashes++
         client.disk.crashAfterWrites = Option.some(rng.int(6))
         const op = rng.chance(0.6) ? pullStep(client) : pushStep(client)
         note(`${client.clientId}: crash armed`)
         yield* op.pipe(
           Effect.catchDefect((defect) =>
             defect instanceof MemorySyncStorage.SimulatedCrash
-              ? Effect.sync(() => note("  ↳ crashed mid-transaction"))
+              ? Effect.sync(() => {
+                  stats.crashes++
+                  note("  ↳ crashed mid-transaction")
+                })
               : Effect.die(defect)
           )
         )
@@ -616,7 +663,7 @@ export const run = (options: Options) =>
     for (const client of clients) client.online = true
     for (let round = 0; round < 30; round++) {
       for (const client of clients) {
-        yield* client.engine.push
+        yield* countingBackstop(client, client.engine.push)
         yield* pull(client)
         yield* checkClient(client)
       }

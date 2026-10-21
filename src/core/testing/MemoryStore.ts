@@ -54,6 +54,8 @@ export const cloneTables = (tables: Tables): Tables => new Map([...tables].map((
 
 export interface MemoryStore {
   readonly tables: () => Tables
+  /** Replaces every table (rollback of an enclosing transaction that owns the decision). */
+  readonly replace: (tables: Tables) => void
   readonly read: (table: string, id: string) => Effect.Effect<Option.Option<EncodedRow>>
   readonly write: (table: string, id: string, row: Option.Option<EncodedRow>) => Effect.Effect<void>
   readonly purgeScope: (scopeId: string) => Effect.Effect<void>
@@ -119,6 +121,9 @@ export const make = (initial: Tables = new Map()): MemoryStore => {
 
   return {
     tables: () => tables,
+    replace: (next) => {
+      tables = next
+    },
     read: (table, id) => Effect.sync(() => Option.fromNullishOr(tables.get(table)?.get(id))),
     write: (table, id, row) =>
       Effect.sync(() => {
@@ -137,16 +142,20 @@ export const make = (initial: Tables = new Map()): MemoryStore => {
     range,
     transaction: (self) =>
       lock.withPermit(
-        Effect.suspend(() => {
-          const before = cloneTables(tables)
-          return self.pipe(
-            Effect.onExit((exit) =>
-              Effect.sync(() => {
-                if (exit._tag === "Failure") tables = before
-              })
+        // One commit/rollback decision from the body's own exit: only the body is interruptible,
+        // so no interruption can land between the body finishing and the decision.
+        Effect.uninterruptibleMask((restore) =>
+          Effect.suspend(() => {
+            const before = cloneTables(tables)
+            return restore(self).pipe(
+              Effect.onExit((exit) =>
+                Effect.sync(() => {
+                  if (exit._tag === "Failure") tables = before
+                })
+              )
             )
-          )
-        })
+          })
+        )
       )
   }
 }

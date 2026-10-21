@@ -1,4 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
+import type { Scheduler } from "effect/Scheduler"
 import { Deferred, Effect, Fiber, Option } from "effect"
 import * as Engine from "../../client/sync/Engine.ts"
 import type { PullResponse } from "../../client/sync/Wire.ts"
@@ -42,6 +43,7 @@ describe("reconciliation simulation", () => {
           resnapshots: 0,
           lateRetries: 0,
           markerHits: 0,
+          backstopReleases: 0,
           unknownTableWrites: 0,
           crashes: 0,
           interleaved: 0
@@ -52,6 +54,7 @@ describe("reconciliation simulation", () => {
           reached.resnapshots += stats.resnapshots
           reached.lateRetries += stats.lateRetries
           reached.markerHits += stats.markerHits
+          reached.backstopReleases += stats.backstopReleases
           reached.unknownTableWrites += stats.unknownTableWrites
           reached.crashes += stats.crashes
           reached.interleaved += stats.interleaved
@@ -75,6 +78,22 @@ describe("reconciliation simulation", () => {
           caught += yield* Simulation.run({ seed, steps: 400, pullMode: "incremental" }).pipe(
             Effect.as(0),
             Effect.catchTag("InvariantViolated", () => Effect.succeed(1))
+          )
+        }
+        assert.isAbove(caught, 5)
+      }),
+    60_000
+  )
+
+  it.effect(
+    "an allocator that reuses a released entry's seq is caught by the never-reused check",
+    () =>
+      Effect.gen(function* () {
+        let caught = 0
+        for (let seed = 1; seed <= 10; seed++) {
+          caught += yield* Simulation.run({ seed, steps: 400, seqFromPending: true }).pipe(
+            Effect.as(0),
+            Effect.catchTag("InvariantViolated", (e) => Effect.succeed(e.invariant === "a seq is never reused" ? 1 : 0))
           )
         }
         assert.isAbove(caught, 5)
@@ -180,6 +199,50 @@ describe("reconciliation simulation", () => {
       assert.deepStrictEqual([...server.executions.values()], [1, 1, 1])
     })
   )
+
+  // Reviewer's reproduction: interrupt at every scheduler boundary of one transaction.
+  it("an interrupted storage transaction commits rows, seq and meta together or not at all", async () => {
+    const split: Array<number> = []
+    const outcomes = new Set<boolean>()
+    for (let boundary = 1; boundary < 150; boundary++) {
+      const disk = MemorySyncStorage.makeDisk()
+      const storage = MemorySyncStorage.make(disk)
+      const controller = new AbortController()
+      let ticks = 0
+      let yielded = false
+      const tasks: Array<() => void> = []
+      const scheduler: Scheduler = {
+        executionMode: "async",
+        shouldYield: () => !yielded && ++ticks === boundary && (yielded = true),
+        makeDispatcher: () => ({
+          scheduleTask: (task) => {
+            tasks.push(task)
+          },
+          flush: () => {
+            while (tasks.length > 0) tasks.shift()?.()
+          }
+        })
+      }
+      const running = Effect.runPromiseExit(
+        storage.transaction(
+          Effect.gen(function* () {
+            yield* storage.nextSeq
+            yield* storage.rows.write("t", "a", Option.some({ id: "a", access_scope_id: "s" }))
+            yield* storage.setMeta({ cursor: 1n, pushedThrough: 1, resnapshot: false })
+          })
+        ),
+        { scheduler, signal: controller.signal }
+      )
+      if (yielded) controller.abort()
+      while (tasks.length > 0) tasks.shift()?.()
+      await running
+      const hasRow = disk.replica.tables().get("t")?.has("a") ?? false
+      outcomes.add(hasRow)
+      if (hasRow !== (disk.lastSeq === 1) || hasRow !== (disk.meta.cursor === 1n)) split.push(boundary)
+    }
+    assert.deepStrictEqual(split, [])
+    assert.strictEqual(outcomes.size, 2) // the sweep spans the transaction
+  })
 
   it.effect("a failed or interrupted MemoryStore transaction does not erase a concurrently committed write", () =>
     Effect.gen(function* () {
