@@ -23,6 +23,7 @@ import {
   Stream,
   SubscriptionRef
 } from "effect"
+import { HttpClientError } from "effect/http"
 import type { Errors } from "echo-sync"
 import type * as Engine from "./Engine.ts"
 
@@ -40,7 +41,7 @@ export type SyncPhase = typeof SyncPhase.Type
  * What kind of transient failure `lastError` reports (DESIGN §9.1), so an app can tell "sign in again"
  * from "you are offline" without parsing text:
  * - `credentials`: `syncHeaders` raised; nothing was sent.
- * - `unauthorized`: the server rejected the credential (`Unauthorized`).
+ * - `unauthorized`: the server rejected the credential (`Unauthorized` or HTTP 401/403).
  * - `unavailable`: the server reported `ServerUnavailable`.
  * - `network`: no usable RPC result (transport, HTTP, or a response body that was empty, incomplete
  *   or unreadable after an HTTP response arrived).
@@ -109,9 +110,18 @@ const tagOf = (node: unknown): string | undefined =>
 
 /** DESIGN §9.1 kinds, by the innermost evidence: a credential failure inside an RPC error is `credentials`. */
 const kindOf = (error: unknown): SyncErrorKind => {
-  const tags = chain(error).map(tagOf)
+  const nodes = chain(error)
+  const tags = nodes.map(tagOf)
   if (tags.includes("CredentialsUnavailable")) return "credentials"
   if (tags.includes("Unauthorized")) return "unauthorized"
+  if (
+    nodes.some(
+      (node) =>
+        node instanceof HttpClientError.StatusCodeError &&
+        (node.response.status === 401 || node.response.status === 403)
+    )
+  )
+    return "unauthorized"
   if (tags.includes("ServerUnavailable")) return "unavailable"
   if (tags.includes("RpcClientError")) return "network"
   return "server"
