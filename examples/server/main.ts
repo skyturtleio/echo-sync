@@ -49,6 +49,14 @@ const sync = Startup.layer({
   mutations: serverMutations,
   appMigrations,
   principalFor: (headers) => {
+    // HTTP-boundary policy: these are the real request headers, never NDJSON message headers.
+    // Reject sibling origins too: same-site is not the same as same-origin.
+    const site = headers["sec-fetch-site"]
+    if (site === "cross-site" || site === "same-site") {
+      return Effect.fail(new Protocol.Unauthorized({ message: "cross-origin sync request" }))
+    }
+    // Non-browser callers can omit Sec-Fetch-Site. Production apps must authenticate a secret
+    // session cookie / bearer token here; this harness's principal header is not authentication.
     const principal = headers[principalHeader]
     return principal === undefined || principal === ""
       ? Effect.fail(new Protocol.Unauthorized({ message: `missing ${principalHeader}` }))

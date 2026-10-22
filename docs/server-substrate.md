@@ -41,16 +41,31 @@ the registry is skipped; its log entries arrive as tombstones, never as payloads
 `layerHttp({ registry, mutations, principalFor, path = "/sync" })` mounts `Protocol.SyncRpcs`
 and `Protocol.PresenceRpcs` (one merged group, one path, each group's handlers provided with
 `Layer.provide`) with `RpcServer.layerHttp({ protocol: "http" })` and `RpcSerialization.layerNdjson`, the
-transport the browser speaks. `principalFor(headers)` is the app's authentication; the principal
-is never read from the payload. It runs on every push and pull, and once when a stream opens
+transport the browser speaks. `principalFor(headers)` is the app's HTTP-boundary authentication
+and request policy: its headers are exclusively the real `HttpServerRequest.headers`, never
+the RPC metadata bag (which the protocol merges with body-supplied message headers). The
+principal and policies such as origin, fetch metadata, and media type therefore cannot be
+overridden by NDJSON message headers. It runs on every push and pull, and once when a stream opens
 (`pokes`, presence `room`; `track` is a plain call and runs it too). A credential that expires
 while a stream is open is therefore not detected until that stream reconnects; the client's
 `idleTimeout` and the server's heartbeat bound how long a dead connection stays open, not how long
 an expired token is honoured on a live one. The client evaluates `syncHeaders` per request (DESIGN
 §9.1 Credentials), so a reconnect carries the renewed credential. `ClientForbidden` becomes `Unauthorized`.
 
-Composing a transport: `handlers` is exported seams in order, and another transport (or a
-test) composes the same ones without the RPC layer. Authorize with `principalFor(headers)`
+For example, `examples/server` rejects `Sec-Fetch-Site: cross-site` and `same-site` inside
+`principalFor` before reading the credential; sibling origins are not same-origin. An app can
+also reject any present `Origin` unequal to its configured origin. Non-browser callers can
+omit these headers, so request policy never replaces secret session-cookie / bearer-token
+authentication (the example's principal header is only a dev harness). The HTTP protocol still
+decodes the body before invoking `principalFor`; this callback is not a pre-decoder body gate.
+The pinned Effect HTTP protocol preserves the request context when forking handlers, before
+branching into buffered or streaming responses, so the same provenance holds for all five RPCs.
+The client already installs `syncHeaders` as real HTTP request headers, not message headers.
+
+Composing a transport: the RPC `handlers` / `presenceHandlers` require `layerHttp`; a missing
+HTTP request context is a defect naming that mount, never empty headers or `Unauthorized`.
+Another transport (or a test) composes the exported transport-neutral steps instead.
+Authorize with the app's `principalFor(headers)` using that transport's trusted boundary headers
 (fails `Unauthorized`; requires nothing). Push is `principalFor` then `executeBatch(options,
 actor, request)`, with `pushFailures` over both: it maps the whole cause, so infrastructure
 anywhere, including a `SqlError` from authentication, is an empty results list (a transient

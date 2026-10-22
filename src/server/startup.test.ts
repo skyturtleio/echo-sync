@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as PgClient from "@effect/sql-pg/PgClient"
-import { Effect, Exit, Layer, Option, Redacted } from "effect"
+import { Effect, Exit, Layer, Option, Redacted, Schema } from "effect"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
 import { RpcClient, RpcSerialization } from "effect/rpc"
@@ -53,6 +53,64 @@ const pullOnce = Effect.gen(function* () {
 }).pipe(Effect.scoped)
 
 describe.skipIf(!pgAvailable)("server startup (§11)", () => {
+  it.live("body-supplied cookie and origin headers cannot change a push's HTTP principal or origin policy", () =>
+    Effect.gen(function* () {
+      const db = yield* Effect.context<SqlClient | PgClient.PgClient>()
+      const web = HttpRouter.toWebHandler(
+        Startup.layer({
+          ...options,
+          mutations: Mutation.makeRegistry([
+            Mutation.make("noop", { args: Schema.Struct({}), handler: () => Effect.void })
+          ]),
+          principalFor: (headers) =>
+            headers["origin"] === "https://app.test" && headers["cookie"] === "session=http-secret"
+              ? Effect.succeed(AccessScope.PrincipalId.make("http-principal"))
+              : Effect.fail(new Protocol.Unauthorized({ message: "HTTP credential or origin refused" }))
+        }).pipe(Layer.provide(Layer.succeedContext(db))),
+        { disableLogger: true }
+      )
+      yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
+      const push = (cookie: string, origin: string, bodyCookie: string, bodyOrigin: string) =>
+        Effect.promise(async () => {
+          const response = await web.handler(
+            new Request("http://echo.test/sync", {
+              method: "POST",
+              headers: { cookie, origin, "content-type": "text/plain" },
+              body: `${JSON.stringify({
+                _tag: "Request",
+                id: "1",
+                tag: "push",
+                payload: {
+                  clientId: "http-headers",
+                  mutations: [{ mutationId: "http-mutation", seq: 1, name: "noop", args: {} }]
+                },
+                headers: [
+                  ["cookie", bodyCookie],
+                  ["origin", bodyOrigin]
+                ]
+              })}\n`
+            })
+          )
+          return response.text()
+        })
+      // Real HTTP credentials/policy admit the push despite the conflicting body headers.
+      const accepted = yield* push("session=http-secret", "https://app.test", "session=body", "https://evil.test")
+      assert.include(accepted, '"_tag":"Success"')
+      assert.deepStrictEqual(
+        yield* (yield* SqlClient)`SELECT principal_id FROM echo_sync.clients WHERE client_id = 'http-headers'`,
+        [{ principal_id: "http-principal" }]
+      )
+      // Neither a forged origin nor a forged credential can rescue a refused HTTP request.
+      for (const { cookie, origin } of [
+        { cookie: "session=http-secret", origin: "https://evil.test" },
+        { cookie: "session=wrong", origin: "https://app.test" }
+      ]) {
+        const refused = yield* push(cookie, origin, "session=http-secret", "https://app.test")
+        assert.include(refused, '"_tag":"Unauthorized"')
+      }
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
   it.live("a server whose database drifted from the registry never serves; restored, it serves", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient
