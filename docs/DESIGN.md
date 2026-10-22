@@ -982,6 +982,24 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
    - Invariants to test (PG): an acked row older than `retention` expires and a resubmission of it answers `Rejected{ClientExpired}` with the recorded position, not a second execution; an acked row younger than `retention` and an unacked row of any age survive; the floor after a job is a `seq` prefix and `PullDone.expiredThrough` reports it; a client that lost the ack and pulls after expiry gets `OutcomeUnknown` for that mutation and releases it; a job run with no eligible rows changes nothing; the reconcile simulation seeds that double-applied under naive ledger GC pass under this policy.
 6. Local full-text search: the pinned wa-sqlite build lacks FTS5 (§10); decide custom build vs. non-FTS search when the search primitive is scheduled.
 7. Additive schema evolution across a deploy — **resolved in §11** (codecs drop excess keys, fail on missing; new columns nullable/defaulted; deploy server first). Remaining: a wire manifest/version gate so a newer client against an older server degrades cleanly instead of failing row decode; needed before clients can ship ahead of the server.
+   **Scope ruling (coordinator, user pick G; scheduled, medium dial):** the gate covers both
+   directions, because a PWA user can dismiss the reload prompt and run an old client against a
+   newer server indefinitely. Requirements, mechanism to be proposed by the implementing thread
+   and approved before code: (a) every `pull` and `push` carries the client's registry
+   `dataHash` and the engine wire version; (b) the server decides through an app-supplied
+   policy whose default is *serve* (additive evolution already works, §11); a refused client
+   gets a typed `ClientOutdated`, which the client treats as **not transient**: no retry loop, no
+   rebuild, outbox and replica kept, `syncStatus.lastError.kind: "outdated"` (closed union
+   grows), and the app owns the "update required" prompt and the service-worker reload;
+   (c) a row of a known table that fails decode on a **missing declared key** is "server behind"
+   (§11: the server must send every declared column), reported as `lastError.kind:
+   "server-outdated"` with backoff and never a rebuild, which removes the only way a newer
+   client could corrupt its replica against an older server; (d) the generator keeps a history
+   of committed `dataHash`es in `migrations/manifest.json` so an app can express its floor as
+   "every manifest since NNN" without hand-copying hashes. Invariants: an old client against an
+   additive newer server still syncs (fails if the gate is too strict); a client below the floor
+   is refused with `ClientOutdated`, stops retrying, and its outbox survives the forced reload;
+   a newer client against an older server shows `server-outdated` and never rebuilds.
 8. Query `limit` pushdown through the scope filter — **resolved** (main 41b878a): `IndexRangePlan` carries `readableBy` (principals) and `limit`; every `RowStore` applies readability as a `scope_grants` semi-join on `(access_scope_id, principal_id)` and stops after `limit` readable rows; `Store.planResult` is the shared reference. Covered by the `Conformance.rowStore` invariant run by Memory, SQLite and PG. Integration rule still owed by `ws/query` at landing: a registered-query run must record `scope_grants` as read whenever the plan carries `readableBy`, so a revoke re-runs the query.
 9. Pokes liveness — **resolved (user: a)**, see §6 Liveness: `Poke | Heartbeat` stream element, server `heartbeatInterval` (default 15 s), client `idleTimeout` (default 45 s) that ends and reconnects the stream; heartbeats never wake the loop. The harness-only proxy workaround goes away once the client timeout exists.
 10. Credential refresh — **resolved (user: a)**, see §9.1 Credentials: `syncHeaders` returns an Effect and is evaluated per outgoing request (push, pull, every stream (re)connect); the app owns refresh; `Unauthorized` stays retried and never fatal. Scheduled (ws/credential-refresh).
