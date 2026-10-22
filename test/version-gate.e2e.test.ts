@@ -367,7 +367,15 @@ describe.skipIf(!pgAvailable)("two-direction version gate (DESIGN §16.7), real 
           transport: {
             push: transport.push,
             pull: () =>
-              Effect.succeed(done({ id: "null-is-present", access_scope_id: "s1", body: "valid", extra_note: null }))
+              Effect.succeed(
+                done({
+                  id: "null-is-present",
+                  access_scope_id: "s1",
+                  body: "valid",
+                  extra_note: null,
+                  unknown_column: "drop me"
+                })
+              )
           }
         })
         yield* valid.pull
