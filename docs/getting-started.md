@@ -85,6 +85,15 @@ migration.
 Keep `manifest.json` byte-identical to `g.snapshot`. Exclude it from your formatter: this repo's
 `.oxfmtrc.json` ignores `**/migrations/manifest.json`.
 
+`generate` also preserves `history: [{ migration: "NNN_name", dataHash }]` and appends the
+current registry hash, including on index-only migrations (repeated hashes are intentional).
+The hash includes system tables such as `scope_grants`, exactly as the client's `Registry.make`
+does; the snapshot's `tables` still holds only app manifests. Pre-gate snapshots without history
+remain readable; no hashes are invented for earlier releases. History starts at your next
+generated migration. Always use `generate`, not `snapshotOf`, to rewrite the committed file.
+See [the server policy hook](server-substrate.md#client-compatibility-policy) for deriving an
+accepted floor from these entries. The default is serve: an additive rollout needs no policy.
+
 ## 4. Startup and serving
 
 ```ts

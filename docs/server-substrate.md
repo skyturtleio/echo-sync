@@ -82,9 +82,9 @@ Authorize with the app's `principalFor(headers)` using that transport's trusted 
 actor, request)`, with `pushFailures` over both: it maps the whole cause, so infrastructure
 anywhere, including a `SqlError` from authentication, is an empty results list (a transient
 stop), `ClientForbidden` becomes `Unauthorized`, and a non-SQL defect stays a defect.
-`executeBatch` already applies it (it fails only `Unauthorized | MalformedEnvelope`, never with
-infrastructure), and it is idempotent. Pull is `pull(registry, { principalId, clientId, cursor,
-continuation, limit })` piped through `serverFailures`, which maps the whole cause: any
+`executeBatch` already applies it (it fails only `Unauthorized | MalformedEnvelope | ClientOutdated`,
+never with infrastructure), and it is idempotent. Pull is `pull(registry, { principalId, clientId,
+clientVersion, cursor, continuation, limit }, clientPolicy)` piped through `serverFailures`, which maps the whole cause: any
 `SqlError` becomes `ServerUnavailable`, `ClientForbidden` becomes `Unauthorized` (matched by
 `_tag`, first failure, as `catchTag`), `ResnapshotRequired` and interrupts pass through, and a
 non-SQL defect stays a defect. Pokes applies the same mapping with the Stream operators
@@ -92,6 +92,65 @@ non-SQL defect stays a defect. Pokes applies the same mapping with the Stream op
 which, unlike `serverFailures`, reduce a composite typed cause to its first failure.
 `executeBatch` and `pull` require `SqlClient`; the two failure combinators keep their input's
 requirements.
+
+## Client compatibility policy
+
+Every gate-aware client's push batch and pull page carries
+`clientVersion: { dataHash: registry.dataHash, wireVersion: Protocol.wireVersion }` (initial
+engine version 1). This is compatibility advice from an untrusted caller, not authorization.
+`SyncServerOptions.clientPolicy` (also accepted by `Startup.layer`) defaults to **serve**:
+different hashes do not imply incompatibility, and old clients keep syncing additive changes.
+
+An app that retires a table shape can derive a floor from generated manifest history:
+
+```ts
+import { Effect } from "effect"
+import { Migrate, Protocol } from "echo-sync"
+import { Postgres } from "echo-sync/server"
+
+const manifest = Migrate.decodeSnapshot(await Bun.file("migrations/manifest.json").text())
+const floor = 3 // accept every recorded manifest since 003, not just the latest hash
+const accepted = new Set((manifest.history ?? [])
+  .filter((entry) => Number(entry.migration.split("_")[0]) >= floor)
+  .map((entry) => entry.dataHash))
+const clientPolicy: Postgres.ClientPolicy = (version) =>
+  version !== undefined && version.wireVersion === Protocol.wireVersion && accepted.has(version.dataHash)
+    ? Effect.void
+    : Effect.fail(new Protocol.ClientOutdated({ message: "update required" }))
+// Pass clientPolicy alongside registry, mutations and principalFor to Startup.layer / layerHttp.
+```
+
+The generator records the combined registry hash, system tables included, byte-identical to
+what the client's `Registry.make` sends. It preserves earlier entries and appends even for
+index-only changes. Legacy version-1 snapshots without history still decode; generation starts
+recording at the next migration, never fabricates older entries. An absent `clientVersion`
+means pre-gate/unknown; this example refuses it, while the default serves it. Versions decode
+as arbitrary non-negative integers so the app can choose its accepted range. Pre-gate clients
+cannot decode `ClientOutdated` or obey the stop rule retroactively; refusing them prevents
+server work but cannot change their old retry/status behavior.
+
+The HTTP adapter authenticates first using real HTTP headers, then checks policy **before**
+catalog access, client registration, replay/idempotency lookup, ledger writes or cursor work.
+No policy runs on pokes or presence. Custom transports authenticate first, pass `clientPolicy`
+in `executeBatch` options and as the third argument to `pull`, and carry `request.clientVersion`
+into the server-side pull request. The typed refusal passes through the failure combinators
+unchanged. It never produces a ledgered rejection.
+
+Refused gate-aware clients stop both directions for the leader's lifetime with
+`syncStatus.lastError.kind: "outdated"`, phase `idle`, no next retry. Wakes cannot resume them;
+the app owns the update prompt and service-worker reload. Local reads, mutations, pending
+counts and export keep working, and the outbox survives an update. A known-table upsert that
+fails decode with an absent declared top-level wire key instead reports `server-outdated` with
+ordinary backoff (`null` is present). The install transaction rolls back; neither case rebuilds
+the replica or clears cursor, outbox or staging. Unknown tables still skip. Deploy server first.
+
+Raise the floor before a non-additive **table-shape** change: dropping, renaming or retyping
+a declared column, or writing nulls after NOT NULL → nullable. Otherwise an old client can
+misreport a removed column as `server-outdated`. The floor governs columns, kinds and
+nullability, not mutations. Keep mutation names while any client may have queued them, and
+version args with unions/upcasts (§6). Removing a name gives retained `UnknownMutation`
+rejections; incompatible args give retained `ArgsDecodeFailed`, not `outdated`. A second,
+mutation-registry floor signal is a possible future item, not implemented here.
 
 - push: one SERIALIZABLE ledger transaction per mutation (read-modify-write handlers would lose
   updates under READ COMMITTED; `40001` retries the whole attempt), `roleFor` read from `scope_grants` (own grant or

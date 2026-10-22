@@ -492,8 +492,16 @@ tables and replica schema, one transaction) and builds `Engine.make` over the SQ
   with `SyncDisabled`.
 - `syncStatus` is `{ push, lastError, pendingMutations, lastSyncedAt, phase, nextRetryAt }` (DESIGN §9.1).
   `lastError` is `null | { kind, message }`: `kind` is `credentials` (`syncHeaders` raised),
-  `unauthorized`, `unavailable` (`ServerUnavailable`), `network` (no usable RPC result) or `server`
-  (the fallback, local `StoreUnavailable` included); `message` is a library constant per kind, never
+  `unauthorized`, `unavailable` (`ServerUnavailable`), `network` (no usable RPC result), `server`
+  (the fallback, local `StoreUnavailable` included), `outdated` (server policy refused this client),
+  or `server-outdated` (a known-table row lacks a declared top-level wire column).
+  `outdated` stops both push and pull for the leader's lifetime, even on wakes; phase is `idle`
+  and `nextRetryAt` is null. `server-outdated` retries with ordinary backoff. Neither rebuilds,
+  resets the cursor or drops staged pages; replica and outbox stay intact. The app owns the update
+  prompt and service-worker reload, never the engine. Local mutations, reads, pending counts,
+  notices and export stay available while refused, and queued intents resume after an accepted
+  update. A fresh leader tries again; an unchanged refused bundle stops again.
+  `message` is a library constant per kind, never
   raw error text, and the `Halted` reason follows the same rule. The full cause goes to the leader log.
   HTTP 401/403 on push or pull report `unauthorized`; stream-only refusals on pokes or room use their
   separate retry loops and do not update `syncStatus.lastError`.
@@ -505,7 +513,7 @@ tables and replica schema, one transaction) and builds `Engine.make` over the SQ
   cycle whose push finished cleanly and whose pull installed a `PullDone`; it is in memory, so a new leader
   starts at `null`. `phase` is set by the loop (`pushing`, `pulling`, `backoff` with `nextRetryAt`, `idle`).
   `requestSync` offers to the loop's sliding wake queue: during backoff it cuts the wait short, and it
-  never touches a `Halted` push.
+  never clears a `Halted` push or an `outdated` stop.
 - `syncStatus` (stream, resumes on handover like `subscribe`), `requestSync`, `notices` (stream) and
   `exportPending` (pending outbox in seq order; reads storage only, so it is available while push is
   halted) are RPCs on `LeaderRpcs`.

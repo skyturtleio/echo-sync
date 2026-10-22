@@ -234,8 +234,8 @@ rejection is ledgered only when it is the sole kind of failure in the cause, i.e
 a transaction that would have committed had the handler succeeded. The same rule applies to
 `Mutation.run` in core (`StoreUnavailable` outranks `MutationRejection`).
 
-**Request-level push errors are reserved for input an honest client cannot produce.** Push
-fails as a whole, with nothing executed or ledgered, only on `Unauthorized` and
+**Request-level push errors are authentication, compatibility policy, or malformed input.** Push
+fails as a whole, with nothing executed or ledgered, on `Unauthorized`, `ClientOutdated` (§11), or
 `MalformedEnvelope` (e.g. `seq < 1`; the `Seq` schema already refuses this at RPC decode, so
 the server guard is defense in depth against corrupt or forged input). Any per-envelope check
 an honest client *could* fail (args decode, authorization, domain error, size) must instead be
@@ -288,8 +288,11 @@ client's last pull and the `LISTEN` is therefore covered by the pull that initia
 and a change committed after it produces a notification. The client must not rely on a pull
 issued *before* the stream is established to close a reconnect gap, and v1 adds no periodic
 resync timer. Transient push failures
-(`RpcClientError`, `Unauthorized`, interruption) and every pull failure (including a pull defect
-or an undecodable page, mapped to a transient pull error) are retried with backoff. v1 uses one
+(`RpcClientError`, `Unauthorized`, interruption) and pull failures other than `ClientOutdated`
+(including a pull defect or an undecodable page) are retried with backoff. `ClientOutdated`
+stops both directions for the leader's lifetime (§11), without retry or rebuild. A known-table
+row missing a declared top-level wire key reports `server-outdated`, with backoff and no rebuild.
+v1 uses one
 backoff per sync cycle (push then pull), not one per operation: a transient push failure also
 delays the next pull. A halted push does not count as a failure and does not delay pull.
 Transport: `SyncRpcs` over HTTP POST with NDJSON (`RpcServer.layerHttp({ protocol: "http" })`
@@ -333,7 +336,8 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
 
 - Cursor-based, scope-filtered, paginated. Each page is read in its own `REPEATABLE READ`
   snapshot (a snapshot cannot span HTTP requests without holding a transaction open, which a
-  transaction pooler forbids). Request: `{ clientId, cursor, continuation: Option<PullContinuation> }`.
+  transaction pooler forbids). Request: `{ clientId, clientVersion?, cursor, continuation: Option<PullContinuation> }`
+  (`clientVersion` is always sent by gate-aware clients, §11).
   Response is a tagged union so "more but nothing to continue with" and "done but no position"
   are unrepresentable: `PullPage { changes, acks, continuation }` (more to come) or
   `PullDone { changes, acks, nextCursor: Position, expiredThrough }` (page set complete; `expiredThrough` per §16.5). `PullContinuation` is
@@ -408,22 +412,31 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
   every replicated row (all `SyncTable`s, system tables included; not the outbox, not the
   staging table), installs the set, and replays pending mutations on top. For a first sync the
   clear is a no-op. `RowStore` gains a `clearAll` primitive for this; it is the only caller.
-- **Unknown table in a pull response is skipped, not a failure.** The manifest is never
-  exchanged on the wire: the server checks its registry against the database, the client
+- **Unknown table in a pull response is skipped, not a failure.** The client's combined
+  registry `dataHash` and engine `wireVersion` travel on every push and pull (§11), not the
+  full manifest. The server checks its registry against the database, the client
   rebuilds its replica when its *own* registry changes (§9). So during a deploy that adds a
   synced table, a running client with the old registry legitimately receives `upsert`/`tombstone`
   changes for a table it does not know. It cannot store or query them, and nothing is lost: its
   next app version has a new manifest, which rebuilds the replica from a `null` cursor and
   fetches those rows. The engine resolves `Change.table` through `Registry.get` and drops
   unknown names with a log line, inside the same install transaction. A defect here would kill
-  sync for every stale client until the app updated. (Rows of a *known* table at a newer server
-  schema are the separate additive-evolution question, open item 7.)
+  sync for every stale client until the app updated. Known-table additive columns are dropped
+  by the old client's codec (§11); differing hashes alone never refuse a client.
 - **A known table's row is never installed raw.** `Protocol.Change` carries the row as generic
   JSON; the install path decodes every `upsert` payload through `table.wire` and writes the
   canonical re-encoding, so the replica only ever holds rows the table codec produced (the §11
   excess-key drop and missing-key failure happen here). A row that fails to decode fails the
   whole page-set install: the transaction rolls back, nothing from the set is installed, the
-  cursor does not move, and the failure is a transient pull failure per §6. Decoding, not an
+  cursor does not move, and the failure is retried with backoff per §6. On decode failure an
+  absent declared top-level column key is `ServerOutdated` (`null` counts as present), surfaced
+  as `lastError.kind: "server-outdated"`; invalid present values remain `MalformedChange`.
+  Before staging a `PullPage`, the client decodes every known-table upsert through the same
+  classification, without installing rows or changing the page's wire form. A failed page is
+  never persisted; prior valid staging, cursor and resnapshot flag remain unchanged, so the
+  next attempt uses the last valid continuation and re-fetches that page after backoff.
+  Install-time decoding remains in place, including for the final `PullDone`.
+  Neither triggers a rebuild, cursor reset, resnapshot flag or staging clear. Decoding, not an
   `id` type check, is what makes the row's key trustworthy.
 - Realtime: a poke stream (RPC stream) says "something may have changed"; it is a hint, never
   data. Pull is the only truth.
@@ -540,7 +553,13 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
   `"unauthorized"` (the server rejected the credential), `"unavailable"` (`ServerUnavailable`),
   `"network"` (the request failed before a server response: transport, HTTP, decode of a
   response that never arrived), `"server"` (any other server-produced transient failure, the
-  stopped-batch case included). Amendment after the fd77a29 review: preserving arbitrary
+  stopped-batch case included), `"outdated"` (`ClientOutdated`, both directions stopped for this
+  leader's lifetime), `"server-outdated"` (a known-table row lacks a declared top-level wire
+  column; retry with backoff, never rebuild). An outdated leader stays `phase: "idle"`,
+  `nextRetryAt: null`; wakes from pokes, `requestSync` and local writes cannot resume it.
+  Local `mutate`, reads, export and reactive pending counts continue. The app owns the update
+  prompt and service-worker reload; a fresh leader tries again, keeping the durable outbox.
+  Amendment after the fd77a29 review: preserving arbitrary
   inner text and an absolute no-secrets guarantee cannot both hold, and the guarantee wins.
   `message` is a **library-controlled constant** chosen by walking the cause chain to the
   innermost *recognized* stage or tag (so an outer `RpcClientError` never hides a wrapped
@@ -556,7 +575,7 @@ surface, and adds no sync semantics of its own. Rulings (coordinator):
   change; lands before any app ships on `syncStatus`.
 - **`requestSync`**: `Effect<void, SyncDisabled | LeaderUnavailable>` on the tab client. It
   wakes the sync loop (coalesced with the existing wake queue) and completes once the wake is
-  accepted. It never implies network success, never clears `Halted`, and retries `LeaderLost`
+  accepted. It never implies network success, never clears `Halted` or `outdated`, and retries `LeaderLost`
   like `mutate`. Its outcome is observable only through `syncStatus`.
 - **Closing the tab client's scope** terminates a locally owned leader worker and nothing else.
   The outbox is durable (§9), so a push in flight at that moment resolves on the next leader
@@ -769,8 +788,14 @@ const todosByProject = Query.make("todos.byProject", {
     (default `migrations/manifest.json`): canonical JSON of the registry's `TableManifest`s. The
     generator reads it, emits `NNN_name.ts`, and rewrites the snapshot in the same commit, so
     "committed" means committed and review sees the manifest diff. It is never read from a
-    database. `TableManifest` carries the unique sets (`unique`, already part of `indexHash`), so
-    the snapshot needs nothing beyond the manifests.
+    database. `TableManifest` carries the unique sets (`unique`, already part of `indexHash`).
+    The snapshot also keeps ordered `history: [{ migration: "NNN_name", dataHash }]`, appended
+    by `generate` at every migration, index-only migrations included. This is the byte-identical
+    combined `Registry.make` hash the client sends, including engine tables such as
+    `scope_grants`, not a hash of the app-table-only snapshot. Old version-1 snapshots without
+    history still decode; history starts at the next generated migration, never inferred for
+    earlier releases. Commit the generated migration and snapshot together; `snapshotOf`
+    alone describes tables for planning, not a replacement for history-preserving `generate`.
   - App migrations run in their **own history table** (default `echo_sync.app_migrations`),
     numbered from `001`, via `PgMigrator.make({})({ loader: fromRecord(...), table })` after the
     engine's `migrate` (which keeps `echo_sync.migrations` for `001_engine`). Never share the
@@ -837,12 +862,40 @@ const todosByProject = Query.make("todos.byProject", {
   a row without the new column into its *own* replica only, and the next pull overwrites it —
   the server is authoritative and always runs the newest schema, and mutations carry args, not
   rows); (3) a newer client against an older server is a decode failure the §9 rebuild cannot
-  repair, so **deploy order is server first, then clients**; the startup verifier (above) makes
-  the server refuse to serve a mismatched database, never a stale client. A manifest/version
-  gate on the wire is the later fix for (3). Key presence is the server's obligation: a row on
+  repair, so **deploy order remains server first, then clients**; the startup verifier (above)
+  makes the server refuse to serve a mismatched database. The wire gate below makes skew
+  degrade cleanly, not make missing data syncable. Key presence is the server's obligation: a row on
   the wire carries **every declared column, `null` included** (a missing key fails decode on
   every client). That holds only if every declared column exists in the live table, which the
   startup verifier enforces.
+- **Two-direction wire version gate (§16.7):** every new client's push and pull page carries
+  `clientVersion: { dataHash: registry.dataHash, wireVersion: Protocol.wireVersion }` (initial
+  engine version 1). Both schemas accept an optional key for legacy pre-gate clients; absence
+  is unknown/legacy, never the server's own hash. Wire versions decode as non-negative integers,
+  not a literal equal to this server's version. Effect 4.0.5 RPC uses these payload schemas;
+  an old server drops extra metadata, and a new server accepts absent metadata.
+  `SyncServerOptions.clientPolicy?: (version | undefined) => Effect<void, ClientOutdated>`
+  defaults to **serve**, not equality. It runs after `principalFor`, before catalog reads,
+  registration, replay/idempotency lookup, ledger writes or cursor work, on every push and pull.
+  Exported `executeBatch` and `pull` apply the same policy for other transports. Metadata is
+  untrusted compatibility advice, never authentication. Pokes and presence have no policy gate.
+  Refusal is a typed request error, never a mutation rejection or integrity error; the client
+  stops as in §9.1, keeping replica and outbox. A pre-gate binary cannot understand the new error
+  or stop rule retroactively; default serve preserves it, but an app refusing legacy clients
+  can only prevent server work, not fix their old retry/status behavior.
+- **Manifest floor governs table shape only** (columns, kinds, nullability). An app can accept
+  the set of history hashes from migration number NNN onwards. A non-additive table-shape change
+  (dropping, renaming or retyping a declared column, or NOT NULL → nullable followed by writing
+  nulls) requires raising the floor past every incompatible old manifest. Otherwise a dropped
+  or renamed column can make an old client misreport `server-outdated`: missing-key detection
+  cannot determine which side is newer. Hashes are identities, not ordered versions; repeated
+  hashes cannot distinguish releases with the same table shape.
+  Mutation evolution stays under §6: version args with unions/upcasts so old queued intents
+  still decode, and never remove a mutation name while any client may still hold it queued.
+  If an app does, old intents land as retained `UnknownMutation` rejections, not as `outdated`;
+  incompatible args similarly produce retained `ArgsDecodeFailed` rejections. The notice is
+  the user's recovery record (§9.1). A mutation-registry hash as a second floor signal is a
+  possible future item if a real app needs it, not part of this gate.
 - **Pull payloads are built from the declared columns through core's codec, never from the
   live relation.** `to_jsonb(t)` / `row_to_json` are forbidden for synced rows: they emit
   `timestamptz` as an ISO string where the wire is epoch ms (§10), and they ship any column the
@@ -981,11 +1034,10 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
    - Also from that review (fixed in cb16ef0): the pull head includes the global maximum recorded expired position, so a cursor never regresses after the newest ledger row expires (its position can exceed the log's maximum after log GC) and another client's continuation at that position survives; a cursor non-regression and a continuation-across-expiry test cover it.
    - Invariants to test (PG): an acked row older than `retention` expires and a resubmission of it answers `Rejected{ClientExpired}` with the recorded position, not a second execution; an acked row younger than `retention` and an unacked row of any age survive; the floor after a job is a `seq` prefix and `PullDone.expiredThrough` reports it; a client that lost the ack and pulls after expiry gets `OutcomeUnknown` for that mutation and releases it; a job run with no eligible rows changes nothing; the reconcile simulation seeds that double-applied under naive ledger GC pass under this policy.
 6. Local full-text search: the pinned wa-sqlite build lacks FTS5 (§10); decide custom build vs. non-FTS search when the search primitive is scheduled.
-7. Additive schema evolution across a deploy — **resolved in §11** (codecs drop excess keys, fail on missing; new columns nullable/defaulted; deploy server first). Remaining: a wire manifest/version gate so a newer client against an older server degrades cleanly instead of failing row decode; needed before clients can ship ahead of the server.
+7. Additive schema evolution and the two-direction wire version gate — **resolved (ws/version-gate, implementation cd325dd)**, see §8, §9.1 and §11. Default serve preserves additive evolution; app policy can stop an outdated client without losing its outbox, and missing declared keys back off as `server-outdated` without rebuilding. Generated manifest history supplies the table-shape floor.
    **Scope ruling (coordinator, user pick G; scheduled, medium dial):** the gate covers both
    directions, because a PWA user can dismiss the reload prompt and run an old client against a
-   newer server indefinitely. Requirements, mechanism to be proposed by the implementing thread
-   and approved before code: (a) every `pull` and `push` carries the client's registry
+   newer server indefinitely. Implemented after coordinator approval: (a) every `pull` and `push` carries the client's registry
    `dataHash` and the engine wire version; (b) the server decides through an app-supplied
    policy whose default is *serve* (additive evolution already works, §11); a refused client
    gets a typed `ClientOutdated`, which the client treats as **not transient**: no retry loop, no
@@ -994,7 +1046,12 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
    (c) a row of a known table that fails decode on a **missing declared key** is "server behind"
    (§11: the server must send every declared column), reported as `lastError.kind:
    "server-outdated"` with backoff and never a rebuild, which removes the only way a newer
-   client could corrupt its replica against an older server; (d) the generator keeps a history
+   client could corrupt its replica against an older server. A `PullPage` is decoded under the
+   client registry before staging: an incompatible page is never persisted; prior valid staging
+   and its continuation are kept so the same page is re-fetched after backoff and can converge
+   when the server catches up. Pre-fix poisoned staging needs no recovery path because no
+   production replica exists yet, and a registry rebuild already discards staging.
+   (d) the generator keeps a history
    of committed `dataHash`es in `migrations/manifest.json` so an app can express its floor as
    "every manifest since NNN" without hand-copying hashes. Invariants: an old client against an
    additive newer server still syncs (fails if the gate is too strict); a client below the floor
