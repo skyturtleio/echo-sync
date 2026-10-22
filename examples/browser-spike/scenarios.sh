@@ -583,6 +583,38 @@ return { held, info: i.ok ? i.value.leaderId : null, leaderId: s.leaderId ?? nul
                and $b2.leaderId == $a.leaderId and $b2.subEnded == null),
         killed: $k, a: $a, b: $b, after: $b2 }')"
   for t in "$DA" "$DB" "$DC"; do ab tab close "$t" >/dev/null; done
+
+  # A late Connected for an *older* epoch: F's first Connected(A) (from R0) is buffered, R0 is killed, C
+  # relaunches it and F is served by A through R1; then A's tab closes and F is served by the successor B.
+  # The buffered Connected(A) is delivered last: it names a dead epoch and must not displace B.
+  APP="router-old-$RUN"
+  OA=$(open_tab "$BASE/?app=$APP")
+  oa=$(ev <<<"$SERVED")
+  OF=$(open_tab "$BASE/?app=$APP&holdRouterIn")
+  ev <<<'await echo.until(() => echo.routerHeld().in >= 1); return true' >/dev/null
+  killed=$(bun "$(dirname "$0")/cdp/kill-router.ts" "$(ab get cdp-url)" "echo:$APP:default:router")
+  OC=$(open_tab "$BASE/?app=$APP")
+  ev <<<"$SERVED" >/dev/null
+  ab tab "$OF" >/dev/null
+  of=$(ev <<<"$SERVED")
+  ab tab close "$OA" >/dev/null
+  ab tab "$OF" >/dev/null
+  of2=$(ev <<<"const old = $(jq '.leaderId' <<<"$oa")
+const b = await echo.until(async () => { const s = await echo.status(); const i = await echo.info(); return s.leaderId !== undefined && s.leaderId !== old && i.ok && i.value.leaderId === s.leaderId ? s.leaderId : undefined })
+window.osub = echo.subscribe(['SELECT 1 AS n'], []); await echo.until(() => osub.emissions.length >= 1)
+const held = echo.routerHeld().in
+echo.flushRouter()
+const i = await Promise.race([echo.info(), new Promise((r) => setTimeout(() => r({ ok: false, error: 'timeout' }), 5000))])
+// Displacement fails the open subscription with LeaderLost; give it a moment to surface.
+await echo.until(() => osub.ended !== undefined, 1500)
+const s = await echo.status()
+return { b: b ?? null, held, info: i.ok ? i.value.leaderId : i.error, leaderId: s.leaderId ?? null, subEnded: osub.ended ?? null }")
+  check "a late Connected for a dead older epoch (from a dead router instance) is ignored: the successor keeps serving the tab and its open subscription" \
+    "$(jq -nc --argjson k "${killed:-null}" --argjson a "$oa" --argjson f "$of" --argjson f2 "$of2" '
+      { pass: ($k.killed > 0 and $f.served == $a.leaderId and $f2.b != null and $f2.b != $a.leaderId and $f2.held >= 1
+               and $f2.info == $f2.b and $f2.leaderId == $f2.b and $f2.subEnded == null),
+        killed: $k, a: $a, f: $f, after: $f2 }')"
+  for t in "$OF" "$OC"; do ab tab close "$t" >/dev/null; done
 fi
 
 # ── identities that would escape the storage namespace are refused up front ──────────────────────────

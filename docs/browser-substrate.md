@@ -37,9 +37,13 @@ tab B ──spawns──▶ leader-candidate worker B (queued on the leader lock
     died before its first `Connected`, no connected epoch ends to trigger a reconnect.
   - Idempotent on a live router: `Hello` carries `connectedTo` (the leader the tab is already connected
     to), and the router never links a tab twice to the same leader, so no connection is displaced and no
-    request or stream fails. Across router instances the tab dedups itself: a `Connected` for the epoch it is
-    already connected or handshaking to (e.g. a late one from a dead instance) is ignored and its port
-    closed. A re-announcement goes through the same `accept` epoch-lock fence as any other. Old router ports stay open so a `Connected` already in flight on one is still delivered.
+    request or stream fails. Across router instances the tab fences on epoch, not arrival order: deliveries
+    on different router ports are not ordered with each other (a dead instance's `Connected` can arrive
+    after its relaunch's), so the tab accepts `Connected` messages one at a time across all its router
+    ports and installs one only if it is not the epoch it is already connected or handshaking to and that
+    epoch's lock is held exclusively when it is processed. A duplicate or a dead epoch is ignored and its
+    port closed, so a late `Connected(A)` never displaces the live successor B (which the router would not
+    relink, having already linked the tab to B). A re-announcement goes through the same `accept` epoch-lock fence as any other. Old router ports stay open so a `Connected` already in flight on one is still delivered.
   - Bound (accepted for v1): a tab keeps one router port for each reconnect for its lifetime, so it holds
     at most 2 + router relaunches + leader epoch ends it has seen (the 2: its first connect and its own
     worker's election, which happens at most once). The count grows with browser and user
@@ -415,7 +419,7 @@ the established cause. Needs a check on real Safari.
 | reset (7 checks) | pass | |
 | presence: entry while open; across handover | pass | |
 | identity `.` refused | pass | |
-| router killed while tabs connected, before a successor's first `Connected`, late duplicate `Connected` (4 checks) | skipped | Chromium only (CDP); WebKit kills the router itself in the handover scenarios |
+| router killed while tabs connected, before a successor's first `Connected`, late duplicate or older-epoch `Connected` (5 checks) | skipped | Chromium only (CDP); WebKit kills the router itself in the handover scenarios |
 | slice S1–S4, S6–S8 (two clients, rejection, revoke/re-grant, server restart, offline, conflicts, delete/edit) | pass | |
 | slice S5: leader closed while its push is held | pass since ws/router-relaunch | failed at the smoke: the next leader never got a route (finding 1) |
 
@@ -564,7 +568,8 @@ Invariants checked:
    tabs are served by one new leader. Router killed before a successor's first `Connected` (its `Hello` held by
    `?holdRouterOut`): the newly elected tab reconnects and is served. A late `Connected` for the leader a tab
    is already connected to (buffered by `?holdRouterIn` from the killed instance): ignored, the open
-   subscription stays open. Skipped under `WEBKIT=1` (no CDP); there the handover scenarios kill
+   subscription stays open. A late `Connected` for a dead older epoch, delivered after the tab is served by
+   the successor: ignored, the successor keeps serving the tab and its subscription. Skipped under `WEBKIT=1` (no CDP); there the handover scenarios kill
    the router naturally.
 5. Crash after commit: the leader dies after committing an enqueue but before responding, while two tabs
    enqueue that same `mutationId` simultaneously; both retries return the committed seq, there is one row,

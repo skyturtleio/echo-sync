@@ -575,16 +575,27 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
 
     // The current router SharedWorker; `undefined` in `single-tab` mode. Replaced by `reconnectRouter`.
     let router: SharedWorker | undefined
+    /**
+     * Install a `Connected` only if it can be the live route. Deliveries from different router ports (a dead
+     * instance's and its relaunch's) are not ordered with each other, so one can arrive late. Acceptance is
+     * serialized across all ports, and each one is checked when it is processed:
+     * - the epoch this tab is already connected (or handshaking) to: a duplicate, which must not displace it;
+     * - an epoch whose lock is not held exclusively: its leader is dead, and installing it would displace the
+     *   live connection while the router, which already linked this tab to the successor, never relinks it.
+     */
+    let routerConnects: Promise<void> = Promise.resolve()
+    const acceptConnected = (leaderId: string, port: MessagePort) =>
+      Effect.gen(function* () {
+        const live =
+          active?.leaderId !== leaderId &&
+          (yield* Platform.isLockHeld(Platform.leaderEpochLockName(identity, leaderId)))
+        if (live) connect(leaderId, port)
+        else port.close()
+      }).pipe(Effect.catchCause((cause) => Effect.logError("echo: accepting a router connection failed", cause)))
     const onRouterMessage = (event: MessageEvent) => {
       const message: unknown = event.data
       if (!isFromRouter(message)) return
-      // Already connected (or handshaking) to this epoch: a second Connected for it, e.g. a late one from a
-      // dead router instance, must not displace the live connection.
-      if (active?.leaderId === message.leaderId) {
-        message.port.close()
-        return
-      }
-      connect(message.leaderId, message.port)
+      routerConnects = routerConnects.then(() => Effect.runPromise(acceptConnected(message.leaderId, message.port)))
     }
     /** Announce this tab's worker as leader `leaderId` to the current router, over a fresh port pair. */
     const announce = (leaderId: string) => {
