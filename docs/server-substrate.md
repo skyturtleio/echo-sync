@@ -252,11 +252,25 @@ Failures are classified over the whole `Cause`, never by its first reason, with 
 defect > transient > rejection (DESIGN §6):
 - any defect or interruption anywhere ⇒ die with the full cause (typed failures turned into
   defects): never retried, never ledgered, never reported transient;
-- otherwise any SQL failure or `StoreUnavailable` anywhere ⇒ transient. The transaction could not have committed, so
+- otherwise any SQL failure other than the body constraints below, or `StoreUnavailable` anywhere ⇒ transient. The transaction could not have committed, so
   a rejection in the same cause is not trusted. A conflict (`40001`, deadlock) is retried; when
   the retries run out, or the failure is a connection error, the batch stops as
   `MutationTransient` with nothing ledgered;
-- a rejection is ledgered only when the body's cause consists solely of `MutationRejection`s.
+- a rejection is ledgered only when the body's cause consists solely of `MutationRejection`s
+  or non-retryable SQL constraint failures. A pinned `ConstraintError` (check, foreign key,
+  not-null) becomes `Rejected{ConstraintViolated{constraint, message}}` immediately; a
+  `UniqueViolation` first uses the bounded conflict retry and becomes the same rejection only
+  if it persists. A conflict anywhere in that cause still wins and stays transient. Every
+  rejection has a recorded position and the batch continues. App handlers should still check
+  domain rules first and return typed `DomainError`s; this is the safety net, not the UX.
+
+`ConstraintViolated` is an additive member of core's outcome JSON schema and uses the existing
+client `Rejected` notice path. Its `message` is the SQL error's message; `constraint` is the
+identifier exposed by `UniqueViolation`, or `undefined` for `ConstraintError` (the pinned reason
+does not expose a name). After unique retries exhaust, the failed transaction has rolled back;
+the server records the rejection in a fresh transaction with the normal identity check and
+conflict retry, without running the body again. Infrastructure failures outside the body are
+never turned into constraint rejections.
 
 One interpretation to note: a defect carrying a `SqlError` is the pinned `SqlClient`'s way of
 reporting a failed savepoint or rollback cleanup on a dead connection. It counts as transient,
@@ -268,9 +282,10 @@ rejection retries and ledgers `Applied`; the same compound cause on every attemp
 batch with nothing ledgered; a `40001` plus a programmer defect dies after one attempt; both
 orderings of SQL defect and programmer defect die.
 
-`40001` and deadlocks are retried with a `Schedule` (default: 4 retries, exponential from
-10 ms). Anything else becomes `MutationTransient`, which means *outcome unknown*, not "not
-recorded". That covers any other `SqlError`, a conflict still failing after the retries, and
+`40001`, deadlocks and unique violations are retried with a `Schedule` (default: 4 retries,
+exponential from 10 ms). Apart from the body constraints above, SQL failures become
+`MutationTransient`, which means *outcome unknown*, not "not recorded". That covers other
+`SqlError`s, a conflict still failing after the retries, and
 SqlError defects. The pinned `SqlClient` raises savepoint and rollback cleanup failures on a
 dead connection as defects, and `runMutation` maps those to transient too (tested by killing
 the backend from another connection after the body succeeds). A COMMIT whose reply is lost may

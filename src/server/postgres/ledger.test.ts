@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Cause, DateTime, Deferred, Effect, Exit, Option, Ref, Schedule, Schema } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Option, Ref, Schedule, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { SqlError, UnknownError } from "effect/sql/SqlError"
 import { AccessScope, Ids, Mutation, Registry, Store, SyncTable } from "echo-sync"
@@ -83,6 +83,127 @@ const env = (mutationId: string, seq: bigint) => ({ principalId: "p", clientId: 
 const reject = (message: string) => Effect.fail(new Mutation.DomainError({ mutation: "test", error: message }))
 
 describe.skipIf(!pgAvailable)("mutation ledger (§6)", () => {
+  it.live("a persistent unique violation is ledgered with a position instead of blocking later mutations", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      yield* sql`CREATE UNIQUE INDEX items_unique_body ON items (body)`
+      let attempts = 0
+      const duplicate = Effect.gen(function* () {
+        attempts++
+        yield* sql`INSERT INTO items (id, access_scope_id, body) VALUES ('second', 's1', 'same')`
+      })
+      const result = yield* runBatch(
+        "p",
+        "c1",
+        [
+          {
+            mutationId: "first",
+            seq: 1n,
+            body: sql`INSERT INTO items (id, access_scope_id, body) VALUES ('first', 's1', 'same')`.pipe(Effect.asVoid)
+          },
+          { mutationId: "duplicate", seq: 2n, body: duplicate },
+          { mutationId: "third", seq: 3n, body: appendEffect("unrelated") }
+        ],
+        fastRetry
+      )
+      assert.strictEqual(result.stopped, null)
+      assert.deepStrictEqual(
+        result.processed.map((p) => p.outcome._tag),
+        ["Applied", "Rejected", "Applied"]
+      )
+      assert.strictEqual(attempts, 3, "a unique violation gets the bounded conflict retry")
+      const second = result.processed[1]
+      assert.isDefined(second)
+      if (second?.outcome._tag !== "Rejected") return yield* Effect.die("missing rejection")
+      assert.strictEqual(second.outcome.error._tag, "ConstraintViolated")
+      if (second.outcome.error._tag !== "ConstraintViolated") return yield* Effect.die("wrong rejection")
+      assert.strictEqual(second.outcome.error.constraint, "items_unique_body")
+      assert.isAbove(second.outcome.error.message.length, 0)
+      assert.isTrue(second.position > (result.processed[0]?.position ?? second.position))
+      assert.isTrue(second.position < (result.processed[2]?.position ?? second.position))
+      assert.deepStrictEqual(yield* ledgerIds, ["first", "duplicate", "third"])
+      assert.strictEqual(yield* counterBody, "unrelated")
+      assert.deepStrictEqual(yield* sql`SELECT id FROM items WHERE id = 'second'`, [])
+      // Re-reading the ledger also exercises the JSON wire codec for the new rejection.
+      assert.deepStrictEqual(yield* runMutation(env("duplicate", 2n), appendEffect("not run")), {
+        outcome: second.outcome,
+        position: second.position
+      })
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("a check constraint is rejected immediately without retries or partial writes", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      yield* sql`ALTER TABLE items ADD CONSTRAINT body_not_bad CHECK (body <> 'bad')`
+      let attempts = 0
+      const body = Effect.gen(function* () {
+        attempts++
+        yield* appendEffect("partial")
+        yield* sql`INSERT INTO items (id, access_scope_id, body) VALUES ('bad', 's1', 'bad')`
+      })
+      const result = yield* runBatch("p", "c1", [{ mutationId: "check", seq: 1n, body }], fastRetry)
+      assert.strictEqual(result.stopped, null)
+      assert.strictEqual(attempts, 1)
+      const rejected = result.processed[0]
+      if (rejected?.outcome._tag !== "Rejected") return yield* Effect.die("missing rejection")
+      assert.strictEqual(rejected.outcome.error._tag, "ConstraintViolated")
+      if (rejected.outcome.error._tag !== "ConstraintViolated") return yield* Effect.die("wrong rejection")
+      assert.strictEqual(rejected.outcome.error.constraint, undefined)
+      assert.isAbove(rejected.outcome.error.message.length, 0)
+      assert.isTrue(rejected.position > 0n)
+      assert.strictEqual(yield* counterBody, "")
+      assert.deepStrictEqual(yield* ledgerIds, ["check"])
+      assert.deepStrictEqual(yield* runMutation(env("check", 1n), Effect.void), {
+        outcome: rejected.outcome,
+        position: rejected.position
+      })
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("a unique violation from a stale snapshot retries to Applied instead of stopping the batch transient", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      yield* sql`CREATE TABLE unique_keys (id text PRIMARY KEY, key text NOT NULL)`
+      yield* sql`CREATE UNIQUE INDEX unique_keys_key ON unique_keys (key)`
+      const readAbsent = yield* Deferred.make<void>()
+      const competitorCommitted = yield* Deferred.make<void>()
+      let attempts = 0
+      let uniqueFailures = 0
+      const body = Effect.gen(function* () {
+        attempts++
+        const existing = yield* sql`SELECT id FROM unique_keys WHERE key = 'shared'`
+        if (existing.length === 0) {
+          yield* Deferred.succeed(readAbsent, undefined)
+          yield* Deferred.await(competitorCommitted)
+          yield* sql`INSERT INTO unique_keys (id, key) VALUES ('mutation', 'shared')`
+        }
+      }).pipe(
+        Effect.catchTag("SqlError", (error) => {
+          if (error.reason._tag === "UniqueViolation") uniqueFailures++
+          return Effect.fail(error)
+        })
+      )
+      const mutation = yield* Effect.forkScoped(
+        runBatch("p", "c1", [{ mutationId: "racing", seq: 1n, body }], fastRetry)
+      )
+      yield* Deferred.await(readAbsent)
+      yield* sql.withTransaction(sql`INSERT INTO unique_keys (id, key) VALUES ('competitor', 'shared')`)
+      yield* Deferred.succeed(competitorCommitted, undefined)
+      const result = yield* Fiber.join(mutation)
+      assert.strictEqual(result.stopped, null)
+      assert.strictEqual(attempts, 2)
+      assert.strictEqual(uniqueFailures, 1, "the first attempt must actually hit 23505, not 40001")
+      assert.deepStrictEqual(
+        result.processed.map((p) => p.outcome),
+        [{ _tag: "Applied" }]
+      )
+      assert.isTrue((result.processed[0]?.position ?? 0n) > 0n)
+      assert.deepStrictEqual(yield* ledgerIds, ["racing"])
+      assert.deepStrictEqual(yield* sql`SELECT id, key FROM unique_keys`, [{ id: "competitor", key: "shared" }])
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
   it.live("a resubmitted envelope (lost response) returns the recorded outcome and position without re-executing", () =>
     Effect.gen(function* () {
       const first = yield* runMutation(env("6f1c…uuid", 1n), appendEffect("x"))

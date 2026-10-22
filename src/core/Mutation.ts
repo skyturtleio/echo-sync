@@ -46,6 +46,12 @@ export class DomainError extends Schema.TaggedError<DomainError>()("DomainError"
   error: Schema.Json
 }) {}
 
+/** A database constraint refused the authoritative mutation (DESIGN §16.15). */
+export class ConstraintViolated extends Schema.TaggedError<ConstraintViolated>()("ConstraintViolated", {
+  constraint: Schema.optional(Schema.String),
+  message: Schema.String
+}) {}
+
 /**
  * Terminal (DESIGN §16.5): the server answered a `seq ≤` its expiry floor for this client. The
  * mutation was processed at some point; its outcome is unknown, its effect (if any) is installed.
@@ -62,6 +68,7 @@ export const MutationRejection = Schema.Union([
   ScopeForbidden,
   InvalidRow,
   DomainError,
+  ConstraintViolated,
   ClientExpired
 ])
 export type MutationRejection = typeof MutationRejection.Type

@@ -58,7 +58,7 @@ export interface Envelope {
 }
 
 export interface LedgerOptions {
-  /** Retry policy for serialization failures and deadlocks. Default: 4 retries, exponential from 10ms. */
+  /** Retry policy for conflicts and unique violations. Default: 4 retries, exponential from 10ms. */
   readonly conflictRetry?: Schedule.Schedule<unknown> | undefined
 }
 
@@ -80,7 +80,10 @@ export type BodyError = Mutation.MutationRejection | Errors.StoreUnavailable | S
 type AttemptError = BodyError | ClientForbidden
 
 const isConflict = (error: unknown) =>
-  (isSqlError(error) && (error.reason._tag === "SerializationError" || error.reason._tag === "DeadlockError")) ||
+  (isSqlError(error) &&
+    (error.reason._tag === "SerializationError" ||
+      error.reason._tag === "DeadlockError" ||
+      error.reason._tag === "UniqueViolation")) ||
   (error instanceof Errors.StoreUnavailable && isConflictUnavailable(error))
 
 /** A reason that makes the attempt a defect (DESIGN §6 precedence: defect > transient > rejection). */
@@ -93,7 +96,7 @@ const isDefectReason = (r: Cause.Reason<unknown>) =>
 /**
  * A failed attempt with its whole cause. `Effect.retry` looks only at the first typed failure,
  * so every failed attempt is wrapped here and retry decides on `retryable`, computed over the
- * whole cause: no defect anywhere, and a conflict (`40001`, deadlock) anywhere. A rejection in
+ * whole cause: no defect anywhere, and a conflict (`40001`, deadlock, unique violation) anywhere. A rejection in
  * the same cause does not block the retry: it was decided on a snapshot that could not commit.
  */
 class FailedAttempt {
@@ -111,15 +114,34 @@ class FailedAttempt {
 const wrapAttempt = <A, R>(attempt: Effect.Effect<A, AttemptError, R>): Effect.Effect<A, FailedAttempt, R> =>
   Effect.catchCause(attempt, (cause) => Effect.fail(new FailedAttempt(cause)))
 
-/** The body failed with only rejections: a permanent, recordable outcome (the first one). */
-const asRejection = (cause: Cause.Cause<BodyError>): MutationOutcome | undefined => {
-  const errors = cause.reasons.flatMap((r) => (Cause.isFailReason(r) ? [r.error] : []))
+/** Only permanent failures may become an outcome; unique violations wait for retry exhaustion. */
+const asRejection = (
+  cause: Cause.Cause<AttemptError>,
+  uniqueExhausted = false
+): Mutation.MutationRejection | undefined => {
+  const errors = cause.reasons.flatMap((r) => {
+    if (!Cause.isFailReason(r)) return []
+    const error = r.error
+    if (
+      isSqlError(error) &&
+      !error.reason.isRetryable &&
+      (error.reason._tag === "ConstraintError" || (uniqueExhausted && error.reason._tag === "UniqueViolation"))
+    ) {
+      return [
+        new Mutation.ConstraintViolated({
+          constraint: error.reason._tag === "UniqueViolation" ? error.reason.constraint : undefined,
+          message: error.message
+        })
+      ]
+    }
+    return [error]
+  })
   const [first] = errors
   return errors.length === cause.reasons.length &&
     first !== undefined &&
     isRejection(first) &&
     errors.every(isRejection)
-    ? { _tag: "Rejected", error: first }
+    ? first
     : undefined
 }
 
@@ -128,7 +150,7 @@ const asRejection = (cause: Cause.Cause<BodyError>): MutationOutcome | undefined
  * rejection (DESIGN §6):
  * - any defect or interruption ⇒ die with the full cause (typed failures turned into defects), so
  *   no `catchTag` downstream can mistake it for a retryable transient;
- * - otherwise any SQL failure ⇒ `MutationTransient` (the transaction could not have committed, so
+ * - otherwise any remaining SQL failure ⇒ `MutationTransient` (the transaction could not have committed, so
  *   a rejection in the same cause is not trustworthy and is not ledgered);
  * - otherwise `ClientForbidden`.
  * A cause made solely of rejections never gets here: the body turns it into a ledgered outcome.
@@ -227,8 +249,10 @@ export const runMutation = <R>(
       return yield* Effect.die("runMutation must own its transaction; do not call it inside withTransaction")
     }
 
+    let bodyUniqueRejection = false
     const execute = sql.withTransaction(
       Effect.gen(function* () {
+        bodyUniqueRejection = false
         // SERIALIZABLE, first statement of every attempt: handlers read-modify-write through the
         // Store (patch, counters, query-then-insert), and under READ COMMITTED two clients'
         // concurrent mutations would both commit on one stale read (lost update). A conflict is
@@ -276,7 +300,10 @@ export const runMutation = <R>(
           // rejection: it must not be ledgered as one.
           Effect.catchCause((cause) => {
             const rejection = asRejection(cause)
-            return rejection === undefined ? Effect.failCause(cause) : Effect.succeed(rejection)
+            bodyUniqueRejection = rejection === undefined && asRejection(cause, true) !== undefined
+            return rejection === undefined
+              ? Effect.failCause(cause)
+              : Effect.succeed<MutationOutcome>({ _tag: "Rejected", error: rejection })
           })
         )
         const inserted = yield* sql<{ position: bigint }>`
@@ -293,8 +320,16 @@ export const runMutation = <R>(
 
     return yield* wrapAttempt(execute).pipe(
       Effect.retry({ schedule: options?.conflictRetry ?? defaultConflictRetry, while: (e) => e.retryable }),
-      Effect.catch((e) => Effect.failCause(e.attempt)),
-      Effect.catchCause((cause) => classify(envelope, cause))
+      Effect.catch(
+        (e): Effect.Effect<Processed, MutationTransient | ClientForbidden | Protocol.MalformedEnvelope, SqlClient> => {
+          const rejection = bodyUniqueRejection ? asRejection(e.attempt, true) : undefined
+          // The unique-failing transaction rolled back. Record its permanent outcome in a fresh
+          // transaction, with the normal identity check and conflict retry, but never rerun its body.
+          return rejection === undefined
+            ? classify(envelope, e.attempt)
+            : runMutation(envelope, Effect.fail(rejection), options)
+        }
+      )
     )
   })
 
