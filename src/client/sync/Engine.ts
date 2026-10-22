@@ -16,7 +16,7 @@
  */
 import { Array as Arr, Clock, Effect, Option, Schema, Semaphore } from "effect"
 import { Mutation, Protocol, Store } from "../../core/index.ts"
-import type { AccessScope, Errors, Ids, Registry } from "../../core/index.ts"
+import type { AccessScope, Errors, Ids, Registry, SyncTable } from "../../core/index.ts"
 
 type PullPage = typeof Protocol.PullPage.Type
 type PullDone = typeof Protocol.PullDone.Type
@@ -192,6 +192,16 @@ const rebase = <E>(
     yield* storage.addNotices(notices)
   })
 
+/** The same wire decode gates staging and install; never persist a page that retries must re-fetch. */
+const decodeRow = (table: SyncTable.AnySyncTable, row: SyncTable.EncodedRow) =>
+  Schema.decodeUnknownEffect(table.wire)(row).pipe(
+    Effect.mapError((error) =>
+      table.columns.some((column) => !Object.hasOwn(row, column.name))
+        ? new ServerOutdated({ table: table.name })
+        : new MalformedChange({ table: table.name, message: error.message })
+    )
+  )
+
 const applyChange = (storage: SyncStorage, registry: Registry.SyncRegistry, change: Protocol.Change) =>
   Effect.gen(function* () {
     if (change._tag === "scopePurged") return yield* storage.rows.purgeScope(change.scopeId)
@@ -207,13 +217,7 @@ const applyChange = (storage: SyncStorage, registry: Registry.SyncRegistry, chan
     // canonical re-encoding (excess columns dropped, values normalized), as every writer does.
     const malformed = (error: Schema.SchemaError) =>
       new MalformedChange({ table: change.table, message: error.message })
-    const decoded = yield* Schema.decodeUnknownEffect(table.value.wire)(change.row).pipe(
-      Effect.mapError((error) =>
-        table.value.columns.some((column) => !Object.hasOwn(change.row, column.name))
-          ? new ServerOutdated({ table: change.table })
-          : malformed(error)
-      )
-    )
+    const decoded = yield* decodeRow(table.value, change.row)
     const row = yield* Schema.encodeEffect(table.value.wire)(decoded).pipe(Effect.mapError(malformed))
     yield* storage.rows.write(table.value, decoded.id, Option.some(row))
   })
@@ -415,6 +419,13 @@ export const make = <TE>(options: {
           if (Option.isNone(page)) continue
           const response = page.value
           if (response._tag === "PullPage") {
+            // Keep only valid pages: retry the incompatible page from the last valid continuation,
+            // rather than persisting its stale payload and resuming after it forever.
+            for (const change of response.changes) {
+              if (change._tag !== "upsert") continue
+              const table = options.registry.get(change.table)
+              if (Option.isSome(table)) yield* decodeRow(table.value, change.row)
+            }
             yield* storage.transaction(storage.stage(response))
             continue
           }

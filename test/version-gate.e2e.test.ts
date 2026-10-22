@@ -266,13 +266,19 @@ describe.skipIf(!pgAvailable)("two-direction version gate (DESIGN §16.7), real 
   )
 
   it.live(
-    "a newer client reports server-outdated with backoff and never rebuilds or installs a partial set",
+    "a newer client preserves valid staging on server-outdated and converges without rebuilding when the server catches up",
     () =>
       Effect.gen(function* () {
         const pg = yield* SqlClient
         yield* writableScope
         yield* pg`INSERT INTO items (id, access_scope_id, body) VALUES ('server', 's1', 'older payload')`
-        const { transport, sent } = yield* serve(registry)
+        const older = yield* serve(registry)
+        const { sent } = older
+        let upstream = older.transport
+        const transport: Engine.Transport<Transport.TransportError> = {
+          push: (request) => upstream.push(request),
+          pull: (request) => upstream.pull(request)
+        }
         // Bootstrap at the old schema, then emulate a newer client with a previously valid installed replica.
         const old = yield* device(registry, transport)
         yield* old.engine.pull
@@ -300,6 +306,8 @@ describe.skipIf(!pgAvailable)("two-direction version gate (DESIGN §16.7), real 
         yield* storage.setMeta({ ...meta, pushedThrough: 1 })
         yield* pg`INSERT INTO notes (id, access_scope_id, body) VALUES ('staged', 's1', 'never partially installed')`
         yield* pg`UPDATE items SET body = 'changed since cursor' WHERE id = 'server'`
+        // With pageLimit 1 the incompatible server row is intermediate, not PullDone.
+        yield* pg`INSERT INTO items (id, access_scope_id, body) VALUES ('tail', 's1', 'last page')`
         const savedRows = yield* storage.rows.scan(extendedItems)
         const savedPending = yield* storage.pending
         const savedMeta = yield* storage.meta
@@ -318,16 +326,18 @@ describe.skipIf(!pgAvailable)("two-direction version gate (DESIGN §16.7), real 
         expect(yield* storage.meta).toEqual(savedMeta)
         expect(yield* storage.rows.scan(Notes)).toEqual([])
         const staged = yield* storage.staged
+        expect(staged).toHaveLength(1)
         expect(staged.flatMap((p) => p.changes).map((c) => (c._tag === "upsert" ? c.table : c._tag))).toEqual(["notes"])
         const attempts = sent.length
         yield* clock.adjust("1 second")
         yield* waitFor(loop, (s) => s.phase === "backoff" && s.nextRetryAt !== null && s.nextRetryAt > 1000)
         expect(sent.length).toBeGreaterThan(attempts)
-        expect(
-          sent
-            .slice(attempts)
-            .every((r) => r.tag === "pull" && "cursor" in r.payload && r.payload.cursor === meta.cursor)
-        ).toBe(true)
+        for (const retry of sent.slice(attempts)) {
+          expect(retry).toMatchObject({
+            tag: "pull",
+            payload: { cursor: meta.cursor, continuation: Option.some(staged.at(-1)?.continuation) }
+          })
+        }
         expect(yield* storage.rows.scan(extendedItems)).toEqual(savedRows)
         expect(yield* storage.meta).toEqual(savedMeta)
         expect(yield* storage.staged).toEqual(staged)
@@ -340,6 +350,30 @@ describe.skipIf(!pgAvailable)("two-direction version gate (DESIGN §16.7), real 
                 r.payload.clientVersion.wireVersion === Protocol.wireVersion
             )
         ).toBe(true)
+        // The same leader must recover when the server catches up, without clearing valid staging.
+        yield* pg`ALTER TABLE items ADD COLUMN extra_note text COLLATE "C"`
+        const current = yield* serve(newRegistry)
+        upstream = current.transport
+        yield* clock.adjust("2 seconds")
+        yield* waitFor(loop, (s) => s.lastSyncedAt !== null)
+        expect((yield* loop.status).lastError).toBeNull()
+        expect((yield* storage.pending).map((p) => p.envelope)).toEqual(savedPending.map((p) => p.envelope))
+        expect((yield* loop.status).pendingMutations).toBe(1)
+        expect(yield* storage.rows.scan(extendedItems)).toEqual([
+          { id: "kept", access_scope_id: "s1", body: "installed", extra_note: null },
+          { id: "pending", access_scope_id: "s1", body: "optimistic", extra_note: null },
+          { id: "server", access_scope_id: "s1", body: "changed since cursor", extra_note: null },
+          { id: "tail", access_scope_id: "s1", body: "last page", extra_note: null }
+        ])
+        expect(yield* storage.rows.scan(Notes)).toEqual([
+          { id: "staged", access_scope_id: "s1", body: "never partially installed" }
+        ])
+        expect((yield* storage.meta).cursor).not.toEqual(savedMeta.cursor)
+        expect(yield* storage.staged).toEqual([])
+        expect(current.sent[0]?.payload).toMatchObject({
+          cursor: savedMeta.cursor,
+          continuation: Option.some(staged.at(-1)?.continuation)
+        })
         yield* Fiber.interrupt(running)
         // Invalid present fields are ordinary malformed data, not a missing-key/server-behind signal.
         const probe = yield* Engine.make({
