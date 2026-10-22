@@ -22,12 +22,20 @@
  * Termination: `onFailure` is the terminal element of an adapter stream. The tab client already absorbs
  * `LeaderLost` (re-subscription, `mutate`/`requestSync`/`dismissNotices` retry); any error it lets through
  * ends its stream (DESIGN §9.1), and the adapter never retries or re-subscribes on its own. Re-opening is the
- * app's decision, e.g. by changing the Subscription's dependencies. This module imports nothing from
+ * app's decision, e.g. by changing the Subscription's dependencies.
+ *
+ * Limits: the handlers (`onValue`, `onFailure`, `onSuccess`) must not throw; they are message constructors and
+ * run outside the translation. A run cancelled from outside (FoldKit replacing a Subscription's stream,
+ * interrupting a Command) skips recovery, so a finalizer that dies during that cancellation stays on the
+ * cancelled fiber's exit, which FoldKit discards for a replaced stream. This module imports nothing from
  * `foldkit`.
  */
 import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
+import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import type { Mutation, Query } from "echo-sync"
 import type { LeaderClient, LeaderRpcs } from "echo-sync/client"
@@ -60,20 +68,33 @@ export interface EffectHandlers<A, E, V, F> {
   readonly onFailure: (failure: Failure<E>) => F
 }
 
-const recover = <E, F>(onFailure: (failure: Failure<E>) => F, cause: Cause.Cause<E>): Effect.Effect<F> => {
-  if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt
+/** The final cause of a run, upstream finalization included; `undefined` for an interruption-only cause. */
+const classify = <E>(cause: Cause.Cause<E>): Failure<E> | undefined => {
+  if (Cause.hasInterruptsOnly(cause)) return undefined
   // Any defect wins over a typed error in the same cause: a defect must never hide behind an ordinary error.
   const error = Cause.hasDies(cause) ? Option.none() : Cause.findErrorOption(cause)
-  return Effect.succeed(onFailure(Option.isSome(error) ? { _tag: "Error", error: error.value } : { _tag: "Defect" }))
+  return Option.isSome(error) ? { _tag: "Error", error: error.value } : { _tag: "Defect" }
 }
 
+/**
+ * The upstream runs to completion, its finalizers included, inside `Effect.exit`; only then is its final
+ * cause classified. `Stream.catchCause` would not do: it recovers before the upstream's scope closes, so a
+ * finalizer's defect would escape to FoldKit after the terminal message (or with none).
+ */
 const watch = <A, E, R, V, F>(
   stream: Stream.Stream<A, E, R>,
   h: StreamHandlers<A, E, V, F>
-): Stream.Stream<V | F, never, R> =>
-  stream.pipe(
-    Stream.map(h.onValue),
-    Stream.catchCause((cause) => Stream.fromEffect(recover(h.onFailure, cause)))
+): Stream.Stream<V | F, never, Exclude<R, Scope.Scope>> =>
+  Stream.callback<V | F, never, R>(
+    (queue) =>
+      Effect.flatMap(Effect.exit(Stream.runForEach(stream, (a) => Queue.offer(queue, h.onValue(a)))), (exit) => {
+        if (Exit.isSuccess(exit)) return Queue.end(queue)
+        const failure = classify(exit.cause)
+        return failure === undefined
+          ? Queue.failCause(queue, Cause.interrupt())
+          : Effect.andThen(Queue.offer(queue, h.onFailure(failure)), Queue.end(queue))
+      }),
+    { strategy: "suspend" }
   )
 
 const run = <A, E, R, V, F>(
@@ -82,7 +103,10 @@ const run = <A, E, R, V, F>(
 ): Effect.Effect<V | F, never, R> =>
   effect.pipe(
     Effect.map(h.onSuccess),
-    Effect.catchCause((cause) => recover(h.onFailure, cause))
+    Effect.catchCause((cause) => {
+      const failure = classify(cause)
+      return failure === undefined ? Effect.failCause(Cause.interrupt()) : Effect.succeed(h.onFailure(failure))
+    })
   )
 
 type Stream_<K extends "syncStatus" | "notices" | "status"> = TabClient[K]

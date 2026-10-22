@@ -98,6 +98,34 @@ it.effect(
     }).pipe(Effect.provide(recording), Effect.provideService(References.MinimumLogLevel, "All"))
 )
 
+/** A client whose `notices` stream owns a finalizer that dies after the stream ends with `end`. */
+const dyingFinalizer = (end: Stream.Stream<never, LeaderRpcs.SqlFailure>) =>
+  Effect.map(client(calls({})), (c) => ({
+    ...c,
+    notices: Stream.unwrap(
+      Effect.as(
+        Effect.addFinalizer(() => Effect.die(SECRET)),
+        end
+      )
+    )
+  }))
+
+it.effect(
+  "a client stream whose finalizer dies after it fails or ends is one terminal Defect, never an escaped cause",
+  () =>
+    Effect.gen(function* () {
+      // Wrong implementation: recovery handles the stream's failure, then its scope closes outside the recovery
+      // boundary and the finalizer's defect reaches FoldKit's runtime (an app crash) with the raw cause.
+      const afterFailure = yield* Effect.exit(
+        Stream.runCollect(Echo.notices(dyingFinalizer(Stream.fail(new LeaderRpcs.SqlFailure({ message: "x" }))), h()))
+      )
+      expect(afterFailure).toEqual(Exit.succeed([{ _tag: "Defect" }]))
+      const afterEnd = yield* Effect.exit(Stream.runCollect(Echo.notices(dyingFinalizer(Stream.empty), h())))
+      expect(afterEnd).toEqual(Exit.succeed([{ _tag: "Defect" }]))
+      expect(logged).toEqual([])
+    }).pipe(Effect.provide(recording), Effect.provideService(References.MinimumLogLevel, "All"))
+)
+
 it.effect("a typed error is the stream's last message and the adapter never re-subscribes", () =>
   Effect.gen(function* () {
     let opens = 0
