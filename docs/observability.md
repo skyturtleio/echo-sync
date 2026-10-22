@@ -122,6 +122,13 @@ const routineLogger = Logger.make((options) => {
 `Logger.Options` carries the fiber, not an annotations snapshot. Do not look for
 `options.annotations`. Do not routinely export unfiltered diagnostics to a backend.
 
+The filter must be installed in **every runtime that executes engine code**, not only the HTTP
+serving layer: `Startup.prepare` and other maintenance entry points run before the server
+listens, and the leader worker, router and each tab are separate runtimes. Engine code is
+inside its boundary wherever it runs; the host's logger is what decides whether a diagnostics
+entry leaves the process, so a pre-listen readiness check with an unfiltered Debug logger
+exports raw causes (found in the NilBurger upgrade review).
+
 ## Signal contract
 
 All exported exits are `Success(undefined)`. `echo.outcome` carries the actual outcome.
