@@ -514,7 +514,8 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
 ### 9.1 Tab-side API (the contract every UI adapter builds on)
 
 `src/client` owns one typed tab-side surface. The library is UI-framework agnostic: any
-adapter (FoldKit, React, or other) lives in the consuming app, is a thin translation of this
+adapter (FoldKit, React, or other) lives in the consuming app or in the library's
+`echo-sync/foldkit` entry point (§16.17), is a thin translation of this
 surface, and adds no sync semantics of its own. Rulings (coordinator):
 
 - **`mutate(mutation, args)`** is the only write API. It encodes `args` with the mutation's

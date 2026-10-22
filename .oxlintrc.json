@@ -24,6 +24,12 @@
             "name": "effect/schema",
             "message": "Use the stable `effect/Schema` module; `effect/schema` is a different, unstable barrel."
           }
+        ],
+        "patterns": [
+          {
+            "group": ["foldkit", "foldkit/**"],
+            "message": "Only examples may import FoldKit; the adapter, core, client and server never do (DESIGN §16.17)."
+          }
         ]
       }
     ],
@@ -58,6 +64,10 @@
               {
                 "group": ["**/server", "**/server/**", "echo-sync/server"],
                 "message": "Browser/shared code must never import src/server."
+              },
+              {
+                "group": ["foldkit", "foldkit/**"],
+                "message": "Only examples may import FoldKit; the adapter, core, client and server never do (DESIGN §16.17)."
               }
             ]
           }
@@ -84,7 +94,27 @@
               {
                 "group": ["**/client", "**/client/**", "echo-sync/client"],
                 "allowTypeImports": true,
-                "message": "Core must not import src/client at runtime (DESIGN \u00a714); `import type` only. Engine-driving harnesses live in src/client/sync/testing."
+                "message": "Core must not import src/client at runtime (DESIGN §14); `import type` only. Engine-driving harnesses live in src/client/sync/testing."
+              },
+              {
+                "group": ["foldkit", "foldkit/**"],
+                "message": "Only examples may import FoldKit; the adapter, core, client and server never do (DESIGN §16.17)."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["examples/foldkit/**"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "effect/schema",
+                "message": "Use the stable `effect/Schema` module."
               }
             ]
           }
