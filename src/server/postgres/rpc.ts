@@ -23,7 +23,7 @@ import { RpcSerialization, RpcServer } from "effect/rpc"
 import { SqlClient } from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
 import { AccessScope, Ids, Mutation, Protocol, type Registry, Store } from "echo-sync"
-import { type ClientForbidden, type LedgerOptions, registerClient, runBatch } from "./ledger.ts"
+import { assertPrincipal, type ClientForbidden, type LedgerOptions, registerClient, runBatch } from "./ledger.ts"
 import * as Presence from "./presence.ts"
 import { type ClientPolicy, pull } from "./pull.ts"
 import * as RowStore from "./rowStore.ts"
@@ -323,7 +323,8 @@ export const layerNotifications = (options: Pick<SyncServerOptions, "heartbeatIn
  * and returns the processed prefix as a `PushResponse`. Never fails with infrastructure: a SQL
  * failure before the first mutation (catalog read) is an empty result list, and `runBatch` turns
  * one inside the batch into a short list, so a defect always means a server bug (the client halts
- * push on any defect). A client id bound to another principal fails `Unauthorized`.
+ * push on any defect). A client id bound to another principal, or a `request.principal` that is not
+ * `actor` (DESIGN §16.21, checked first), fails `Unauthorized`.
  */
 export const executeBatch = (
   options: Pick<SyncServerOptions, "registry" | "mutations" | "ledger" | "clientPolicy">,
@@ -335,6 +336,7 @@ export const executeBatch = (
   SqlClient
 > =>
   Effect.gen(function* () {
+    yield* assertPrincipal(actor, request.principal)
     if (options.clientPolicy !== undefined) yield* options.clientPolicy(request.clientVersion)
     const sql = yield* SqlClient
     const tables = yield* resolveTables(options.registry)
@@ -425,6 +427,7 @@ export const handlers = (options: SyncServerOptions) =>
                 principalId,
                 clientId: request.clientId,
                 clientVersion: request.clientVersion,
+                principal: request.principal,
                 cursor: request.cursor,
                 continuation: request.continuation,
                 limit: options.pageLimit ?? 500
@@ -443,10 +446,11 @@ export const handlers = (options: SyncServerOptions) =>
             Effect.provideService(SqlClient, sql),
             (work) => Telemetry.observe(work, "echo.server.pull")
           ),
-        pokes: ({ clientId }) =>
+        pokes: ({ clientId, principal }) =>
           Stream.unwrap(
             Effect.gen(function* () {
               const principalId = yield* options.principalFor(yield* requestHeaders)
+              yield* assertPrincipal(principalId, principal)
               yield* registerClient(principalId, clientId)
               return pokes
             }).pipe(Effect.provideService(SqlClient, sql))
@@ -524,6 +528,7 @@ export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor"
           Stream.unwrap(
             Effect.gen(function* () {
               const principalId = yield* options.principalFor(yield* requestHeaders)
+              yield* assertPrincipal(principalId, payload.principal)
               if (!(yield* holdsRoom(principalId, payload.room))) {
                 return yield* new Protocol.Forbidden({ room: payload.room })
               }
@@ -533,6 +538,7 @@ export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor"
         track: (payload) =>
           Effect.gen(function* () {
             const principalId = yield* options.principalFor(yield* requestHeaders)
+            yield* assertPrincipal(principalId, payload.principal)
             yield* presence.track({ principalId, ...payload })
           })
       })

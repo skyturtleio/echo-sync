@@ -1,7 +1,7 @@
 import { Array as Arr, Effect, Option, type Order, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation, Protocol, type Registry, type SyncTable } from "echo-sync"
-import { registerClient } from "./ledger.ts"
+import { assertPrincipal, registerClient } from "./ledger.ts"
 import { decodeRow, q, selectList } from "./rowStore.ts"
 import { type Resolved, resolveTables } from "./schema.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
@@ -46,6 +46,8 @@ export interface PullRequest {
   readonly principalId: string
   readonly clientId: string
   readonly clientVersion?: Protocol.ClientVersion | undefined
+  /** The wire's replica principal (DESIGN §16.21): checked against `principalId`, never used as it. */
+  readonly principal?: string | undefined
   readonly cursor: bigint | null
   readonly continuation: Option.Option<string>
   /** Upper bound on upserts and tombstones per page (≥ 1). Purges are not counted. */
@@ -97,6 +99,7 @@ export const pull = Effect.fnUntraced(function* (
   request: PullRequest,
   clientPolicy?: ClientPolicy
 ) {
+  yield* assertPrincipal(request.principalId, request.principal)
   if (clientPolicy !== undefined) yield* clientPolicy(request.clientVersion)
   const sql = yield* SqlClient
   yield* registerClient(request.principalId, request.clientId)

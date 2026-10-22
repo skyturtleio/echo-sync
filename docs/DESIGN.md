@@ -336,8 +336,9 @@ cursor is older than the horizon receives a typed `ResnapshotRequired` and re-sn
 
 - Cursor-based, scope-filtered, paginated. Each page is read in its own `REPEATABLE READ`
   snapshot (a snapshot cannot span HTTP requests without holding a transaction open, which a
-  transaction pooler forbids). Request: `{ clientId, clientVersion?, cursor, continuation: Option<PullContinuation> }`
-  (`clientVersion` is always sent by gate-aware clients, §11).
+  transaction pooler forbids). Request: `{ clientId, clientVersion?, principal?, cursor, continuation: Option<PullContinuation> }`
+  (`clientVersion` is always sent by gate-aware clients, §11; `principal` is the replica's, an
+  assertion checked against the authenticated principal, §16.21).
   Response is a tagged union so "more but nothing to continue with" and "done but no position"
   are unrepresentable: `PullPage { changes, acks, continuation }` (more to come) or
   `PullDone { changes, acks, nextCursor: Position, expiredThrough }` (page set complete; `expiredThrough` per §16.5). `PullContinuation` is
@@ -908,7 +909,10 @@ const todosByProject = Query.make("todos.byProject", {
 ## 12. Transport
 
 - Shared contracts module: `RpcGroup`s with Schema payload/success/error.
-  `SyncRpcs`: `push`, `pull`, `pokes` (stream). `PresenceRpcs` (user ruling, §16 item 12a):
+  `SyncRpcs`: `push`, `pull`, `pokes` (stream). Every sync and presence payload carries an
+  optional `principal`, the replica's own; the server refuses the request `Unauthorized`, before
+  any client binding, grant, ledger or presence work, unless it equals the authenticated
+  principal, and never uses it as the actor (§16.21). `PresenceRpcs` (user ruling, §16 item 12a):
   `room({ clientId, room, tabId, state }): Stream<RoomSnapshot>` joins and observes; the entry
   keyed by `(clientId, tabId)` lives exactly while that stream is open and is dropped when it
   ends for any reason. `track({ clientId, room, tabId, state })` replaces that entry's state

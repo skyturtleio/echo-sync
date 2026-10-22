@@ -24,6 +24,7 @@ import { SqlError, UnknownError } from "effect/sql/SqlError"
 import { AccessScope, Ids, Mutation, Protocol } from "echo-sync"
 import * as TestClock from "effect/testing/TestClock"
 import * as SyncLoop from "../../client/sync/SyncLoop.ts"
+import type { ClientPolicy } from "./pull.ts"
 import { layerHttp, sharedPokes } from "./rpc.ts"
 import { grant, Items, pgAvailable, registry, RowId, TestDatabase } from "./test-support.ts"
 
@@ -53,13 +54,15 @@ const connectTo = (
   db: Context.Context<SqlClient | PgClient.PgClient>,
   heartbeatInterval?: Duration.Input,
   principalFor: () => Effect.Effect<AccessScope.PrincipalId, Protocol.Unauthorized> = () =>
-    Effect.succeed(AccessScope.PrincipalId.make("p"))
+    Effect.succeed(AccessScope.PrincipalId.make("p")),
+  clientPolicy?: ClientPolicy
 ) =>
   Effect.gen(function* () {
     const app = layerHttp({
       registry,
       mutations,
       principalFor,
+      clientPolicy,
       ledger: { conflictRetry: undefined },
       heartbeatInterval
     }).pipe(Layer.provide(Layer.succeedContext(db)))
@@ -288,6 +291,136 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (§6, §8)", () => {
       yield* killed
       const exit = yield* Fiber.join(stream)
       assert.deepStrictEqual(failureTag(exit), "ServerUnavailable")
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+})
+
+const pullFor = (clientId: string, principal?: AccessScope.PrincipalId) => ({
+  clientId: Ids.ClientId.make(clientId),
+  ...(principal === undefined ? {} : { principal }),
+  cursor: null,
+  continuation: Option.none()
+})
+const pushFor = (clientId: string, principal?: AccessScope.PrincipalId) => ({
+  ...push([["m1", "written"]]),
+  clientId: Ids.ClientId.make(clientId),
+  ...(principal === undefined ? {} : { principal })
+})
+const refusal = (exit: Exit.Exit<unknown, { readonly _tag: string }>) =>
+  Exit.isFailure(exit) ? Option.getOrUndefined(Exit.findErrorOption(exit)) : undefined
+
+describe.skipIf(!pgAvailable)("the replica's principal against the authenticated session (§16.21)", () => {
+  const alice = AccessScope.PrincipalId.make("alice-replica-principal")
+  const bob = AccessScope.PrincipalId.make("bob-session-principal")
+  /**
+   * The server with bob's session. Bob may write s1 and holds a row there, so any request that ran
+   * as bob would bind, ledger or deliver something. `statements` counts every statement the
+   * handlers issue and `policyCalls` every `clientPolicy` run: a request refused before any sync
+   * work issues neither.
+   */
+  const asBob = Effect.gen(function* () {
+    const sql = yield* SqlClient
+    yield* grant(bob, "s1")
+    yield* sql`UPDATE echo_sync.scope_grants SET role = 'writer' WHERE principal_id = ${bob}`
+    yield* sql`INSERT INTO items (id, access_scope_id, body) VALUES ('bobs', 's1', 'bob only')`
+    const counts = { statements: 0, policyCalls: 0 }
+    const counting = new Proxy(sql, {
+      apply: (target, self, args) => {
+        counts.statements++
+        return Reflect.apply(target, self, args)
+      },
+      get: (target, key, receiver) => {
+        const value = Reflect.get(target, key, receiver)
+        return (key === "unsafe" || key === "withTransaction") && typeof value === "function"
+          ? (...args: ReadonlyArray<unknown>) => {
+              counts.statements++
+              return Reflect.apply(value, target, args)
+            }
+          : value
+      }
+    })
+    const db = yield* Effect.context<SqlClient | PgClient.PgClient>()
+    const client = yield* connectTo(
+      Context.add(db, SqlClient, counting),
+      undefined,
+      () => Effect.succeed(bob),
+      () => Effect.sync(() => void counts.policyCalls++)
+    )
+    return { client, counts }
+  })
+  /** Every row a request could bind, ledger, record or write, in full. */
+  const state = Effect.gen(function* () {
+    const sql = yield* SqlClient
+    const [row] = yield* sql<{ state: string }>`SELECT jsonb_build_object(
+      'clients', (SELECT jsonb_agg(to_jsonb(t) ORDER BY client_id) FROM echo_sync.clients t),
+      'ledger', (SELECT jsonb_agg(to_jsonb(t) ORDER BY position) FROM echo_sync.mutations t),
+      'cursors', (SELECT jsonb_agg(to_jsonb(t) ORDER BY client_id, position) FROM echo_sync.client_scopes t),
+      'items', (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM items t)
+    )::text AS state`
+    return row?.state
+  })
+  const clientRows = Effect.gen(function* () {
+    const sql = yield* SqlClient
+    return yield* sql<{ client_id: string; principal_id: string }>`
+      SELECT client_id, principal_id FROM echo_sync.clients ORDER BY client_id`
+  })
+
+  it.live(
+    "push, pull and pokes asserting another principal than the session's run no statement or policy and change no row, even for a bound client",
+    () =>
+      Effect.gen(function* () {
+        const { client, counts } = yield* asBob
+        const refuse = Effect.gen(function* () {
+          const before = { ...counts, state: yield* state }
+          const exits = [
+            yield* Effect.exit(client.push(pushFor("fresh", alice))),
+            yield* Effect.exit(client.pull(pullFor("fresh", alice))),
+            yield* Effect.exit(
+              Stream.runHead(client.pokes({ clientId: Ids.ClientId.make("fresh"), principal: alice }))
+            ),
+            yield* Effect.exit(client.push(pushFor("bound", alice))),
+            yield* Effect.exit(client.pull(pullFor("bound", alice)))
+          ]
+          const messages = new Set<string>()
+          for (const exit of exits) {
+            const error = refusal(exit)
+            assert.strictEqual(error?._tag, "Unauthorized", String(exit))
+            messages.add(error !== undefined && "message" in error ? String(error.message) : "")
+          }
+          // One fixed message, naming neither principal.
+          assert.strictEqual(messages.size, 1)
+          assert.isFalse(
+            [...messages].some((m) => m.includes(alice) || m.includes(bob)),
+            [...messages].join()
+          )
+          assert.deepStrictEqual({ ...counts, state: yield* state }, before)
+        })
+        assert.deepStrictEqual(yield* clientRows, [])
+        yield* refuse
+
+        // Control: the same requests asserting the session's own principal run as bob.
+        assert.strictEqual((yield* client.push(pushFor("bound", bob))).results.length, 1)
+        assert.strictEqual((yield* client.pull(pullFor("bound", bob)))._tag, "PullDone")
+        assert.isAbove(counts.statements, 0)
+        assert.isAbove(counts.policyCalls, 0)
+        assert.deepStrictEqual(yield* clientRows, [{ client_id: "bound", principal_id: bob }])
+
+        // Every request is checked, not only the first: bob's bound client asserting alice is refused alike.
+        yield* refuse
+      }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
+  it.live("push, pull and pokes from an old client without the field still bind an unknown client on first sight", () =>
+    Effect.gen(function* () {
+      const { client } = yield* asBob
+      assert.strictEqual((yield* client.push(pushFor("old-push"))).results.length, 1)
+      assert.strictEqual((yield* client.pull(pullFor("old-pull")))._tag, "PullDone")
+      assert.isTrue(Option.isSome(yield* Stream.runHead(client.pokes({ clientId: Ids.ClientId.make("old-pokes") }))))
+      assert.deepStrictEqual(yield* clientRows, [
+        { client_id: "old-pokes", principal_id: bob },
+        { client_id: "old-pull", principal_id: bob },
+        { client_id: "old-push", principal_id: bob }
+      ])
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 })

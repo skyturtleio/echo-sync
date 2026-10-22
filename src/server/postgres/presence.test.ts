@@ -92,6 +92,9 @@ const show = (element: Protocol.RoomElement) =>
 /** A stream's typed failure as JSON; `expected` is the one a revoked or ungranted stream ends with. */
 const forbidden = (exit: Exit.Exit<unknown, unknown>) =>
   Exit.isFailure(exit) ? Option.map(Exit.findErrorOption(exit), (e) => JSON.stringify(e)) : Option.none()
+/** A request's typed failure tag, if it failed. */
+const tagOf = (exit: Exit.Exit<unknown, { readonly _tag: string }>) =>
+  Exit.isFailure(exit) ? Option.map(Exit.findErrorOption(exit), (e) => e._tag) : Option.none()
 const expected = Option.some(JSON.stringify(new Protocol.Forbidden({ room: s1 })))
 
 /** Takes snapshots until one shows exactly `want`; fails with the last one seen after 5 s. */
@@ -673,6 +676,39 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (§12)", () => {
         []
       )
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
+  it.live(
+    "a join or track asserting another replica principal than the session's is Unauthorized and changes no entry (§16.21)",
+    () =>
+      Effect.gen(function* () {
+        yield* grant("p", "s1")
+        yield* grant("q", "s1") // q may join s1, so only the assertion can keep it out
+        const connect = yield* server
+        const observer = yield* open(yield* connect("p"), payload("c0", "watch"))
+        yield* until(observer.snapshots, ["p/c0/watch=null"])
+        const q = yield* connect("q")
+        const asserting = (p: ReturnType<typeof payload>, principal: string) => ({
+          ...p,
+          principal: AccessScope.PrincipalId.make(principal)
+        })
+
+        // A join as q asserting replica principal p: refused before any grant check or entry.
+        const joined = yield* Effect.exit(
+          Stream.runDrain(q.room(asserting(payload("cq", "t1"), "p"))).pipe(Effect.timeout("3 seconds"))
+        )
+        assert.deepStrictEqual(tagOf(joined), Option.some("Unauthorized"))
+
+        // q's own entry (asserting q) joins; a track of it asserting p changes nothing.
+        const own = yield* open(q, asserting(payload("cq", "t2"), "q"))
+        yield* until(observer.snapshots, ["p/c0/watch=null", "q/cq/t2=null"])
+        const tracked = yield* Effect.exit(q.track(asserting(payload("cq", "t2", "switched", 1), "p")))
+        assert.deepStrictEqual(tagOf(tracked), Option.some("Unauthorized"))
+        yield* (yield* connect("p")).track(payload("c0", "watch", "changed", 1))
+        yield* until(observer.snapshots, ['p/c0/watch="changed"', "q/cq/t2=null"])
+        assert.isFalse(observer.seen.flat().some((e) => e.includes("switched") || e.includes("/t1=")))
+        yield* Fiber.interrupt(own.fiber)
+      }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
   it.live(

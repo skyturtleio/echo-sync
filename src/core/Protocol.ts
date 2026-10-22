@@ -30,6 +30,12 @@ export const PushRequest = Schema.Struct({
   clientId: ClientId,
   /** Absent only for pre-gate clients; never infer compatibility from absence. */
   clientVersion: Schema.optionalKey(ClientVersion),
+  /**
+   * The principal this replica acts as (DESIGN §16.21). A consistency assertion, never a credential:
+   * the server refuses the request `Unauthorized` unless it equals the authenticated principal, and
+   * never uses it as the actor. Absent only for clients that predate it.
+   */
+  principal: Schema.optionalKey(PrincipalId),
   mutations: Schema.NonEmptyArray(PushMutation).check(Schema.isMaxLength(100))
 })
 export type PushRequest = typeof PushRequest.Type
@@ -70,6 +76,8 @@ export type Ack = typeof Ack.Type
 export const PullRequest = Schema.Struct({
   clientId: ClientId,
   clientVersion: Schema.optionalKey(ClientVersion),
+  /** As on `PushRequest` (DESIGN §16.21). */
+  principal: Schema.optionalKey(PrincipalId),
   cursor: Cursor,
   continuation: Schema.OptionFromNullOr(PullContinuation)
 })
@@ -150,7 +158,8 @@ export const SyncRpcs = RpcGroup.make(
     error: Schema.Union([ResnapshotRequired, ServerUnavailable, Unauthorized, ClientOutdated])
   }),
   Rpc.make("pokes", {
-    payload: { clientId: ClientId },
+    /** `principal` as on `PushRequest` (DESIGN §16.21). */
+    payload: { clientId: ClientId, principal: Schema.optionalKey(PrincipalId) },
     success: PokesElement,
     error: Schema.Union([ServerUnavailable, Unauthorized]),
     stream: true
@@ -192,6 +201,8 @@ export type RoomElement = typeof RoomElement.Type
 /** The entry's identity and state. `room` is an access scope the principal must be able to read. */
 export const PresencePayload = Schema.Struct({
   clientId: ClientId,
+  /** As on `PushRequest` (DESIGN §16.21); not part of the entry. */
+  principal: Schema.optionalKey(PrincipalId),
   room: AccessScopeId,
   tabId: TabId,
   state: Schema.Json,

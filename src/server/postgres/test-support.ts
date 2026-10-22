@@ -171,7 +171,7 @@ export class Replica {
       remaining: number
     ): Effect.Effect<
       void,
-      Protocol.ResnapshotRequired | Protocol.ClientOutdated | ClientForbidden | SqlError,
+      Protocol.ResnapshotRequired | Protocol.ClientOutdated | Protocol.Unauthorized | ClientForbidden | SqlError,
       SqlClient
     > =>
       remaining === 0

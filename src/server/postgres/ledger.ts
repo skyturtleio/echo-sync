@@ -191,6 +191,20 @@ const classify = (
 }
 
 /**
+ * The request's replica principal against the authenticated one (DESIGN §16.21): equal or absent
+ * (a client that predates the field) passes; anything else fails before the request binds a
+ * client or does any grant, ledger or presence work. An assertion only: the actor is always the
+ * authenticated principal, and the message names neither.
+ */
+export const assertPrincipal = (
+  authenticated: string,
+  asserted: string | undefined
+): Effect.Effect<void, Protocol.Unauthorized> =>
+  asserted === undefined || asserted === authenticated
+    ? Effect.void
+    : Effect.fail(new Protocol.Unauthorized({ message: "the replica's principal is not the authenticated principal" }))
+
+/**
  * Binds a client id to its principal on first sight and refuses it to any other principal, so
  * one principal can never read another's acks or replay another's mutation ids.
  */
