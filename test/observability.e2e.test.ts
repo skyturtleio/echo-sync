@@ -70,10 +70,16 @@ it.live(
             yield* engine
               .mutate(Ids.MutationId.make("nested"), "accept", {})
               .pipe(Effect.withSpan("sql.dependency"), Effect.provideService(Tracer.ParentSpan, external))
+            yield* engine
+              .mutate(Ids.MutationId.make("rooted"), "accept", {})
+              .pipe(Effect.withSpan("dependency.root", { root: true, sampled: true }))
+            yield* engine
+              .mutate(Ids.MutationId.make("explicit-root-parent"), "accept", {})
+              .pipe(Effect.withSpan("dependency.explicit-root-parent", { root: true, parent: external }))
             return done
           })
       })
-      yield* engine.pull
+      yield* engine.pull.pipe(Effect.withSpan("host.parent"))
       const pull = recording.spans.find((span) => span.name === "echo.pull")
       expect(pull).toBeDefined()
       expect(current).toEqual([0, 1].map(() => ({ spanId: pull?.spanId, traceId: pull?.traceId, sampled: false })))
@@ -85,6 +91,19 @@ it.live(
       const install = recording.spans.find((span) => span.name === "echo.install")
       expect(install?.parentSpanId).toBe(pull?.spanId)
       expect(install?.parentTraceId).toBe(pull?.traceId)
+      const root = recording.spans.filter((span) => span.name === "echo.enqueue")[1]
+      const host = recording.spans.find((span) => span.name === "host.parent")
+      expect(root).toBeDefined()
+      expect(host).toBeDefined()
+      expect(root?.parentSpanId).toBeUndefined()
+      expect(root?.parentTraceId).toBeUndefined()
+      expect(root?.traceId).not.toBe(host?.traceId)
+      expect(root?.sampled).toBe(false)
+      const explicitRootParent = recording.spans.filter((span) => span.name === "echo.enqueue")[2]
+      expect(explicitRootParent?.parentSpanId).toBe(external.spanId)
+      expect(explicitRootParent?.parentTraceId).toBe(external.traceId)
+      expect(explicitRootParent?.traceId).toBe(external.traceId)
+      expect(explicitRootParent?.sampled).toBe(false)
     }).pipe(Effect.scoped, Effect.provide(recording.layer))
   }
 )
@@ -99,11 +118,10 @@ it.effect("batch telemetry agrees with the loop's whole-cause decision and custo
         message: secret
       })
     )
-    let hostDecisions = 0
     for (const { cause, isFatal, expected } of [
       { cause: Cause.combine(unauthorized, malformed), isFatal: Transport.isFatalPush, expected: "halted" },
       { cause: Cause.combine(malformed, unauthorized), isFatal: Transport.isFatalPush, expected: "halted" },
-      { cause: Cause.fail({ _tag: "HostFatal" }), isFatal: () => ++hostDecisions === 1, expected: "halted" },
+      { cause: Cause.fail({ _tag: "HostFatal" }), isFatal: () => true, expected: "halted" },
       { cause: malformed, isFatal: () => false, expected: "server" }
     ]) {
       const recording = recorder()
@@ -142,13 +160,12 @@ it.effect("batch telemetry agrees with the loop's whole-cause decision and custo
   })
 )
 
-it.effect("policy defects and outer push cleanup cannot be swallowed or overridden by a cached batch decision", () =>
+it.effect("policy defects and the whole final push cause remain authoritative, including typed cleanup failures", () =>
   Effect.gen(function* () {
-    for (const mode of ["policy", "defect", "interrupt"]) {
+    for (const mode of ["policy", "defect", "interrupt", "typed"]) {
       const recording = recorder()
       yield* Effect.gen(function* () {
         let pulls = 0
-        let decisions = 0
         const failure = new Error(`policy-or-cleanup-${secret}`)
         const { engine, storage } = yield* device({
           push: () => Effect.fail(new Protocol.Unauthorized({ message: secret })),
@@ -162,21 +179,36 @@ it.effect("policy defects and outer push cleanup cannot be swallowed or overridd
         const push =
           mode === "policy"
             ? engine.push
-            : engine.push.pipe(Effect.ensuring(mode === "interrupt" ? Effect.interrupt : Effect.die(failure)))
+            : engine.push.pipe(
+                Effect.onExit(() =>
+                  mode === "typed"
+                    ? Effect.fail(
+                        new Protocol.MalformedEnvelope({
+                          clientId: Ids.ClientId.make("device"),
+                          mutationId: Ids.MutationId.make("intent"),
+                          message: secret
+                        })
+                      )
+                    : mode === "interrupt"
+                      ? Effect.interrupt
+                      : Effect.die(failure)
+                )
+              )
         const loop = yield* SyncLoop.make({
           engine: { ...engine, push },
-          isFatalPush: () => {
-            decisions++
-            if (mode === "policy" && decisions === 1) throw failure
-            return false
+          isFatalPush: (error) => {
+            if (mode === "policy") throw failure
+            return mode === "typed" && Transport.isFatalPush(error)
           },
           pendingMutations: storage.pendingCount
         })
         const fiber = yield* Effect.forkChild(Effect.exit(loop.run))
         yield* Effect.repeat(Effect.yieldNow, { times: 80 })
-        if (mode === "defect") {
+        if (mode === "defect" || mode === "typed") {
           expect((yield* loop.status).push._tag).toBe("Halted")
           expect(pulls).toBe(1)
+          yield* TestClock.adjust("30 seconds")
+          expect((yield* loop.status).phase).toBe("idle")
           yield* Fiber.interrupt(fiber)
         } else {
           const exit = yield* Fiber.join(fiber)
@@ -190,7 +222,21 @@ it.effect("policy defects and outer push cleanup cannot be swallowed or overridd
           }
           expect(pulls).toBe(0)
         }
-        expect(decisions).toBe(1)
+        if (mode === "typed") {
+          // The batch saw only Unauthorized; the loop additionally saw the fatal cleanup error.
+          expect(
+            recording.spans
+              .filter((span) => span.name === "echo.push")
+              .map((span) => new Map(span.attributes).get("echo.outcome"))
+          ).toEqual(["unauthorized"])
+          expect(
+            (yield* Metric.value(Metric.counter("echo.push.total", { attributes: { "echo.outcome": "unauthorized" } })))
+              .count
+          ).toBe(1)
+          expect(
+            (yield* Metric.value(Metric.counter("echo.push.total", { attributes: { "echo.outcome": "halted" } }))).count
+          ).toBe(0)
+        }
       }).pipe(Effect.scoped, Effect.provide(recording.layer))
     }
   })

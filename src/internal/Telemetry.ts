@@ -116,6 +116,8 @@ const parentFor = (
   while (Option.isSome(current) && current.value._tag === "Span" && forwarded.has(current.value)) {
     const exported = forwarded.get(current.value)
     if (exported !== undefined) return Option.some(exported)
+    if (current.value instanceof SafeSpan && current.value.root && Option.isNone(current.value.parent))
+      return Option.none()
     current = current.value.parent
   }
   return Option.isSome(current) ? current : external
@@ -123,10 +125,12 @@ const parentFor = (
 
 class SafeSpan extends Tracer.NativeSpan {
   readonly target: Tracer.Span | undefined
+  readonly root: boolean
   constructor(options: Parameters<Tracer.Tracer["span"]>[0], target: Tracer.Span | undefined) {
     const visible = target ?? Option.getOrUndefined(parentFor(options.parent, Option.none()))
     super({ ...options, sampled: visible?.sampled ?? options.sampled })
     this.target = target
+    this.root = options.root
     // The proxy and suppressed dependency spans propagate the exported identity, not a phantom one.
     if (visible !== undefined) {
       this._spanId = visible.spanId

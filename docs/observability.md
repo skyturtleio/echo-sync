@@ -69,6 +69,9 @@ Engine spans attach to the nearest exported engine ancestor, otherwise the paren
 boundary. Proxies retain the exported span's IDs and sampling; suppressed spans propagate the
 nearest visible ancestor's identity. An explicit external span inside the boundary is terminal
 and remains the parent, rather than being replaced by the boundary's captured parent.
+An effective root on a suppressed ancestor also terminates traversal: its descendants start a new
+trace and never reconnect to that captured parent. As in Effect, an explicit `parent` takes precedence
+over `root: true`. The fallback applies only at the boundary.
 Host parent metadata, host global metric
 attributes and log annotations are host-owned: do not put credentials or identities in them.
 
@@ -128,8 +131,11 @@ Its closed vocabulary is `ok`, `credentials`, `unauthorized`, `unavailable`, `ne
 `server-end`, `page`, `done`. Interruption takes precedence over defects, then recognized typed
 failures, then `server`. Classification is descriptive; it never supplies retry/halt policy.
 For push batches driven by `SyncLoop`, its actual whole-cause classification supplies the outcome:
-`halted` when the host's `isFatalPush` halts, otherwise its closed error kind. That decision is
-reused for status, not recomputed from tags; interruption and defect outcomes retain precedence.
+`halted` when the host's `isFatalPush` halts, otherwise its closed error kind. The same classifier
+independently decides status from the whole final push cause, including outer cleanup failures;
+no cached batch decision can hide those failures. Thus a transient batch can record `unauthorized`
+while a typed fatal outer cleanup failure makes the final status `Halted`. `isFatalPush` must be
+pure and may run more than once per failure. Interruption and defect outcomes retain precedence.
 `echo.result` carries the operation-specific success result from the same vocabulary;
 `echo.reason` distinguishes first-element idle timeout from clean stream end.
 Only nonnegative safe integer counts and `echo.resnapshot: boolean` are otherwise allowed.
