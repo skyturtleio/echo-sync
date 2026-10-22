@@ -447,10 +447,11 @@ it.effect(
 /** A real Engine (memory storage) holding one pending mutation, `m1#1`, and the real sync loop over `transport`. */
 const loopOver = (transport: Effect.Success<typeof Transport.make>) =>
   Effect.gen(function* () {
+    const storage = MemorySyncStorage.make(MemorySyncStorage.makeDisk())
     const engine = yield* Engine.make({
       clientId: Ids.ClientId.make("c"),
       actor: AccessScope.PrincipalId.make("p"),
-      storage: MemorySyncStorage.make(MemorySyncStorage.makeDisk()),
+      storage,
       registry: Registry.make([]),
       mutations: Mutation.makeRegistry([
         Mutation.make("noop", { args: Schema.Struct({}), handler: () => Effect.void })
@@ -467,7 +468,7 @@ const loopOver = (transport: Effect.Success<typeof Transport.make>) =>
     })
     const statuses: Array<SyncLoop.SyncStatus> = []
     yield* Effect.forkChild(Stream.runForEach(loop.changes, (status) => Effect.sync(() => void statuses.push(status))))
-    return { loop, statuses }
+    return { loop, statuses, pending: storage.transaction(storage.pending) }
   })
 
 /** Real time: polls `check` every 10 ms for up to 5 s. */
@@ -639,6 +640,36 @@ it.live("a server Unauthorized is reported as kind unauthorized", () =>
     fixture.state.valid = "t2" // the client still sends t1
     expect((yield* errorOf(fixture))?.kind).toBe("unauthorized")
   }).pipe(Effect.scoped)
+)
+
+it.live(
+  "an empty HTTP 401 reports unauthorized, retries with backoff without halting, and keeps the pending mutation",
+  () =>
+    Effect.gen(function* () {
+      let requests = 0
+      const fetch = Object.assign(
+        (_input: URL | RequestInfo, _init?: RequestInit) => {
+          requests++
+          return Promise.resolve(new Response(null, { status: 401 }))
+        },
+        { preconnect: globalThis.fetch.preconnect }
+      )
+      const transport = yield* Transport.make.pipe(Effect.provide(Transport.layerProtocolHttp("http://echo.test/sync")))
+      const { loop, statuses, pending } = yield* loopOver(transport)
+      yield* Effect.forkChild(loop.run.pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)))
+      yield* eventually(
+        () => statuses.filter((s) => s.phase === "backoff").length >= 2,
+        "two failed cycles with backoff"
+      )
+      expect(firstError(statuses)).toEqual({
+        kind: "unauthorized",
+        message: "the server rejected the credential"
+      })
+      expect(requests).toBeGreaterThanOrEqual(4) // push and pull, then their retries
+      expect(statuses.map((s) => s.push._tag)).not.toContain("Halted")
+      expect(statuses.filter((s) => s.phase === "backoff").every((s) => s.nextRetryAt !== null)).toBe(true)
+      expect((yield* pending).map((entry) => [entry.envelope.mutationId, entry.envelope.seq])).toEqual([["m1", 1]])
+    }).pipe(Effect.scoped)
 )
 
 it.live("a server ServerUnavailable is reported as kind unavailable", () =>

@@ -177,7 +177,10 @@ export const layerProtocolHttp = (
   // cannot add the HTTP error the credential step may raise.
   const protocol = Layer.effect(RpcClient.Protocol)(
     Effect.flatMap(HttpClient.HttpClient, (base) => {
-      const client = HttpClient.mapRequest(base, HttpClientRequest.prependUrl(url))
+      // Refuse authentication statuses before RPC reads the body; leave all other statuses alone.
+      const client = HttpClient.mapRequest(base, HttpClientRequest.prependUrl(url)).pipe(
+        HttpClient.filterStatus((status) => status !== 401 && status !== 403)
+      )
       if (headers === undefined) return RpcClient.makeProtocolHttp(client)
       return RpcClient.makeProtocolHttp(
         HttpClient.mapRequestEffect(client, (request) =>
