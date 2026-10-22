@@ -36,7 +36,8 @@ const bindColumn = (column: SyncTable.Column, value: Schema.Json) => {
 
 /**
  * Postgres `RowStore` (DESIGN §4) over the relations of `schemaOf` (SyncTable name → schema).
- * Runs inside the caller's transaction; maps every SQL failure to `StoreUnavailable`.
+ * Runs inside the caller's transaction. Writes preserve constraint failures; reads and all
+ * other SQL failures retain the transient `StoreUnavailable` mapping.
  */
 const decodeAll = (table: SyncTable.AnySyncTable, rows: ReadonlyArray<unknown>) =>
   Effect.forEach(rows, (row) => decodeRow(table, row))
@@ -50,8 +51,6 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
   }
   return Effect.gen(function* () {
     const sql = yield* SqlClient
-    const run = (statement: string, params: ReadonlyArray<unknown>) =>
-      sql.unsafe<Record<string, unknown>>(statement, params).pipe(Effect.mapError(unavailable))
     /** `statement` receives the table's quoted relation; an unattached table dies before any SQL. */
     const query = (
       table: SyncTable.AnySyncTable,
@@ -61,29 +60,41 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
       const rel = relation(table)
       return rel === undefined
         ? Effect.die(`RowStore: table ${table.name} is not an attached registry table`)
-        : run(statement(rel), params)
+        : sql.unsafe<Record<string, unknown>>(statement(rel), params)
     }
 
     const rowStore: Store.RowStore = {
       read: (table, id) =>
         Effect.flatMap(
-          query(table, (rel) => `SELECT ${selectList(table)} FROM ${rel} WHERE "id" = $1`, [id]),
+          query(table, (rel) => `SELECT ${selectList(table)} FROM ${rel} WHERE "id" = $1`, [id]).pipe(
+            Effect.mapError(unavailable)
+          ),
           (rows) =>
             rows[0] === undefined ? Effect.succeed(Option.none()) : Effect.map(decodeRow(table, rows[0]), Option.some)
         ),
-      write: (table, id, row) => {
-        if (Option.isNone(row)) return Effect.asVoid(query(table, (rel) => `DELETE FROM ${rel} WHERE "id" = $1`, [id]))
-        const params = table.columns.map((c) => bindColumn(c, row.value[c.name] ?? null))
-        const names = table.columns.map((c) => q(c.name))
-        return Effect.asVoid(
-          query(
+      write: (table, id, row) =>
+        Effect.gen(function* () {
+          if (Option.isNone(row))
+            return yield* Effect.asVoid(query(table, (rel) => `DELETE FROM ${rel} WHERE "id" = $1`, [id]))
+          const params = table.columns.map((c) => bindColumn(c, row.value[c.name] ?? null))
+          const names = table.columns.map((c) => q(c.name))
+          yield* query(
             table,
             (rel) => `INSERT INTO ${rel} (${names.join(", ")}) VALUES (${names.map((_, i) => `$${i + 1}`).join(", ")})
              ON CONFLICT ("id") DO UPDATE SET ${names.map((n) => `${n} = EXCLUDED.${n}`).join(", ")}`,
             params
           )
-        )
-      },
+        }).pipe(
+          Effect.mapError((error) =>
+            error.reason._tag === "UniqueViolation" || error.reason._tag === "ConstraintError"
+              ? new Errors.ConstraintViolated({
+                  kind: error.reason._tag === "UniqueViolation" ? "unique" : "other",
+                  constraint: error.reason._tag === "UniqueViolation" ? error.reason.constraint : null,
+                  message: error.message
+                })
+              : unavailable(error)
+          )
+        ),
       range: (table, plan) => {
         const where: Array<string> = []
         const params: Array<unknown> = []
@@ -131,14 +142,16 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
               (rel) =>
                 `SELECT ${selectList(table, "t")} FROM ${rel} AS t${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY ${order}${limit}`,
               params
-            ),
+            ).pipe(Effect.mapError(unavailable)),
             (rows) => decodeAll(table, rows)
           )
         )
       },
       scan: (table) =>
         Effect.flatMap(
-          query(table, (rel) => `SELECT ${selectList(table)} FROM ${rel} ORDER BY "id"`, []),
+          query(table, (rel) => `SELECT ${selectList(table)} FROM ${rel} ORDER BY "id"`, []).pipe(
+            Effect.mapError(unavailable)
+          ),
           (rows) => decodeAll(table, rows)
         )
     }

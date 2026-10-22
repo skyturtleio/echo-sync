@@ -1,6 +1,7 @@
 import { Cause, DateTime, Effect, Option, Random, Schema } from "effect"
 import type { PrincipalId } from "./AccessScope.ts"
 import {
+  ConstraintViolated,
   InvalidRow,
   RowAlreadyExists,
   RowNotFound,
@@ -44,12 +45,6 @@ export class ArgsDecodeFailed extends Schema.TaggedError<ArgsDecodeFailed>()("Ar
 export class DomainError extends Schema.TaggedError<DomainError>()("DomainError", {
   mutation: Schema.String,
   error: Schema.Json
-}) {}
-
-/** A database constraint refused the authoritative mutation (DESIGN §16.15). */
-export class ConstraintViolated extends Schema.TaggedError<ConstraintViolated>()("ConstraintViolated", {
-  constraint: Schema.optional(Schema.String),
-  message: Schema.String
 }) {}
 
 /**
@@ -125,13 +120,12 @@ export interface Mutation<Name extends string, A extends PureSchema, E extends P
   readonly handler: (ctx: MutationContext, args: A["Type"]) => Effect.Effect<void, E["Type"] | StoreError>
 }
 
-const isStoreFailure = (
-  e: unknown
-): e is RowNotFound | RowAlreadyExists | ScopeForbidden | InvalidRow | StoreUnavailable | ArgsDecodeFailed =>
+const isStoreFailure = (e: unknown): e is StoreError | ArgsDecodeFailed =>
   e instanceof RowNotFound ||
   e instanceof RowAlreadyExists ||
   e instanceof ScopeForbidden ||
   e instanceof InvalidRow ||
+  e instanceof ConstraintViolated ||
   e instanceof StoreUnavailable ||
   e instanceof ArgsDecodeFailed
 

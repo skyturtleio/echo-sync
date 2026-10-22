@@ -29,6 +29,13 @@ export class InvalidRow extends Schema.TaggedError<InvalidRow>()("InvalidRow", {
   message: Schema.String
 }) {}
 
+/** An authoritative database write violated an app constraint (DESIGN §16.15). */
+export class ConstraintViolated extends Schema.TaggedError<ConstraintViolated>()("ConstraintViolated", {
+  kind: Schema.Literals(["unique", "other"]),
+  constraint: Schema.NullOr(Schema.String),
+  message: Schema.String
+}) {}
+
 /** Permanent store errors a handler can produce; they become typed rejections. */
-export type StoreRejection = RowNotFound | RowAlreadyExists | ScopeForbidden | InvalidRow
+export type StoreRejection = RowNotFound | RowAlreadyExists | ScopeForbidden | InvalidRow | ConstraintViolated
 export type StoreError = StoreRejection | StoreUnavailable

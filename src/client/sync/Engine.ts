@@ -267,9 +267,12 @@ export interface Engine<TE> {
     args: Schema.Json
   ) => Effect.Effect<Mutation.MutationEnvelope, StoreUnavailable | LocallyRejected>
   /** Sends unprocessed outbox entries in seq order until none remain or the server stops. */
-  readonly push: Effect.Effect<PushResult, StoreUnavailable | TE>
+  readonly push: Effect.Effect<PushResult, StoreUnavailable | Errors.ConstraintViolated | TE>
   /** Pulls until `PullDone`, staging intermediate pages, then installs the set atomically. */
-  readonly pull: Effect.Effect<void, StoreUnavailable | TE | Protocol.ResnapshotRequired | MalformedChange>
+  readonly pull: Effect.Effect<
+    void,
+    StoreUnavailable | Errors.ConstraintViolated | TE | Protocol.ResnapshotRequired | MalformedChange
+  >
 }
 
 export const make = <TE>(options: {

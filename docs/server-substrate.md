@@ -33,6 +33,15 @@ paths), and core's `Conformance.rowStore` suite (`conformance.test.ts`): seeded 
 plans against `Store.planMatches`/`planOrder`, exact read/write round-trips, and all-or-nothing
 transactions under failure, defect and interruption at every boundary, on attached tables.
 
+Writes preserve Postgres `UniqueViolation` and `ConstraintError` as core's permanent store
+failure `ConstraintViolated{kind: "unique" | "other", constraint: string | null, message}`.
+`RowStore.write`, and therefore typed insert, patch, delete and scope/grant writes, carry it;
+reads retain their existing `StoreUnavailable` error channel. Every other SQL failure still
+maps to `StoreUnavailable` with the reason-tag prefix used by `isConflictUnavailable`.
+`Mutation.make` recognises the constraint as a store failure, not an undeclared domain error;
+its whole-cause precedence is unchanged: `StoreUnavailable` anywhere wins. The SQLite replica
+mapper is unchanged: its tables have no app constraints and its primary-key write is an upsert.
+
 Only registry tables that are attached are synced (`resolveTables`). A captured relation outside
 the registry is skipped; its log entries arrive as tombstones, never as payloads.
 
@@ -257,17 +266,18 @@ defect > transient > rejection (DESIGN §6):
   the retries run out, or the failure is a connection error, the batch stops as
   `MutationTransient` with nothing ledgered;
 - a rejection is ledgered only when the body's cause consists solely of `MutationRejection`s
-  or non-retryable SQL constraint failures. A pinned `ConstraintError` (check, foreign key,
-  not-null) becomes `Rejected{ConstraintViolated{constraint, message}}` immediately; a
-  `UniqueViolation` first uses the bounded conflict retry and becomes the same rejection only
+  or non-retryable SQL constraint failures. `ConstraintViolated{kind: "other"}` (check, foreign
+  key, not-null) is ledgered immediately; `kind: "unique"` first uses the bounded conflict
+  retry and becomes a ledgered rejection only
   if it persists. A conflict anywhere in that cause still wins and stays transient. Every
   rejection has a recorded position and the batch continues. App handlers should still check
   domain rules first and return typed `DomainError`s; this is the safety net, not the UX.
 
 `ConstraintViolated` is an additive member of core's outcome JSON schema and uses the existing
-client `Rejected` notice path. Its `message` is the SQL error's message; `constraint` is the
-identifier exposed by `UniqueViolation`, or `undefined` for `ConstraintError` (the pinned reason
-does not expose a name). After unique retries exhaust, the failed transaction has rolled back;
+client `Rejected` notice path. Its `message` is the SQL error reason's message; `constraint` is
+the identifier exposed by `UniqueViolation`, or `null` for `ConstraintError` (the pinned reason
+does not expose a name). Raw `SqlError` mutation bodies use the same mapping and retry rule,
+although app handlers use the Store path. After unique retries exhaust, the failed transaction has rolled back;
 the server records the rejection in a fresh transaction with the normal identity check and
 conflict retry, without running the body again. Infrastructure failures outside the body are
 never turned into constraint rejections.

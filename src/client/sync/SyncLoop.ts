@@ -165,7 +165,7 @@ const classify = <E>(cause: Cause.Cause<E>, isFatal: ((error: E) => boolean) | u
 export const make = <TE>(options: {
   readonly engine: Engine.Engine<TE>
   /** Whether a push failure is an integrity error that must stop pushing (see module doc). */
-  readonly isFatalPush: (error: Errors.StoreUnavailable | TE) => boolean
+  readonly isFatalPush: (error: Errors.StoreUnavailable | Errors.ConstraintViolated | TE) => boolean
   /** First retry delay after a transient failure; doubles up to `maxRetryDelay`. */
   readonly retryDelay?: Duration.Input
   readonly maxRetryDelay?: Duration.Input
