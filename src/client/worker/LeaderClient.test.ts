@@ -1,5 +1,5 @@
 import { expect, it } from "@effect/vitest"
-import { Cause, Deferred, Effect, Exit, Layer, Scope, Stream } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Layer, Option, Scope, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { AccessScope } from "echo-sync"
 import type * as Rpc from "effect/rpc"
@@ -13,6 +13,8 @@ import type * as Platform from "./platform.ts"
 const remote = vi.hoisted(() => ({
   shared: false,
   held: vi.fn<() => Effect.Effect<boolean>>(),
+  /** The tab lock; by default held for nothing and released at once. */
+  holdLock: vi.fn<() => Effect.Effect<void, never, Scope.Scope>>(),
   track: vi.fn<() => Effect.Effect<void>>(),
   presence: vi.fn<() => Stream.Stream<{ room: AccessScope.AccessScopeId; entries: [] }>>(),
   notices: vi.fn<() => Stream.Stream<unknown, unknown>>(),
@@ -37,13 +39,14 @@ vi.mock("./platform.ts", async (original) => {
     ...actual,
     tabCapability: () => ({ sharedWorker: remote.shared }),
     isLockHeld: () => remote.held(),
-    holdLock: () => effect.Effect.void,
+    holdLock: () => (remote.holdLock.getMockImplementation() === undefined ? effect.Effect.void : remote.holdLock()),
     awaitLockReleased: () => effect.Effect.never
   }
 })
 
 afterEach(() => {
   remote.shared = false
+  remote.holdLock.mockReset()
   vi.unstubAllGlobals()
 })
 
@@ -177,6 +180,55 @@ it.live("closing a client cannot abandon a transferred port queued for acceptanc
       control.port2.close()
       transferred.port2.close()
     }
+  })
+)
+
+it.live("closing the client's scope while a reset is releasing its locks returns only once they are released", () =>
+  Effect.gen(function* () {
+    vi.stubGlobal("navigator", { storage: { persist: () => Promise.resolve(false) } })
+    // The tab lock's release suspends until `gate` opens, so the reset's close of the client's topology is in
+    // progress (already detached from the client's scope) when the client's scope is closed.
+    const releasing = yield* Deferred.make<void>()
+    const gate = yield* Deferred.make<void>()
+    let released = false
+    remote.holdLock.mockImplementation(() =>
+      Effect.addFinalizer(() =>
+        Deferred.succeed(releasing, undefined).pipe(
+          Effect.andThen(Deferred.await(gate)),
+          Effect.andThen(Effect.sync(() => (released = true)))
+        )
+      )
+    )
+    const worker = Object.assign(new EventTarget(), {
+      onmessage: null,
+      onmessageerror: null,
+      onerror: null,
+      postMessage() {},
+      terminate() {}
+    })
+    const scope = yield* Scope.make()
+    const context = yield* Layer.buildWithScope(
+      layer({
+        appId: "reset",
+        profile: "join",
+        principal: "me",
+        spawnLeader: () => worker,
+        spawnRouter: () => {
+          throw new Error("single-tab")
+        }
+      }),
+      scope
+    )
+    const client = Context.get(context, LeaderClient)
+    const channel = new BroadcastChannel("echo:reset:join:reset")
+    // oxlint-disable-next-line unicorn/require-post-message-target-origin -- BroadcastChannel has no target origin
+    channel.postMessage({ _tag: "ResetSignal", appId: "reset", profile: "join" })
+    channel.close()
+    yield* Deferred.await(releasing).pipe(Effect.timeout("2 seconds"))
+    setTimeout(() => Deferred.doneUnsafe(gate, Effect.void), 50)
+    yield* Scope.close(scope, Exit.void)
+    expect(released).toBe(true)
+    expect((yield* Stream.runHead(client.status)).pipe(Option.map((s) => s.reset))).toEqual(Option.some(true))
   })
 )
 

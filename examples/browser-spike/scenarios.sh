@@ -541,6 +541,26 @@ const d = await echo.opfsList('echo-sync/$APP/default')
 return { pass: r.ok && d === null, r, d }")"
 for t in "$P" "$Q"; do ab tab close "$t" >/dev/null; done
 
+# The client's scope closed while the reset's own close of the client's topology is in progress (`closeOnReset`
+# forks it in the task that delivers the signal): once that scope close completes, every lock the page held or
+# queued is gone. Smoke coverage only: the race needs the topology close to suspend after it detached from the
+# client's scope, which the harness cannot force, so this check also passes on e4b93b5. The deterministic
+# regression is the LeaderClient.test.ts invariant with a gated tab-lock release.
+APP="coord-close-$RUN"
+P=$(open_tab "$BASE/?app=$APP&closeOnReset")
+ev <<<"$SERVED" >/dev/null
+Q=$(open_tab "$BASE/?app=$APP")
+ev <<<"$SERVED" >/dev/null
+check "coordinated reset: an infinite or NaN closeTimeout fails ResetFailed before anything is signalled or touched" "$(ev <<<"const r = await echo.resetReplica({ appId: '$APP', profile: 'default' }, false, undefined, Infinity)
+const n = await echo.resetReplica({ appId: '$APP', profile: 'default' }, false, undefined, NaN)
+const s = await echo.status()
+return { pass: !r.ok && r.error._tag === 'ResetFailed' && !n.ok && n.error._tag === 'ResetFailed' && !s.reset && s.leaderId !== undefined && (await echo.opfsList('echo-sync/$APP/default')) !== null, r, s }")"
+ab tab "$P" >/dev/null
+cl=$(ev <<<'const before = await echo.pageLocks(); echo.signalReset(); const after = await echo.closedOnReset(); return { before, after }')
+check "coordinated reset: a client scope closed as the reset arrives has released every lock of the page once the close completes" \
+  "$(jq -nc --argjson c "$cl" '{ pass: (($c.before.held | length) > 0 and $c.after.held == [] and $c.after.pending == []), c: $c }')"
+for t in "$P" "$Q"; do ab tab close "$t" >/dev/null; done
+
 # ── presence (DESIGN §9.1, §12): entry exactly while the tab stream is open; survives handover ────────
 # Needs the real server (PresenceRpcs is mounted with SyncRpcs on /sync). L is the leader tab; F and W follow.
 if [ "$SYNC_MODE" = real ]; then

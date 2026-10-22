@@ -52,6 +52,26 @@ if (params.has("ignoreReset")) {
     }
   })
 }
+/** Set once the client exists: what `?closeOnReset` runs right after the client handled the reset signal. */
+let afterResetDelivered: (() => void) | undefined
+if (params.has("closeOnReset")) {
+  // Fault injection: right after the client's own reset listener ran (same task, so its reset close of the
+  // client's topology has only been forked), close the client's scope one scheduler step later, which lands
+  // while that topology close is still in progress.
+  const add = BroadcastChannel.prototype.addEventListener
+  Object.defineProperty(BroadcastChannel.prototype, "addEventListener", {
+    value: function (this: BroadcastChannel, type: string, listener: EventListener, ...rest: Array<unknown>) {
+      if (!(this.name.startsWith("echo:") && this.name.endsWith(":reset"))) {
+        return Reflect.apply(add, this, [type, listener, ...rest])
+      }
+      const wrapped = (event: Event) => {
+        listener(event)
+        afterResetDelivered?.()
+      }
+      return Reflect.apply(add, this, [type, wrapped, ...rest])
+    }
+  })
+}
 if (noSharedWorker) {
   // Simulates a browser without SharedWorker (e.g. Chrome Android) to exercise the fail-closed fallback.
   Reflect.deleteProperty(globalThis, "SharedWorker")
@@ -112,6 +132,13 @@ const client = await Effect.runPromise(
   }).pipe(Scope.provide(scope))
 )
 addEventListener("pagehide", () => Effect.runFork(Scope.close(scope, Exit.void)))
+/** With `?closeOnReset`: the client's scope close forked as the reset reached the client, then this page's locks. */
+let closedOnReset: Promise<{ readonly held: Array<string>; readonly pending: Array<string> }> | undefined
+afterResetDelivered = () => {
+  closedOnReset ??= Effect.runPromise(Effect.andThen(Effect.yieldNow, Scope.close(scope, Exit.void))).then(() =>
+    echo.pageLocks()
+  )
+}
 
 /** Errors are returned as values so the driving script can assert on `_tag`/`reason`. */
 type Outcome<A> = { readonly ok: true; readonly value: A } | { readonly ok: false; readonly error: unknown }
@@ -232,6 +259,33 @@ const echo = {
     return true
   },
   track: (room: string, state: string) => run(client.track(AccessScope.AccessScopeId.make(room), state)),
+  /** Post the engine's reset signal for this page's identity directly, as `resetReplica` does (no reset worker). */
+  signalReset: () => {
+    const channel = new BroadcastChannel(`echo:${appId}:${profile}:reset`)
+    // oxlint-disable-next-line unicorn/require-post-message-target-origin -- BroadcastChannel has no target origin
+    channel.postMessage({ _tag: "ResetSignal", appId, profile })
+    channel.close()
+    return true
+  },
+  /** With `?closeOnReset`: resolves once the scope close forked by the reset completed, with this page's locks. */
+  closedOnReset: async () => {
+    const settled = await echo.until(() => closedOnReset)
+    return settled === undefined ? null : await settled
+  },
+  /** This page's own (not its workers') Web Locks of its identity, held or pending, as `mode:name`. */
+  pageLocks: async () => {
+    const probe = `echo-test:probe:${crypto.randomUUID()}`
+    return navigator.locks.request(probe, async () => {
+      const snapshot = await navigator.locks.query()
+      const self = (snapshot.held ?? []).find((l) => l.name === probe)?.clientId
+      const prefix = `echo:${appId}:${profile}:`
+      const pick = (locks: ReadonlyArray<LockInfo> | undefined) =>
+        (locks ?? [])
+          .filter((l) => l.clientId === self && l.name?.startsWith(prefix) === true)
+          .map((l) => `${l.mode}:${l.name}`)
+      return { held: pick(snapshot.held), pending: pick(snapshot.pending) }
+    })
+  },
   /** `resetReplica` for `target` (this page's own identity by default); resolves with how long it took. */
   resetReplica: async (
     target: { readonly appId: string; readonly profile: string } = { appId, profile },

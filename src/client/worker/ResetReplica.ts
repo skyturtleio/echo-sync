@@ -44,7 +44,7 @@ export interface ResetReplicaOptions {
   /**
    * How long to wait for the identity's clients to let go of the leader lock after the reset signal before
    * failing `ReplicaInUse`; the whole budget for the lock request, so a near-zero value can refuse even a free
-   * lock. Default 5 s.
+   * lock. Must be finite (an infinite one fails `ResetFailed`, nothing touched). Default 5 s.
    */
   readonly closeTimeout?: Duration.Input
 }
@@ -57,6 +57,18 @@ export const resetReplica = (
     const identity: Platform.ReplicaIdentity = { appId: config.appId, profile: config.profile }
     const invalid = Platform.validateIdentity(identity) ?? Platform.tabCapability().unsupported
     if (invalid !== undefined) return yield* new ResetFailed({ message: invalid })
+    // Bounded by contract (DESIGN §16.24): an unhonoured signal must surface as `ReplicaInUse`, never as a reset
+    // that waits forever. Refused before anything is spawned or broadcast.
+    // `Duration` reads a numeric NaN as 0 and throws on malformed input: both are refused here, typed.
+    const closeTimeout = options.closeTimeout ?? "5 seconds"
+    const closeTimeoutMillis = yield* Effect.try({
+      try: () =>
+        typeof closeTimeout === "number" && Number.isNaN(closeTimeout) ? NaN : Duration.toMillis(closeTimeout),
+      catch: () => new ResetFailed({ message: "closeTimeout is not a valid duration" })
+    })
+    if (!Number.isFinite(closeTimeoutMillis)) {
+      return yield* new ResetFailed({ message: "closeTimeout must be finite" })
+    }
     const outcome = yield* Effect.acquireUseRelease(
       // A synchronous throw (a bad worker URL, a CSP refusal) is a failed reset, not a defect.
       Effect.try({
@@ -82,7 +94,7 @@ export const resetReplica = (
             appId: config.appId,
             profile: config.profile,
             discardPending: options.discardPending === true,
-            closeTimeoutMillis: Duration.toMillis(options.closeTimeout ?? "5 seconds")
+            closeTimeoutMillis
           }
           const signal: ResetSignal = { _tag: "ResetSignal", appId: config.appId, profile: config.profile }
           // A throwing postMessage is a failed reset, not a defect; interruption is never caught here. The

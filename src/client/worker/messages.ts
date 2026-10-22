@@ -18,13 +18,13 @@ export const ToLeader = Schema.Union([
   /**
    * Instead of `Init`: reset this identity's replica (DESIGN §9.1 `resetReplica`) and answer with one
    * `ResetOutcome`. The worker never becomes leader. `closeTimeoutMillis`: how long it waits for the leader
-   * lock while the identity's clients close (DESIGN §16.24); non-finite waits without a deadline.
+   * lock while the identity's clients close (DESIGN §16.24); always finite.
    */
   Schema.TaggedStruct("Reset", {
     appId: Schema.String,
     profile: Schema.String,
     discardPending: Schema.Boolean,
-    closeTimeoutMillis: Schema.Number
+    closeTimeoutMillis: Schema.Finite
   })
 ])
 export type ToLeader = typeof ToLeader.Type

@@ -443,6 +443,17 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     let open = true
     /** Set once by the reset signal, never cleared: no path below starts, elects or joins a leader after it. */
     let reset = false
+    /**
+     * Completed once a reset's close of `topology` has finished. Closing a scope detaches it from its parent
+     * before its finalizers run, so a close of `scope` racing that reset close would no longer see `topology`
+     * and could finish while the tab lock and the lock watchers are still being released. This finalizer makes
+     * the client's scope close wait for it: once `scope` is closed, every lock this tab held or queued is gone.
+     */
+    const topologyClosed = Deferred.makeUnsafe<void>()
+    yield* Scope.addFinalizer(
+      scope,
+      Effect.suspend(() => (reset ? Deferred.await(topologyClosed) : Effect.void))
+    )
     const resetError = new LeaderUnavailable({
       reason: "Reset",
       message: "resetReplica closed this client; build a new client to use the replica again"
@@ -626,7 +637,11 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
       routerPorts.clear()
       router = undefined
       publishStatus()
-      Effect.runForkWith(context)(Effect.andThen(Effect.yieldNow, Scope.close(topology, Exit.void)))
+      Effect.runForkWith(context)(
+        Effect.andThen(Effect.yieldNow, Scope.close(topology, Exit.void)).pipe(
+          Effect.ensuring(Deferred.done(topologyClosed, Exit.void))
+        )
+      )
     }
     const resetSignals = new BroadcastChannel(Platform.resetChannelName(identity))
     resetSignals.addEventListener("message", (event) => {
