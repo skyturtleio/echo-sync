@@ -67,8 +67,11 @@ also reject any present `Origin` unequal to its configured origin. Non-browser c
 omit these headers, so request policy never replaces secret session-cookie / bearer-token
 authentication (the example's principal header is only a dev harness). The HTTP protocol still
 decodes the body before invoking `principalFor`; this callback is not a pre-decoder body gate.
-The pinned Effect HTTP protocol preserves the request context when forking handlers, before
-branching into buffered or streaming responses, so the same provenance holds for all five RPCs.
+Effect 4.0.5's `node_modules/effect/src/rpc/RpcServer.ts` preserves the request context when
+forking handlers, before branching into buffered or streaming responses, so the same provenance
+holds for all five RPCs: `httpEffect` reads and dispatches in the HTTP request context
+(lines 1179–1249), `writeDecodedRequest` calls `server.write` (831), `write` captures the request
+fiber (183), and `handleRequest` forks with the merged handler/request context (378–380, 568).
 The client already installs `syncHeaders` as real HTTP request headers, not message headers.
 
 Composing a transport: the RPC `handlers` / `presenceHandlers` require `layerHttp`; a missing
