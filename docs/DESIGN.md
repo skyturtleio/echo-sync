@@ -1055,7 +1055,7 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
    its first production clients are pre-gate (no `clientVersion` on the wire, cannot decode
    `ClientOutdated`, pre-fix staging). Its upgrade to 604dc2e must deploy server-first under the
    default serve policy (or treat an absent `clientVersion` explicitly as legacy) and precede any
-   non-additive table change.
+   non-additive table change. **Done:** NilBurger deployed engine pin 7c8b7a2 (gate + observability) server-first under the default policy on 2026-10-22 (NilBurger e763e03); a refusing policy or non-additive change still waits until every deployed client is on that pin.
    (d) the generator keeps a history
    of committed `dataHash`es in `migrations/manifest.json` so an app can express its floor as
    "every manifest since NNN" without hand-copying hashes. Invariants: an old client against an
