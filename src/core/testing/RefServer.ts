@@ -29,9 +29,9 @@ type MutationOutcome = Mutation.MutationOutcome
 
 const scopeOf = (row: EncodedRow) => String(row["access_scope_id"])
 const asPosition = (p: Position) => Ids.Position.make(p)
-/** The in-memory store never fails transiently; a `StoreUnavailable` here is a bug. */
-const inMemory = <A, E, R>(self: Effect.Effect<A, E | Errors.StoreUnavailable, R>) =>
-  Effect.catchTag(self, "StoreUnavailable", (error) => Effect.die(error))
+/** The in-memory store has neither SQL constraints nor transient failures. */
+const inMemory = <A, E, R>(self: Effect.Effect<A, E | Errors.StoreUnavailable | Errors.ConstraintViolated, R>) =>
+  Effect.catchTag(self, ["StoreUnavailable", "ConstraintViolated"], (error) => Effect.die(error))
 
 interface LogEntry {
   readonly position: Position

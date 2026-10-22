@@ -84,7 +84,8 @@ const isConflict = (error: unknown) =>
     (error.reason._tag === "SerializationError" ||
       error.reason._tag === "DeadlockError" ||
       error.reason._tag === "UniqueViolation")) ||
-  (error instanceof Errors.StoreUnavailable && isConflictUnavailable(error))
+  (error instanceof Errors.StoreUnavailable && isConflictUnavailable(error)) ||
+  (error instanceof Errors.ConstraintViolated && error.kind === "unique")
 
 /** A reason that makes the attempt a defect (DESIGN §6 precedence: defect > transient > rejection). */
 const isDefectReason = (r: Cause.Reason<unknown>) =>
@@ -128,8 +129,9 @@ const asRejection = (
       (error.reason._tag === "ConstraintError" || (uniqueExhausted && error.reason._tag === "UniqueViolation"))
     ) {
       return [
-        new Mutation.ConstraintViolated({
-          constraint: error.reason._tag === "UniqueViolation" ? error.reason.constraint : undefined,
+        new Errors.ConstraintViolated({
+          kind: error.reason._tag === "UniqueViolation" ? "unique" : "other",
+          constraint: error.reason._tag === "UniqueViolation" ? error.reason.constraint : null,
           message: error.message
         })
       ]
@@ -140,7 +142,11 @@ const asRejection = (
   return errors.length === cause.reasons.length &&
     first !== undefined &&
     isRejection(first) &&
-    errors.every(isRejection)
+    errors.every(
+      (error) =>
+        isRejection(error) &&
+        (uniqueExhausted || !(error instanceof Errors.ConstraintViolated && error.kind === "unique"))
+    )
     ? first
     : undefined
 }
@@ -250,6 +256,7 @@ export const runMutation = <R>(
     }
 
     let bodyUniqueRejection = false
+    let rejectionToRecord: Mutation.MutationRejection | undefined
     const execute = sql.withTransaction(
       Effect.gen(function* () {
         bodyUniqueRejection = false
@@ -294,12 +301,13 @@ export const runMutation = <R>(
           return expired
         }
 
-        const outcome: MutationOutcome = yield* sql.withTransaction(body).pipe(
+        const attemptBody = rejectionToRecord === undefined ? body : Effect.fail(rejectionToRecord)
+        const outcome: MutationOutcome = yield* sql.withTransaction(attemptBody).pipe(
           Effect.as<MutationOutcome>({ _tag: "Applied" }),
           // A rejection combined with anything else (e.g. a defect in a finalizer) is not a
           // rejection: it must not be ledgered as one.
           Effect.catchCause((cause) => {
-            const rejection = asRejection(cause)
+            const rejection = asRejection(cause, rejectionToRecord !== undefined)
             bodyUniqueRejection = rejection === undefined && asRejection(cause, true) !== undefined
             return rejection === undefined
               ? Effect.failCause(cause)
@@ -318,18 +326,18 @@ export const runMutation = <R>(
       })
     )
 
-    return yield* wrapAttempt(execute).pipe(
-      Effect.retry({ schedule: options?.conflictRetry ?? defaultConflictRetry, while: (e) => e.retryable }),
-      Effect.catch(
-        (e): Effect.Effect<Processed, MutationTransient | ClientForbidden | Protocol.MalformedEnvelope, SqlClient> => {
-          const rejection = bodyUniqueRejection ? asRejection(e.attempt, true) : undefined
-          // The unique-failing transaction rolled back. Record its permanent outcome in a fresh
-          // transaction, with the normal identity check and conflict retry, but never rerun its body.
-          return rejection === undefined
-            ? classify(envelope, e.attempt)
-            : runMutation(envelope, Effect.fail(rejection), options)
-        }
-      )
+    const attempts = wrapAttempt(execute).pipe(
+      Effect.retry({ schedule: options?.conflictRetry ?? defaultConflictRetry, while: (e) => e.retryable })
+    )
+    return yield* attempts.pipe(
+      Effect.catch((e) => {
+        const rejection = bodyUniqueRejection ? asRejection(e.attempt, true) : undefined
+        if (rejection === undefined) return classify(envelope, e.attempt)
+        // The unique-failing transaction rolled back. Record its permanent outcome in a fresh
+        // transaction, with the normal identity check and conflict retry, but never rerun its body.
+        rejectionToRecord = rejection
+        return attempts.pipe(Effect.catch((recording) => classify(envelope, recording.attempt)))
+      })
     )
   })
 

@@ -9,7 +9,14 @@ import {
   satisfies,
   strongest
 } from "./AccessScope.ts"
-import { InvalidRow, RowAlreadyExists, RowNotFound, ScopeForbidden, type StoreUnavailable } from "./Errors.ts"
+import {
+  type ConstraintViolated,
+  InvalidRow,
+  RowAlreadyExists,
+  RowNotFound,
+  ScopeForbidden,
+  type StoreUnavailable
+} from "./Errors.ts"
 import { grantId, ScopeGrants } from "./ScopeGrants.ts"
 import type { AnySyncTable, Column, EncodedRow, Index } from "./SyncTable.ts"
 
@@ -163,7 +170,8 @@ export const planResult = (
  * reference. Contract for every method:
  * - runs inside a transaction the substrate owns; never begins, commits or rolls back;
  * - performs no authorization (the typed `EchoStore` does);
- * - fails only with the transient `StoreUnavailable`.
+ * - reads fail only with the transient `StoreUnavailable`; writes may also fail permanently
+ *   with `ConstraintViolated` when an authoritative database constraint refuses the write.
  */
 export interface RowStore {
   readonly read: (table: AnySyncTable, id: string) => Effect.Effect<Option.Option<EncodedRow>, StoreUnavailable>
@@ -172,7 +180,7 @@ export interface RowStore {
     table: AnySyncTable,
     id: string,
     row: Option.Option<EncodedRow>
-  ) => Effect.Effect<void, StoreUnavailable>
+  ) => Effect.Effect<void, StoreUnavailable | ConstraintViolated>
   /** Rows matching `plan`: `planResult` (match, readable scope, plan order, limit). */
   readonly range: (
     table: AnySyncTable,
@@ -278,16 +286,16 @@ export interface EchoStore {
   readonly insert: <T extends AnySyncTable>(
     table: T,
     row: RowOf<T>
-  ) => Effect.Effect<void, RowAlreadyExists | ScopeForbidden | InvalidRow | StoreUnavailable>
+  ) => Effect.Effect<void, RowAlreadyExists | ScopeForbidden | InvalidRow | StoreUnavailable | ConstraintViolated>
   readonly patch: <T extends AnySyncTable>(
     table: T,
     id: RowOf<T>["id"],
     patch: Partial<Omit<RowOf<T>, "id">>
-  ) => Effect.Effect<void, RowNotFound | ScopeForbidden | InvalidRow | StoreUnavailable>
+  ) => Effect.Effect<void, RowNotFound | ScopeForbidden | InvalidRow | StoreUnavailable | ConstraintViolated>
   readonly delete: <T extends AnySyncTable>(
     table: T,
     id: RowOf<T>["id"]
-  ) => Effect.Effect<void, RowNotFound | ScopeForbidden | StoreUnavailable>
+  ) => Effect.Effect<void, RowNotFound | ScopeForbidden | StoreUnavailable | ConstraintViolated>
   readonly query: <T extends AnySyncTable>(table: T) => TableQuery<T, InvalidRow | StoreUnavailable>
   readonly scan: <T extends AnySyncTable>(table: T) => Effect.Effect<ReadonlyArray<RowOf<T>>, StoreUnavailable>
   /**
@@ -304,7 +312,9 @@ export interface EchoStore {
    *
    * Mutation store only: not part of a query's read-only store.
    */
-  readonly createScope: (scopeId: AccessScopeId) => Effect.Effect<void, ScopeForbidden | InvalidRow | StoreUnavailable>
+  readonly createScope: (
+    scopeId: AccessScopeId
+  ) => Effect.Effect<void, ScopeForbidden | InvalidRow | StoreUnavailable | ConstraintViolated>
 }
 
 /** The read half of `EchoStore`: what a registered query's handler gets (DESIGN §10.1). */

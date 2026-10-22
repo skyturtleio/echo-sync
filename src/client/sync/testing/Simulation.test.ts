@@ -417,44 +417,97 @@ describe("reconciliation simulation", () => {
   )
 
   it.effect(
-    "a Rejected{ClientExpired} push result above the installed cursor is released on receipt with an OutcomeUnknown notice; an Applied one there still waits for its ack",
+    "constraint rejections neither release before covering acks nor lose fields in retained notices; ClientExpired still releases on receipt",
     () =>
       Effect.gen(function* () {
         const disk = installedDisk() // cursor 1
         const base = valueOf(disk, "x")
+        const response = Schema.decodeUnknownSync(Schema.toCodecJson(Protocol.PushResponse))({
+          results: [
+            {
+              mutationId: "m1",
+              position: "5",
+              outcome: { _tag: "Rejected", error: { _tag: "ClientExpired", mutationId: "m1" } }
+            },
+            { mutationId: "m2", position: "6", outcome: { _tag: "Applied" } },
+            {
+              mutationId: "m3",
+              position: "7",
+              outcome: {
+                _tag: "Rejected",
+                error: {
+                  _tag: "ConstraintViolated",
+                  kind: "unique",
+                  constraint: "counter_unique",
+                  message: "duplicate counter"
+                }
+              }
+            },
+            {
+              mutationId: "m4",
+              position: "8",
+              outcome: {
+                _tag: "Rejected",
+                error: { _tag: "ConstraintViolated", kind: "other", constraint: null, message: "counter check" }
+              }
+            }
+          ]
+        })
         const engine = yield* Engine.make({
           ...engineOptions,
           storage: MemorySyncStorage.make(disk),
           transport: {
             // An expired identity answers m1 at position 5, above the cursor; no pull will ever ack it.
-            push: () =>
-              Effect.succeed<Protocol.PushResponse>({
-                results: [
-                  {
-                    mutationId: id("m1"),
-                    position: position(5n),
-                    outcome: { _tag: "Rejected", error: new Mutation.ClientExpired({ mutationId: id("m1") }) }
-                  },
-                  { mutationId: id("m2"), position: position(6n), outcome: { _tag: "Applied" } }
-                ]
-              }),
-            pull: () => Effect.die("unused")
+            push: () => Effect.succeed(response),
+            pull: () =>
+              Effect.succeed<Protocol.PullResponse>({
+                _tag: "PullDone",
+                changes: [{ _tag: "upsert", table: Counters.name, row: counterRow("x", Number(base) + 10) }],
+                acks: response.results.slice(1),
+                nextCursor: position(8n),
+                expiredThrough: Ids.SeqFloor.make(0)
+              })
           }
         })
         yield* engine.mutate(id("m1"), "increment", { id: "x", by: 1 })
         yield* engine.mutate(id("m2"), "increment", { id: "x", by: 10 })
-        assert.strictEqual((yield* engine.push).processed, 2)
+        yield* engine.mutate(id("m3"), "increment", { id: "x", by: 100 })
+        yield* engine.mutate(id("m4"), "increment", { id: "x", by: 1000 })
+        assert.strictEqual((yield* engine.push).processed, 4)
         assert.deepStrictEqual(
           disk.outbox.map((entry) => entry.envelope.mutationId),
-          ["m2"],
-          "m1 released, m2 waits"
+          ["m2", "m3", "m4"],
+          "only the expired identity releases before the covering pull"
         )
         assert.deepStrictEqual(
           disk.notices.map((notice) => [notice._tag, notice.envelope.mutationId]),
           [["OutcomeUnknown", "m1"]]
         )
-        // m1's optimistic effect is gone (its effect, if any, comes with a pull); m2's stays.
+        // m1's optimistic effect is gone; all unacked effects still remain.
+        assert.strictEqual(valueOf(disk, "x"), Number(base) + 1110)
+        yield* engine.pull
+        assert.strictEqual(disk.outbox.length, 0)
         assert.strictEqual(valueOf(disk, "x"), Number(base) + 10)
+        // These JSON-only fields use the same notice schema as durable SQLite and the tab RPC.
+        const noticeJson = Schema.Array(Mutation.Notice)
+        const encoded = Schema.encodeSync(noticeJson)(disk.notices)
+        const decoded = Schema.decodeUnknownSync(noticeJson)(JSON.parse(JSON.stringify(encoded)))
+        assert.deepStrictEqual(decoded, disk.notices)
+        assert.deepStrictEqual(
+          decoded.map((notice) => [notice._tag, notice.envelope.mutationId]),
+          [
+            ["OutcomeUnknown", "m1"],
+            ["Rejected", "m3"],
+            ["Rejected", "m4"]
+          ]
+        )
+        assert.deepStrictEqual(
+          encoded.slice(1).map((notice) => (notice._tag === "Rejected" ? notice.error : undefined)),
+          [
+            { _tag: "ConstraintViolated", kind: "unique", constraint: "counter_unique", message: "duplicate counter" },
+            { _tag: "ConstraintViolated", kind: "other", constraint: null, message: "counter check" }
+          ]
+        )
       })
   )
 
