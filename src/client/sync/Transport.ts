@@ -12,7 +12,8 @@
  *   (fatal defects are broadcast as `Defect`). §6 says a defect is never retried and never ledgered, so
  *   retrying the same batch could only repeat it, and skipping it would open a seq gap.
  *
- * Everything else is transient and retried by the loop: `RpcClientError` (HTTP, socket, protocol),
+ * `ClientOutdated` is a separate compatibility stop for both directions until a new leader (§11).
+ * Other errors are transient and retried by the loop: `RpcClientError` (HTTP, socket, protocol),
  * `Unauthorized` (credentials may be renewed), interruption. Every pull defect (a handler defect, or a
  * response the RPC client cannot decode, which it raises as a defect) becomes the transient
  * `PullProtocolError`, so a bad page never kills the loop's fiber; core's `ResnapshotRequired` passes through for the engine to handle.

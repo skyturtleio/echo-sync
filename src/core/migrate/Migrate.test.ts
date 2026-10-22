@@ -280,6 +280,23 @@ describe("safe changes become exactly the pinned DDL", () => {
       'DROP INDEX "items__stale"',
       'CREATE INDEX "items__by_at" ON "items" ("at" ASC NULLS FIRST, "id" ASC)'
     ])
+    // A legacy snapshot has no fabricated history; index-only migrations still record the same floor identity.
+    const first = Migrate.generate({
+      previous: snapshotOf(v1),
+      registry: Registry.make([v1]),
+      existing: ["001_legacy"],
+      name: "tracked"
+    })
+    const second = Migrate.generate({
+      previous: Migrate.decodeSnapshot(first.snapshot),
+      registry: Registry.make([v2]),
+      existing: ["001_legacy", first.id],
+      name: "indexed"
+    })
+    expect(Migrate.decodeSnapshot(second.snapshot).history).toEqual([
+      { migration: "002_tracked", dataHash: Registry.make([v1]).dataHash },
+      { migration: "003_indexed", dataHash: Registry.make([v2]).dataHash }
+    ])
   })
 
   it("scope_grants is the engine's table and is never planned; no change plans nothing", () => {

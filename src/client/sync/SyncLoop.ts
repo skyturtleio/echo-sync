@@ -38,7 +38,7 @@ export const SyncPhase = Schema.Literals(["idle", "pushing", "pulling", "backoff
 export type SyncPhase = typeof SyncPhase.Type
 
 /**
- * What kind of transient failure `lastError` reports (DESIGN §9.1), so an app can tell "sign in again"
+ * What kind of failure `lastError` reports (DESIGN §9.1), so an app can tell "sign in again"
  * from "you are offline" without parsing text:
  * - `credentials`: `syncHeaders` raised; nothing was sent.
  * - `unauthorized`: the server rejected the credential (`Unauthorized` or HTTP 401/403).
@@ -47,6 +47,8 @@ export type SyncPhase = typeof SyncPhase.Type
  *   or unreadable after an HTTP response arrived).
  * - `server`: the fallback for any other transient failure: a stopped push batch, a pull defect, a
  *   local `StoreUnavailable`.
+ * - `outdated`: compatibility policy refused this client; sync stays stopped until a new leader.
+ * - `server-outdated`: a known-table payload lacks a declared column; back off without rebuilding.
  */
 export const SyncErrorKind = Schema.Literals([
   "credentials",
@@ -60,7 +62,7 @@ export const SyncErrorKind = Schema.Literals([
 export type SyncErrorKind = typeof SyncErrorKind.Type
 
 /**
- * A transient failure: its kind and a library-controlled description of it (DESIGN §9.1). Never raw
+ * A failure: its kind and a library-controlled description of it (DESIGN §9.1). Never raw
  * error text, so never header values, bodies, URLs or tokens; the leader logs the full cause.
  */
 export const SyncError = Schema.Struct({ kind: SyncErrorKind, message: Schema.String })
@@ -69,7 +71,7 @@ export type SyncError = typeof SyncError.Type
 /** The leader's sync state (DESIGN §9.1). No `connected` flag: a finished cycle proves nothing about now. */
 export const SyncStatus = Schema.Struct({
   push: PushState,
-  /** Last transient failure, cleared by the next cycle that completes cleanly. */
+  /** Last failure, cleared by a clean cycle; `outdated` persists for this leader's lifetime. */
   lastError: Schema.NullOr(SyncError),
   /** Unreleased outbox entries (pushed-but-not-installed included); follows every append and release. */
   pendingMutations: Schema.Int,
@@ -84,7 +86,7 @@ export type SyncStatus = typeof SyncStatus.Type
 export interface SyncLoop {
   /**
    * Request a cycle soon (coalesced: many wakes while one is queued run one cycle). During backoff it
-   * cuts the wait short; it never clears a `Halted` push.
+   * cuts the wait short; it never clears a `Halted` push or a terminal `outdated` stop.
    */
   readonly wake: Effect.Effect<void>
   readonly status: Effect.Effect<SyncStatus>

@@ -511,7 +511,7 @@ describe("reconciliation simulation", () => {
       })
   )
 
-  it.effect("a known-table row that does not decode fails the install whole: no ack, cursor or staging change", () =>
+  it.effect("a known-table row missing declared keys is server-outdated: no ack, cursor or staging change", () =>
     Effect.gen(function* () {
       const disk = installedDisk()
       const ack = { mutationId: id("u-1"), position: position(2n), outcome: { _tag: "Applied" as const } }
@@ -532,7 +532,7 @@ describe("reconciliation simulation", () => {
       yield* engine.mutate(id("u-1"), "increment", { id: "x", by: 5 })
 
       const error = yield* Effect.flip(engine.pull)
-      assert.strictEqual(error._tag, "MalformedChange")
+      assert.strictEqual(error._tag, "ServerOutdated")
       assert.strictEqual(disk.outbox.length, 1) // a released intent would have no covering row
       assert.strictEqual(disk.meta.cursor, position(1n))
       assert.strictEqual(disk.staged.length, 1)
