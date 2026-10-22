@@ -369,9 +369,10 @@ const reset = (message: Reset): Effect.Effect<ResetOutcome> =>
         // go in time (an old build, a frozen tab) is `ReplicaInUse` and nothing is touched. A grant after the
         // deadline is released at once (`holdLockWithin`), so this worker never holds the lock it gave up on.
         const lock = Platform.leaderLockName(identity)
-        const held =
-          (yield* Platform.tryHoldLock(lock)) || (yield* Platform.holdLockWithin(lock, message.closeTimeoutMillis))
-        if (!held) return { _tag: "ReplicaInUse" } satisfies ResetOutcome
+        // One request, so it queues before any candidate spawned later. `closeTimeout` is its whole budget: a
+        // timeout too short for even a free lock's (asynchronous) grant answers `ReplicaInUse`, never a deletion.
+        if (!(yield* Platform.holdLockWithin(lock, message.closeTimeoutMillis)))
+          return { _tag: "ReplicaInUse" } satisfies ResetOutcome
         if ((yield* opfsDirectory(poolDirectory)) === undefined) return { _tag: "Done" } satisfies ResetOutcome
         if (message.discardPending) {
           // Never opens the database (DESIGN §9.1): a corrupt or partially removed replica can still be reset.

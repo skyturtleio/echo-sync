@@ -178,7 +178,9 @@ also runs when no tab client for that identity is alive. It closes the identity'
   path in that client starts, elects or joins a leader again: using the replica again means building a new
   `LeaderClient`. The signal is an event, not a tombstone: a client built afterwards never sees it. The router
   needs no message; the dead leader's epoch lock clears its route. Single-tab mode coordinates the same way.
-- The reset worker takes the leader lock if it is free, else queues for it at most `closeTimeout` (default 5 s).
+- The reset worker requests the leader lock once and waits for it at most `closeTimeout` (default 5 s), so a
+  candidate spawned later queues behind the reset, never ahead of it. `closeTimeout` is the whole budget: one too
+  short for even a free lock's asynchronous grant (0 ms, say) answers `ReplicaInUse` and deletes nothing.
   A holder that does not let go in time (an old build, a frozen tab) is `ReplicaInUse`, and nothing is touched.
   The deadline and the grant are decided in one lock-request callback (`Platform.holdLockWithin`): a grant
   whose callback runs after the deadline fired is released at once, so the worker never holds a lock it gave

@@ -120,8 +120,10 @@ const request = (
     // A deadline gives up the wait with `undefined`. Exactly one of the deadline and the grant decides, both on
     // this thread: a grant whose callback runs after the deadline fired sees `signal.aborted` and is released
     // at once, so a waiter that gave up never ends up holding the lock.
+    // One signal for both the deadline and interruption, without `AbortSignal.any` (Safari < 17.4 lacks it).
     const deadline = new AbortController()
-    const signal = AbortSignal.any([interrupted, deadline.signal])
+    const signal = deadline.signal
+    interrupted.addEventListener("abort", () => deadline.abort(), { once: true })
     let granted = false
     let timer: ReturnType<typeof setTimeout> | undefined
     const within = options.withinMillis

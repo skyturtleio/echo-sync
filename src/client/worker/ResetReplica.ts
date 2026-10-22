@@ -43,7 +43,8 @@ export interface ResetReplicaOptions {
   readonly discardPending?: true
   /**
    * How long to wait for the identity's clients to let go of the leader lock after the reset signal before
-   * failing `ReplicaInUse`. Default 5 s.
+   * failing `ReplicaInUse`; the whole budget for the lock request, so a near-zero value can refuse even a free
+   * lock. Default 5 s.
    */
   readonly closeTimeout?: Duration.Input
 }
