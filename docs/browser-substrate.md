@@ -194,8 +194,11 @@ also runs when no tab client for that identity is alive. It closes the identity'
 - With `discardPending` it never opens the database (DESIGN §9.1, 5fcccb7): it only waits, as a new leader
   does, for a predecessor's access handles to be released. So a corrupt or partially removed replica can
   still be reset.
-- Then it closes whatever it opened (database and pool, releasing the access handles), removes the directory
-  `echo-sync/<appId>/<profile>` recursively, and releases the lock last. A candidate of a client built after the signal that
+- Then it closes whatever it opened (database and pool, releasing the access handles), writes the identity's
+  tombstone `echo-sync/<appId>/~reset-<sha256(profile)>` (DESIGN §16.26), removes the directory
+  `echo-sync/<appId>/<profile>` recursively, removes the tombstone, and releases the lock last. The tombstone
+  is written only here, under the lock and after the pending decision, and removed only after the directory;
+  its `~` prefix is outside `validateIdentity`'s charset, so it is never a profile's directory. A candidate of a client built after the signal that
   queued meanwhile is elected only after the directory is gone, so it creates a fresh replica with a new `clientId`. After a
   `PendingWrites` refusal the clients stay reset and the lock is free, so `discardPending` succeeds at once, and
   a new `LeaderClient` keeps the data.
@@ -204,9 +207,17 @@ also runs when no tab client for that identity is alive. It closes the identity'
 - Notices belong to the replica and go with it. The outbox is the only guarded content.
 - Any other failure (unsupported browser, invalid identity, an OPFS error, a `spawnLeader` or
   `postMessage` that throws) is `ResetFailed { message }`; interruption stays interruption.
-  Interrupting the reset terminates its worker, and the browser then releases the lock and handles. A
-  removal that had already begun may be partial. What a leader makes of such a directory is not
-  established; a reset with `discardPending` never opens it, so retry that.
+  Interrupting the reset terminates its worker, and the browser then releases the lock and handles.
+- Durable across a crash (DESIGN §16.26): a reset worker that ends before the tombstone is written leaves the
+  replica intact (same `clientId`, outbox and rows). After the tombstone is written, interruption can leave
+  the directory intact, partially removed or gone, with the tombstone still present: the tombstone is removed
+  only after the directory removal succeeded. If both removals completed before the interruption, neither
+  remains. Every leader, after taking the leader and epoch locks and before
+  opening its pool, checks for its identity's tombstone; if present it completes the removal (directory, then
+  tombstone) and starts on a fresh, empty replica with a new `clientId`, transparently to the tab. A reset
+  that finds the tombstone under the lock completes the removal the same way and answers `Done` without
+  opening or counting the condemned database. A leader whose completion fails cannot serve: it releases its
+  locks and ends without opening the replica. A reset whose completion fails answers `ResetFailed`. No app-side reset or recovery marker is needed.
 
 Evidence: `scenarios.sh` "coordinated reset …" checks (from the leader tab, from a follower tab, and in
 single-tab mode from the tab whose candidate is queued: the directory is gone, both clients are reset with
@@ -219,7 +230,15 @@ checks: a leader whose page ignores the signal (`?ignoreReset`) → `ReplicaInUs
 with the directory listing unchanged and no queued leader request left; one pending write → `PendingWrites{1}` unchanged; `discardPending` removes `a` and keeps `b`; the
 next leader for `a` has an empty outbox and a new `clientId`; `b` keeps its rows and `clientId`; a replica
 whose database header is overwritten is refused with `ResetFailed` and left intact without
-`discardPending`, and removed with it; throwing `spawnLeader` and `postMessage` are `ResetFailed`).
+`discardPending`, and removed with it; throwing `spawnLeader` and `postMessage` are `ResetFailed`). The
+"reset …" checks of DESIGN §16.26 terminate the reset worker at a harness crash point
+(`echo.resetReplica(…, 'beforeTombstone' | 'midRemoval')`): a reset that ends before its tombstone
+(`ReplicaInUse`, `PendingWrites`, or terminated before the write) leaves the replica intact with no tombstone;
+another profile's tombstone and partial directory change nothing for this identity; after a crash past the
+tombstone, the next `LeaderClient` starts on a fresh, empty replica with a new `clientId`, and no tombstone and
+none of the condemned pool files remain (the new leader's fresh pool directory is expected); a second
+`resetReplica` without `discardPending`, on a condemned replica that still holds a pending write, answers `Done`
+with neither directory nor tombstone left. On the prior main all four fail.
 
 ### Presence (`presence` / `track`, DESIGN §9.1, §12, §16 item 13)
 
@@ -586,7 +605,10 @@ Harness-only fault injection (in `examples/browser-spike/leader.worker.ts`, enab
 `crashAfterCommit` ends that tab's leader worker instead of sending a committed `enqueue` response whose
 mutation id starts with `crash-after-commit`; `failOpen` makes OPFS startup fail when another tab posts on
 `echo-test:fail-open`; `ignoreReset` (in `main.ts`) mutes the page's engine reset channels, as an old build
-would. `echo.forgeLeaderAnnouncement(id)` replays a leader announcement to the router.
+would; `echo.resetReplica(target, discard, 'beforeTombstone' | 'midRemoval')` gives only that reset's worker
+a crash point (`resetFault`: the tombstone's creation never starts, or a recursive removal deletes one
+non-database pool file and stalls) and interrupts the reset, terminating the worker, once it is reached.
+`echo.forgeLeaderAnnouncement(id)` replays a leader announcement to the router.
 `?syncUrl=<url>` gives that tab's leader a sync loop; `examples/browser-spike/fakeSync.ts` mounts a fake
 `SyncRpcs` server at `/fake-sync/rpc` (Vite middleware) whose push always fails with `MalformedEnvelope`,
 whose pull answers an empty `PullDone` and whose pokes stream ends after one poke, with per-client
