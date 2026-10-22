@@ -126,6 +126,80 @@ it.effect(
     }).pipe(Effect.provide(recording), Effect.provideService(References.MinimumLogLevel, "All"))
 )
 
+it.live(
+  "a stalled consumer backpressures the client stream: bounded read-ahead, ordered lossless drain, then the terminal message",
+  () =>
+    Effect.gen(function* () {
+      // Wrong implementation: an unbounded queue reads the whole client stream ahead of a stalled FoldKit consumer.
+      let pulled = 0
+      const upstream = Stream.concat(
+        Stream.fromIterable(Array.from({ length: 1000 }, (_, i) => i)).pipe(
+          Stream.tap(() => Effect.sync(() => void pulled++))
+        ),
+        Stream.fail(new LeaderRpcs.SqlFailure({ message: "x" }))
+      )
+      const source = Effect.map(client(calls({})), (c) => ({ ...c, notices: Stream.map(upstream, () => []) }))
+      let i = 0
+      const values = Echo.notices(source, { onValue: () => i++, onFailure: (f) => f._tag })
+      const gate = yield* Deferred.make<void>()
+      const seen: Array<number | string> = []
+      const running = yield* Effect.forkChild(
+        Stream.runForEach(values, (o) =>
+          Effect.suspend(() => {
+            seen.push(o)
+            return seen.length === 1 ? Deferred.await(gate) : Effect.void
+          })
+        )
+      )
+      yield* Effect.sleep("100 millis")
+      expect(seen).toEqual([0])
+      expect(pulled).toBeLessThan(10)
+      yield* Deferred.succeed(gate, undefined)
+      yield* Fiber.join(running)
+      expect(seen).toEqual([...Array.from({ length: 1000 }, (_, k) => k), "Error"])
+
+      // Torn down while the producer is blocked on a full queue: completes without hanging, runs the client
+      // stream's finalizers, yields no failure message and no escaped cause. Wrong implementation: the blocked
+      // producer outlives the consumer and the client stream is never released.
+      let blockedPulls = 0
+      let finalized = false
+      const saturated = yield* Deferred.make<void>()
+      const held = Stream.fromIterable(Array.from({ length: 1000 }, (_, k) => k)).pipe(
+        Stream.tap(() =>
+          Effect.suspend(() => {
+            blockedPulls++
+            // One consumed, one buffered, one awaiting its offer: the producer is now blocked.
+            return blockedPulls === 3 ? Deferred.succeed(saturated, undefined) : Effect.void
+          })
+        ),
+        Stream.ensuring(Effect.sync(() => void (finalized = true)))
+      )
+      const heldSource = Effect.map(client(calls({})), (c) => ({ ...c, notices: Stream.map(held, () => []) }))
+      const stalled: Array<unknown> = []
+      const delivered = yield* Deferred.make<void>()
+      const blocked = yield* Effect.forkChild(
+        Stream.runForEach(Echo.notices(heldSource, { onValue: () => "v", onFailure: (f) => f._tag }), (o) =>
+          Effect.andThen(
+            Effect.andThen(
+              Effect.sync(() => void stalled.push(o)),
+              Deferred.succeed(delivered, undefined)
+            ),
+            Effect.never
+          )
+        )
+      )
+      yield* Deferred.await(delivered).pipe(Effect.timeout("5 seconds"))
+      yield* Deferred.await(saturated).pipe(Effect.timeout("5 seconds"))
+      yield* Fiber.interrupt(blocked).pipe(Effect.timeout("5 seconds"))
+      const exit = yield* Fiber.await(blocked)
+      expect(Exit.hasInterrupts(exit)).toBe(true)
+      expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(false)
+      expect(finalized).toBe(true)
+      expect(stalled).toEqual(["v"])
+      expect(blockedPulls).toBeLessThan(10)
+    })
+)
+
 it.effect("a typed error is the stream's last message and the adapter never re-subscribes", () =>
   Effect.gen(function* () {
     let opens = 0

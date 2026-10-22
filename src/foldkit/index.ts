@@ -94,7 +94,8 @@ const watch = <A, E, R, V, F>(
           ? Queue.failCause(queue, Cause.interrupt())
           : Effect.andThen(Queue.offer(queue, h.onFailure(failure)), Queue.end(queue))
       }),
-    { strategy: "suspend" }
+    // Bounded read-ahead: a stalled FoldKit consumer backpressures the client stream instead of buffering it.
+    { strategy: "suspend", bufferSize: 1 }
   )
 
 const run = <A, E, R, V, F>(
