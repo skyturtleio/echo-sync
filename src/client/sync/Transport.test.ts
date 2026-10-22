@@ -1,6 +1,6 @@
 import { expect, it } from "@effect/vitest"
 import { Cause, Effect, Exit, Layer, Option, Schema, Stream } from "effect"
-import { FetchHttpClient, HttpRouter } from "effect/http"
+import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
 import { Rpc, RpcClient, RpcGroup, RpcSerialization, RpcServer } from "effect/rpc"
 import { AccessScope, Ids, Mutation, Protocol, Registry } from "echo-sync"
 import * as Engine from "./Engine.ts"
@@ -643,32 +643,60 @@ it.live("a server Unauthorized is reported as kind unauthorized", () =>
 )
 
 it.live(
-  "an empty HTTP 401 reports unauthorized, retries with backoff without halting, and keeps the pending mutation",
+  "HTTP auth refusals before RPC decoding report unauthorized, retry without halting, and keep the pending mutation; other statuses stay network",
   () =>
     Effect.gen(function* () {
-      let requests = 0
-      const fetch = Object.assign(
-        (_input: URL | RequestInfo, _init?: RequestInit) => {
-          requests++
-          return Promise.resolve(new Response(null, { status: 401 }))
-        },
-        { preconnect: globalThis.fetch.preconnect }
-      )
-      const transport = yield* Transport.make.pipe(Effect.provide(Transport.layerProtocolHttp("http://echo.test/sync")))
-      const { loop, statuses, pending } = yield* loopOver(transport)
-      yield* Effect.forkChild(loop.run.pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)))
-      yield* eventually(
-        () => statuses.filter((s) => s.phase === "backoff").length >= 2,
-        "two failed cycles with backoff"
-      )
-      expect(firstError(statuses)).toEqual({
-        kind: "unauthorized",
-        message: "the server rejected the credential"
-      })
-      expect(requests).toBeGreaterThanOrEqual(4) // push and pull, then their retries
-      expect(statuses.map((s) => s.push._tag)).not.toContain("Halted")
-      expect(statuses.filter((s) => s.phase === "backoff").every((s) => s.nextRetryAt !== null)).toBe(true)
-      expect((yield* pending).map((entry) => [entry.envelope.mutationId, entry.envelope.seq])).toEqual([["m1", 1]])
+      for (const status of [401, 403, 500]) {
+        yield* Effect.gen(function* () {
+          const received: Array<string | undefined> = []
+          const refusal = HttpRouter.middleware((httpEffect) =>
+            Effect.gen(function* () {
+              const request = yield* HttpServerRequest.HttpServerRequest
+              received.push(request.headers["authorization"])
+              if (status !== 200) return HttpServerResponse.empty({ status })
+              return yield* httpEffect
+            })
+          )
+          const app = RpcServer.layerHttp({ group: Protocol.SyncRpcs, path: "/sync", protocol: "http" }).pipe(
+            Layer.provide([
+              Protocol.SyncRpcs.toLayer({
+                push: () => Effect.die("middleware must refuse before RPC"),
+                pull: () => Effect.die("middleware must refuse before RPC"),
+                pokes: () => Stream.die("middleware must refuse before RPC")
+              }),
+              RpcSerialization.layerNdjson,
+              refusal.layer
+            ])
+          )
+          const web = HttpRouter.toWebHandler(app, { disableLogger: true })
+          yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
+          const fetch = Object.assign(
+            (input: URL | RequestInfo, init?: RequestInit) => web.handler(new Request(input, init)),
+            { preconnect: globalThis.fetch.preconnect }
+          )
+          const transport = yield* Transport.make.pipe(
+            Effect.provide(
+              Transport.layerProtocolHttp("http://echo.test/sync", Effect.succeed({ authorization: "valid-token" }))
+            )
+          )
+          const { loop, statuses, pending } = yield* loopOver(transport)
+          yield* Effect.forkChild(loop.run.pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)))
+          yield* eventually(
+            () => statuses.filter((s) => s.phase === "backoff").length >= 2,
+            "two failed cycles with backoff"
+          )
+          expect(firstError(statuses)).toEqual(
+            status === 500
+              ? { kind: "network", message: "the request produced no usable response" }
+              : { kind: "unauthorized", message: "the server rejected the credential" }
+          )
+          expect(received.length).toBeGreaterThanOrEqual(4) // push and pull, then their retries
+          expect(received.every((token) => token === "valid-token")).toBe(true)
+          expect(statuses.map((s) => s.push._tag)).not.toContain("Halted")
+          expect(statuses.filter((s) => s.phase === "backoff").every((s) => s.nextRetryAt !== null)).toBe(true)
+          expect((yield* pending).map((entry) => [entry.envelope.mutationId, entry.envelope.seq])).toEqual([["m1", 1]])
+        }).pipe(Effect.scoped)
+      }
     }).pipe(Effect.scoped)
 )
 

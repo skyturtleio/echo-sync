@@ -495,6 +495,8 @@ tables and replica schema, one transaction) and builds `Engine.make` over the SQ
   `unauthorized`, `unavailable` (`ServerUnavailable`), `network` (no usable RPC result) or `server`
   (the fallback, local `StoreUnavailable` included); `message` is a library constant per kind, never
   raw error text, and the `Halted` reason follows the same rule. The full cause goes to the leader log.
+  HTTP 401/403 on push or pull report `unauthorized`; stream-only refusals on pokes or room use their
+  separate retry loops and do not update `syncStatus.lastError`.
   `pendingMutations` is a recount of unreleased `echo_outbox` rows taken under the storage permit after
   every write to that table (`SqliteSyncStorage.pendingCount`, reactive on the connection's update hook),
   so it follows each enqueue and release, not only cycle ends, and cannot drift. A leader publishes no
