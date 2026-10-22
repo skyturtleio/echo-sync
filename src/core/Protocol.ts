@@ -5,6 +5,14 @@ import { ClientId, Cursor, MutationId, Position, Seq, SeqFloor } from "./Ids.ts"
 import { MutationOutcome } from "./Mutation.ts"
 import { EncodedRow } from "./SyncTable.ts"
 
+/** Engine wire contract, independent of the app's registry hash. Not an equality gate. */
+export const wireVersion = 1
+export const ClientVersion = Schema.Struct({
+  dataHash: Schema.String,
+  wireVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+})
+export type ClientVersion = typeof ClientVersion.Type
+
 // ---------------------------------------------------------------------------------------------
 // Push (DESIGN §6)
 // ---------------------------------------------------------------------------------------------
@@ -20,6 +28,8 @@ export type PushMutation = typeof PushMutation.Type
 
 export const PushRequest = Schema.Struct({
   clientId: ClientId,
+  /** Absent only for pre-gate clients; never infer compatibility from absence. */
+  clientVersion: Schema.optionalKey(ClientVersion),
   mutations: Schema.NonEmptyArray(PushMutation).check(Schema.isMaxLength(100))
 })
 export type PushRequest = typeof PushRequest.Type
@@ -59,6 +69,7 @@ export type Ack = typeof Ack.Type
 
 export const PullRequest = Schema.Struct({
   clientId: ClientId,
+  clientVersion: Schema.optionalKey(ClientVersion),
   cursor: Cursor,
   continuation: Schema.OptionFromNullOr(PullContinuation)
 })
@@ -95,6 +106,11 @@ export class Unauthorized extends Schema.TaggedError<Unauthorized>()("Unauthoriz
   message: Schema.String
 }) {}
 
+/** App policy refused this client. Stop sync until reload, without changing local storage. */
+export class ClientOutdated extends Schema.TaggedError<ClientOutdated>()("ClientOutdated", {
+  message: Schema.String
+}) {}
+
 /**
  * Request-level push rejection (DESIGN §6): an envelope in the batch is malformed (e.g.
  * `seq < 1`), so the whole push is refused; nothing is executed or ledgered.
@@ -126,12 +142,12 @@ export const SyncRpcs = RpcGroup.make(
   Rpc.make("push", {
     payload: PushRequest,
     success: PushResponse,
-    error: Schema.Union([MalformedEnvelope, Unauthorized])
+    error: Schema.Union([MalformedEnvelope, Unauthorized, ClientOutdated])
   }),
   Rpc.make("pull", {
     payload: PullRequest,
     success: PullResponse,
-    error: Schema.Union([ResnapshotRequired, ServerUnavailable, Unauthorized])
+    error: Schema.Union([ResnapshotRequired, ServerUnavailable, Unauthorized, ClientOutdated])
   }),
   Rpc.make("pokes", {
     payload: { clientId: ClientId },

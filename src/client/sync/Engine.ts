@@ -105,6 +105,11 @@ export class MalformedChange extends Schema.TaggedError<MalformedChange>()("Malf
   message: Schema.String
 }) {}
 
+/** A known table's server payload lacks a declared wire column. Retry, never rebuild. */
+export class ServerOutdated extends Schema.TaggedError<ServerOutdated>()("ServerOutdated", {
+  table: Schema.String
+}) {}
+
 /** The handler rejected the mutation against the local replica; nothing was saved. */
 export class LocallyRejected extends Schema.TaggedError<LocallyRejected>()("LocallyRejected", {
   name: Schema.String,
@@ -202,7 +207,13 @@ const applyChange = (storage: SyncStorage, registry: Registry.SyncRegistry, chan
     // canonical re-encoding (excess columns dropped, values normalized), as every writer does.
     const malformed = (error: Schema.SchemaError) =>
       new MalformedChange({ table: change.table, message: error.message })
-    const decoded = yield* Schema.decodeUnknownEffect(table.value.wire)(change.row).pipe(Effect.mapError(malformed))
+    const decoded = yield* Schema.decodeUnknownEffect(table.value.wire)(change.row).pipe(
+      Effect.mapError((error) =>
+        table.value.columns.some((column) => !Object.hasOwn(change.row, column.name))
+          ? new ServerOutdated({ table: change.table })
+          : malformed(error)
+      )
+    )
     const row = yield* Schema.encodeEffect(table.value.wire)(decoded).pipe(Effect.mapError(malformed))
     yield* storage.rows.write(table.value, decoded.id, Option.some(row))
   })
@@ -271,7 +282,7 @@ export interface Engine<TE> {
   /** Pulls until `PullDone`, staging intermediate pages, then installs the set atomically. */
   readonly pull: Effect.Effect<
     void,
-    StoreUnavailable | Errors.ConstraintViolated | TE | Protocol.ResnapshotRequired | MalformedChange
+    StoreUnavailable | Errors.ConstraintViolated | TE | Protocol.ResnapshotRequired | MalformedChange | ServerOutdated
   >
 }
 
@@ -290,6 +301,10 @@ export const make = <TE>(options: {
   Effect.gen(function* () {
     const { clientId, storage, transport } = options
     const context = { storage, mutations: options.mutations, actor: options.actor, registry: options.registry }
+    const clientVersion: Protocol.ClientVersion = {
+      dataHash: options.registry.dataHash,
+      wireVersion: Protocol.wireVersion
+    }
     const batchSize = Math.min(options.pushBatchSize ?? 50, 100)
     const pushLock = yield* Semaphore.make(1)
     const pullLock = yield* Semaphore.make(1)
@@ -321,6 +336,7 @@ export const make = <TE>(options: {
           if (!Arr.isReadonlyArrayNonEmpty(batch)) return { processed, stopped: false }
           const response = yield* transport.push({
             clientId,
+            clientVersion,
             mutations: Arr.map(batch, ({ envelope }) => ({
               mutationId: envelope.mutationId,
               seq: envelope.seq,
@@ -373,7 +389,7 @@ export const make = <TE>(options: {
             Effect.all({ meta: storage.meta, staged: storage.staged })
           )
           const continuation = Option.fromNullishOr(staged.at(-1)?.continuation)
-          const request: Protocol.PullRequest = { clientId, cursor: pullFrom(meta), continuation }
+          const request: Protocol.PullRequest = { clientId, clientVersion, cursor: pullFrom(meta), continuation }
           const page = yield* transport.pull(request).pipe(
             Effect.map(Option.some<Protocol.PullResponse>),
             // Generic `TE` defeats `catchTag`'s tag extraction, so narrow by class.

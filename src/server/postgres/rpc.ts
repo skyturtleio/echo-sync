@@ -25,7 +25,7 @@ import { isSqlError, type SqlError } from "effect/sql/SqlError"
 import { AccessScope, Ids, Mutation, Protocol, type Registry, Store } from "echo-sync"
 import { type ClientForbidden, type LedgerOptions, registerClient, runBatch } from "./ledger.ts"
 import * as Presence from "./presence.ts"
-import { pull } from "./pull.ts"
+import { type ClientPolicy, pull } from "./pull.ts"
 import * as RowStore from "./rowStore.ts"
 import { resolveTables } from "./schema.ts"
 
@@ -37,6 +37,8 @@ export interface SyncServerOptions {
    * Body-supplied RPC message headers are never exposed. Runs for every call / stream open.
    */
   readonly principalFor: (headers: Headers) => Effect.Effect<AccessScope.PrincipalId, Protocol.Unauthorized>
+  /** After authentication, before any sync work. Omitted = serve, including legacy clients. */
+  readonly clientPolicy?: ClientPolicy | undefined
   /** Upserts and tombstones per pull page. Default 500. */
   readonly pageLimit?: number | undefined
   readonly ledger?: LedgerOptions | undefined
@@ -323,11 +325,16 @@ export const layerNotifications = (options: Pick<SyncServerOptions, "heartbeatIn
  * push on any defect). A client id bound to another principal fails `Unauthorized`.
  */
 export const executeBatch = (
-  options: Pick<SyncServerOptions, "registry" | "mutations" | "ledger">,
+  options: Pick<SyncServerOptions, "registry" | "mutations" | "ledger" | "clientPolicy">,
   actor: AccessScope.PrincipalId,
   request: Protocol.PushRequest
-): Effect.Effect<Protocol.PushResponse, Protocol.Unauthorized | Protocol.MalformedEnvelope, SqlClient> =>
+): Effect.Effect<
+  Protocol.PushResponse,
+  Protocol.Unauthorized | Protocol.MalformedEnvelope | Protocol.ClientOutdated,
+  SqlClient
+> =>
   Effect.gen(function* () {
+    if (options.clientPolicy !== undefined) yield* options.clientPolicy(request.clientVersion)
     const sql = yield* SqlClient
     const tables = yield* resolveTables(options.registry)
     const rowStore = yield* RowStore.make(new Map(tables.map((t) => [t.table.name, t.schema])))
@@ -397,13 +404,18 @@ export const handlers = (options: SyncServerOptions) =>
         pull: (request) =>
           Effect.gen(function* () {
             const principalId = yield* options.principalFor(yield* requestHeaders)
-            return yield* pull(options.registry, {
-              principalId,
-              clientId: request.clientId,
-              cursor: request.cursor,
-              continuation: request.continuation,
-              limit: options.pageLimit ?? 500
-            })
+            return yield* pull(
+              options.registry,
+              {
+                principalId,
+                clientId: request.clientId,
+                clientVersion: request.clientVersion,
+                cursor: request.cursor,
+                continuation: request.continuation,
+                limit: options.pageLimit ?? 500
+              },
+              options.clientPolicy
+            )
           }).pipe(serverFailures, Effect.provideService(SqlClient, sql)),
         pokes: ({ clientId }) =>
           Stream.unwrap(

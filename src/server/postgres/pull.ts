@@ -37,10 +37,14 @@ const ContinuationJson = Schema.fromJsonString(Continuation)
 const encodeContinuation = Schema.encodeSync(ContinuationJson)
 const decodeContinuation = Schema.decodeUnknownEffect(ContinuationJson)
 
+/** Untrusted compatibility advice, never authorization. Omission serves every client. */
+export type ClientPolicy = (version: Protocol.ClientVersion | undefined) => Effect.Effect<void, Protocol.ClientOutdated>
+
 /** The server-side request: the principal is authenticated by the app, never taken from the wire. */
 export interface PullRequest {
   readonly principalId: string
   readonly clientId: string
+  readonly clientVersion?: Protocol.ClientVersion | undefined
   readonly cursor: bigint | null
   readonly continuation: Option.Option<string>
   /** Upper bound on upserts and tombstones per page (≥ 1). Purges are not counted. */
@@ -87,7 +91,12 @@ const payloadOf = Effect.fnUntraced(function* (table: SyncTable.AnySyncTable, ra
  * At `PullDone` the held set is recorded under `nextCursor`, so the next page set starts from it.
  * See docs/server-substrate.md.
  */
-export const pull = Effect.fnUntraced(function* (registry: Registry.SyncRegistry, request: PullRequest) {
+export const pull = Effect.fnUntraced(function* (
+  registry: Registry.SyncRegistry,
+  request: PullRequest,
+  clientPolicy?: ClientPolicy
+) {
+  if (clientPolicy !== undefined) yield* clientPolicy(request.clientVersion)
   const sql = yield* SqlClient
   yield* registerClient(request.principalId, request.clientId)
   const stale = new Protocol.ResnapshotRequired({ reason: "staleContinuation" })

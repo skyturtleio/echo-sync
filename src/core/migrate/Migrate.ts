@@ -34,8 +34,13 @@ const TableManifestSchema = Schema.Struct({
   indexHash: Schema.String
 })
 
-/** The committed snapshot: the app tables' manifests, sorted by name. */
-export const Snapshot = Schema.Struct({ version: Schema.Literal(1), tables: Schema.Array(TableManifestSchema) })
+/** The committed snapshot, with registry hashes (system tables included) at migration boundaries. */
+export const Snapshot = Schema.Struct({
+  version: Schema.Literal(1),
+  tables: Schema.Array(TableManifestSchema),
+  /** Missing in pre-gate snapshots; never invent history for their earlier migrations. */
+  history: Schema.optionalKey(Schema.Array(Schema.Struct({ migration: Schema.String, dataHash: Schema.String })))
+})
 export type Snapshot = typeof Snapshot.Type
 
 /** The snapshot before the first app migration. */
@@ -433,5 +438,9 @@ export const generate = (options: {
 }): Generated => {
   const id = nextId(options.existing, options.name)
   const steps = plan(options.previous, options.registry, options.intent)
-  return { id, source: render(id, steps), snapshot: encodeSnapshot(snapshotOf(options.registry)), steps }
+  const snapshot: Snapshot = {
+    ...snapshotOf(options.registry),
+    history: [...(options.previous.history ?? []), { migration: id, dataHash: options.registry.dataHash }]
+  }
+  return { id, source: render(id, steps), snapshot: encodeSnapshot(snapshot), steps }
 }

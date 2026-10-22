@@ -40,6 +40,7 @@ export type TransportError =
   | Protocol.Unauthorized
   | Protocol.MalformedEnvelope
   | Protocol.ServerUnavailable
+  | Protocol.ClientOutdated
   | PushIntegrityError
   | PullProtocolError
 

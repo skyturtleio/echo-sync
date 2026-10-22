@@ -12,7 +12,7 @@ export {
   runBatch,
   runMutation
 } from "./ledger.ts"
-export { pull, type PullRequest } from "./pull.ts"
+export { type ClientPolicy, pull, type PullRequest } from "./pull.ts"
 export * as RowStore from "./rowStore.ts"
 export {
   executeBatch,

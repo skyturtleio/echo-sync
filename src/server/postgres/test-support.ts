@@ -169,7 +169,11 @@ export class Replica {
   sync(limit = 1000) {
     const loop = (
       remaining: number
-    ): Effect.Effect<void, Protocol.ResnapshotRequired | ClientForbidden | SqlError, SqlClient> =>
+    ): Effect.Effect<
+      void,
+      Protocol.ResnapshotRequired | Protocol.ClientOutdated | ClientForbidden | SqlError,
+      SqlClient
+    > =>
       remaining === 0
         ? Effect.die(`pull did not reach PullDone from cursor ${String(this.cursor)}`)
         : Effect.flatMap(this.pullOnce(limit), (response) =>

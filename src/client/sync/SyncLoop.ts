@@ -48,7 +48,15 @@ export type SyncPhase = typeof SyncPhase.Type
  * - `server`: the fallback for any other transient failure: a stopped push batch, a pull defect, a
  *   local `StoreUnavailable`.
  */
-export const SyncErrorKind = Schema.Literals(["credentials", "unauthorized", "unavailable", "network", "server"])
+export const SyncErrorKind = Schema.Literals([
+  "credentials",
+  "unauthorized",
+  "unavailable",
+  "network",
+  "server",
+  "outdated",
+  "server-outdated"
+])
 export type SyncErrorKind = typeof SyncErrorKind.Type
 
 /**
@@ -123,6 +131,8 @@ const kindOf = (error: unknown): SyncErrorKind => {
   )
     return "unauthorized"
   if (tags.includes("ServerUnavailable")) return "unavailable"
+  if (tags.includes("ClientOutdated")) return "outdated"
+  if (tags.includes("ServerOutdated")) return "server-outdated"
   if (tags.includes("RpcClientError")) return "network"
   return "server"
 }
@@ -137,7 +147,9 @@ const messages: Record<SyncErrorKind, string> = {
   unauthorized: "the server rejected the credential",
   unavailable: "the server is temporarily unavailable",
   network: "the request produced no usable response",
-  server: "a transient failure; retrying"
+  server: "a transient failure; retrying",
+  outdated: "this client requires an update; sync is stopped",
+  "server-outdated": "the server is missing a declared column; retrying"
 }
 
 const stoppedBatch: SyncError = { kind: "server", message: "the server stopped the push batch at a transient failure" }
@@ -204,9 +216,21 @@ export const make = <TE>(options: {
     const wakes = yield* Queue.sliding<void>(1)
     // Completed once `pendingMutations` holds a real count; nothing reads the status before that.
     const counted = yield* Deferred.make<void>()
+    // Policy refusal is terminal for this leader, unlike the push-only integrity halt.
+    let outdated = false
+    const stopOutdated = (error: SyncError) => {
+      outdated = true
+      return SubscriptionRef.update(status, (s): SyncStatus => ({
+        ...s,
+        lastError: error,
+        phase: "idle",
+        nextRetryAt: null
+      }))
+    }
 
     /** One push+pull cycle; returns whether it hit a transient failure. */
     const cycle = Effect.gen(function* () {
+      if (outdated) return false
       let transient = Option.none<SyncError>()
       // A cycle whose push did not run (halted) or did not finish cleanly is not a completed sync.
       let pushedCleanly = false
@@ -215,6 +239,10 @@ export const make = <TE>(options: {
         const pushed = yield* Effect.exit(engine.push)
         if (Exit.isFailure(pushed)) {
           const { halts, error, halt } = yield* classify(pushed.cause, options.isFatalPush)
+          if (!halts && error.kind === "outdated") {
+            yield* stopOutdated(error)
+            return false
+          }
           if (halts) {
             yield* Effect.logError(`echo-sync: push halted by an integrity error: ${halt}`, pushed.cause)
             const halted: PushState = { _tag: "Halted", message: halt }
@@ -230,12 +258,16 @@ export const make = <TE>(options: {
         }
       }
       yield* setPhase("pulling")
-      // Every pull failure, a defect included, is transient (§6): nothing was installed.
+      // Nothing was installed on failure. Policy refusal stops sync; other failures back off.
       const pulled = yield* Effect.exit(engine.pull)
       if (Exit.isFailure(pulled)) {
         const { error } = yield* classify(pulled.cause, undefined)
+        if (error.kind === "outdated") {
+          yield* stopOutdated(error)
+          return false
+        }
         yield* Effect.logWarning(`echo-sync: pull failed (${error.kind}); retrying`, pulled.cause)
-        if (Option.isNone(transient)) transient = Option.some(error)
+        if (Option.isNone(transient) || error.kind === "server-outdated") transient = Option.some(error)
       }
       // `engine.pull` succeeds only once a `PullDone` set is installed.
       const syncedAt = pushedCleanly && Exit.isSuccess(pulled) ? yield* Clock.currentTimeMillis : undefined
