@@ -1050,7 +1050,12 @@ sidecar / invasive storage), Phoenix Presence (connection-scoped presence).
    client registry before staging: an incompatible page is never persisted; prior valid staging
    and its continuation are kept so the same page is re-fetched after backoff and can converge
    when the server catches up. Pre-fix poisoned staging needs no recovery path because no
-   production replica exists yet, and a registry rebuild already discards staging.
+   production replica existed when this landed, and a registry rebuild already discards staging.
+   **Production note:** NilBurger cut over on engine pin 3cb3492, one commit before this gate, so
+   its first production clients are pre-gate (no `clientVersion` on the wire, cannot decode
+   `ClientOutdated`, pre-fix staging). Its upgrade to 604dc2e must deploy server-first under the
+   default serve policy (or treat an absent `clientVersion` explicitly as legacy) and precede any
+   non-additive table change.
    (d) the generator keeps a history
    of committed `dataHash`es in `migrations/manifest.json` so an app can express its floor as
    "every manifest since NNN" without hand-copying hashes. Invariants: an old client against an
