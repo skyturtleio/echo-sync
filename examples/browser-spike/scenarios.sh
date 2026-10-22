@@ -444,6 +444,91 @@ return { pass: !s.ok && s.error._tag === 'ResetFailed' && s.error.message.includ
   && !p.ok && p.error._tag === 'ResetFailed' && p.error.message.includes('injected postMessage failure'), s, p }")"
 ab tab close "$R" >/dev/null
 
+# ── reset durability across a crash (DESIGN §16.26): an engine-owned tombstone ──────────────────────
+# Profiles "a" and "b" of one app each hold a row and a pending write (the fake server's push halts). Resets
+# with discardPending run from a tab of an unrelated app and are interrupted at a crash point inside their
+# worker (`echo.resetReplica(…, fault)`, leader.worker.ts), which terminates the worker there: before the
+# tombstone is written, or after it with the profile directory partially removed.
+APP="tomb-$RUN"
+seed() { # $1 = profile of the active tab; prints { clientId }
+  ev <<<"await echo.ready(); await echo.exec('CREATE TABLE keep (v TEXT)'); await echo.exec('INSERT INTO keep VALUES (?)', ['$1-row'])
+await echo.enqueue({ mutationId: 'pending-$1', name: 't', args: {} }); const i = await echo.info(); return { clientId: i.ok ? i.value.clientId : null }"
+}
+# This tab's replica: clientId, unreleased outbox entries and the `keep` rows (null if the table is absent).
+REPLICA="await echo.ready()
+const i = await echo.info(); const ob = await echo.exec('SELECT count(*) AS n FROM echo_outbox WHERE released_at IS NULL')
+const t = await echo.exec(\"SELECT count(*) AS n FROM sqlite_master WHERE name = 'keep'\")
+const k = t.ok && t.value[0].n > 0 ? await echo.exec('SELECT v FROM keep') : null
+return { clientId: i.ok ? i.value.clientId : null, outbox: ob.ok ? ob.value[0].n : null, keep: k === null ? null : k.ok ? k.value.map((r) => r.v) : k }"
+B=$(open_tab "$BASE/?app=$APP&profile=b&syncUrl=$BASE/fake-sync/rpc")
+tb0=$(seed b)
+ab tab close "$B" >/dev/null
+# A's page ignores the reset signal, so its live leader refuses the first reset (ReplicaInUse).
+A=$(open_tab "$BASE/?app=$APP&profile=a&syncUrl=$BASE/fake-sync/rpc&ignoreReset")
+ta0=$(seed a)
+R=$(open_tab "$BASE/?app=tomb-resetter-$RUN")
+FREE="const free = (p) => echo.until(async () => !(await navigator.locks.query()).held.some((l) => l.name === 'echo:$APP:' + p + ':leader'))
+const marks = async () => ((await echo.opfsList('echo-sync/$APP')) ?? []).filter((n) => n.startsWith('~'))"
+in_use=$(ev <<<"$FREE
+const r = await echo.resetReplica({ appId: '$APP', profile: 'a' }, true, undefined, 500)
+return { r, marks: await marks() }")
+ab tab "$A" >/dev/null
+ab tab close "$A" >/dev/null
+ab tab "$R" >/dev/null
+before_a=$(ev <<<"$FREE
+await free('a')
+const before = await echo.opfsList('echo-sync/$APP/a')
+const pending = await echo.resetReplica({ appId: '$APP', profile: 'a' }, false)
+const afterPending = await marks()
+const r = await echo.resetReplica({ appId: '$APP', profile: 'a' }, true, 'beforeTombstone')
+return { pending, afterPending, r, before, after: await echo.opfsList('echo-sync/$APP/a'), marks: await marks() }")
+A=$(open_tab "$BASE/?app=$APP&profile=a&syncUrl=$BASE/fake-sync/rpc")
+ra=$(ev <<<"$REPLICA")
+ab tab close "$A" >/dev/null
+check "a reset that ends before its tombstone (refused ReplicaInUse or PendingWrites, or its worker terminated before the write) leaves the replica intact: same clientId, outbox and rows, no tombstone" \
+  "$(jq -nc --argjson u "$in_use" --argjson x "$before_a" --argjson a "$ra" --argjson a0 "$ta0" '{ pass: ((($u.r.ok | not) and $u.r.error._tag == "ReplicaInUse" and $u.marks == [])
+    and (($x.pending.ok | not) and $x.pending.error._tag == "PendingWrites" and $x.afterPending == [])
+    and $x.r.interrupted and $x.before != null and ($x.before | length) > 0 and $x.after == $x.before and $x.marks == []
+    and $a.clientId == $a0.clientId and $a.outbox == 1 and $a.keep == ["a-row"]), inUse: $u, crash: $x, replica: $a }')"
+
+ab tab "$R" >/dev/null
+mid_b=$(ev <<<"$FREE
+await free('b')
+const before = await echo.opfsList('echo-sync/$APP/b')
+const r = await echo.resetReplica({ appId: '$APP', profile: 'b' }, true, 'midRemoval')
+return { r, before, dir: await echo.opfsList('echo-sync/$APP/b'), app: await echo.opfsList('echo-sync/$APP'), tombstone: await echo.tombstoneName({ appId: '$APP', profile: 'b' }) }")
+A=$(open_tab "$BASE/?app=$APP&profile=a&syncUrl=$BASE/fake-sync/rpc")
+ra=$(ev <<<"$REPLICA")
+after_b=$(ev <<<"return { dir: await echo.opfsList('echo-sync/$APP/b'), app: await echo.opfsList('echo-sync/$APP') }")
+ab tab close "$A" >/dev/null
+check "a tombstone of another profile of the same app changes nothing for this identity (clientId, outbox, rows; the other profile's partial directory and tombstone untouched)" \
+  "$(jq -nc --argjson m "$mid_b" --argjson a "$ra" --argjson a0 "$ta0" --argjson b "$after_b" '{ pass: ($m.r.interrupted and ($m.app | index($m.tombstone)) != null
+    and $m.dir != null and ($m.dir | length) == ($m.before | length) - 1
+    and $a.clientId == $a0.clientId and $a.outbox == 1 and $a.keep == ["a-row"] and $b.dir == $m.dir and $b.app == $m.app), crash: $m, replica: $a, after: $b }')"
+
+ab tab "$R" >/dev/null
+mid_a=$(ev <<<"$FREE
+await free('a')
+const r = await echo.resetReplica({ appId: '$APP', profile: 'a' }, true, 'midRemoval')
+return { r, dir: await echo.opfsList('echo-sync/$APP/a'), app: await echo.opfsList('echo-sync/$APP'), tombstone: await echo.tombstoneName({ appId: '$APP', profile: 'a' }) }")
+A=$(open_tab "$BASE/?app=$APP&profile=a&syncUrl=$BASE/fake-sync/rpc")
+ra=$(ev <<<"$REPLICA")
+after_a=$(ev <<<"return { dir: await echo.opfsList('echo-sync/$APP/a'), app: await echo.opfsList('echo-sync/$APP') }")
+ab tab close "$A" >/dev/null
+check "a reset worker terminated mid-removal after its tombstone: the next LeaderClient starts on a fresh, empty replica with a new clientId; no tombstone or old pool file remains" \
+  "$(jq -nc --argjson m "$mid_a" --argjson a "$ra" --argjson a0 "$ta0" --argjson n "$after_a" '{ pass: ($m.r.interrupted and ($m.app | index($m.tombstone)) != null and $m.dir != null and ($m.dir | length) > 0
+    and $a.clientId != null and $a.clientId != $a0.clientId and $a.outbox == 0 and $a.keep == null
+    and ($n.app | index($m.tombstone)) == null and $n.dir != null and ([$n.dir[] as $f | $m.dir | index($f)] | all(. == null))), crash: $m, replica: $a, after: $n }')"
+
+ab tab "$R" >/dev/null
+check "a second resetReplica (without discardPending) after an interrupted one answers Done, and neither the directory nor the tombstone remains" "$(ev <<<"$FREE
+const tombstone = await echo.tombstoneName({ appId: '$APP', profile: 'b' })
+const before = await echo.opfsList('echo-sync/$APP')
+const r = await echo.resetReplica({ appId: '$APP', profile: 'b' }, false)
+const app = await echo.opfsList('echo-sync/$APP')
+return { pass: before.includes(tombstone) && r.ok && !r.interrupted && app !== null && !app.includes('b') && !app.includes(tombstone) && app.includes('a'), r, before, app }")"
+ab tab close "$R" >/dev/null
+
 # ── coordinated reset (DESIGN §16.24): resetReplica closes the identity's clients itself ─────────────
 # Two tabs hold clients of one identity (the leader in one of them) and a third holds a sibling profile. One
 # of the two calls resetReplica with no app-side preparation. On main this fails ReplicaInUse (nothing closes

@@ -13,6 +13,7 @@ import type { OutboxEnvelope, QueryResult, SqlParams } from "../../src/client/wo
 import type { ToRouter } from "../../src/client/worker/messages.ts"
 import type { SyncStatus } from "../../src/client/sync/SyncLoop.ts"
 import { resetReplica } from "../../src/client/worker/ResetReplica.ts"
+import * as Platform from "../../src/client/worker/platform.ts"
 import * as Schema from "effect/Schema"
 import { AccessScope, Mutation } from "../../src/core/index.ts"
 
@@ -109,10 +110,12 @@ const spawnRouter = (name: string) => {
   return router
 }
 
-// Fault-injection flags (`crashAfterCommit`, `failOpen`) are forwarded to this tab's leader candidate only.
-const spawnLeader = (name: string) => {
+// Fault-injection flags (`crashAfterCommit`, `failOpen`) are forwarded to this tab's leader candidate only;
+// `extra` adds worker flags for one spawn (a reset's crash point, see `echo.resetReplica`).
+const spawnLeaderWith = (extra: Readonly<Record<string, string>>) => (name: string) => {
   const url = new URL("./leader.worker.ts", import.meta.url)
   for (const flag of ["crashAfterCommit", "failOpen"]) if (params.has(flag)) url.searchParams.set(flag, "")
+  for (const [flag, value] of Object.entries(extra)) url.searchParams.set(flag, value)
   const syncUrl = params.get("syncUrl")
   if (syncUrl !== null) url.searchParams.set("syncUrl", syncUrl)
   // The harness network gate (`echo.setOffline`), per identity; the state outlives a reload.
@@ -120,6 +123,7 @@ const spawnLeader = (name: string) => {
   if (localStorage.getItem(`echo-test:net:${netKey}`) === "offline") url.searchParams.set("offline", "")
   return new Worker(url, { type: "module", name })
 }
+const spawnLeader = spawnLeaderWith({})
 
 const scope = Effect.runSync(Scope.make())
 const client = await Effect.runPromise(
@@ -286,20 +290,36 @@ const echo = {
       return { held: pick(snapshot.held), pending: pick(snapshot.pending) }
     })
   },
-  /** `resetReplica` for `target` (this page's own identity by default); resolves with how long it took. */
+  /**
+   * `resetReplica` for `target` (this page's own identity by default); resolves with how long it took. With a
+   * crash-point `fault` (`beforeTombstone`, `midRemoval`; see leader.worker.ts) the reset is interrupted, which
+   * terminates its worker, as soon as its worker reaches that point (`interrupted: true`); a reset that never
+   * reaches it completes as usual (`interrupted: false`).
+   */
   resetReplica: async (
     target: { readonly appId: string; readonly profile: string } = { appId, profile },
     discardPending = false,
-    fault: "spawnThrows" | "postThrows" | undefined = undefined,
+    fault: "spawnThrows" | "postThrows" | "beforeTombstone" | "midRemoval" | undefined = undefined,
     closeTimeoutMs: number | undefined = undefined
   ) => {
     const started = performance.now()
-    const outcome = await run(
-      resetReplica(
-        {
-          ...target,
-          spawnLeader:
-            fault === "spawnThrows"
+    const crash = fault === "beforeTombstone" || fault === "midRemoval" ? fault : undefined
+    const faultChannel = `echo-test:reset-fault:${crypto.randomUUID()}`
+    const hit = new Promise<void>((resolve) => {
+      if (crash === undefined) return
+      const channel = new BroadcastChannel(faultChannel)
+      channel.addEventListener("message", () => {
+        channel.close()
+        resolve()
+      })
+    })
+    const reset = resetReplica(
+      {
+        ...target,
+        spawnLeader:
+          crash !== undefined
+            ? spawnLeaderWith({ resetFault: crash, faultChannel })
+            : fault === "spawnThrows"
               ? () => {
                   throw new TypeError("injected spawnLeader failure")
                 }
@@ -314,15 +334,30 @@ const echo = {
                     return worker
                   }
                 : spawnLeader
-        },
-        {
-          ...(discardPending ? { discardPending: true } : {}),
-          ...(closeTimeoutMs === undefined ? {} : { closeTimeout: closeTimeoutMs })
-        }
+      },
+      {
+        ...(discardPending ? { discardPending: true } : {}),
+        ...(closeTimeoutMs === undefined ? {} : { closeTimeout: closeTimeoutMs })
+      }
+    )
+    const outcome = await run(
+      Effect.raceFirst(
+        Effect.as(reset, { interrupted: false }),
+        Effect.as(
+          Effect.promise(() => hit),
+          { interrupted: true }
+        )
       )
     )
-    return { ...outcome, ms: Math.round(performance.now() - started) }
+    return {
+      ...outcome,
+      interrupted: outcome.ok && outcome.value.interrupted,
+      ms: Math.round(performance.now() - started)
+    }
   },
+  /** The engine's reset tombstone name for `target` (DESIGN §16.26), an entry of `echo-sync/<appId>`. */
+  tombstoneName: (target: { readonly appId: string; readonly profile: string } = { appId, profile }) =>
+    Effect.runPromise(Platform.tombstoneName(target)),
   /**
    * Fault injection: overwrite the SQLite header of `<appId>/<profile>`'s database file in its pool (the
    * pool keeps its own 4096-byte header per file, path first), so the database no longer opens.

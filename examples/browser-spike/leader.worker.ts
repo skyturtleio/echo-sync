@@ -35,6 +35,56 @@ if (flags.has("failOpen")) {
   })
 }
 
+const resetFault = flags.get("resetFault")
+if (resetFault !== null) {
+  // Crash points inside a reset worker (DESIGN §16.26), set by `echo.resetReplica(…, fault)` on the reset's
+  // worker only. At the point, the worker posts on `faultChannel` and stops making progress; the tab then
+  // interrupts the reset, which terminates this worker there. `beforeTombstone`: the creation of an engine-owned
+  // "~" entry (the tombstone) never starts. `midRemoval`: the recursive removal of a profile directory deletes
+  // one of the pool's non-database files and never finishes, leaving a partially removed directory.
+  const announce = () => {
+    const channel = new BroadcastChannel(flags.get("faultChannel") ?? "")
+    // oxlint-disable-next-line unicorn/require-post-message-target-origin -- BroadcastChannel has no target origin
+    channel.postMessage("hit")
+    channel.close()
+  }
+  const stall = () => {
+    announce()
+    return new Promise<never>(() => {})
+  }
+  const proto = FileSystemDirectoryHandle.prototype
+  if (resetFault === "beforeTombstone") {
+    const getFileHandle = proto.getFileHandle
+    Object.defineProperty(proto, "getFileHandle", {
+      value: function (this: FileSystemDirectoryHandle, name: string, options?: FileSystemGetFileOptions) {
+        if (options?.create === true && name.startsWith("~")) return stall()
+        return Reflect.apply(getFileHandle, this, [name, options])
+      }
+    })
+  }
+  if (resetFault === "midRemoval") {
+    const removeEntry = proto.removeEntry
+    Object.defineProperty(proto, "removeEntry", {
+      value: async function (this: FileSystemDirectoryHandle, name: string, options?: FileSystemRemoveOptions) {
+        if (options?.recursive !== true) return Reflect.apply(removeEntry, this, [name, options])
+        const dir = await this.getDirectoryHandle(name)
+        // oxlint-disable-next-line typescript/consistent-type-assertions -- platform edge: `values()` is not in TS's DOM lib
+        const iterable = dir as unknown as { values(): AsyncIterable<FileSystemHandle> }
+        for await (const handle of iterable.values()) {
+          if (!(handle instanceof FileSystemFileHandle)) continue
+          // The pool keeps each file's SQLite path at the start of its header; skip the database itself.
+          const header = new Uint8Array(await (await handle.getFile()).slice(0, 512).arrayBuffer())
+          const path = new TextDecoder().decode(header.subarray(0, Math.max(0, header.indexOf(0))))
+          if (path.endsWith(".db")) continue
+          await Reflect.apply(removeEntry, dir, [handle.name])
+          break
+        }
+        return stall()
+      }
+    })
+  }
+}
+
 const syncUrl = flags.get("syncUrl")
 if (flags.has("net")) {
   // Harness network gate (slice.sh): while this replica's identity is "offline", every request to the sync
