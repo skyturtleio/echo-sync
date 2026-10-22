@@ -18,6 +18,7 @@
  *   the caller re-subscribes and receives a fresh full result from the new leader.
  */
 import * as BrowserWorker from "@effect/platform-browser/BrowserWorker"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
@@ -183,12 +184,25 @@ const isLeaderLost = (e: unknown): e is LeaderUnavailable => e instanceof Leader
 // No tight loop while the old connection is not yet marked lost: the next attempt waits for a new leader.
 const lostBackoff = Schedule.spaced("50 millis")
 
-/** Re-open `open` on the next leader whenever it ends with `LeaderLost`, emitting nothing in between. */
+/**
+ * Only a cause whose failures are all `LeaderLost` and that has no defect is a handover (DESIGN §16.23): a
+ * defect means the leader died of a bug, which a silent resubscription would hide.
+ */
+const isHandover = <E>(cause: Cause.Cause<E>): boolean =>
+  Cause.hasFails(cause) &&
+  cause.reasons.every(
+    (reason) => Cause.isInterruptReason(reason) || (Cause.isFailReason(reason) && isLeaderLost(reason.error))
+  )
+
+/**
+ * Re-open `open` on the next leader whenever it ends with a handover, emitting nothing in between. Every other
+ * cause passes through unchanged: `Stream.catchIf` would re-fail the bare error and drop a defect beside it.
+ */
 const resubscribing = <A, E>(
   open: Stream.Stream<A, E | LeaderUnavailable>
 ): Stream.Stream<A, E | LeaderUnavailable> => {
   const loop: Stream.Stream<A, E | LeaderUnavailable> = open.pipe(
-    Stream.catchIf(isLeaderLost, () =>
+    Stream.catchCauseIf(isHandover, () =>
       Stream.unwrap(
         Effect.as(
           Effect.sleep("50 millis"),
@@ -458,14 +472,22 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     /** A stream from the current leader that ends with `LeaderLost` when that leader goes away. */
     const streamWithLeader = <A, E>(
       f: (client: Client) => Stream.Stream<A, E | RpcClientError>
-    ): Stream.Stream<A, Exclude<E, RpcClientError> | LeaderUnavailable> =>
+    ): Stream.Stream<A, E | LeaderUnavailable> =>
       Stream.unwrap(
         Effect.suspend(() => Deferred.await(current)).pipe(
           Effect.map((connection) =>
             connection._tag === "Unavailable"
               ? Stream.fail(connection.error)
               : f(connection.client).pipe(
-                  Stream.catchIf(isRpcClientError, (e) => Stream.fail(lostError(connection.leaderId, e.message))),
+                  // Maps only the transport failures, keeping every other reason (a defect included): a
+                  // `Stream.catchIf` would re-fail any other error bare (DESIGN §16.23).
+                  Stream.catchCause((cause) =>
+                    Stream.failCause(
+                      Cause.map(cause, (e: E | RpcClientError): E | LeaderUnavailable =>
+                        isRpcClientError(e) ? lostError(connection.leaderId, e.message) : e
+                      )
+                    )
+                  ),
                   Stream.interruptWhen(
                     Deferred.await(connection.lost).pipe(Effect.andThen(Effect.fail(lostError(connection.leaderId))))
                   )

@@ -1,10 +1,12 @@
 import { expect, it } from "@effect/vitest"
-import { Deferred, Effect, Exit, Layer, Scope, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Layer, Scope, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { AccessScope } from "echo-sync"
 import type * as Rpc from "effect/rpc"
+import { RpcClientDefect, RpcClientError } from "effect/rpc/RpcClientError"
 import { afterEach, vi } from "vitest"
 import { layer, LeaderClient, type TabApiOptions } from "./LeaderClient.ts"
+import { LeaderUnavailable } from "./LeaderRpcs.ts"
 import type * as Platform from "./platform.ts"
 
 // Only the browser/worker transport is replaced: the public layer builds the tab API and sender.
@@ -12,7 +14,9 @@ const remote = vi.hoisted(() => ({
   shared: false,
   held: vi.fn<() => Effect.Effect<boolean>>(),
   track: vi.fn<() => Effect.Effect<void>>(),
-  presence: vi.fn<() => Stream.Stream<{ room: AccessScope.AccessScopeId; entries: [] }>>()
+  presence: vi.fn<() => Stream.Stream<{ room: AccessScope.AccessScopeId; entries: [] }>>(),
+  notices: vi.fn<() => Stream.Stream<unknown, unknown>>(),
+  syncStatus: vi.fn<() => Stream.Stream<unknown, unknown>>()
 }))
 vi.mock("effect/rpc", async (original) => {
   const actual = await original<typeof Rpc>()
@@ -174,4 +178,84 @@ it.live("closing a client cannot abandon a transferred port queued for acceptanc
       transferred.port2.close()
     }
   })
+)
+
+// Platform edge: a fake dedicated worker that only announces election; the RPCs are `remote`'s.
+const electedWorker = (): Worker => {
+  const worker = new EventTarget()
+  return Object.assign(worker, {
+    onmessage: null,
+    onmessageerror: null,
+    onerror: null,
+    postMessage: (message: { _tag: string }) => {
+      if (message._tag === "Init")
+        worker.dispatchEvent(new MessageEvent("message", { data: { _tag: "Elected", leaderId: "leader" } }))
+    },
+    terminate: () => {}
+  })
+}
+
+const typedFailure = new Error("typed leader failure")
+const lostTransport = new RpcClientError({ reason: new RpcClientDefect({ message: "port closed", cause: null }) })
+const label = (u: unknown) =>
+  u instanceof LeaderUnavailable && u.reason === "LeaderLost" ? "LeaderLost" : u === typedFailure ? "X" : "other"
+
+it.live(
+  "a leader stream's defect must reach the tab, and only a defect-free all-LeaderLost cause may resubscribe",
+  () =>
+    Effect.gen(function* () {
+      vi.stubGlobal("navigator", { storage: { persist: () => Promise.resolve(false) } })
+      const fresh = [{ fresh: true }]
+      const scenarios = [
+        // DESIGN §16.23: Fail(X)+Die must not collapse to Fail(X) on its way to the consumer.
+        { first: Cause.combine(Cause.fail(typedFailure), Cause.die("bug")), opens: 1, fails: ["X"], dies: ["bug"] },
+        // A plain LeaderLost resubscribes: the consumer gets the next leader's emission and no error.
+        { first: Cause.fail(lostTransport), opens: 2, fails: undefined, dies: [] },
+        // LeaderLost with a defect is a leader that died of a bug: end with both, never resubscribe silently.
+        {
+          first: Cause.combine(Cause.fail(lostTransport), Cause.die("bug")),
+          opens: 1,
+          fails: ["LeaderLost"],
+          dies: ["bug"]
+        },
+        // Recovery needs every failure to be LeaderLost, not the first one: X beside it ends the stream.
+        {
+          first: Cause.combine(Cause.fail(lostTransport), Cause.fail(typedFailure)),
+          opens: 1,
+          fails: ["LeaderLost", "X"],
+          dies: []
+        }
+      ] as const
+      for (const stream of ["notices", "syncStatus"] as const) {
+        for (const scenario of scenarios) {
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              let opens = 0
+              remote[stream].mockImplementation(() =>
+                Stream.suspend(() => (++opens === 1 ? Stream.failCause(scenario.first) : Stream.make(fresh)))
+              )
+              const context = yield* Layer.build(
+                layer({
+                  appId: "cause",
+                  profile: "test",
+                  principal: "me",
+                  spawnLeader: electedWorker,
+                  spawnRouter: () => {
+                    throw new Error("single-tab")
+                  }
+                })
+              )
+              const client = yield* LeaderClient.pipe(Effect.provide(context))
+              const open: Stream.Stream<unknown, unknown> = stream === "notices" ? client.notices : client.syncStatus
+              const exit = yield* open.pipe(Stream.take(1), Stream.runCollect, Effect.timeout("5 seconds"), Effect.exit)
+              expect(opens).toBe(scenario.opens)
+              if (scenario.fails === undefined) return expect(exit).toEqual(Exit.succeed([fresh]))
+              if (Exit.isSuccess(exit)) return expect.fail(`${stream} ended without the leader's failure`)
+              expect(exit.cause.reasons.filter(Cause.isFailReason).map((r) => label(r.error))).toEqual(scenario.fails)
+              expect(exit.cause.reasons.filter(Cause.isDieReason).map((r) => r.defect)).toEqual(scenario.dies)
+            })
+          )
+        }
+      }
+    })
 )
