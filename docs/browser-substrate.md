@@ -159,18 +159,33 @@ dedicated worker does not outlive its document), so no separate scope-close scen
 that ends itself after a commit is covered too: "crash after commit" and "worker-only crash" in
 `scenarios.sh`.
 
-### Resetting a replica (`resetReplica`, DESIGN §9.1)
+### Resetting a replica (`resetReplica`, DESIGN §9.1, §16.24)
 
-`ResetReplica.resetReplica({ appId, profile, spawnLeader }, { discardPending? })` deletes one identity's
-replica, for example on sign-out. It is a static function (exported from `echo-sync/client`), so it runs
-while no tab client for that identity is alive. Closing the tab clients first is the app's job, through its
-own cross-tab sign-out signal.
+`ResetReplica.resetReplica({ appId, profile, spawnLeader }, { discardPending?, closeTimeout? })` deletes one
+identity's replica, for example on sign-out. It is a static function (exported from `echo-sync/client`), so it
+also runs when no tab client for that identity is alive. It closes the identity's tab clients itself
+(DESIGN §16.24); the app prepares nothing.
 
+- Once the reset worker is spawned, it broadcasts `ResetSignal { appId, profile }` on the BroadcastChannel
+  `echo:<appId>:<profile>:reset` (a `spawnLeader` that throws closes nothing). Every `LeaderClient` of the
+  identity in the browser, the caller's own included, checks the payload against its own identity and enters a
+  terminal reset state at once: it terminates its leader candidate (the browser releases its leader and epoch
+  locks, or drops its queued leader request), fails its in-flight and waiting requests with
+  `LeaderUnavailable { reason: "Reset" }`, releases its tab lock, dequeues its lock watchers, closes its router
+  and leader ports, and emits `status` with `reset: true`, `isLeaderTab: false`, `leaderId: undefined`. The
+  `status` stream stays open; `subscribe`, `notices`, `syncStatus`, `presence` and `subscribeRaw` end with the
+  `Reset` error, which `mutate`, `requestSync` and `dismissNotices` do not retry and nothing resubscribes. No
+  path in that client starts, elects or joins a leader again: using the replica again means building a new
+  `LeaderClient`. The signal is an event, not a tombstone: a client built afterwards never sees it. The router
+  needs no message; the dead leader's epoch lock clears its route. Single-tab mode coordinates the same way.
+- The reset worker takes the leader lock if it is free, else queues for it at most `closeTimeout` (default 5 s).
+  A holder that does not let go in time (an old build, a frozen tab) is `ReplicaInUse`, and nothing is touched.
+  The deadline and the grant are decided in one lock-request callback (`Platform.holdLockWithin`): a grant
+  whose callback runs after the deadline fired is released at once, so the worker never holds a lock it gave
+  up on (and the tab terminates the worker after every outcome anyway).
 - It spawns the app's leader worker (`spawnLeader`, the same factory `LeaderClient.make` takes) and sends it
   `Reset` instead of `Init`. That worker never becomes leader: it opens the pool through the leader's own
   OPFS host (`openConnection` in `Leader.ts`), so there is no second OPFS host path. It does not migrate.
-- It takes the identity's leader lock with `ifAvailable`. If the lock is held, it fails `ReplicaInUse` and
-  touches nothing. It never queues, so it cannot be granted ahead of or behind a waiting candidate.
 - Without `discardPending`, under the lock it opens the database and counts unreleased `echo_outbox` rows.
   A count above 0 fails `PendingWrites { count }`. A database that does not open or an outbox that cannot be
   read fails closed with `ResetFailed`. Either way nothing is deleted.
@@ -178,8 +193,10 @@ own cross-tab sign-out signal.
   does, for a predecessor's access handles to be released. So a corrupt or partially removed replica can
   still be reset.
 - Then it closes whatever it opened (database and pool, releasing the access handles), removes the directory
-  `echo-sync/<appId>/<profile>` recursively, and releases the lock last. A candidate queued meanwhile is
-  elected only after the directory is gone, so it creates a fresh replica with a new `clientId`.
+  `echo-sync/<appId>/<profile>` recursively, and releases the lock last. A candidate of a client built after the signal that
+  queued meanwhile is elected only after the directory is gone, so it creates a fresh replica with a new `clientId`. After a
+  `PendingWrites` refusal the clients stay reset and the lock is free, so `discardPending` succeeds at once, and
+  a new `LeaderClient` keeps the data.
 - Sibling identities (`echo-sync/<appId>/<other profile>`) are untouched. A replica that never existed
   resets successfully.
 - Notices belong to the replica and go with it. The outbox is the only guarded content.
@@ -189,8 +206,15 @@ own cross-tab sign-out signal.
   removal that had already begun may be partial. What a leader makes of such a directory is not
   established; a reset with `discardPending` never opens it, so retry that.
 
-Evidence: `scenarios.sh` "reset …" checks (live leader → `ReplicaInUse` with the directory listing
-unchanged; one pending write → `PendingWrites{1}` unchanged; `discardPending` removes `a` and keeps `b`; the
+Evidence: `scenarios.sh` "coordinated reset …" checks (from the leader tab, from a follower tab, and in
+single-tab mode from the tab whose candidate is queued: the directory is gone, both clients are reset with
+`mutate` failing `Reset` in under a second and the open subscription ended `Reset`, for 1.5 s nothing holds or
+queues a lock of the identity in `navigator.locks.query` and the directory is not re-created, a sibling
+profile's client is untouched, a reloaded tab elects a leader on an empty replica with a new `clientId`;
+`PendingWrites{1}` keeps the directory and leaves the clients reset with every lock free, and the following
+`discardPending` reset succeeds on its first call). On main these fail with `ReplicaInUse`. The "reset …"
+checks: a leader whose page ignores the signal (`?ignoreReset`) → `ReplicaInUse` after a 1 s `closeTimeout`
+with the directory listing unchanged and no queued leader request left; one pending write → `PendingWrites{1}` unchanged; `discardPending` removes `a` and keeps `b`; the
 next leader for `a` has an empty outbox and a new `clientId`; `b` keeps its rows and `clientId`; a replica
 whose database header is overwritten is refused with `ResetFailed` and left intact without
 `discardPending`, and removed with it; throwing `spawnLeader` and `postMessage` are `ResetFailed`).
@@ -559,7 +583,8 @@ script opens a warm-up page first.
 Harness-only fault injection (in `examples/browser-spike/leader.worker.ts`, enabled per tab by URL flag):
 `crashAfterCommit` ends that tab's leader worker instead of sending a committed `enqueue` response whose
 mutation id starts with `crash-after-commit`; `failOpen` makes OPFS startup fail when another tab posts on
-`echo-test:fail-open`. `echo.forgeLeaderAnnouncement(id)` replays a leader announcement to the router.
+`echo-test:fail-open`; `ignoreReset` (in `main.ts`) mutes the page's engine reset channels, as an old build
+would. `echo.forgeLeaderAnnouncement(id)` replays a leader announcement to the router.
 `?syncUrl=<url>` gives that tab's leader a sync loop; `examples/browser-spike/fakeSync.ts` mounts a fake
 `SyncRpcs` server at `/fake-sync/rpc` (Vite middleware) whose push always fails with `MalformedEnvelope`,
 whose pull answers an empty `PullDone` and whose pokes stream ends after one poke, with per-client

@@ -84,6 +84,12 @@ export const routerName = ({ appId, profile }: ReplicaIdentity): string => `echo
 
 export const leaderLockName = ({ appId, profile }: ReplicaIdentity): string => `echo:${appId}:${profile}:leader`
 
+/**
+ * The BroadcastChannel `resetReplica` signals on (DESIGN §16.24): every tab client of this identity that
+ * receives it enters its terminal reset state and terminates its leader candidate.
+ */
+export const resetChannelName = ({ appId, profile }: ReplicaIdentity): string => `echo:${appId}:${profile}:reset`
+
 /** Held exclusively by one specific leader incarnation; acquiring it in shared mode == "that leader is gone". */
 export const leaderEpochLockName = ({ appId, profile }: ReplicaIdentity, leaderId: string): string =>
   `echo:${appId}:${profile}:leader:${leaderId}`
@@ -108,13 +114,32 @@ const lockError = (name: string, cause: unknown) =>
  */
 const request = (
   name: string,
-  options: { readonly mode: LockMode; readonly ifAvailable?: true }
+  options: { readonly mode: LockMode; readonly ifAvailable?: true; readonly withinMillis?: number }
 ): Effect.Effect<(() => void) | undefined, LockError> =>
-  Effect.callback<(() => void) | undefined, LockError>((resume, signal) => {
+  Effect.callback<(() => void) | undefined, LockError>((resume, interrupted) => {
+    // A deadline gives up the wait with `undefined`. Exactly one of the deadline and the grant decides, both on
+    // this thread: a grant whose callback runs after the deadline fired sees `signal.aborted` and is released
+    // at once, so a waiter that gave up never ends up holding the lock.
+    const deadline = new AbortController()
+    const signal = AbortSignal.any([interrupted, deadline.signal])
+    let granted = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const within = options.withinMillis
+    if (within !== undefined && Number.isFinite(within)) {
+      timer = setTimeout(
+        () => {
+          if (granted || signal.aborted) return
+          deadline.abort()
+          resume(Effect.succeed(undefined))
+        },
+        Math.min(Math.max(within, 0), 2_147_483_647)
+      )
+      interrupted.addEventListener("abort", () => clearTimeout(timer))
+    }
     // `signal` and `ifAvailable` cannot be combined; an ifAvailable request never queues anyway.
     const lockOptions: LockOptions = options.ifAvailable
       ? { mode: options.mode, ifAvailable: true }
-      : { ...options, signal }
+      : { mode: options.mode, signal }
     navigator.locks
       .request(name, lockOptions, (lock) => {
         if (lock === null) {
@@ -126,6 +151,9 @@ const request = (
         const held = new Promise<void>((resolve) => {
           release = resolve
         })
+        // Decided: the deadline no longer applies.
+        granted = true
+        clearTimeout(timer)
         resume(Effect.succeed(release))
         return held
       })
@@ -157,6 +185,14 @@ export const holdLock = (name: string): Effect.Effect<void, LockError, Scope.Sco
 /** Like `holdLock` but never waits: `true` and the lock is held if it was free, `false` otherwise. */
 export const tryHoldLock = (name: string): Effect.Effect<boolean, LockError, Scope.Scope> =>
   holdUntilScopeCloses(request(name, { mode: "exclusive", ifAvailable: true }))
+
+/**
+ * Like `holdLock` but waits at most `millis` (non-finite: no deadline): `true` and the lock is held if it was
+ * granted in time, `false` otherwise, and then the request has left the queue and nothing is held. A grant
+ * whose callback runs after the deadline fired is released at once (see `request`).
+ */
+export const holdLockWithin = (name: string, millis: number): Effect.Effect<boolean, LockError, Scope.Scope> =>
+  holdUntilScopeCloses(request(name, { mode: "exclusive", withinMillis: millis }))
 
 /**
  * Completes when the exclusive holder of `name` releases it (or immediately if nobody holds it).

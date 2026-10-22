@@ -348,12 +348,13 @@ const countUnreleased = (sql: SqlClient.SqlClient) =>
   })
 
 /**
- * `resetReplica`'s worker half (DESIGN §9.1). Takes the leader lock only if it is free, so it never queues
- * ahead of or behind a leader. Under it, without `discardPending`, it opens the database through the
- * leader's own OPFS host (no migration), counts the outbox and closes the database and the pool; any
- * failure there is `ResetFailed` with nothing removed. With `discardPending` it never opens the database.
- * Then it removes `echo-sync/<appId>/<profile>` and releases the lock last. A candidate queued meanwhile
- * is elected only after the directory is gone, so it creates a fresh replica.
+ * `resetReplica`'s worker half (DESIGN §9.1, §16.24). Takes the leader lock once the identity's clients have
+ * let go of it, waiting at most the reset's `closeTimeout`; it never gets it from a live leader. Under it,
+ * without `discardPending`, it opens the database through the leader's own OPFS host (no migration), counts
+ * the outbox and closes the database and the pool; any failure there is `ResetFailed` with nothing removed.
+ * With `discardPending` it never opens the database. Then it removes `echo-sync/<appId>/<profile>` and
+ * releases the lock last. A candidate of a client built after the signal that queued meanwhile is elected
+ * only after the directory is gone, so it creates a fresh replica.
  */
 const reset = (message: Reset): Effect.Effect<ResetOutcome> =>
   Effect.gen(function* () {
@@ -363,9 +364,14 @@ const reset = (message: Reset): Effect.Effect<ResetOutcome> =>
     const poolDirectory = Platform.poolDirectory(identity)
     return yield* Effect.scoped(
       Effect.gen(function* () {
-        if (!(yield* Platform.tryHoldLock(Platform.leaderLockName(identity)))) {
-          return { _tag: "ReplicaInUse" } satisfies ResetOutcome
-        }
+        // The tab broadcast the reset signal before sending `Reset`, so every honouring client is terminating its
+        // candidate (DESIGN §16.24). Wait for the lock at most `closeTimeoutMillis`; a holder that does not let
+        // go in time (an old build, a frozen tab) is `ReplicaInUse` and nothing is touched. A grant after the
+        // deadline is released at once (`holdLockWithin`), so this worker never holds the lock it gave up on.
+        const lock = Platform.leaderLockName(identity)
+        const held =
+          (yield* Platform.tryHoldLock(lock)) || (yield* Platform.holdLockWithin(lock, message.closeTimeoutMillis))
+        if (!held) return { _tag: "ReplicaInUse" } satisfies ResetOutcome
         if ((yield* opfsDirectory(poolDirectory)) === undefined) return { _tag: "Done" } satisfies ResetOutcome
         if (message.discardPending) {
           // Never opens the database (DESIGN §9.1): a corrupt or partially removed replica can still be reset.

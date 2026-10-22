@@ -374,8 +374,10 @@ check "the longest database path the pool holds (appId 233 + profile 255) opens 
 # ── resetReplica (DESIGN §9.1): guarded by the leader lock and the outbox, deletes only its identity ──
 # Profile "a" syncs with the fake server, whose push always halts, so its entry stays pending. Profile "b"
 # is a sibling identity of the same app. The resets run from a tab of an unrelated app (no client for "a").
+# A's page never hears the reset signal (`ignoreReset`, as an old build or a frozen tab), so its leader lives
+# on through the first reset (DESIGN §16.24).
 APP="reset-$RUN"
-A=$(open_tab "$BASE/?app=$APP&profile=a&syncUrl=$BASE/fake-sync/rpc")
+A=$(open_tab "$BASE/?app=$APP&profile=a&syncUrl=$BASE/fake-sync/rpc&ignoreReset")
 a0=$(ev <<<'await echo.ready(); const e = await echo.enqueue({ mutationId: "pending-a", name: "t", args: {} }); const i = await echo.info(); return { ok: e.ok, clientId: i.ok ? i.value.clientId : null }')
 B=$(open_tab "$BASE/?app=$APP&profile=b&syncUrl=$BASE/fake-sync/rpc")
 b0=$(ev <<<'await echo.ready(); await echo.exec("CREATE TABLE keep (v TEXT)"); await echo.exec("INSERT INTO keep VALUES (?)", ["b-row"]); const i = await echo.info(); return { clientId: i.ok ? i.value.clientId : null }')
@@ -385,10 +387,12 @@ ev <<<'await echo.ready(); return true' >/dev/null
 TARGET="{ appId: '$APP', profile: 'a' }"
 # Retries only ReplicaInUse, for the moment between a closed tab and the browser releasing its worker's lock.
 RESET="const reset = async (discard) => { let r; for (let i = 0; i < 100; i++) { r = await echo.resetReplica($TARGET, discard); if (r.ok || r.error._tag !== 'ReplicaInUse') return r; await new Promise((res) => setTimeout(res, 50)) } return r }"
-check "reset while a leader is live fails ReplicaInUse and deletes nothing" "$(ev <<<"const before = await echo.opfsList('echo-sync/$APP/a')
-const r = await echo.resetReplica($TARGET)
+check "a leader that ignores the reset signal yields ReplicaInUse after closeTimeout (1 s), deletes nothing, and leaves no queued leader request" "$(ev <<<"const before = await echo.opfsList('echo-sync/$APP/a')
+const r = await echo.resetReplica($TARGET, false, undefined, 1000)
 const after = await echo.opfsList('echo-sync/$APP/a')
-return { pass: !r.ok && r.error._tag === 'ReplicaInUse' && before !== null && before.length > 0 && JSON.stringify(after) === JSON.stringify(before), r, before, after }")"
+const queued = await echo.until(async () => { const l = await echo.locksFor($TARGET); return l.pending.includes('exclusive:echo:$APP:a:leader') ? undefined : l }, 3000)
+return { pass: !r.ok && r.error._tag === 'ReplicaInUse' && r.ms >= 1000 && before !== null && before.length > 0 && JSON.stringify(after) === JSON.stringify(before)
+  && queued !== undefined && queued.held.includes('exclusive:echo:$APP:a:leader'), r, before, after, locks: queued ?? null }")"
 ab tab "$A" >/dev/null
 alive=$(ev <<<'const r = await echo.exec("SELECT mutation_id FROM echo_outbox WHERE released_at IS NULL"); return r.ok && r.value.length === 1')
 ab tab close "$A" >/dev/null
@@ -439,6 +443,103 @@ const p = await echo.resetReplica($TARGET_C, false, 'postThrows')
 return { pass: !s.ok && s.error._tag === 'ResetFailed' && s.error.message.includes('injected spawnLeader failure')
   && !p.ok && p.error._tag === 'ResetFailed' && p.error.message.includes('injected postMessage failure'), s, p }")"
 ab tab close "$R" >/dev/null
+
+# ── coordinated reset (DESIGN §16.24): resetReplica closes the identity's clients itself ─────────────
+# Two tabs hold clients of one identity (the leader in one of them) and a third holds a sibling profile. One
+# of the two calls resetReplica with no app-side preparation. On main this fails ReplicaInUse (nothing closes
+# the leader), or, in single-tab mode, the queued candidate is elected and re-creates the replica.
+# `RESET_STATE` reports this page's client after the signal: its status, a `mutate` attempt, its open raw
+# subscription and its `syncStatus` stream (if it had them). A raw subscription ends on any leader change, so in
+# a tab whose leader died before its own copy of the signal arrived it may legitimately end `LeaderLost`;
+# `syncStatus` resubscribes across `LeaderLost` and must end `Reset` either way.
+RESET_STATE='await echo.until(() => (window.sub === undefined || window.sub.ended !== undefined) && (echo.syncStatusLog.length === 0 || echo.syncWatch.ended !== undefined), 5000)
+const s = await echo.status(); const m = await echo.mutate()
+return { status: s, last: echo.statusLog.at(-1) ?? null, statusEnded: echo.statusWatch.ended ?? null, mutate: m,
+  hadSub: window.sub !== undefined, sub: window.sub?.ended ?? null, hadSync: echo.syncStatusLog.length > 0, sync: echo.syncWatch.ended ?? null }'
+IS_RESET='(.status.reset and (.status.isLeaderTab | not) and .status.leaderId == null and .last.reset and .statusEnded == null
+  and (.mutate.ok | not) and .mutate.error.reason == "Reset" and .mutate.ms < 1000
+  and ((.hadSub | not) or (.sub | tostring | test("\"(Reset|LeaderLost)\"")))
+  and ((.hadSync | not) or (.sync | tostring | contains("\"Reset\""))))'
+coordinated_reset() { # $1 = label, $2 = which tab resets (leader|follower), $3 = extra page flags
+  APP="coord-$2-${#3}-$RUN"
+  P=$(open_tab "$BASE/?app=$APP$3")
+  p=$(ev <<<"$SERVED")
+  p_client=$(ev <<<'return (await echo.info()).value.clientId')
+  ev <<<'await echo.exec("CREATE TABLE coord_rows (id INTEGER PRIMARY KEY)"); await echo.exec("INSERT INTO coord_rows DEFAULT VALUES")
+window.sub = echo.subscribe(["SELECT count(*) AS n FROM coord_rows"], ["coord_rows"]); await echo.until(() => sub.emissions.length >= 1); echo.watchStatus(); echo.watchSyncStatus(); await echo.until(() => echo.syncStatusLog.length > 0); return true' >/dev/null
+  Q=$(open_tab "$BASE/?app=$APP$3")
+  if [[ "$3" == *noSharedWorker* ]]; then
+    # Single-tab mode: Q's candidate queues behind P's leader and Q is not served.
+    q=$(ev <<<"await echo.until(async () => (await echo.locksFor()).pending.includes('exclusive:echo:$APP:default:leader')); echo.watchStatus(); return await echo.status()")
+  else
+    q=$(ev <<<"$SERVED")
+    ev <<<'window.sub = echo.subscribe(["SELECT count(*) AS n FROM coord_rows"], ["coord_rows"]); await echo.until(() => sub.emissions.length >= 1); echo.watchStatus(); echo.watchSyncStatus(); await echo.until(() => echo.syncStatusLog.length > 0); return true' >/dev/null
+  fi
+  S=$(open_tab "$BASE/?app=$APP&profile=other$3")
+  s0=$(ev <<<"$SERVED")
+  if [ "$2" = leader ]; then X=$P; Y=$Q; else X=$Q; Y=$P; fi
+  ab tab "$X" >/dev/null
+  r=$(ev <<<"const r = await echo.resetReplica(); return { ...r, dir: await echo.opfsList('echo-sync/$APP/default'), app: await echo.opfsList('echo-sync/$APP') }")
+  x=$(ev <<<"$RESET_STATE")
+  ab tab "$Y" >/dev/null
+  y=$(ev <<<"$RESET_STATE")
+  check "coordinated reset ($1): resetReplica from the $2 tab, with no app-side preparation, removes only this profile's replica" \
+    "$(jq -nc --argjson r "$r" --argjson p "$p" '{ pass: ($r.ok and $r.dir == null and ($r.app | any(.[]; . == "other")) and $p.isLeaderTab), r: $r }')"
+  check "coordinated reset ($1): both clients enter the reset state (status says reset and stays open, mutate fails Reset at once, syncStatus ends Reset)" \
+    "$(jq -nc --argjson x "$x" --argjson y "$y" "{ pass: ((\$x | $IS_RESET) and (\$y | $IS_RESET)), resetting: \$x, other: \$y }")"
+  # Absence over a window: nothing re-elects, re-creates the directory, or holds or queues a lock of the identity.
+  quiet=$(ev <<<"const until = Date.now() + 1500; let seen = null
+while (Date.now() < until && seen === null) {
+  const l = await echo.locksFor(); const d = await echo.opfsList('echo-sync/$APP/default'); const s = await echo.status()
+  if (l.held.length > 0 || l.pending.length > 0 || d !== null || !s.reset || s.leaderId !== undefined) seen = { l, d, s }
+  await new Promise((res) => setTimeout(res, 50))
+}
+return { seen }")
+  check "coordinated reset ($1): no leader is elected and the identity holds or queues no Web Lock (navigator.locks.query) until a tab builds a new client" \
+    "$(jq -nc --argjson q "$quiet" '{ pass: ($q.seen == null), quiet: $q }')"
+  ab tab "$S" >/dev/null
+  s1=$(ev <<<"const s = await echo.status(); const i = await echo.info(); const e = await echo.exec('SELECT 1 AS one'); return { ...s, served: i.ok ? i.value.leaderId : null, exec: e.ok }")
+  check "coordinated reset ($1): the client of another profile of the same app is unaffected" \
+    "$(jq -nc --argjson a "$s0" --argjson b "$s1" '{ pass: (($b.reset | not) and $b.leaderId == $a.leaderId and $b.served == $a.leaderId and $b.exec), before: $a, after: $b }')"
+  # A new client (Y reloads): elected on a fresh, empty replica. X's old client stays reset.
+  ab tab "$Y" >/dev/null
+  ab reload >/dev/null
+  fresh=$(ev <<<"$SERVED")
+  f=$(ev <<<"const i = await echo.info(); const ob = await echo.exec('SELECT count(*) AS n FROM echo_outbox'); const t = await echo.exec(\"SELECT name FROM sqlite_master WHERE name = 'coord_rows'\")
+return { clientId: i.ok ? i.value.clientId : null, outbox: ob.ok ? ob.value[0].n : null, items: t.ok ? t.value.length : null }")
+  ab tab "$X" >/dev/null
+  xs=$(ev <<<'return await echo.status()')
+  old=$(jq -nc --argjson p "$p" '$p.leaderId')
+  check "coordinated reset ($1): a client built after the signal elects a leader on a fresh, empty replica; the reset client stays reset" \
+    "$(jq -nc --argjson n "$fresh" --argjson f "$f" --argjson x "$xs" --argjson old "$old" --argjson c "$p_client" '{ pass: ($n.isLeaderTab and $n.leaderId != $old and $f.clientId != $c and ($n.reset | not) and $f.outbox == 0 and $f.items == 0 and $x.reset and $x.leaderId == null), fresh: $n, replica: $f, resetClient: $x }')"
+  for t in "$P" "$Q" "$S"; do ab tab close "$t" >/dev/null; done
+}
+coordinated_reset "leader tab resets" leader ""
+coordinated_reset "follower tab resets" follower ""
+coordinated_reset "single-tab mode, queued candidate" follower "&noSharedWorker"
+
+# PendingWrites refusal: the clients stay reset, the lock is free, nothing is deleted, and the following
+# discardPending reset succeeds at once (no ReplicaInUse, no retry).
+APP="coord-pending-$RUN"
+P=$(open_tab "$BASE/?app=$APP&syncUrl=$BASE/fake-sync/rpc")
+ev <<<'await echo.ready(); await echo.enqueue({ mutationId: "pending-coord", name: "t", args: {} }); echo.watchStatus(); return true' >/dev/null
+Q=$(open_tab "$BASE/?app=$APP&syncUrl=$BASE/fake-sync/rpc")
+ev <<<"$SERVED" >/dev/null
+ev <<<'echo.watchStatus(); return true' >/dev/null
+r=$(ev <<<"const before = await echo.opfsList('echo-sync/$APP/default'); const r = await echo.resetReplica()
+const free = await echo.until(async () => { const l = await echo.locksFor(); return l.held.length === 0 && l.pending.length === 0 ? l : undefined }, 3000)
+return { r, before, after: await echo.opfsList('echo-sync/$APP/default'), free: free ?? await echo.locksFor() }")
+q=$(ev <<<"$RESET_STATE")
+ab tab "$P" >/dev/null
+p=$(ev <<<"$RESET_STATE")
+check "coordinated reset: PendingWrites{1} deletes nothing, leaves both clients reset and every lock of the identity free" \
+  "$(jq -nc --argjson r "$r" --argjson p "$p" --argjson q "$q" "{ pass: ((\$r.r.ok | not) and \$r.r.error._tag == \"PendingWrites\" and \$r.r.error.count == 1
+    and \$r.before != null and (\$r.before | length) > 0 and \$r.after == \$r.before and \$r.free.held == [] and \$r.free.pending == []
+    and (\$p | $IS_RESET) and (\$q | $IS_RESET)), r: \$r, p: \$p, q: \$q }")"
+check "coordinated reset: a following discardPending reset succeeds on its first call (no ReplicaInUse)" "$(ev <<<"const r = await echo.resetReplica(undefined, true)
+const d = await echo.opfsList('echo-sync/$APP/default')
+return { pass: r.ok && d === null, r, d }")"
+for t in "$P" "$Q"; do ab tab close "$t" >/dev/null; done
 
 # ── presence (DESIGN §9.1, §12): entry exactly while the tab stream is open; survives handover ────────
 # Needs the real server (PresenceRpcs is mounted with SyncRpcs on /sync). L is the leader tab; F and W follow.

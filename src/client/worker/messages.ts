@@ -17,9 +17,15 @@ export const ToLeader = Schema.Union([
   Schema.TaggedStruct("RouterPort", { port: Port }),
   /**
    * Instead of `Init`: reset this identity's replica (DESIGN §9.1 `resetReplica`) and answer with one
-   * `ResetOutcome`. The worker never becomes leader.
+   * `ResetOutcome`. The worker never becomes leader. `closeTimeoutMillis`: how long it waits for the leader
+   * lock while the identity's clients close (DESIGN §16.24); non-finite waits without a deadline.
    */
-  Schema.TaggedStruct("Reset", { appId: Schema.String, profile: Schema.String, discardPending: Schema.Boolean })
+  Schema.TaggedStruct("Reset", {
+    appId: Schema.String,
+    profile: Schema.String,
+    discardPending: Schema.Boolean,
+    closeTimeoutMillis: Schema.Number
+  })
 ])
 export type ToLeader = typeof ToLeader.Type
 export const isToLeader = Schema.is(ToLeader)
@@ -80,6 +86,15 @@ export const isFromRouter = Schema.is(FromRouter)
 export const RouterBroadcast = Schema.TaggedStruct("RouterStarted", {})
 export type RouterBroadcast = typeof RouterBroadcast.Type
 export const isRouterBroadcast = Schema.is(RouterBroadcast)
+
+/**
+ * `resetReplica` → every tab client of the identity, on the BroadcastChannel named
+ * `Platform.resetChannelName(identity)` (DESIGN §16.24). A client that receives it for its own identity enters
+ * its terminal reset state. An event, not a tombstone: a client built afterwards never sees it.
+ */
+export const ResetSignal = Schema.TaggedStruct("ResetSignal", { appId: Schema.String, profile: Schema.String })
+export type ResetSignal = typeof ResetSignal.Type
+export const isResetSignal = Schema.is(ResetSignal)
 
 /** Minimal shape shared by `MessagePort`, `Worker`, and a dedicated worker's global scope. */
 export interface Endpoint {

@@ -13,7 +13,8 @@ import type { OutboxEnvelope, QueryResult, SqlParams } from "../../src/client/wo
 import type { ToRouter } from "../../src/client/worker/messages.ts"
 import type { SyncStatus } from "../../src/client/sync/SyncLoop.ts"
 import { resetReplica } from "../../src/client/worker/ResetReplica.ts"
-import { AccessScope } from "../../src/core/index.ts"
+import * as Schema from "effect/Schema"
+import { AccessScope, Mutation } from "../../src/core/index.ts"
 
 const params = new URLSearchParams(location.search)
 const appId = params.get("app") ?? "spike"
@@ -38,6 +39,17 @@ if (params.has("holdEpochWatch")) {
             return callback(lock)
           })
         : request(name, options, callback)
+  })
+}
+if (params.has("ignoreReset")) {
+  // Fault injection: this page never hears the engine's reset signal (DESIGN §16.24), as an old build or a
+  // frozen tab would not; its client keeps its leader. Only the engine's `echo:*:reset` channels are muted.
+  const add = BroadcastChannel.prototype.addEventListener
+  Object.defineProperty(BroadcastChannel.prototype, "addEventListener", {
+    value: function (this: BroadcastChannel, ...args: Parameters<typeof add>) {
+      if (this.name.startsWith("echo:") && this.name.endsWith(":reset")) return
+      return Reflect.apply(add, this, args)
+    }
   })
 }
 if (noSharedWorker) {
@@ -126,6 +138,9 @@ const currentStatus = Stream.runHead(client.status).pipe(
 
 /** Every `status` emission since `watchStatus()`, in order (the stream is continuous, not polled). */
 const statusLog: Array<LeaderClientModule.Status> = []
+const statusWatch: { ended: unknown } = { ended: undefined }
+/** The harness app's no-op mutation `t` (app.ts), for `client.mutate`: only its name and args schema matter. */
+const t = Mutation.make("t", { args: Schema.Json, handler: () => Effect.void })
 /**
  * Every `syncStatus` emission since `watchSyncStatus()`, each with the `statusLog` length when it arrived
  * (to order it against leader changes); `syncStatusEnded` is how the stream ended, if it did.
@@ -143,6 +158,21 @@ const presenceWatches = new Map<string, PresenceWatch>()
 
 const echo = {
   statusLog,
+  statusWatch,
+  /** `client.mutate` (the retrying write API) with mutation `t`; resolves with how long it took. */
+  mutate: async (args: Schema.Json = {}) => {
+    const started = performance.now()
+    const outcome = await run(client.mutate(t, args))
+    return { ...outcome, ms: Math.round(performance.now() - started) }
+  },
+  /** Every Web Lock, held or pending, of this page's identity (or `target`), by name and mode. */
+  locksFor: async (target: { readonly appId: string; readonly profile: string } = { appId, profile }) => {
+    const prefix = `echo:${target.appId}:${target.profile}:`
+    const snapshot = await navigator.locks.query()
+    const pick = (locks: ReadonlyArray<LockInfo> | undefined) =>
+      (locks ?? []).filter((l) => l.name?.startsWith(prefix) === true).map((l) => `${l.mode}:${l.name}`)
+    return { held: pick(snapshot.held), pending: pick(snapshot.pending) }
+  },
   /** Lets the epoch-lock callbacks held by `?holdEpochWatch` run. */
   releaseEpochWatch: () => {
     releaseEpochWatch()
@@ -202,13 +232,15 @@ const echo = {
     return true
   },
   track: (room: string, state: string) => run(client.track(AccessScope.AccessScopeId.make(room), state)),
-  /** `resetReplica` for another identity (this tab's own client must not be for it). */
-  resetReplica: (
-    target: { readonly appId: string; readonly profile: string },
+  /** `resetReplica` for `target` (this page's own identity by default); resolves with how long it took. */
+  resetReplica: async (
+    target: { readonly appId: string; readonly profile: string } = { appId, profile },
     discardPending = false,
-    fault: "spawnThrows" | "postThrows" | undefined = undefined
-  ) =>
-    run(
+    fault: "spawnThrows" | "postThrows" | undefined = undefined,
+    closeTimeoutMs: number | undefined = undefined
+  ) => {
+    const started = performance.now()
+    const outcome = await run(
       resetReplica(
         {
           ...target,
@@ -229,9 +261,14 @@ const echo = {
                   }
                 : spawnLeader
         },
-        discardPending ? { discardPending: true } : {}
+        {
+          ...(discardPending ? { discardPending: true } : {}),
+          ...(closeTimeoutMs === undefined ? {} : { closeTimeout: closeTimeoutMs })
+        }
       )
-    ),
+    )
+    return { ...outcome, ms: Math.round(performance.now() - started) }
+  },
   /**
    * Fault injection: overwrite the SQLite header of `<appId>/<profile>`'s database file in its pool (the
    * pool keeps its own 4096-byte header per file, path first), so the database no longer opens.
@@ -269,7 +306,14 @@ const echo = {
     return names.toSorted()
   },
   watchStatus: () => {
-    Effect.runFork(Stream.runForEach(client.status, (s) => Effect.sync(() => void statusLog.push(s))))
+    Effect.runFork(
+      Stream.runForEach(client.status, (s) => Effect.sync(() => void statusLog.push(s))).pipe(
+        Effect.exit,
+        Effect.map((exit) => {
+          statusWatch.ended = Exit.isFailure(exit) ? JSON.parse(JSON.stringify(exit.cause)) : "completed"
+        })
+      )
+    )
     return true
   },
   status: () => Effect.runPromise(currentStatus),

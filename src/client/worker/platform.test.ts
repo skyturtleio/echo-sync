@@ -32,6 +32,30 @@ it.live("an interrupted lock wait leaves the queue and never acquires the lock a
   })
 )
 
+it.live(
+  "a lock wait that reaches its deadline as the holder lets go either holds the lock or leaves nothing held or queued",
+  () =>
+    Effect.gen(function* () {
+      // The holder's release and the waiter's deadline race at every offset around the deadline; whichever wins,
+      // a waiter that answers `false` must not be granted the lock later (DESIGN §16.24 reset `closeTimeout`).
+      for (let offset = -3; offset <= 3; offset++) {
+        const name = `test:${crypto.randomUUID()}`
+        const holder = yield* Scope.make()
+        yield* Platform.holdLock(name).pipe(Scope.provide(holder))
+        setTimeout(() => Effect.runFork(Scope.close(holder, Exit.void)), 20 + offset)
+        const waiter = yield* Scope.make()
+        const held = yield* Platform.holdLockWithin(name, 20).pipe(Scope.provide(waiter))
+        // Let a grant that lost the race arrive, if one is coming.
+        yield* Effect.sleep("30 millis")
+        expect(yield* Platform.isLockHeld(name)).toBe(held)
+        expect(yield* pendingFor(name)).toBe(0)
+        // A lock it did get is released with its scope (asynchronously, once the lock manager sees it).
+        yield* Scope.close(waiter, Exit.void)
+        yield* waitUntil(Effect.map(Effect.orDie(Platform.isLockHeld(name)), (h) => !h))
+      }
+    })
+)
+
 it.live("a name held only in shared mode does not count as held (a dead leader's watchers)", () =>
   Effect.gen(function* () {
     const name = `test:${crypto.randomUUID()}`
