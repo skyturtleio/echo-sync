@@ -169,21 +169,31 @@ const haltReason = (error: unknown): string => {
   return "push failed with an integrity error"
 }
 
+type FailureDecision = { readonly halts: boolean; readonly error: SyncError; readonly halt: string }
+
 /**
  * Classifies a whole failure `Cause` (DESIGN §6: defect > transient > rejection), never just its
  * first `Fail`: a defect anywhere halts push, even beside a transient failure, since an RPC request
  * decode failure arrives as an untagged defect. Interruption is re-raised (the loop is stopping).
  * The returned strings are constants; the cause itself is only ever logged.
  */
-const classify = <E>(cause: Cause.Cause<E>, isFatal: ((error: E) => boolean) | undefined) =>
+const classify = <E>(cause: Cause.Cause<E>, isFatal: ((error: E) => boolean) | undefined, previous?: FailureDecision) =>
   Effect.gen(function* () {
     if (Cause.hasInterrupts(cause)) return yield* Effect.interrupt
     const failures = cause.reasons.filter(Cause.isFailReason).map((reason) => reason.error)
-    const fatalFailure = isFatal === undefined ? undefined : failures.find(isFatal)
-    const halts = isFatal !== undefined && (Cause.hasDies(cause) || fatalFailure !== undefined)
+    const fatalFailure = previous !== undefined || isFatal === undefined ? undefined : failures.find(isFatal)
+    const halts =
+      isFatal !== undefined && (Cause.hasDies(cause) || previous?.halts === true || fatalFailure !== undefined)
     const first = fatalFailure ?? failures[0]
-    const kind: SyncErrorKind = Cause.hasDies(cause) || first === undefined ? "server" : kindOf(first)
-    const halt = fatalFailure !== undefined ? haltReason(fatalFailure) : "push failed with a defect"
+    const kind: SyncErrorKind = Cause.hasDies(cause)
+      ? "server"
+      : (previous?.error.kind ?? (first === undefined ? "server" : kindOf(first)))
+    const halt =
+      previous?.halts === true
+        ? previous.halt
+        : fatalFailure !== undefined
+          ? haltReason(fatalFailure)
+          : "push failed with a defect"
     return { halts, error: { kind, message: messages[kind] } satisfies SyncError, halt }
   })
 
@@ -239,9 +249,26 @@ export const make = <TE>(options: {
       let pushedCleanly = false
       if ((yield* SubscriptionRef.get(status)).push._tag === "Active") {
         yield* setPhase("pushing")
-        const pushed = yield* Effect.exit(engine.push)
+        // Classify at the failing batch's span, then reuse that exact decision for status/policy.
+        let decision: Exit.Exit<FailureDecision> | undefined
+        const pushed = yield* Effect.exit(
+          engine.push.pipe(
+            Effect.provideService(
+              Telemetry.pushOutcome<Errors.StoreUnavailable | Errors.ConstraintViolated | TE>(),
+              (cause) =>
+                Effect.map(Effect.exit(classify(cause, options.isFatalPush)), (result) => {
+                  decision = result
+                  // A policy defect is not a new batch failure. Re-raise it at the original
+                  // decision point without reevaluating the host predicate or changing this Exit.
+                  return Exit.isFailure(result) ? "defect" : result.value.halts ? "halted" : result.value.error.kind
+                })
+            )
+          )
+        )
         if (Exit.isFailure(pushed)) {
-          const { halts, error, halt } = yield* classify(pushed.cause, options.isFatalPush)
+          if (Cause.hasInterrupts(pushed.cause)) return yield* Effect.interrupt
+          const previous = decision === undefined ? undefined : yield* decision
+          const { halts, error, halt } = yield* classify(pushed.cause, options.isFatalPush, previous)
           if (!halts && error.kind === "outdated") {
             yield* stopOutdated(error)
             return false

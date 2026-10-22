@@ -118,14 +118,20 @@ const parentFor = (
     if (exported !== undefined) return Option.some(exported)
     current = current.value.parent
   }
-  return external
+  return Option.isSome(current) ? current : external
 }
 
 class SafeSpan extends Tracer.NativeSpan {
   readonly target: Tracer.Span | undefined
   constructor(options: Parameters<Tracer.Tracer["span"]>[0], target: Tracer.Span | undefined) {
-    super(options)
+    const visible = target ?? Option.getOrUndefined(parentFor(options.parent, Option.none()))
+    super({ ...options, sampled: visible?.sampled ?? options.sampled })
     this.target = target
+    // The proxy and suppressed dependency spans propagate the exported identity, not a phantom one.
+    if (visible !== undefined) {
+      this._spanId = visible.spanId
+      this._traceId = visible.traceId
+    }
     forwarded.set(this, target)
   }
   override attribute(key: string, value: unknown): void {
@@ -176,7 +182,7 @@ export const boundary = <A, E, R>(work: Effect.Effect<A, E, R>): Effect.Effect<A
               ? guard(() =>
                   host.span({
                     ...options,
-                    parent: parentFor(options.parent, external),
+                    parent: parentFor(options.parent, options.root ? Option.none() : external),
                     annotations: Context.empty(),
                     links: []
                   })
@@ -300,7 +306,15 @@ export const outcome = <A, E>(exit: Exit.Exit<A, E>): string =>
       ? "interrupted"
       : Cause.hasDies(exit.cause)
         ? "defect"
-        : kind(exit.cause.reasons.find(Cause.isFailReason)?.error)
+        : exit.cause.reasons.some((reason) => Cause.isFailReason(reason) && kind(reason.error) === "halted")
+          ? "halted"
+          : kind(exit.cause.reasons.find(Cause.isFailReason)?.error)
+
+/** Internal typed key: Engine and its SyncLoop bind the same transport error union. */
+export const pushOutcome = <E>() =>
+  Context.Reference<(cause: Cause.Cause<E>) => Effect.Effect<string>>("echo-sync/PushOutcome", {
+    defaultValue: () => (cause) => Effect.succeed(outcome(Exit.failCause(cause)))
+  })
 
 export const annotate = (attributes: Record<string, unknown>) =>
   Effect.withFiber((fiber) => {
@@ -377,7 +391,13 @@ export const observe = <A, E, R>(work: Effect.Effect<A, E, R>, name: Name): Effe
         return work.pipe(
           Effect.onExit((exit) =>
             Effect.gen(function* () {
-              const result = outcome(exit)
+              const result =
+                Exit.isFailure(exit) &&
+                !Cause.hasInterrupts(exit.cause) &&
+                !Cause.hasDies(exit.cause) &&
+                name === "echo.push"
+                  ? yield* Effect.flatMap(pushOutcome<E>(), (classify) => classify(exit.cause))
+                  : outcome(exit)
               // A success result set inside the operation (saved/duplicate/stopped/etc.) takes precedence.
               const parent = yield* Effect.serviceOption(Tracer.ParentSpan)
               const recorded =

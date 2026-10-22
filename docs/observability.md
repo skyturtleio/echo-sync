@@ -66,7 +66,10 @@ Host-authored SQL outside engine operations remains the host's responsibility.
 Echo Sync never parses `traceparent`, baggage, or forwarded headers. The host decides which
 incoming trace context to trust and installs its parent with Effect's tracing facilities.
 Engine spans attach to the nearest exported engine ancestor, otherwise the parent outside the
-boundary. External spans terminate parent traversal. Host parent metadata, host global metric
+boundary. Proxies retain the exported span's IDs and sampling; suppressed spans propagate the
+nearest visible ancestor's identity. An explicit external span inside the boundary is terminal
+and remains the parent, rather than being replaced by the boundary's captured parent.
+Host parent metadata, host global metric
 attributes and log annotations are host-owned: do not put credentials or identities in them.
 
 ## Privacy boundary and sink failures
@@ -124,6 +127,9 @@ Its closed vocabulary is `ok`, `credentials`, `unauthorized`, `unavailable`, `ne
 `forbidden`, `halted`, `stopped`, `saved`, `duplicate`, `elected`, `lost`, `idle-timeout`,
 `server-end`, `page`, `done`. Interruption takes precedence over defects, then recognized typed
 failures, then `server`. Classification is descriptive; it never supplies retry/halt policy.
+For push batches driven by `SyncLoop`, its actual whole-cause classification supplies the outcome:
+`halted` when the host's `isFatalPush` halts, otherwise its closed error kind. That decision is
+reused for status, not recomputed from tags; interruption and defect outcomes retain precedence.
 `echo.result` carries the operation-specific success result from the same vocabulary;
 `echo.reason` distinguishes first-element idle timeout from clean stream end.
 Only nonnegative safe integer counts and `echo.resnapshot: boolean` are otherwise allowed.
@@ -132,7 +138,7 @@ Never identifiers, table/mutation names, args, rows, headers, URLs, free text, c
 | Exact name | Boundary and attributes |
 | --- | --- |
 | `echo.enqueue` | Local transaction through commit; `saved`, `duplicate`, `rejected` or failure kind. Duplicate does not count as saved. Interruption does not imply rollback of a masked commit. |
-| `echo.push` | One actually sent batch, through response bookkeeping; `echo.batch_size`, `echo.processed`, `echo.applied`, `echo.rejected`; short prefix is `stopped`. Unsent/empty/halted cycles have no batch span. Each real retry is a new span. |
+| `echo.push` | One attempted nonempty batch, before credential acquisition through response bookkeeping; `echo.batch_size`, `echo.processed`, `echo.applied`, `echo.rejected`; short prefix is `stopped`. Credential acquisition failure records `credentials` even though nothing was sent. Empty/halted cycles have no batch span. Each real retry is a new span. |
 | `echo.pull` | One set attempt through install, including resumed staged pages. `echo.pages`, `echo.resnapshot`, `echo.resnapshot_count`. Internal resnapshot restarts stay inside the attempt and successful recovery is `resnapshot`. External backoff retries are new spans. On success pages includes the entire installed set and PullDone; on failure it is the last observed set size including staged pages, if a page arrived. |
 | `echo.install` | Child of pull, after PullDone, wraps the storage transaction through commit/rollback. Empty PullDone still installs successfully. Push halt does not prevent install. |
 | `echo.rebase` | Child of install or push's covered-outcome release; `echo.pending`, `echo.replayed`, `echo.released`, `echo.notices_rejected`, `echo.notices_unknown`. Empty replay counts are zero. Completion is inside the transaction; only install proves commit. |
@@ -156,7 +162,8 @@ Metrics use the same host context:
 - `echo.pokes.reconnect.total`, classified stream-termination reason; no reconnect on teardown.
 - `echo.outbox.pending` gauge, from the existing reactive count, no extra query/timer. Without
   a host runtime attribute it is a last-writer gauge across workers, not an aggregate.
-- `echo.push.batch_size` histogram: boundaries `[0,1,10,25,50,100]`, sent batches only.
+- `echo.push.batch_size` histogram: boundaries `[0,1,10,25,50,100]`, attempted nonempty batches,
+  including those stopped by credential acquisition before sending.
 - `echo.pull.pages` histogram: `[1,2,5,10,25,50,100,500]`, successful installed sets only.
 - `echo.install.duration`, `echo.rebase.duration`: `Metric.timer`, milliseconds, including
   failed/interrupted attempts, tagged by outcome; Effect adds `time_unit=milliseconds`.

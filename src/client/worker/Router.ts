@@ -110,14 +110,20 @@ export const router = (self: SharedWorkerScope): Effect.Effect<void> =>
     }
 
     const onConnect = (event: MessageEvent) => {
-      if (!open) return
+      if (!open) {
+        for (const port of event.ports) port.close()
+        return
+      }
       const tabPort = event.ports[0]
       if (tabPort === undefined) return
       ports.add(tabPort)
       const onMessage = (message: MessageEvent) => {
-        if (!open) return
         const data: unknown = message.data
-        if (!isToRouter(data)) return
+        if (!open || !isToRouter(data)) {
+          for (const port of message.ports) port.close()
+          if (isToRouter(data) && data._tag === "Leader") data.port.close()
+          return
+        }
         switch (data._tag) {
           case "Hello": {
             if (identity === undefined) {
@@ -149,7 +155,10 @@ export const router = (self: SharedWorkerScope): Effect.Effect<void> =>
             return
           }
           case "Leader": {
-            if (identity === undefined) return
+            if (identity === undefined) {
+              data.port.close()
+              return
+            }
             const replica = identity
             const announced = { leaderId: data.leaderId, port: data.port }
             ports.add(data.port)

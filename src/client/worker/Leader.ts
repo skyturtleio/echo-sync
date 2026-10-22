@@ -259,14 +259,20 @@ const serveTab = (
   identity: Platform.ReplicaIdentity,
   tabId: string,
   port: MessagePort,
-  handlers: Context.Context<Rpc.ToHandler<RpcGroup.Rpcs<typeof LeaderRpcs>>>
+  handlers: Context.Context<Rpc.ToHandler<RpcGroup.Rpcs<typeof LeaderRpcs>>>,
+  pending: Set<MessagePort>
 ) =>
   RpcServer.make(LeaderRpcs).pipe(
     Effect.provide(RpcServer.layerProtocolWorkerRunner.pipe(Layer.provide(BrowserWorkerRunner.layerMessagePort(port)))),
     Effect.provide(handlers),
     // Tabs never say goodbye reliably; their lifetime lock does.
     Effect.raceFirst(Platform.awaitLockReleased(Platform.tabLockName(identity, tabId))),
-    Effect.ensuring(Effect.sync(() => port.close()))
+    Effect.ensuring(
+      Effect.sync(() => {
+        port.close()
+        pending.delete(port)
+      })
+    )
   )
 
 /** A dedicated worker's global scope, as far as the leader uses it. */
@@ -389,7 +395,13 @@ const reset = (message: Reset): Effect.Effect<ResetOutcome> =>
     )
   )
 
-const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: LeaderOptions, init: Init) =>
+const program = (
+  endpoint: WorkerScope,
+  inbox: Queue.Queue<ToLeader>,
+  options: LeaderOptions,
+  init: Init,
+  pending: Set<MessagePort>
+) =>
   Effect.gen(function* () {
     const identity: Platform.ReplicaIdentity = { appId: init.appId, profile: init.profile }
     const invalid = Platform.validateIdentity(identity) ?? Platform.leaderHostCapability()
@@ -462,10 +474,12 @@ const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: L
       const message = yield* Queue.take(inbox)
       switch (message._tag) {
         case "Connect":
-          yield* Effect.forkScoped(serveTab(identity, message.tabId, message.port, handlers))
+          // Keep outer ownership until the child closes it: a scheduled child may never start.
+          yield* Effect.forkScoped(serveTab(identity, message.tabId, message.port, handlers, pending))
           break
         case "RouterPort":
-          yield* listen(message.port, inbox)
+          yield* listen(message.port, inbox, pending)
+          pending.delete(message.port)
           break
         case "Init":
           break
@@ -495,13 +509,21 @@ const listen = (
     removeEventListener?: (type: "message", listener: (event: MessageEvent) => void) => void
     close?: () => void
   },
-  inbox: Queue.Queue<ToLeader>
+  inbox: Queue.Queue<ToLeader>,
+  pending: Set<MessagePort>
 ) =>
   Effect.acquireRelease(
     Effect.sync(() => {
       let open = true
       const listener = (event: MessageEvent) => {
-        if (open && isToLeader(event.data)) Queue.offerUnsafe(inbox, event.data)
+        if (!open || !isToLeader(event.data)) {
+          for (const port of event.ports) port.close()
+          if (isToLeader(event.data) && (event.data._tag === "Connect" || event.data._tag === "RouterPort"))
+            event.data.port.close()
+          return
+        }
+        if (event.data._tag === "Connect" || event.data._tag === "RouterPort") pending.add(event.data.port)
+        Queue.offerUnsafe(inbox, event.data)
       }
       endpoint.addEventListener("message", listener)
       endpoint.start?.()
@@ -518,17 +540,29 @@ const listen = (
 export const leaderWorker = (self: WorkerScope, options: LeaderOptions): Effect.Effect<void> =>
   Effect.gen(function* () {
     const inbox = yield* Queue.unbounded<ToLeader>()
+    const pending = new Set<MessagePort>()
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        for (const port of pending) port.close()
+        pending.clear()
+      })
+    )
     // The host owns the worker global; only RouterPorts are ours to close.
     yield* listen(
       {
         addEventListener: self.addEventListener.bind(self),
         ...(self.removeEventListener === undefined ? {} : { removeEventListener: self.removeEventListener.bind(self) })
       },
-      inbox
+      inbox,
+      pending
     )
     let first = yield* Queue.take(inbox)
-    while (first._tag !== "Init" && first._tag !== "Reset") first = yield* Queue.take(inbox)
-    if (first._tag === "Init") return yield* program(self, inbox, options, first)
+    while (first._tag !== "Init" && first._tag !== "Reset") {
+      first.port.close()
+      pending.delete(first.port)
+      first = yield* Queue.take(inbox)
+    }
+    if (first._tag === "Init") return yield* program(self, inbox, options, first, pending)
     const outcome = yield* reset(first)
     // Every lock and handle is released by now (the reset's scope closed); the tab ends this worker.
     send(self, { _tag: "ResetOutcome", outcome })

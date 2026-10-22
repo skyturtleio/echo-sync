@@ -3,6 +3,11 @@ import { Cause, Context, type Exit, Layer, Logger, Metric, Option, References, T
 
 export interface RecordedSpan {
   readonly name: string
+  readonly spanId: string
+  readonly traceId: string
+  readonly sampled: boolean
+  readonly parentSpanId: string | undefined
+  readonly parentTraceId: string | undefined
   readonly parent: string | undefined
   readonly attributes: ReadonlyArray<readonly [string, unknown]>
   readonly events: ReadonlyArray<unknown>
@@ -11,7 +16,7 @@ export interface RecordedSpan {
   readonly exit: Exit.Exit<unknown, unknown>
 }
 
-export const recorder = (throws: "none" | "create" | "attribute" | "end" | "logger" = "none") => {
+export const recorder = (throws: "none" | "create" | "attribute" | "end" | "logger" = "none", sampled?: boolean) => {
   const spans: Array<RecordedSpan> = []
   const logs: Array<{ diagnostics: boolean; message: unknown; cause: string }> = []
   const registry: Metric.MetricRegistry = new Map()
@@ -24,6 +29,11 @@ export const recorder = (throws: "none" | "create" | "attribute" | "end" | "logg
       super.end(time, exit)
       spans.push({
         name: this.name,
+        spanId: this.spanId,
+        traceId: this.traceId,
+        sampled: this.sampled,
+        parentSpanId: Option.getOrUndefined(this.parent)?.spanId,
+        parentTraceId: Option.getOrUndefined(this.parent)?.traceId,
         parent: Option.isSome(this.parent)
           ? this.parent.value._tag === "Span"
             ? this.parent.value.name
@@ -41,7 +51,7 @@ export const recorder = (throws: "none" | "create" | "attribute" | "end" | "logg
   const tracer = Tracer.make({
     span(options) {
       if (throws === "create") throw new Error("host create sink failed")
-      return new Recorded(options)
+      return new Recorded(sampled === undefined ? options : { ...options, sampled })
     }
   })
   const logger = Logger.make<unknown, void>((options) => {

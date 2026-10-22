@@ -50,6 +50,152 @@ const device = Effect.fnUntraced(
   Effect.provideService(Tracer.Tracer, Tracer.nativeTracer)
 )
 
+it.live(
+  "sync propagates exported IDs and sampling through suppressed spans and preserves an explicit external parent",
+  () => {
+    const recording = recorder("none", false)
+    return Effect.gen(function* () {
+      const external = Tracer.externalSpan({ spanId: "incoming-span", traceId: "incoming-trace", sampled: false })
+      const current: Array<{ spanId: string; traceId: string; sampled: boolean }> = []
+      const capture = Effect.gen(function* () {
+        const span = yield* Effect.currentSpan
+        current.push({ spanId: span.spanId, traceId: span.traceId, sampled: span.sampled })
+      })
+      const { engine } = yield* device({
+        push: () => Effect.succeed({ results: [] }),
+        pull: (): Effect.Effect<Protocol.PullResponse, unknown> =>
+          Effect.gen(function* () {
+            yield* capture
+            yield* capture.pipe(Effect.withSpan("http.dependency"))
+            yield* engine
+              .mutate(Ids.MutationId.make("nested"), "accept", {})
+              .pipe(Effect.withSpan("sql.dependency"), Effect.provideService(Tracer.ParentSpan, external))
+            return done
+          })
+      })
+      yield* engine.pull
+      const pull = recording.spans.find((span) => span.name === "echo.pull")
+      expect(pull).toBeDefined()
+      expect(current).toEqual([0, 1].map(() => ({ spanId: pull?.spanId, traceId: pull?.traceId, sampled: false })))
+      const enqueue = recording.spans.find((span) => span.name === "echo.enqueue")
+      expect(enqueue?.parentSpanId).toBe(external.spanId)
+      expect(enqueue?.parentTraceId).toBe(external.traceId)
+      expect(enqueue?.traceId).toBe(external.traceId)
+      expect(enqueue?.sampled).toBe(false)
+      const install = recording.spans.find((span) => span.name === "echo.install")
+      expect(install?.parentSpanId).toBe(pull?.spanId)
+      expect(install?.parentTraceId).toBe(pull?.traceId)
+    }).pipe(Effect.scoped, Effect.provide(recording.layer))
+  }
+)
+
+it.effect("batch telemetry agrees with the loop's whole-cause decision and custom fatal policy, not a tag guess", () =>
+  Effect.gen(function* () {
+    const unauthorized = Cause.fail(new Protocol.Unauthorized({ message: secret }))
+    const malformed = Cause.fail(
+      new Protocol.MalformedEnvelope({
+        clientId: Ids.ClientId.make("device"),
+        mutationId: Ids.MutationId.make("intent"),
+        message: secret
+      })
+    )
+    let hostDecisions = 0
+    for (const { cause, isFatal, expected } of [
+      { cause: Cause.combine(unauthorized, malformed), isFatal: Transport.isFatalPush, expected: "halted" },
+      { cause: Cause.combine(malformed, unauthorized), isFatal: Transport.isFatalPush, expected: "halted" },
+      { cause: Cause.fail({ _tag: "HostFatal" }), isFatal: () => ++hostDecisions === 1, expected: "halted" },
+      { cause: malformed, isFatal: () => false, expected: "server" }
+    ]) {
+      const recording = recorder()
+      yield* Effect.gen(function* () {
+        let pushes = 0
+        const { engine, storage } = yield* device({
+          push: () =>
+            Effect.suspend(() => {
+              pushes++
+              return Effect.failCause(cause)
+            }),
+          pull: () => Effect.succeed(done)
+        })
+        yield* engine.mutate(Ids.MutationId.make("intent"), "accept", {})
+        const loop = yield* SyncLoop.make({ engine, isFatalPush: isFatal, pendingMutations: storage.pendingCount })
+        const fiber = yield* Effect.forkChild(loop.run)
+        yield* Effect.repeat(Effect.yieldNow, { times: 80 })
+        expect((yield* loop.status).push._tag).toBe(expected === "halted" ? "Halted" : "Active")
+        if (expected === "halted") yield* TestClock.adjust("30 seconds")
+        expect(pushes).toBe(1)
+        expect(
+          recording.spans
+            .filter((span) => span.name === "echo.push")
+            .map((span) => new Map(span.attributes).get("echo.outcome"))
+        ).toEqual([expected])
+        expect(
+          (yield* Metric.value(Metric.counter("echo.push.total", { attributes: { "echo.outcome": expected } }))).count
+        ).toBe(1)
+        expect(
+          (yield* Metric.value(Metric.counter("echo.push.total", { attributes: { "echo.outcome": "unauthorized" } })))
+            .count
+        ).toBe(0)
+        yield* Fiber.interrupt(fiber)
+      }).pipe(Effect.scoped, Effect.provide(recording.layer))
+    }
+  })
+)
+
+it.effect("policy defects and outer push cleanup cannot be swallowed or overridden by a cached batch decision", () =>
+  Effect.gen(function* () {
+    for (const mode of ["policy", "defect", "interrupt"]) {
+      const recording = recorder()
+      yield* Effect.gen(function* () {
+        let pulls = 0
+        let decisions = 0
+        const failure = new Error(`policy-or-cleanup-${secret}`)
+        const { engine, storage } = yield* device({
+          push: () => Effect.fail(new Protocol.Unauthorized({ message: secret })),
+          pull: () =>
+            Effect.sync(() => {
+              pulls++
+              return done
+            })
+        })
+        yield* engine.mutate(Ids.MutationId.make("intent"), "accept", {})
+        const push =
+          mode === "policy"
+            ? engine.push
+            : engine.push.pipe(Effect.ensuring(mode === "interrupt" ? Effect.interrupt : Effect.die(failure)))
+        const loop = yield* SyncLoop.make({
+          engine: { ...engine, push },
+          isFatalPush: () => {
+            decisions++
+            if (mode === "policy" && decisions === 1) throw failure
+            return false
+          },
+          pendingMutations: storage.pendingCount
+        })
+        const fiber = yield* Effect.forkChild(Effect.exit(loop.run))
+        yield* Effect.repeat(Effect.yieldNow, { times: 80 })
+        if (mode === "defect") {
+          expect((yield* loop.status).push._tag).toBe("Halted")
+          expect(pulls).toBe(1)
+          yield* Fiber.interrupt(fiber)
+        } else {
+          const exit = yield* Fiber.join(fiber)
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit)) {
+            expect(mode === "policy" ? Cause.hasDies(exit.cause) : Cause.hasInterrupts(exit.cause)).toBe(true)
+            if (mode === "policy")
+              expect(exit.cause.reasons.some((reason) => Cause.isDieReason(reason) && reason.defect === failure)).toBe(
+                true
+              )
+          }
+          expect(pulls).toBe(0)
+        }
+        expect(decisions).toBe(1)
+      }).pipe(Effect.scoped, Effect.provide(recording.layer))
+    }
+  })
+)
+
 it.effect("throwing host sinks cannot change saved intent, retry deadlines, halt or successful installs", () =>
   Effect.gen(function* () {
     for (const failure of ["none", "create", "attribute", "end", "logger"] satisfies ReadonlyArray<
