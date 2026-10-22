@@ -18,6 +18,7 @@ import {
 } from "effect"
 import type { Headers } from "effect/http/Headers"
 import type * as HttpRouter from "effect/http/HttpRouter"
+import * as HttpServerRequest from "effect/http/HttpServerRequest"
 import { RpcSerialization, RpcServer } from "effect/rpc"
 import { SqlClient } from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
@@ -31,7 +32,10 @@ import { resolveTables } from "./schema.ts"
 export interface SyncServerOptions {
   readonly registry: Registry.SyncRegistry
   readonly mutations: Mutation.MutationRegistry
-  /** Authenticates the request (DESIGN §4). The principal is never taken from the payload. */
+  /**
+   * Authenticates and applies request policy to the real HTTP request's headers (DESIGN §4).
+   * Body-supplied RPC message headers are never exposed. Runs for every call / stream open.
+   */
   readonly principalFor: (headers: Headers) => Effect.Effect<AccessScope.PrincipalId, Protocol.Unauthorized>
   /** Upserts and tombstones per pull page. Default 500. */
   readonly pageLimit?: number | undefined
@@ -361,6 +365,16 @@ export const executeBatch = (
     pushFailures
   )
 
+// The pinned HTTP protocol preserves the request fiber's context for all handler fibers,
+// including streams. Its RPC metadata headers, unlike this service, include body-supplied values.
+const requestHeaders = Effect.gen(function* () {
+  const request = yield* Effect.serviceOption(HttpServerRequest.HttpServerRequest)
+  if (Option.isNone(request)) {
+    return yield* Effect.die(new Error("echo-sync RPC handlers require layerHttp; non-HTTP mounts are unsupported"))
+  }
+  return request.value.headers
+})
+
 /**
  * Handlers for `Protocol.SyncRpcs` over Postgres (DESIGN §6, §8).
  *
@@ -375,14 +389,14 @@ export const handlers = (options: SyncServerOptions) =>
       const sql = yield* SqlClient
       const pokes = yield* Notifications
       return Protocol.SyncRpcs.of({
-        push: (request, { headers }) =>
+        push: (request) =>
           Effect.gen(function* () {
-            const actor = yield* options.principalFor(headers)
+            const actor = yield* options.principalFor(yield* requestHeaders)
             return yield* executeBatch(options, actor, request)
           }).pipe(pushFailures, Effect.provideService(SqlClient, sql)),
-        pull: (request, { headers }) =>
+        pull: (request) =>
           Effect.gen(function* () {
-            const principalId = yield* options.principalFor(headers)
+            const principalId = yield* options.principalFor(yield* requestHeaders)
             return yield* pull(options.registry, {
               principalId,
               clientId: request.clientId,
@@ -391,10 +405,10 @@ export const handlers = (options: SyncServerOptions) =>
               limit: options.pageLimit ?? 500
             })
           }).pipe(serverFailures, Effect.provideService(SqlClient, sql)),
-        pokes: ({ clientId }, { headers }) =>
+        pokes: ({ clientId }) =>
           Stream.unwrap(
             Effect.gen(function* () {
-              const principalId = yield* options.principalFor(headers)
+              const principalId = yield* options.principalFor(yield* requestHeaders)
               yield* registerClient(principalId, clientId)
               return pokes
             }).pipe(Effect.provideService(SqlClient, sql))
@@ -467,19 +481,19 @@ export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor"
           )
         )
       return Protocol.PresenceRpcs.of({
-        room: (payload, { headers }) =>
+        room: (payload) =>
           Stream.unwrap(
             Effect.gen(function* () {
-              const principalId = yield* options.principalFor(headers)
+              const principalId = yield* options.principalFor(yield* requestHeaders)
               if (!(yield* holdsRoom(principalId, payload.room))) {
                 return yield* new Protocol.Forbidden({ room: payload.room })
               }
               return presence.join({ principalId, ...payload }, holdsRoom(principalId, payload.room))
             })
           ),
-        track: (payload, { headers }) =>
+        track: (payload) =>
           Effect.gen(function* () {
-            const principalId = yield* options.principalFor(headers)
+            const principalId = yield* options.principalFor(yield* requestHeaders)
             yield* presence.track({ principalId, ...payload })
           })
       })
