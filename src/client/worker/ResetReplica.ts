@@ -11,8 +11,11 @@
  * the leader uses; see `reset` in `Leader.ts`.
  *
  * Interrupting the reset terminates that worker, and the browser then releases its lock and access
- * handles. A removal it had already begun may be partial; what a leader makes of such a directory is not
- * established, but a reset with `discardPending` never opens the database, so it can be retried on it.
+ * handles. The removal is durable across that (DESIGN §16.26): once the pending decision is made, the worker
+ * writes an engine-owned tombstone before touching the directory and removes it last. Interrupted before the
+ * tombstone, the replica is intact; after it, the next leader of the identity (before opening its pool) or the
+ * next reset (answering `Done` without a pending count) completes the removal, and a leader then starts on a
+ * fresh replica with a new clientId.
  */
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"

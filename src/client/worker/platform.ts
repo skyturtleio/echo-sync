@@ -78,6 +78,21 @@ export const validateIdentity = (identity: ReplicaIdentity): string | undefined 
  */
 export const poolDirectory = ({ appId, profile }: ReplicaIdentity): string => `echo-sync/${appId}/${profile}`
 
+/**
+ * Name of the identity's reset tombstone (DESIGN §16.26), an engine-owned file in `echo-sync/<appId>` whose
+ * presence means a reset that passed its pending decision condemned `poolDirectory(identity)`. It starts with
+ * "~", which `validateIdentity` never accepts, so it is never a profile's directory. The profile is hashed
+ * (SHA-256, hex) rather than embedded so the name fits `maxSegmentBytes` for every valid profile.
+ */
+export const tombstoneName = ({ profile }: ReplicaIdentity): Effect.Effect<string, Error> =>
+  Effect.tryPromise({
+    try: async () => {
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(profile)))
+      return `~reset-${Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("")}`
+    },
+    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause)))
+  })
+
 /** Exclusive lock held by exactly one leader worker per replica for its whole lifetime. */
 /** Name of the router SharedWorker and of the BroadcastChannel its instances announce themselves on. */
 export const routerName = ({ appId, profile }: ReplicaIdentity): string => `echo:${appId}:${profile}:router`

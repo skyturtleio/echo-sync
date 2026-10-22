@@ -337,6 +337,55 @@ const opfsDirectory = (path: string) =>
     catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause)))
   })
 
+const toError = (cause: unknown) => (cause instanceof Error ? cause : new Error(String(cause)))
+
+const isNotFound = (cause: unknown) => cause instanceof DOMException && cause.name === "NotFoundError"
+
+/** Remove `name` from `parent`; an entry that is already gone counts as removed. */
+const removeIfPresent = (parent: FileSystemDirectoryHandle, name: string, options?: FileSystemRemoveOptions) =>
+  Effect.tryPromise({
+    try: () =>
+      parent.removeEntry(name, options).catch((cause: unknown) => {
+        if (!isNotFound(cause)) throw cause
+      }),
+    catch: toError
+  })
+
+/**
+ * The removal a tombstone stands for (DESIGN §16.26): the profile's directory, then the tombstone. The
+ * tombstone goes last, so a crash in between leaves it in place and the next leader or reset repeats this.
+ */
+const removeCondemned = (parent: FileSystemDirectoryHandle, identity: Platform.ReplicaIdentity, tombstone: string) =>
+  Effect.andThen(removeIfPresent(parent, identity.profile, { recursive: true }), removeIfPresent(parent, tombstone))
+
+/**
+ * Finish a reset that was interrupted after writing its tombstone (DESIGN §16.26). Call only under the
+ * identity's leader lock and before anything opens the pool. `true` if a tombstone was found; the directory
+ * and the tombstone are then both gone, so the pool opened next is a fresh, empty replica.
+ */
+const completeInterruptedReset = (identity: Platform.ReplicaIdentity) =>
+  Effect.gen(function* () {
+    const parent = yield* opfsDirectory(`echo-sync/${identity.appId}`)
+    if (parent === undefined) return false
+    const tombstone = yield* Platform.tombstoneName(identity)
+    const condemned = yield* Effect.tryPromise({
+      try: () =>
+        parent.getFileHandle(tombstone).then(
+          () => true,
+          (cause: unknown) => {
+            if (isNotFound(cause)) return false
+            throw cause
+          }
+        ),
+      catch: toError
+    })
+    if (!condemned) return false
+    // As a leader does before opening: the interrupted reset's access handles may outlive its worker briefly.
+    yield* Platform.awaitOpfsPoolFree(Platform.poolDirectory(identity))
+    yield* removeCondemned(parent, identity, tombstone)
+    return true
+  })
+
 /** Unreleased outbox entries; a database without an outbox (never migrated) has none. */
 const countUnreleased = (sql: SqlClient.SqlClient) =>
   Effect.gen(function* () {
@@ -352,9 +401,11 @@ const countUnreleased = (sql: SqlClient.SqlClient) =>
  * let go of it, waiting at most the reset's `closeTimeout`; it never gets it from a live leader. Under it,
  * without `discardPending`, it opens the database through the leader's own OPFS host (no migration), counts
  * the outbox and closes the database and the pool; any failure there is `ResetFailed` with nothing removed.
- * With `discardPending` it never opens the database. Then it removes `echo-sync/<appId>/<profile>` and
- * releases the lock last. A candidate of a client built after the signal that queued meanwhile is elected
- * only after the directory is gone, so it creates a fresh replica.
+ * With `discardPending` it never opens the database. Then it writes the identity's tombstone, removes
+ * `echo-sync/<appId>/<profile>`, removes the tombstone (DESIGN §16.26) and releases the lock last. A candidate
+ * of a client built after the signal that queued meanwhile is elected only after the directory is gone, so it
+ * creates a fresh replica. A tombstone found under the lock means an earlier reset was interrupted after its
+ * decision: the removal is completed and the answer is `Done`, with no pending count.
  */
 const reset = (message: Reset): Effect.Effect<ResetOutcome> =>
   Effect.gen(function* () {
@@ -373,6 +424,9 @@ const reset = (message: Reset): Effect.Effect<ResetOutcome> =>
         // timeout too short for even a free lock's (asynchronous) grant answers `ReplicaInUse`, never a deletion.
         if (!(yield* Platform.holdLockWithin(lock, message.closeTimeoutMillis)))
           return { _tag: "ReplicaInUse" } satisfies ResetOutcome
+        // An earlier reset already passed its pending decision and condemned this replica (DESIGN §16.26):
+        // finish its removal and count nothing.
+        if (yield* completeInterruptedReset(identity)) return { _tag: "Done" } satisfies ResetOutcome
         if ((yield* opfsDirectory(poolDirectory)) === undefined) return { _tag: "Done" } satisfies ResetOutcome
         if (message.discardPending) {
           // Never opens the database (DESIGN §9.1): a corrupt or partially removed replica can still be reset.
@@ -388,10 +442,12 @@ const reset = (message: Reset): Effect.Effect<ResetOutcome> =>
         }
         const parent = yield* opfsDirectory(`echo-sync/${identity.appId}`)
         if (parent !== undefined) {
-          yield* Effect.tryPromise({
-            try: () => parent.removeEntry(identity.profile, { recursive: true }),
-            catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause)))
-          })
+          // The decision is made: record it durably before touching the directory (DESIGN §16.26). From here a
+          // crash leaves the tombstone, and the next leader or reset completes the removal; before here it
+          // leaves the replica intact.
+          const tombstone = yield* Platform.tombstoneName(identity)
+          yield* Effect.tryPromise({ try: () => parent.getFileHandle(tombstone, { create: true }), catch: toError })
+          yield* removeCondemned(parent, identity, tombstone)
         }
         return { _tag: "Done" } satisfies ResetOutcome
       })
@@ -428,6 +484,11 @@ const program = (
     // The leader lock is held from here until this worker dies.
     const leaderId = crypto.randomUUID()
     yield* Platform.holdLock(Platform.leaderEpochLockName(identity, leaderId))
+    // Before the pool is opened (DESIGN §16.26): a replica condemned by an interrupted reset is never served; its
+    // removal is completed here and the database below starts fresh, with a new clientId.
+    if (yield* completeInterruptedReset(identity)) {
+      yield* Telemetry.log("Warn", "echo leader completed the removal of a replica condemned by an interrupted reset")
+    }
     const dbName = Platform.dbName(identity)
     const { registry, mutations, syncUrl } = options
     const { sql, reactivity } = yield* openDatabase(identity, registry)
