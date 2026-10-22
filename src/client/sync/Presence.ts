@@ -23,6 +23,7 @@
  */
 import { Cause, Deferred, Duration, Effect, Exit, Queue, type Schema, Stream } from "effect"
 import type { AccessScope, Protocol } from "echo-sync"
+import * as Telemetry from "../../internal/Telemetry.ts"
 
 export interface Upstream<E> {
   /**
@@ -107,7 +108,7 @@ export const make = <E, F extends E>(options: {
           delay = base
           continue
         }
-        yield* Effect.logDebug(`echo-sync: presence track failed; retrying in ${delay} ms`, attempt.cause)
+        yield* Telemetry.log("Debug", "echo-sync: presence track failed; retrying", attempt.cause)
         yield* Effect.sleep(Duration.millis(delay))
         delay = Math.min(delay * 2, cap)
       }
@@ -201,5 +202,8 @@ export const make = <E, F extends E>(options: {
       Deferred.doneUnsafe(sub.wake, Effect.void)
     })
 
-  return { join, track }
+  return {
+    join: (payload) => join(payload).pipe(Telemetry.stream),
+    track: (payload) => track(payload).pipe(Telemetry.boundary)
+  }
 }

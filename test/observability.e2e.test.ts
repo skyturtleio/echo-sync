@@ -1,0 +1,381 @@
+// oxlint-disable-next-line import/no-unassigned-import -- Node wasm fixture
+import "../src/client/testing/nodeWasm.ts"
+import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
+import type * as PgClient from "@effect/sql-pg/PgClient"
+import { describe, expect, it } from "@effect/vitest"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Metric, Schema, Scope, Stream, Tracer } from "effect"
+import * as Reactivity from "effect/reactivity/Reactivity"
+import { FetchHttpClient, Headers, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
+import { Rpc } from "effect/rpc"
+import { RequestId } from "effect/rpc/RpcMessage"
+import { SqlClient } from "effect/sql/SqlClient"
+import { AccessScope, Ids, Mutation, Protocol } from "echo-sync"
+import { TestClock } from "effect/testing"
+import * as Engine from "../src/client/sync/Engine.ts"
+import * as SqliteSyncStorage from "../src/client/sync/SqliteSyncStorage.ts"
+import * as SyncLoop from "../src/client/sync/SyncLoop.ts"
+import * as Transport from "../src/client/sync/Transport.ts"
+import { executeBatch, handlers, layerHttp, Notifications } from "../src/server/postgres/rpc.ts"
+import { collectGarbage, expireLedger } from "../src/server/postgres/gc.ts"
+import { pgAvailable, registry, TestDatabase } from "../src/server/postgres/test-support.ts"
+import { recorder, serialized } from "./telemetry-recorder.ts"
+
+const secret = "canary-header-arg-principal-defect-721994"
+const cursor = Ids.Position.make(819273645564738291n)
+const actor = AccessScope.PrincipalId.make(secret)
+const mutations = Mutation.makeRegistry([Mutation.make("accept", { args: Schema.Json, handler: () => Effect.void })])
+const done: Protocol.PullResponse = {
+  _tag: "PullDone",
+  changes: [],
+  acks: [],
+  nextCursor: cursor,
+  expiredThrough: Ids.SeqFloor.make(0)
+}
+const device = Effect.fnUntraced(
+  function* (transport: Engine.Transport<unknown>) {
+    const sqlite = yield* SqliteClient.makeMemory({})
+    yield* SqliteSyncStorage.migrate(registry).pipe(Effect.provideService(SqlClient, sqlite))
+    const storage = SqliteSyncStorage.make(sqlite, registry)
+    const engine = yield* Engine.make({
+      clientId: Ids.ClientId.make("device"),
+      actor,
+      storage,
+      registry,
+      mutations,
+      transport
+    })
+    return { engine, storage }
+  },
+  Effect.provide(Reactivity.layer),
+  Effect.provideService(Tracer.Tracer, Tracer.nativeTracer)
+)
+
+it.effect("throwing host sinks cannot change saved intent, retry deadlines, halt or successful installs", () =>
+  Effect.gen(function* () {
+    for (const failure of ["none", "create", "attribute", "end", "logger"] satisfies ReadonlyArray<
+      Parameters<typeof recorder>[0]
+    >) {
+      const recording = recorder(failure)
+      const run = Effect.gen(function* () {
+        let pushes = 0
+        const { engine, storage } = yield* device({
+          push: () =>
+            Effect.suspend((): Effect.Effect<never, Protocol.Unauthorized | Protocol.MalformedEnvelope> => {
+              pushes++
+              return pushes === 1
+                ? Effect.fail(new Protocol.Unauthorized({ message: secret }))
+                : Effect.fail(
+                    new Protocol.MalformedEnvelope({
+                      clientId: Ids.ClientId.make("device"),
+                      mutationId: Ids.MutationId.make("intent"),
+                      message: secret
+                    })
+                  )
+            }),
+          pull: () => Effect.succeed(done)
+        })
+        const saved = yield* engine.mutate(Ids.MutationId.make("intent"), "accept", { secret })
+        expect((yield* engine.mutate(Ids.MutationId.make("intent"), "accept", { other: true })).seq).toBe(saved.seq)
+        const loop = yield* SyncLoop.make({
+          engine,
+          isFatalPush: Transport.isFatalPush,
+          pendingMutations: storage.pendingCount
+        })
+        const fiber = yield* Effect.forkChild(loop.run)
+        yield* Effect.repeat(Effect.yieldNow, { times: 80 })
+        expect(pushes).toBe(1)
+        expect((yield* loop.status).lastError?.kind).toBe("unauthorized")
+        yield* TestClock.adjust("999 millis")
+        expect(pushes).toBe(1)
+        yield* TestClock.adjust("1 millis")
+        yield* Effect.repeat(Effect.yieldNow, { times: 80 })
+        expect(pushes).toBe(2)
+        expect((yield* loop.status).push._tag).toBe("Halted")
+        yield* loop.wake
+        yield* Effect.repeat(Effect.yieldNow, { times: 80 })
+        expect(pushes).toBe(2)
+        expect(
+          (yield* storage.transaction(storage.meta).pipe(Effect.provideService(Tracer.Tracer, Tracer.nativeTracer)))
+            .cursor
+        ).toBe(cursor)
+        expect(
+          (yield* storage.transaction(storage.pending).pipe(Effect.provideService(Tracer.Tracer, Tracer.nativeTracer)))
+            .length
+        ).toBe(1)
+        yield* Fiber.interrupt(fiber)
+      }).pipe(Effect.scoped, Effect.provide(recording.layer))
+      yield* run
+      if (failure === "none" || failure === "logger") {
+        const installs = recording.spans.filter((span) => span.name === "echo.install")
+        expect(installs.length).toBe(3)
+        expect(
+          installs.every((span) => span.parent === "echo.pull" && new Map(span.attributes).get("echo.outcome") === "ok")
+        ).toBe(true)
+      }
+      expect(recording.spans.every((span) => Exit.isSuccess(span.exit) && span.exit.value === undefined)).toBe(true)
+    }
+  })
+)
+
+it.live("SQLite sync never exports a typed failure, defect, result or dependency span containing secret inputs", () => {
+  const recording = recorder()
+  return Effect.gen(function* () {
+    let failing = false
+    const { engine, storage } = yield* device({
+      push: () => Effect.fail(new Protocol.Unauthorized({ message: secret })),
+      pull: () => (failing ? Effect.die(new Error(secret)) : Effect.succeed(done))
+    })
+    yield* engine.mutate(Ids.MutationId.make("intent"), "accept", { secret })
+    yield* Effect.exit(engine.push)
+    yield* engine.pull
+    failing = true
+    const failed = yield* Effect.exit(engine.pull)
+    expect(Exit.isFailure(failed) && Cause.pretty(failed.cause)).toContain(secret)
+    const metrics = yield* Metric.snapshot
+    expect(serialized(metrics.map((metric) => ({ name: metric.id, attributes: metric.attributes })))).not.toContain(
+      secret
+    )
+    expect(
+      (yield* storage.transaction(storage.meta).pipe(Effect.provideService(Tracer.Tracer, Tracer.nativeTracer))).cursor
+    ).toBe(cursor)
+    expect(recording.spans.map((span) => span.name)).toEqual(
+      expect.arrayContaining(["echo.enqueue", "echo.push", "echo.pull", "echo.install", "echo.rebase"])
+    )
+    expect(
+      recording.spans.every(
+        (span) =>
+          span.name.startsWith("echo.") &&
+          span.events.length === 0 &&
+          span.links === 0 &&
+          span.annotations === 0 &&
+          Exit.isSuccess(span.exit) &&
+          span.exit.value === undefined
+      )
+    ).toBe(true)
+    expect(serialized(recording.spans)).not.toContain(secret)
+    expect(serialized(recording.spans)).not.toContain(cursor.toString())
+    expect(serialized(recording.logs.filter((log) => !log.diagnostics))).not.toContain(secret)
+    expect(serialized(recording.logs.filter((log) => log.diagnostics))).toContain(secret)
+    expect(
+      recording.spans
+        .filter((span) => span.name === "echo.pull")
+        .map((span) => new Map(span.attributes).get("echo.outcome"))
+    ).toEqual(["ok", "defect"])
+  }).pipe(Effect.scoped, Effect.provide(recording.layer))
+})
+
+describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
+  it.live(
+    "closing a pulled subscription in the host context retains its own outcome and protects cleanup and the host parent",
+    () => {
+      const recording = recorder()
+      const program = Effect.gen(function* () {
+        const seen: Array<string> = []
+        const source = Stream.concat(
+          Stream.succeed<typeof Protocol.PokesElement.Type>({ _tag: "poke" }),
+          Stream.never
+        ).pipe(
+          Stream.onExit((exit) =>
+            Effect.gen(function* () {
+              seen.push(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause) ? "interrupted" : "defect")
+              yield* Effect.logError(secret)
+            }).pipe(Effect.withSpan(`cleanup.${secret}`))
+          )
+        )
+        const db = yield* Effect.context<SqlClient>()
+        const serve = yield* Protocol.SyncRpcs.accessHandler("pokes").pipe(
+          Effect.provide(
+            handlers({ registry, mutations, principalFor: () => Effect.succeed(actor) }).pipe(
+              Layer.provide([
+                Layer.succeed(Notifications, source),
+                Layer.succeedContext(db),
+                Layer.succeed(
+                  HttpServerRequest.HttpServerRequest,
+                  HttpServerRequest.fromWeb(new Request("http://echo.test/sync"))
+                )
+              ])
+            )
+          )
+        )
+        for (const closing of [Exit.interrupt(), Exit.die(new Error(secret))]) {
+          const scope = yield* Scope.make()
+          const subscription = serve(
+            { clientId: Ids.ClientId.make("subscription") },
+            { client: new Rpc.ServerClient(1), requestId: RequestId(1), headers: Headers.empty }
+          )
+          if (!Stream.isStream(subscription)) return yield* Effect.die("expected streaming pokes handler")
+          const pull = yield* Stream.toPull(subscription).pipe(Scope.provide(scope))
+          expect(yield* pull).toEqual([{ _tag: "poke" }])
+          yield* Scope.close(scope, closing)
+        }
+        expect(seen).toEqual(["interrupted", "defect"])
+        expect(recording.spans.map((span) => span.name)).toEqual(["echo.server.pokes", "echo.server.pokes"])
+        expect(recording.spans.map((span) => new Map(span.attributes).get("echo.outcome"))).toEqual([
+          "interrupted",
+          "defect"
+        ])
+        expect(
+          recording.spans.every(
+            (span) =>
+              span.parent === "host.subscription" &&
+              Exit.isSuccess(span.exit) &&
+              span.exit.value === undefined &&
+              span.events.length === 0
+          )
+        ).toBe(true)
+        expect(serialized(recording.spans)).not.toContain(secret)
+        expect(serialized(recording.logs.filter((log) => !log.diagnostics))).not.toContain(secret)
+        expect(serialized(recording.logs.filter((log) => log.diagnostics))).toContain(secret)
+      }).pipe(
+        Effect.withSpan("host.subscription"),
+        Effect.scoped,
+        Effect.provide(recording.layer),
+        Effect.provide(TestDatabase)
+      )
+      return program.pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            expect(recording.spans.find((span) => span.name === "host.subscription")?.events).toEqual([])
+          })
+        )
+      )
+    }
+  )
+
+  it.live(
+    "direct server batches and maintenance cannot export returned identities or fail from a throwing tracer",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient
+        for (const failure of ["none", "create"] satisfies ReadonlyArray<Parameters<typeof recorder>[0]>) {
+          const recording = recorder(failure)
+          const clientId = Ids.ClientId.make(`${secret}-${failure}`)
+          yield* Effect.gen(function* () {
+            const response = yield* executeBatch({ registry, mutations }, actor, {
+              clientId,
+              mutations: [
+                { mutationId: Ids.MutationId.make(secret), seq: Ids.Seq.make(1), name: "accept", args: secret }
+              ]
+            })
+            expect(response.results[0]?.outcome._tag).toBe("Applied")
+            yield* sql`UPDATE echo_sync.mutations SET acked_at = now() - interval '10 days' WHERE client_id = ${clientId}`.pipe(
+              Effect.provideService(Tracer.Tracer, Tracer.nativeTracer)
+            )
+            expect(yield* expireLedger()).toEqual({ clients: 1, expired: 1 })
+            expect((yield* collectGarbage("7 days")).deleted).toBe(0)
+            expect(recording.spans).toEqual([])
+          }).pipe(Effect.provide(recording.layer))
+        }
+      }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
+  it.live(
+    "RPC request context cannot bypass sanitization for typed failures, defects, SQL spans or tracerLogger events",
+    () => {
+      const recording = recorder()
+      return Effect.gen(function* () {
+        const db = yield* Effect.context<SqlClient | PgClient.PgClient>()
+        const sync = layerHttp({
+          registry,
+          mutations,
+          principalFor: (headers) =>
+            headers["x-mode"] === "defect"
+              ? Effect.die(new Error(secret))
+              : headers["x-mode"] === "typed"
+                ? Effect.fail(new Protocol.Unauthorized({ message: secret }))
+                : Effect.succeed(actor)
+        }).pipe(Layer.provide(Layer.succeedContext(db)))
+        const other = HttpRouter.add(
+          "GET",
+          "/other",
+          Effect.succeed(HttpServerResponse.text("host")).pipe(Effect.withSpan("host.route"))
+        )
+        const web = HttpRouter.toWebHandler(Layer.merge(sync, other), {
+          disableLogger: true,
+          middleware: (work) => Effect.provide(work, recording.layer)
+        })
+        yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
+        const fetch: typeof globalThis.fetch = Object.assign(
+          (input: RequestInfo | URL, init?: RequestInit) => web.handler(new Request(input, init)),
+          { preconnect: globalThis.fetch.preconnect }
+        )
+        let mode = "ok"
+        const rpc = yield* Transport.make.pipe(
+          Effect.provide(
+            Transport.layerProtocolHttp(
+              "http://echo.test/sync",
+              Effect.sync(() => ({ "x-mode": mode, authorization: secret }))
+            )
+          )
+        )
+        const transport: Engine.Transport<unknown> = {
+          push: (request) => rpc.push(request).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)),
+          pull: (request) => rpc.pull(request).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+        }
+        const { engine } = yield* device(transport)
+        recording.spans.length = 0
+        recording.logs.length = 0
+        yield* engine.mutate(Ids.MutationId.make("intent"), "accept", { secret })
+        yield* engine.push
+        yield* engine.pull
+        for (const refusal of ["typed", "defect"]) {
+          mode = refusal
+          const failed = yield* Effect.exit(engine.pull)
+          expect(Exit.isFailure(failed)).toBe(true)
+        }
+        const exported = recording.spans
+        expect(exported.map((span) => span.name)).toEqual(
+          expect.arrayContaining(["echo.server.push", "echo.server.pull", "echo.install"])
+        )
+        expect(
+          exported.every(
+            (span) =>
+              span.events.length === 0 &&
+              span.links === 0 &&
+              span.annotations === 0 &&
+              Exit.isSuccess(span.exit) &&
+              span.exit.value === undefined
+          )
+        ).toBe(true)
+        expect(serialized(exported)).not.toContain(secret)
+        expect(serialized(exported)).not.toContain(cursor.toString())
+        expect(serialized(recording.logs.filter((log) => !log.diagnostics))).not.toContain(secret)
+        expect(serialized(recording.logs.filter((log) => log.diagnostics))).toContain(secret)
+        expect(
+          exported
+            .filter((span) => span.name === "echo.server.pull")
+            .map((span) => new Map(span.attributes).get("echo.outcome"))
+        ).toEqual(["done", "unauthorized", "defect"])
+        const before = recording.spans.length
+        yield* Effect.promise(() => web.handler(new Request("http://echo.test/other")))
+        expect(recording.spans.slice(before).some((span) => span.name === "host.route")).toBe(true)
+        mode = "ok"
+        const first = yield* Deferred.make<void>()
+        const beforeStream = recording.spans.length
+        const follower = yield* Effect.forkChild(
+          SyncLoop.followPokes({
+            connect: rpc
+              .pokes(Ids.ClientId.make("device"))
+              .pipe(Effect.map((stream) => stream.pipe(Stream.provideService(FetchHttpClient.Fetch, fetch)))),
+            wake: Deferred.succeed(first, undefined)
+          })
+        )
+        yield* Deferred.await(first)
+        yield* Fiber.interrupt(follower)
+        // Closing the real HTTP handler's scope must classify the subscription in its own span,
+        // even though the closing request fiber no longer has that span as its ambient parent.
+        yield* Effect.promise(web.dispose)
+        const streamSpans = recording.spans.slice(beforeStream)
+        const subscription = streamSpans.find((span) => span.name === "echo.server.pokes")
+        expect(subscription).toBeDefined()
+        expect(new Map(subscription?.attributes).get("echo.outcome")).toBe("interrupted")
+        expect(
+          streamSpans.every(
+            (span) => Exit.isSuccess(span.exit) && span.exit.value === undefined && span.events.length === 0
+          )
+        ).toBe(true)
+      }).pipe(Effect.scoped, Effect.provide(recording.layer), Effect.provide(TestDatabase))
+    },
+    30_000
+  )
+})

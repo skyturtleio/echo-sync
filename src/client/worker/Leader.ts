@@ -43,6 +43,7 @@ import { LeaderRpcs, RawExecDisabled, SqlFailure, SyncDisabled } from "./LeaderR
 import { type Endpoint, type FromLeader, isToLeader, type ResetOutcome, type ToLeader } from "./messages.ts"
 import * as OpfsSqlite from "./OpfsSqlite.ts"
 import * as Platform from "./platform.ts"
+import * as Telemetry from "../../internal/Telemetry.ts"
 
 const causeMessage = (cause: unknown): string =>
   typeof cause === "string"
@@ -271,6 +272,7 @@ const serveTab = (
 /** A dedicated worker's global scope, as far as the leader uses it. */
 export interface WorkerScope extends Endpoint {
   close(): void
+  removeEventListener?(type: "message", listener: (event: MessageEvent) => void): void
 }
 
 /** What the app's leader worker entry provides. */
@@ -394,10 +396,16 @@ const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: L
     if (invalid !== undefined) return yield* Effect.fail(new Error(invalid))
     const actor = yield* Schema.decodeUnknownEffect(AccessScope.PrincipalId)(init.principal)
 
-    if (!(yield* Platform.tryHoldLock(Platform.leaderLockName(identity)))) {
-      send(endpoint, { _tag: "Waiting" })
-      yield* Platform.holdLock(Platform.leaderLockName(identity))
-    }
+    yield* Telemetry.observe(
+      Effect.gen(function* () {
+        if (!(yield* Platform.tryHoldLock(Platform.leaderLockName(identity)))) {
+          send(endpoint, { _tag: "Waiting" })
+          yield* Platform.holdLock(Platform.leaderLockName(identity))
+        }
+        yield* Telemetry.annotate({ "echo.result": "elected" })
+      }),
+      "echo.leader.election"
+    )
     // The leader lock is held from here until this worker dies.
     const leaderId = crypto.randomUUID()
     yield* Platform.holdLock(Platform.leaderEpochLockName(identity, leaderId))
@@ -457,7 +465,7 @@ const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: L
           yield* Effect.forkScoped(serveTab(identity, message.tabId, message.port, handlers))
           break
         case "RouterPort":
-          listen(message.port, inbox)
+          yield* listen(message.port, inbox)
           break
         case "Init":
           break
@@ -467,7 +475,7 @@ const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: L
     // Closing the scope releases the leader and epoch locks and the pool's access handles.
     Effect.scoped,
     Effect.catchCause((cause) =>
-      Effect.logError("echo leader candidate cannot serve", cause).pipe(
+      Telemetry.log("Error", "echo leader candidate cannot serve", cause).pipe(
         Effect.andThen(
           Effect.sync(() => {
             send(endpoint, { _tag: "Failed", message: String(cause) })
@@ -482,27 +490,51 @@ const program = (endpoint: WorkerScope, inbox: Queue.Queue<ToLeader>, options: L
   )
 
 const listen = (
-  endpoint: Pick<Endpoint, "addEventListener"> & { start?: () => void },
+  endpoint: Pick<Endpoint, "addEventListener"> & {
+    start?: () => void
+    removeEventListener?: (type: "message", listener: (event: MessageEvent) => void) => void
+    close?: () => void
+  },
   inbox: Queue.Queue<ToLeader>
-) => {
-  endpoint.addEventListener("message", (event) => {
-    if (isToLeader(event.data)) Queue.offerUnsafe(inbox, event.data)
-  })
-  endpoint.start?.()
-}
-
-/** Entry point for the leader-candidate dedicated worker. Pass the worker's global `self`. */
-export const runLeaderWorker = (self: WorkerScope, options: LeaderOptions): void => {
-  const inbox = Effect.runSync(Queue.unbounded<ToLeader>())
-  listen(self, inbox)
-  Effect.runFork(
-    Effect.gen(function* () {
-      let first = yield* Queue.take(inbox)
-      while (first._tag !== "Init" && first._tag !== "Reset") first = yield* Queue.take(inbox)
-      if (first._tag === "Init") return yield* program(self, inbox, options, first)
-      const outcome = yield* reset(first)
-      // Every lock and handle is released by now (the reset's scope closed); the tab ends this worker.
-      send(self, { _tag: "ResetOutcome", outcome })
-    })
+) =>
+  Effect.acquireRelease(
+    Effect.sync(() => {
+      let open = true
+      const listener = (event: MessageEvent) => {
+        if (open && isToLeader(event.data)) Queue.offerUnsafe(inbox, event.data)
+      }
+      endpoint.addEventListener("message", listener)
+      endpoint.start?.()
+      return () => {
+        open = false
+        endpoint.removeEventListener?.("message", listener)
+        endpoint.close?.()
+      }
+    }),
+    (close) => Effect.sync(close)
   )
+
+/** Host-run dedicated-worker program. References supplied here reach every scoped child. */
+export const leaderWorker = (self: WorkerScope, options: LeaderOptions): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const inbox = yield* Queue.unbounded<ToLeader>()
+    // The host owns the worker global; only RouterPorts are ours to close.
+    yield* listen(
+      {
+        addEventListener: self.addEventListener.bind(self),
+        ...(self.removeEventListener === undefined ? {} : { removeEventListener: self.removeEventListener.bind(self) })
+      },
+      inbox
+    )
+    let first = yield* Queue.take(inbox)
+    while (first._tag !== "Init" && first._tag !== "Reset") first = yield* Queue.take(inbox)
+    if (first._tag === "Init") return yield* program(self, inbox, options, first)
+    const outcome = yield* reset(first)
+    // Every lock and handle is released by now (the reset's scope closed); the tab ends this worker.
+    send(self, { _tag: "ResetOutcome", outcome })
+  }).pipe(Effect.scoped, Telemetry.boundary)
+
+/** Default-runtime convenience runner; use leaderWorker for host-provided telemetry. */
+export const runLeaderWorker = (self: WorkerScope, options: LeaderOptions): void => {
+  Effect.runFork(leaderWorker(self, options))
 }

@@ -4,6 +4,7 @@ import { SqlClient } from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
 import { Errors, Ids, Mutation, Protocol } from "echo-sync"
 import { isConflictUnavailable } from "./rowStore.ts"
+import * as Telemetry from "../../internal/Telemetry.ts"
 
 type MutationOutcome = Mutation.MutationOutcome
 const MutationOutcomeJson = Schema.toCodecJson(Mutation.MutationOutcome)
@@ -204,7 +205,7 @@ export const registerClient = Effect.fnUntraced(function* (principalId: string, 
     return yield* new ClientForbidden({ clientId })
   }
   return row
-})
+}, Telemetry.boundary)
 
 /**
  * `registerClient` for the SERIALIZABLE ledger transaction: binds on first sight, then row-locks
@@ -339,7 +340,7 @@ export const runMutation = <R>(
         return attempts.pipe(Effect.catch((recording) => classify(envelope, recording.attempt)))
       })
     )
-  })
+  }).pipe(Telemetry.boundary)
 
 export interface BatchItem<R> {
   readonly mutationId: string
@@ -379,4 +380,4 @@ export const runBatch = <R>(
       processed.push({ mutationId: item.mutationId, ...result })
     }
     return { processed, stopped: null }
-  })
+  }).pipe(Telemetry.boundary)

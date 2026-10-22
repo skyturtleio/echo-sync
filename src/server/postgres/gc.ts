@@ -1,5 +1,6 @@
 import { Clock, Duration, Effect, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
+import * as Telemetry from "../../internal/Telemetry.ts"
 
 /**
  * Deletes log entries older than `retention` (by the Effect `Clock`, so it is testable) and
@@ -29,7 +30,7 @@ export const collectGarbage = Effect.fnUntraced(function* (retention: Duration.I
       return { horizon: row.gc_horizon, deleted: Number(row.deleted) }
     })
   )
-})
+}, Telemetry.boundary)
 
 /** `expireLedger` was constructed with a retention below `minimumLedgerRetention`. */
 export class LedgerRetentionTooShort extends Schema.TaggedError<LedgerRetentionTooShort>()("LedgerRetentionTooShort", {
@@ -60,22 +61,21 @@ export const minimumLedgerRetention = Duration.hours(48)
  * A retention below 48 h fails the Effect with `LedgerRetentionTooShort` (typed, before any SQL),
  * so a scheduled job fails on its first run and a caller can `catchTag` it. Default 7 days.
  */
-export const expireLedger = Effect.fnUntraced(function* (options?: {
-  readonly retention?: Duration.Input | undefined
-}) {
-  const retention = Duration.fromInputUnsafe(options?.retention ?? "7 days")
-  if (Duration.isLessThan(retention, minimumLedgerRetention)) {
-    return yield* new LedgerRetentionTooShort({
-      retentionMillis: Duration.toMillis(retention),
-      minimumMillis: Duration.toMillis(minimumLedgerRetention)
-    })
-  }
-  const sql = yield* SqlClient
-  const now = yield* Clock.currentTimeMillis
-  const cutoff = new Date(now - Duration.toMillis(retention)).toISOString()
-  return yield* sql.withTransaction(
-    Effect.gen(function* () {
-      const raised = yield* sql<{ client_id: string; expired_through: bigint; expired: bigint }>`
+export const expireLedger = (options?: { readonly retention?: Duration.Input | undefined }) =>
+  Effect.gen(function* () {
+    const retention = Duration.fromInputUnsafe(options?.retention ?? "7 days")
+    if (Duration.isLessThan(retention, minimumLedgerRetention)) {
+      return yield* new LedgerRetentionTooShort({
+        retentionMillis: Duration.toMillis(retention),
+        minimumMillis: Duration.toMillis(minimumLedgerRetention)
+      })
+    }
+    const sql = yield* SqlClient
+    const now = yield* Clock.currentTimeMillis
+    const cutoff = new Date(now - Duration.toMillis(retention)).toISOString()
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const raised = yield* sql<{ client_id: string; expired_through: bigint; expired: bigint }>`
           WITH cleared AS (
             UPDATE echo_sync.mutations SET outcome = NULL, acked_at = NULL
             WHERE acked_at <= ${cutoff}::timestamptz AND outcome IS NOT NULL
@@ -90,24 +90,24 @@ export const expireLedger = Effect.fnUntraced(function* (options?: {
           FROM per_client p
           WHERE c.client_id = p.client_id
           RETURNING c.client_id, c.expired_through, p.n AS expired`
-      if (raised.length === 0) return { clients: 0, expired: 0 }
-      const holes = yield* sql<{ client_id: string; seq: bigint; expired_through: bigint }>`
+        if (raised.length === 0) return { clients: 0, expired: 0 }
+        const holes = yield* sql<{ client_id: string; seq: bigint; expired_through: bigint }>`
           SELECT m.client_id, m.seq, c.expired_through
           FROM echo_sync.mutations m JOIN echo_sync.clients c USING (client_id)
           WHERE m.client_id = ANY(${raised.map((r) => r.client_id)}::text[]) AND m.seq <= c.expired_through
             AND m.outcome IS NOT NULL
           ORDER BY m.client_id, m.seq
           LIMIT 10`
-      if (holes.length > 0) {
-        return yield* Effect.die(
-          new Error(
-            `expireLedger: the expired rows are not a seq prefix; rolled back. Live rows at or below the new floor: ${holes
-              .map((h) => `${h.client_id} seq ${h.seq} (floor ${h.expired_through})`)
-              .join(", ")}`
+        if (holes.length > 0) {
+          return yield* Effect.die(
+            new Error(
+              `expireLedger: the expired rows are not a seq prefix; rolled back. Live rows at or below the new floor: ${holes
+                .map((h) => `${h.client_id} seq ${h.seq} (floor ${h.expired_through})`)
+                .join(", ")}`
+            )
           )
-        )
-      }
-      return { clients: raised.length, expired: raised.reduce((n, r) => n + Number(r.expired), 0) }
-    })
-  )
-})
+        }
+        return { clients: raised.length, expired: raised.reduce((n, r) => n + Number(r.expired), 0) }
+      })
+    )
+  }).pipe(Telemetry.boundary)

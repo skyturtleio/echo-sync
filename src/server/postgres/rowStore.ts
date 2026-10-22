@@ -3,6 +3,7 @@ import { Effect, Option, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
 import { Errors, ScopeGrants, Store, type SyncTable } from "echo-sync"
+import * as Telemetry from "../../internal/Telemetry.ts"
 
 /**
  * The transient store failure for a SQL error. The reason tag leads the message so the ledger
@@ -60,7 +61,7 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
       const rel = relation(table)
       return rel === undefined
         ? Effect.die(`RowStore: table ${table.name} is not an attached registry table`)
-        : sql.unsafe<Record<string, unknown>>(statement(rel), params)
+        : sql.unsafe<Record<string, unknown>>(statement(rel), params).pipe(Telemetry.boundary)
     }
 
     const rowStore: Store.RowStore = {

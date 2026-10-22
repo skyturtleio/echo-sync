@@ -17,7 +17,7 @@ import {
   Stream
 } from "effect"
 import type { Headers } from "effect/http/Headers"
-import type * as HttpRouter from "effect/http/HttpRouter"
+import * as HttpRouter from "effect/http/HttpRouter"
 import * as HttpServerRequest from "effect/http/HttpServerRequest"
 import { RpcSerialization, RpcServer } from "effect/rpc"
 import { SqlClient } from "effect/sql/SqlClient"
@@ -28,6 +28,7 @@ import * as Presence from "./presence.ts"
 import { type ClientPolicy, pull } from "./pull.ts"
 import * as RowStore from "./rowStore.ts"
 import { resolveTables } from "./schema.ts"
+import * as Telemetry from "../../internal/Telemetry.ts"
 
 export interface SyncServerOptions {
   readonly registry: Registry.SyncRegistry
@@ -313,7 +314,7 @@ export const layerNotifications = (options: Pick<SyncServerOptions, "heartbeatIn
       return yield* sharedPokes(yield* PgClient.PgClient, {
         heartbeatInterval: options.heartbeatInterval ?? "15 seconds"
       })
-    })
+    }).pipe(Telemetry.boundary)
   )
 
 /**
@@ -369,7 +370,8 @@ export const executeBatch = (
   }).pipe(
     // Infrastructure before the first mutation (catalog read): nothing processed, a
     // transient stop. runBatch already turns infrastructure failures inside it into one.
-    pushFailures
+    pushFailures,
+    Telemetry.boundary
   )
 
 // The pinned HTTP protocol preserves the request fiber's context for all handler fibers,
@@ -400,7 +402,20 @@ export const handlers = (options: SyncServerOptions) =>
           Effect.gen(function* () {
             const actor = yield* options.principalFor(yield* requestHeaders)
             return yield* executeBatch(options, actor, request)
-          }).pipe(pushFailures, Effect.provideService(SqlClient, sql)),
+          }).pipe(
+            pushFailures,
+            Effect.tap((response) =>
+              Telemetry.annotate({
+                "echo.batch_size": request.mutations.length,
+                "echo.processed": response.results.length,
+                "echo.applied": response.results.filter((r) => r.outcome._tag === "Applied").length,
+                "echo.rejected": response.results.filter((r) => r.outcome._tag === "Rejected").length,
+                "echo.result": response.results.length < request.mutations.length ? "stopped" : "ok"
+              })
+            ),
+            Effect.provideService(SqlClient, sql),
+            (work) => Telemetry.observe(work, "echo.server.push")
+          ),
         pull: (request) =>
           Effect.gen(function* () {
             const principalId = yield* options.principalFor(yield* requestHeaders)
@@ -416,7 +431,18 @@ export const handlers = (options: SyncServerOptions) =>
               },
               options.clientPolicy
             )
-          }).pipe(serverFailures, Effect.provideService(SqlClient, sql)),
+          }).pipe(
+            serverFailures,
+            Effect.tap((response) =>
+              Telemetry.annotate({
+                "echo.result": response._tag === "PullDone" ? "done" : "page",
+                "echo.changes": response.changes.length,
+                "echo.acks": response.acks.length
+              })
+            ),
+            Effect.provideService(SqlClient, sql),
+            (work) => Telemetry.observe(work, "echo.server.pull")
+          ),
         pokes: ({ clientId }) =>
           Stream.unwrap(
             Effect.gen(function* () {
@@ -427,7 +453,8 @@ export const handlers = (options: SyncServerOptions) =>
           ).pipe(
             // A lost LISTEN connection ends the stream typed; the client reconnects on any end (§6).
             Stream.catchCause((cause) => Stream.fromEffect(toServerFailure(cause))),
-            Stream.catchTag("ClientForbidden", (e) => Stream.fail(forbidden(e)))
+            Stream.catchTag("ClientForbidden", (e) => Stream.fail(forbidden(e))),
+            (work) => Telemetry.observeStream(work, "echo.server.pokes")
           )
       })
     })
@@ -476,7 +503,7 @@ export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor"
             Cause.hasInterrupts(cause)
               ? Effect.failCause(cause)
               : Effect.andThen(
-                  Effect.logWarning("presence revocation watch restarting", cause),
+                  Telemetry.log("Warn", "presence revocation watch restarting", cause),
                   Effect.sleep("1 second")
                 )
           )
@@ -509,7 +536,7 @@ export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor"
             yield* presence.track({ principalId, ...payload })
           })
       })
-    })
+    }).pipe(Telemetry.boundary)
   )
 
 /**
@@ -523,6 +550,8 @@ export const layerHttp = (options: SyncServerOptions & { readonly path?: HttpRou
     path: options.path ?? "/sync",
     protocol: "http"
   }).pipe(
+    // Route-scoped, before RpcServer constructs its automatic span and handler context.
+    Layer.provide(HttpRouter.middleware((work) => Telemetry.boundary(work)).layer),
     Layer.provide([handlers(options), presenceHandlers(options), RpcSerialization.layerNdjson]),
     Layer.provide(layerNotifications(options))
   )

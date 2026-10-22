@@ -19,6 +19,7 @@
 import { Effect, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { Registry, SyncTable } from "echo-sync"
+import * as Telemetry from "../../internal/Telemetry.ts"
 
 export const Mismatch = Schema.Struct({ table: Schema.String, problem: Schema.String })
 export type Mismatch = typeof Mismatch.Type
@@ -322,4 +323,4 @@ export const verify = (registry: Registry.SyncRegistry) =>
       }
     }
     if (mismatches.length > 0) return yield* new Drift({ mismatches })
-  })
+  }).pipe(Telemetry.boundary)

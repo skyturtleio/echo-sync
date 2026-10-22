@@ -1,5 +1,5 @@
 import { expect, it } from "@effect/vitest"
-import { Deferred, Effect, Layer, Stream } from "effect"
+import { Deferred, Effect, Exit, Layer, Scope, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { AccessScope } from "echo-sync"
 import type * as Rpc from "effect/rpc"
@@ -9,6 +9,8 @@ import type * as Platform from "./platform.ts"
 
 // Only the browser/worker transport is replaced: the public layer builds the tab API and sender.
 const remote = vi.hoisted(() => ({
+  shared: false,
+  held: vi.fn<() => Effect.Effect<boolean>>(),
   track: vi.fn<() => Effect.Effect<void>>(),
   presence: vi.fn<() => Stream.Stream<{ room: AccessScope.AccessScopeId; entries: [] }>>()
 }))
@@ -29,13 +31,17 @@ vi.mock("./platform.ts", async (original) => {
   const effect = await import("effect")
   return {
     ...actual,
-    tabCapability: () => ({ sharedWorker: false }),
+    tabCapability: () => ({ sharedWorker: remote.shared }),
+    isLockHeld: () => remote.held(),
     holdLock: () => effect.Effect.void,
     awaitLockReleased: () => effect.Effect.never
   }
 })
 
-afterEach(() => vi.unstubAllGlobals())
+afterEach(() => {
+  remote.shared = false
+  vi.unstubAllGlobals()
+})
 
 it.effect(
   "the layer must honor the configured presence deadline and retry delay without shortening the 45 s default",
@@ -111,4 +117,61 @@ it.effect(
         )
       }
     })
+)
+
+it.live("closing a client cannot abandon a transferred port queued for acceptance or waiting for its epoch check", () =>
+  Effect.gen(function* () {
+    vi.stubGlobal("navigator", { storage: { persist: () => Promise.resolve(false) } })
+    remote.shared = true
+    for (const waitForQuery of [false, true]) {
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      const queried = yield* Deferred.make<void>()
+      let queries = 0
+      remote.held.mockImplementation(() =>
+        Effect.gen(function* () {
+          queries++
+          yield* Deferred.succeed(queried, undefined)
+          return yield* Effect.never
+        })
+      )
+      const control = new MessageChannel()
+      const transferred = new MessageChannel()
+      const closed = yield* Deferred.make<void>()
+      transferred.port2.addEventListener("close", () => Deferred.doneUnsafe(closed, Effect.void))
+      const worker = Object.assign(new EventTarget(), {
+        onmessage: null,
+        onmessageerror: null,
+        onerror: null,
+        postMessage() {},
+        terminate() {}
+      })
+      const shared = Object.assign(new EventTarget(), { port: control.port1, onerror: null })
+      yield* Layer.buildWithScope(
+        layer({
+          appId: "ports",
+          profile: "pending",
+          principal: "me",
+          spawnLeader: () => worker,
+          spawnRouter: () => shared
+        }),
+        scope
+      )
+      control.port1.dispatchEvent(
+        new MessageEvent("message", {
+          data: {
+            _tag: "Connected",
+            leaderId: "epoch",
+            port: transferred.port1
+          }
+        })
+      )
+      if (waitForQuery) yield* Deferred.await(queried)
+      yield* Scope.close(scope, Exit.void)
+      yield* Deferred.await(closed).pipe(Effect.timeout("1 second"))
+      expect(queries).toBe(waitForQuery ? 1 : 0)
+      control.port2.close()
+      transferred.port2.close()
+    }
+  })
 )

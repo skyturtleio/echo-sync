@@ -1,6 +1,7 @@
 import type { Effect } from "effect"
 import * as PgMigrator from "@effect/sql-pg/PgMigrator"
 import type { SqlClient } from "effect/sql/SqlClient"
+import * as Telemetry from "../../internal/Telemetry.ts"
 
 /** The app migrations' own history table (DESIGN §11); never the engine's `echo_sync.migrations`. */
 export const appMigrationsTable = "echo_sync.app_migrations"
@@ -17,4 +18,4 @@ export const migrateApp = (
   PgMigrator.make({})({
     loader: PgMigrator.fromRecord(migrations),
     table: options?.table ?? appMigrationsTable
-  })
+  }).pipe(Telemetry.boundary)

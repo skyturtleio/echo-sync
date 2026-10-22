@@ -30,6 +30,7 @@ import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
+import * as Telemetry from "../../internal/Telemetry.ts"
 import { type AccessScope, type Errors, Ids, type Mutation, Protocol, type Query } from "echo-sync"
 import { RpcClient } from "effect/rpc"
 import { RpcClientError } from "effect/rpc/RpcClientError"
@@ -399,7 +400,23 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
       unsupported !== undefined ? "unsupported" : capability.sharedWorker ? "shared-worker" : "single-tab"
     const tabId = crypto.randomUUID()
     const scope = yield* Effect.scope
-    const fork = <A, E>(effect: Effect.Effect<A, E>) => Fiber.runIn(Effect.runFork(effect), scope)
+    const context = yield* Effect.context<never>()
+    let open = true
+    const routerPorts = new Set<MessagePort>()
+    const pendingConnections = new Set<MessagePort>()
+    yield* Scope.addFinalizer(
+      scope,
+      Effect.sync(() => {
+        open = false
+        for (const port of routerPorts) port.close()
+        for (const port of pendingConnections) port.close()
+        pendingConnections.clear()
+      })
+    )
+    const fork = <A, E>(effect: Effect.Effect<A, E>) => {
+      if (!open || scope.state._tag === "Closed") return undefined
+      return Fiber.runIn(Effect.runForkWith(context)(effect), scope)
+    }
 
     // `current` is pending while no leader is connected; requests wait on it.
     let current = Deferred.makeUnsafe<Connection>()
@@ -434,7 +451,8 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
                   Deferred.await(connection.lost).pipe(Effect.andThen(Effect.fail(lostError(connection.leaderId))))
                 )
               )
-        )
+        ),
+        Telemetry.boundary
       )
 
     /** A stream from the current leader that ends with `LeaderLost` when that leader goes away. */
@@ -454,7 +472,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
                 )
           )
         )
-      )
+      ).pipe(Telemetry.stream)
 
     const status = yield* SubscriptionRef.make<Status>({ mode, tabId, isLeaderTab: false, leaderId: undefined })
     // Called from DOM callbacks after every change to `active` or `localEpoch`; `set` never suspends here.
@@ -463,7 +481,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     // connection yet (right after election, before the handshake) it is true, so a fresh leader tab does not
     // flicker to false on its way to connecting to its own worker.
     const publishStatus = () =>
-      Effect.runSync(
+      Effect.runSyncWith(context)(
         SubscriptionRef.set(status, {
           mode,
           tabId,
@@ -532,23 +550,43 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
       fork(
         Platform.awaitLockReleased(Platform.leaderEpochLockName(identity, leaderId)).pipe(
           Effect.andThen(
-            Effect.sync(() => {
-              if (active === connection) {
-                active = undefined
-                publishStatus()
-                publish(undefined)
-              }
-              displace(connection)
-              // The router may have died with that leader's tab (WebKit ends a SharedWorker with its creating
-              // tab); reconnecting relaunches it if so, and is a no-op re-Hello on a live router.
-              reconnectRouter()
+            Effect.suspend(() => {
+              const lost = active === connection
+              const cleanup = Effect.sync(() => {
+                if (lost) {
+                  active = undefined
+                  publishStatus()
+                  publish(undefined)
+                }
+                displace(connection)
+                // The router may have died with that leader's tab (WebKit ends a SharedWorker with its creating
+                // tab); reconnecting relaunches it if so, and is a no-op re-Hello on a live router.
+                reconnectRouter()
+              })
+              return lost
+                ? Telemetry.observe(
+                    cleanup.pipe(
+                      Effect.andThen(Telemetry.count("echo.leader.loss.total", "lost")),
+                      Effect.andThen(Effect.suspend(() => Deferred.await(current))),
+                      Effect.flatMap((replacement) =>
+                        Telemetry.annotate({ "echo.result": replacement._tag === "Connected" ? "elected" : "lost" })
+                      )
+                    ),
+                    "echo.leader.handover"
+                  )
+                : cleanup
             })
           ),
-          Effect.catchCause((cause) => Effect.logError("echo: watching leader epoch failed", cause))
+          Effect.catchCause((cause) => Telemetry.log("Error", "echo: watching leader epoch failed", cause))
         )
       )
       fork(
         Effect.gen(function* () {
+          yield* Scope.addFinalizer(
+            connection.scope,
+            Effect.sync(() => port.close())
+          )
+          pendingConnections.delete(port)
           const protocol = yield* Layer.buildWithScope(
             // One port, multiplexed: a request holds its pool lease until its Exit, so the default per-item
             // concurrency of 1 would let one open `subscribe` stream block every other request.
@@ -562,7 +600,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
         }).pipe(
           // The handshake never completes if the leader died first.
           Effect.raceFirst(Deferred.await(connection.lost)),
-          Effect.catchCause((cause) => Effect.logError("echo: connecting to leader failed", cause))
+          Effect.catchCause((cause) => Telemetry.log("Error", "echo: connecting to leader failed", cause))
         )
       )
     }
@@ -591,11 +629,30 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
           (yield* Platform.isLockHeld(Platform.leaderEpochLockName(identity, leaderId)))
         if (live) connect(leaderId, port)
         else port.close()
-      }).pipe(Effect.catchCause((cause) => Effect.logError("echo: accepting a router connection failed", cause)))
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (pendingConnections.delete(port)) port.close()
+          })
+        ),
+        Effect.catchCause((cause) => Telemetry.log("Error", "echo: accepting a router connection failed", cause))
+      )
     const onRouterMessage = (event: MessageEvent) => {
       const message: unknown = event.data
       if (!isFromRouter(message)) return
-      routerConnects = routerConnects.then(() => Effect.runPromise(acceptConnected(message.leaderId, message.port)))
+      if (!open || scope.state._tag === "Closed") {
+        message.port.close()
+        return
+      }
+      pendingConnections.add(message.port)
+      routerConnects = routerConnects.then(() => {
+        if (!open || scope.state._tag === "Closed") return
+        const fiber = fork(acceptConnected(message.leaderId, message.port))
+        if (fiber !== undefined)
+          return new Promise<void>((resolve) => {
+            fiber.addObserver(() => resolve())
+          })
+      })
     }
     /** Announce this tab's worker as leader `leaderId` to the current router, over a fresh port pair. */
     const announce = (leaderId: string) => {
@@ -613,8 +670,9 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
      * Old router ports stay open: a `Connected` already in flight on one is still delivered.
      */
     const reconnectRouter = () => {
-      if (mode !== "shared-worker") return
+      if (!open || scope.state._tag === "Closed" || mode !== "shared-worker") return
       const next = config.spawnRouter(Platform.routerName(identity))
+      routerPorts.add(next.port)
       next.port.addEventListener("message", onRouterMessage)
       next.port.start()
       router = next
@@ -630,6 +688,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     }
 
     worker.addEventListener("message", (event) => {
+      if (!open || scope.state._tag === "Closed") return
       const message: unknown = event.data
       if (!isFromLeader(message)) return
       switch (message._tag) {
@@ -659,7 +718,9 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
                   publishStatus()
                 })
               ),
-              Effect.catchCause((cause) => Effect.logError("echo: watching this tab's leader epoch failed", cause))
+              Effect.catchCause((cause) =>
+                Telemetry.log("Error", "echo: watching this tab's leader epoch failed", cause)
+              )
             )
           )
           if (router !== undefined) {
@@ -701,6 +762,6 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     worker.postMessage(init, { transfer: [] })
 
     return service
-  })
+  }).pipe(Telemetry.boundary)
 
 export const layer = (config: LeaderClientConfig): Layer.Layer<LeaderClient> => Layer.effect(LeaderClient)(make(config))

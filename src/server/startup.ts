@@ -5,6 +5,7 @@ import { ScopeGrants } from "echo-sync"
 import { migrateApp, verify } from "./migrate/index.ts"
 import { layerHttp, type SyncServerOptions } from "./postgres/rpc.ts"
 import { attach, migrate } from "./postgres/schema.ts"
+import * as Telemetry from "../internal/Telemetry.ts"
 
 export interface StartupOptions extends SyncServerOptions {
   /** The app's generated migrations (`NNN_name` → default export), run after the engine's. */
@@ -43,7 +44,7 @@ export const prepare = (options: Pick<StartupOptions, "registry" | "appMigration
       yield* attach(table).pipe(Effect.catchTag("TableNameConflict", () => Effect.void))
     }
     yield* verify(options.registry)
-  })
+  }).pipe((work) => Telemetry.observe(work, "echo.server.startup"))
 
 /**
  * The sync server: `prepare`, then mount `Protocol.SyncRpcs`. The RPC layer is built only after

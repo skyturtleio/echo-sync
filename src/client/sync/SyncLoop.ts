@@ -26,6 +26,7 @@ import {
 import { HttpClientError } from "effect/http"
 import type { Errors } from "echo-sync"
 import type * as Engine from "./Engine.ts"
+import * as Telemetry from "../../internal/Telemetry.ts"
 
 export const PushState = Schema.Union([
   Schema.TaggedStruct("Active", {}),
@@ -246,11 +247,11 @@ export const make = <TE>(options: {
             return false
           }
           if (halts) {
-            yield* Effect.logError(`echo-sync: push halted by an integrity error: ${halt}`, pushed.cause)
+            yield* Telemetry.log("Error", "echo-sync: push halted by an integrity error", pushed.cause)
             const halted: PushState = { _tag: "Halted", message: halt }
             yield* SubscriptionRef.update(status, (s) => ({ ...s, push: halted }))
           } else {
-            yield* Effect.logWarning(`echo-sync: push failed (${error.kind}); retrying`, pushed.cause)
+            yield* Telemetry.log("Debug", "echo-sync: push failed; retrying", pushed.cause)
             transient = Option.some(error)
           }
         } else if (pushed.value.stopped) {
@@ -268,7 +269,7 @@ export const make = <TE>(options: {
           yield* stopOutdated(error)
           return false
         }
-        yield* Effect.logWarning(`echo-sync: pull failed (${error.kind}); retrying`, pulled.cause)
+        yield* Telemetry.log("Debug", "echo-sync: pull failed; retrying", pulled.cause)
         if (Option.isNone(transient) || error.kind === "server-outdated") transient = Option.some(error)
       }
       // `engine.pull` succeeds only once a `PullDone` set is installed.
@@ -285,10 +286,10 @@ export const make = <TE>(options: {
       // The count is in the ref before readers are let in, so their first (replayed) value carries it.
       Effect.andThen(
         SubscriptionRef.update(status, (s) => ({ ...s, pendingMutations: n })),
-        Deferred.succeed(counted, undefined)
+        Effect.andThen(Deferred.succeed(counted, undefined), Telemetry.pending(n))
       )
     ).pipe(
-      Effect.catchCause((cause) => Effect.logWarning("echo-sync: pending count failed; restarting", cause)),
+      Effect.catchCause((cause) => Telemetry.log("Warn", "echo-sync: pending count failed; restarting", cause)),
       Effect.andThen(Effect.sleep("1 second")),
       Effect.forever
     )
@@ -316,7 +317,7 @@ export const make = <TE>(options: {
       // Both wait for the first count, which `run` produces: a reader before `run` waits, never deadlocks it.
       status: Effect.andThen(Deferred.await(counted), SubscriptionRef.get(status)),
       changes: Stream.unwrap(Effect.as(Deferred.await(counted), SubscriptionRef.changes(status))),
-      run
+      run: Telemetry.boundary(run)
     }
   })
 
@@ -350,10 +351,47 @@ export const followPokes = <E, EP>(options: {
     const idleTimeout = options.idleTimeout ?? "45 seconds"
     // Preparation runs first and is never counted as silence; the clock starts when the stream is
     // first pulled, which is when its request is sent, and bounds the first element and every gap.
-    const connect = Stream.unwrap(Effect.map(options.connect, (stream) => Stream.timeout(stream, idleTimeout)))
     let delay = base
     while (true) {
-      const connection = { poked: false }
+      const connection = { poked: false, timedOut: false }
+      const connect = Stream.transformPull(
+        Stream.unwrap(
+          Effect.map(options.connect, (stream) =>
+            Stream.timeoutOrElse(stream, {
+              duration: idleTimeout,
+              orElse: () =>
+                Stream.fromEffect(
+                  Effect.sync(() => {
+                    connection.timedOut = true
+                  })
+                ).pipe(Stream.drain)
+            })
+          )
+        ),
+        (pull) => {
+          let first = true
+          return Effect.succeed(
+            Effect.suspend(() => {
+              if (!first) return pull
+              first = false
+              return Telemetry.observe(
+                pull.pipe(
+                  Effect.tap((elements) =>
+                    Telemetry.annotate({
+                      "echo.pokes": elements.filter((element) => element._tag === "poke").length,
+                      "echo.heartbeats": elements.filter((element) => element._tag === "heartbeat").length
+                    })
+                  ),
+                  Effect.tapCause(() =>
+                    connection.timedOut ? Telemetry.annotate({ "echo.reason": "idle-timeout" }) : Effect.void
+                  )
+                ),
+                "echo.pokes"
+              )
+            })
+          )
+        }
+      )
       const ended = yield* Effect.exit(
         Stream.runForEach(connect, (element) =>
           element._tag === "poke"
@@ -365,10 +403,16 @@ export const followPokes = <E, EP>(options: {
         )
       )
       if (connection.poked) delay = base
-      yield* Effect.logDebug(
-        `echo-sync: pokes stream ended (${Exit.isSuccess(ended) ? "completed" : Cause.pretty(ended.cause)}); reconnecting in ${delay} ms`
+      yield* Telemetry.count(
+        "echo.pokes.reconnect.total",
+        connection.timedOut ? "idle-timeout" : Exit.isSuccess(ended) ? "server-end" : Telemetry.outcome(ended)
+      )
+      yield* Telemetry.log(
+        "Debug",
+        "echo-sync: pokes stream ended; reconnecting",
+        Exit.isFailure(ended) ? ended.cause : undefined
       )
       yield* Effect.sleep(Duration.millis(delay))
       delay = Math.min(delay * 2, cap)
     }
-  })
+  }).pipe(Telemetry.boundary)

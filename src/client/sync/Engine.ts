@@ -17,6 +17,7 @@
 import { Array as Arr, Clock, Effect, Option, Schema, Semaphore } from "effect"
 import { Mutation, Protocol, Store } from "../../core/index.ts"
 import type { AccessScope, Errors, Ids, Registry, SyncTable } from "../../core/index.ts"
+import * as Telemetry from "../../internal/Telemetry.ts"
 
 type PullPage = typeof Protocol.PullPage.Type
 type PullDone = typeof Protocol.PullDone.Type
@@ -190,7 +191,14 @@ const rebase = <E>(
     }
     yield* storage.release(released)
     yield* storage.addNotices(notices)
-  })
+    yield* Telemetry.annotate({
+      "echo.pending": pending.length,
+      "echo.replayed": pending.length - released.length,
+      "echo.released": released.length,
+      "echo.notices_rejected": notices.filter((n) => n._tag === "Rejected").length,
+      "echo.notices_unknown": notices.filter((n) => n._tag === "OutcomeUnknown").length
+    })
+  }).pipe((work) => Telemetry.observe(work, "echo.rebase"))
 
 /** The same wire decode gates staging and install; never persist a page that retries must re-fetch. */
 const decodeRow = (table: SyncTable.AnySyncTable, row: SyncTable.EncodedRow) =>
@@ -210,7 +218,7 @@ const applyChange = (storage: SyncStorage, registry: Registry.SyncRegistry, chan
       // DESIGN §8: during a deploy that adds a synced table, clients on the old registry receive
       // its rows; they arrive with the next app version, whose manifest change rebuilds the
       // replica from null. Failing here would stop sync for every stale client.
-      return yield* Effect.logWarning(`echo-sync: skipping ${change._tag} for unknown table ${change.table}`)
+      return yield* Telemetry.log("Debug", "echo-sync: unknown table change skipped")
     }
     if (change._tag === "tombstone") return yield* storage.rows.write(table.value, change.id, Option.none())
     // Protocol's row is a generic JSON record; only the table's codec knows its fields. Store the
@@ -314,19 +322,32 @@ export const make = <TE>(options: {
     const pullLock = yield* Semaphore.make(1)
 
     const mutate = (mutationId: Ids.MutationId, name: string, args: Schema.Json) =>
-      storage.transaction(
-        Effect.gen(function* () {
-          const known = yield* storage.lookup(mutationId)
-          if (Option.isSome(known)) return known.value
-          const envelope: Mutation.MutationEnvelope = { clientId, mutationId, seq: yield* storage.nextSeq, name, args }
-          const createdAt = yield* Clock.currentTimeMillis
-          const run = yield* runHandler(storage.rows, options.mutations, options.actor, envelope, createdAt)
-          if (Option.isSome(run.rejection)) {
-            return yield* new LocallyRejected({ name, error: run.rejection.value })
-          }
-          yield* storage.appendPending({ envelope, createdAt, undo: run.undo })
-          return envelope
-        })
+      Telemetry.observe(
+        storage.transaction(
+          Effect.gen(function* () {
+            const known = yield* storage.lookup(mutationId)
+            if (Option.isSome(known)) {
+              yield* Telemetry.annotate({ "echo.result": "duplicate" })
+              return known.value
+            }
+            const envelope: Mutation.MutationEnvelope = {
+              clientId,
+              mutationId,
+              seq: yield* storage.nextSeq,
+              name,
+              args
+            }
+            const createdAt = yield* Clock.currentTimeMillis
+            const run = yield* runHandler(storage.rows, options.mutations, options.actor, envelope, createdAt)
+            if (Option.isSome(run.rejection)) {
+              return yield* new LocallyRejected({ name, error: run.rejection.value })
+            }
+            yield* storage.appendPending({ envelope, createdAt, undo: run.undo })
+            yield* Telemetry.annotate({ "echo.result": "saved" })
+            return envelope
+          })
+        ),
+        "echo.enqueue"
       )
 
     const push = pushLock.withPermit(
@@ -338,106 +359,136 @@ export const make = <TE>(options: {
           )
           const batch = pending.filter((entry) => entry.envelope.seq > meta.pushedThrough).slice(0, batchSize)
           if (!Arr.isReadonlyArrayNonEmpty(batch)) return { processed, stopped: false }
-          const response = yield* transport.push({
-            clientId,
-            clientVersion,
-            mutations: Arr.map(batch, ({ envelope }) => ({
-              mutationId: envelope.mutationId,
-              seq: envelope.seq,
-              name: envelope.name,
-              args: envelope.args
-            }))
-          })
-          // `results` is the processed prefix of the request, in request (= seq) order.
-          const through = batch[response.results.length - 1]?.envelope.seq
-          if (through !== undefined) {
-            yield* storage.transaction(
-              Effect.gen(function* () {
-                const current = yield* storage.meta
-                // §8 corollary: an outcome at a position ≤ the installed cursor is already in
-                // the replica, and no later pull will ack it (acks cover (cursor, nextCursor]).
-                // This is how a duplicate enqueued after its original was released terminates.
-                // Second corollary: `Rejected{ClientExpired}` answers an expired identity, which
-                // no pull ever acks, so it is released on receipt whatever its position (after a
-                // rebuild the cursor is null); its effect, if any, arrives with the next pull.
-                const cursor = current.cursor
-                const covered = new Map(
-                  response.results
-                    .filter(
-                      (result) =>
-                        (cursor !== null && result.position <= cursor) ||
-                        (result.outcome._tag === "Rejected" && result.outcome.error._tag === "ClientExpired")
-                    )
-                    .map((result) => [result.mutationId, result.outcome])
-                )
-                if (covered.size > 0) {
-                  yield* rebase(context, Effect.void, (envelope) => {
-                    const outcome = covered.get(envelope.mutationId)
-                    return outcome === undefined ? Option.none() : Option.some(noticeFor(envelope, outcome))
-                  })
-                }
-                yield* storage.setMeta({ ...current, pushedThrough: Math.max(current.pushedThrough, through) })
+          const stopped = yield* Telemetry.observe(
+            Effect.gen(function* () {
+              yield* Telemetry.annotate({ "echo.batch_size": batch.length })
+              yield* Telemetry.histogram("echo.push.batch_size", batch.length)
+              const response = yield* transport.push({
+                clientId,
+                clientVersion,
+                mutations: Arr.map(batch, ({ envelope }) => ({
+                  mutationId: envelope.mutationId,
+                  seq: envelope.seq,
+                  name: envelope.name,
+                  args: envelope.args
+                }))
               })
-            )
-          }
-          processed += response.results.length
-          if (response.results.length < batch.length) return { processed, stopped: true }
+              // `results` is the processed prefix of the request, in request (= seq) order.
+              const through = batch[response.results.length - 1]?.envelope.seq
+              if (through !== undefined) {
+                yield* storage.transaction(
+                  Effect.gen(function* () {
+                    const current = yield* storage.meta
+                    // §8 corollary: an outcome at a position ≤ the installed cursor is already in
+                    // the replica, and no later pull will ack it (acks cover (cursor, nextCursor]).
+                    // This is how a duplicate enqueued after its original was released terminates.
+                    // Second corollary: `Rejected{ClientExpired}` answers an expired identity, which
+                    // no pull ever acks, so it is released on receipt whatever its position (after a
+                    // rebuild the cursor is null); its effect, if any, arrives with the next pull.
+                    const cursor = current.cursor
+                    const covered = new Map(
+                      response.results
+                        .filter(
+                          (result) =>
+                            (cursor !== null && result.position <= cursor) ||
+                            (result.outcome._tag === "Rejected" && result.outcome.error._tag === "ClientExpired")
+                        )
+                        .map((result) => [result.mutationId, result.outcome])
+                    )
+                    if (covered.size > 0) {
+                      yield* rebase(context, Effect.void, (envelope) => {
+                        const outcome = covered.get(envelope.mutationId)
+                        return outcome === undefined ? Option.none() : Option.some(noticeFor(envelope, outcome))
+                      })
+                    }
+                    yield* storage.setMeta({ ...current, pushedThrough: Math.max(current.pushedThrough, through) })
+                  })
+                )
+              }
+              yield* Telemetry.annotate({
+                "echo.processed": response.results.length,
+                "echo.applied": response.results.filter((r) => r.outcome._tag === "Applied").length,
+                "echo.rejected": response.results.filter((r) => r.outcome._tag === "Rejected").length,
+                "echo.result": response.results.length < batch.length ? "stopped" : "ok"
+              })
+              processed += response.results.length
+              return response.results.length < batch.length
+            }),
+            "echo.push"
+          )
+          if (stopped) return { processed, stopped: true }
         }
       })
     )
 
     const pull = pullLock.withPermit(
-      Effect.gen(function* () {
-        while (true) {
-          const { meta, staged } = yield* storage.transaction(
-            Effect.all({ meta: storage.meta, staged: storage.staged })
-          )
-          const continuation = Option.fromNullishOr(staged.at(-1)?.continuation)
-          const request: Protocol.PullRequest = { clientId, clientVersion, cursor: pullFrom(meta), continuation }
-          const page = yield* transport.pull(request).pipe(
-            Effect.map(Option.some<Protocol.PullResponse>),
-            // Generic `TE` defeats `catchTag`'s tag extraction, so narrow by class.
-            Effect.catch((error) =>
-              Effect.gen(function* () {
-                if (!(error instanceof Protocol.ResnapshotRequired)) return yield* Effect.fail(error)
-                if (request.cursor === null && Option.isNone(continuation)) return yield* error
-                // Never apply a partial set: drop it and start a snapshot from null. The
-                // replica (and its cursor) keeps serving reads until that snapshot is installed.
-                // Re-read meta: the request was built before the network wait, and push responses
-                // may have advanced `pushedThrough` meanwhile; a stale write would resend them.
-                yield* storage.transaction(
-                  Effect.gen(function* () {
-                    const current = yield* storage.meta
-                    yield* storage.clearStaged
-                    yield* storage.setMeta({ ...current, resnapshot: true })
-                  })
-                )
-                return Option.none<Protocol.PullResponse>()
-              })
+      Telemetry.observe(
+        Effect.gen(function* () {
+          let resnapshots = 0
+          while (true) {
+            const { meta, staged } = yield* storage.transaction(
+              Effect.all({ meta: storage.meta, staged: storage.staged })
             )
-          )
-          if (Option.isNone(page)) continue
-          const response = page.value
-          if (response._tag === "PullPage") {
-            // Keep only valid pages: retry the incompatible page from the last valid continuation,
-            // rather than persisting its stale payload and resuming after it forever.
-            for (const change of response.changes) {
-              if (change._tag !== "upsert") continue
-              const table = options.registry.get(change.table)
-              if (Option.isSome(table)) yield* decodeRow(table.value, change.row)
+            const continuation = Option.fromNullishOr(staged.at(-1)?.continuation)
+            const request: Protocol.PullRequest = { clientId, clientVersion, cursor: pullFrom(meta), continuation }
+            const page = yield* transport.pull(request).pipe(
+              Effect.map(Option.some<Protocol.PullResponse>),
+              // Generic `TE` defeats `catchTag`'s tag extraction, so narrow by class.
+              Effect.catch((error) =>
+                Effect.gen(function* () {
+                  if (!(error instanceof Protocol.ResnapshotRequired)) return yield* Effect.fail(error)
+                  if (request.cursor === null && Option.isNone(continuation)) return yield* error
+                  // Never apply a partial set: drop it and start a snapshot from null. The
+                  // replica (and its cursor) keeps serving reads until that snapshot is installed.
+                  // Re-read meta: the request was built before the network wait, and push responses
+                  // may have advanced `pushedThrough` meanwhile; a stale write would resend them.
+                  yield* storage.transaction(
+                    Effect.gen(function* () {
+                      const current = yield* storage.meta
+                      yield* storage.clearStaged
+                      yield* storage.setMeta({ ...current, resnapshot: true })
+                    })
+                  )
+                  resnapshots++
+                  yield* Telemetry.annotate({ "echo.resnapshot_count": resnapshots })
+                  return Option.none<Protocol.PullResponse>()
+                })
+              )
+            )
+            if (Option.isNone(page)) continue
+            const response = page.value
+            yield* Telemetry.annotate({ "echo.pages": staged.length + 1, "echo.resnapshot": pullFrom(meta) === null })
+            if (response._tag === "PullPage") {
+              // Keep only valid pages: retry the incompatible page from the last valid continuation,
+              // rather than persisting its stale payload and resuming after it forever.
+              for (const change of response.changes) {
+                if (change._tag !== "upsert") continue
+                const table = options.registry.get(change.table)
+                if (Option.isSome(table)) yield* decodeRow(table.value, change.row)
+              }
+              yield* storage.transaction(storage.stage(response))
+              continue
             }
-            yield* storage.transaction(storage.stage(response))
-            continue
-          }
-          return yield* storage.transaction(
-            Effect.gen(function* () {
-              const set = yield* storage.staged
-              yield* applyPageSet(context, set, response)
+            yield* Telemetry.observe(
+              storage.transaction(
+                Effect.gen(function* () {
+                  const set = yield* storage.staged
+                  yield* applyPageSet(context, set, response)
+                })
+              ),
+              "echo.install"
+            )
+            yield* Telemetry.histogram("echo.pull.pages", staged.length + 1)
+            yield* Telemetry.annotate({
+              "echo.pages": staged.length + 1,
+              "echo.result": resnapshots > 0 ? "resnapshot" : "ok"
             })
-          )
-        }
-      })
+            return
+          }
+        }),
+        "echo.pull"
+      )
     )
 
-    return { mutate, push, pull }
+    return { mutate, push: Telemetry.boundary(push), pull }
   })

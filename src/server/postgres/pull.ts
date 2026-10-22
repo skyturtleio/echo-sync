@@ -4,6 +4,7 @@ import { AccessScope, Ids, Mutation, Protocol, type Registry, type SyncTable } f
 import { registerClient } from "./ledger.ts"
 import { decodeRow, q, selectList } from "./rowStore.ts"
 import { type Resolved, resolveTables } from "./schema.ts"
+import * as Telemetry from "../../internal/Telemetry.ts"
 
 /** Keyset position of a scope row walk: rows are walked in `(table, id)` code-point order. */
 const RowKey = Schema.Struct({ table: Schema.String, rowId: Schema.String })
@@ -296,7 +297,7 @@ export const pull = Effect.fnUntraced(function* (
       ON CONFLICT DO NOTHING`
   }
   return response.result
-})
+}, Telemetry.boundary)
 
 /** Code-point order, matching `COLLATE "C"` (DESIGN.md §10). Table names are ASCII identifiers. */
 const compare: Order.Order<string> = (a, b) => (a < b ? -1 : a > b ? 1 : 0)

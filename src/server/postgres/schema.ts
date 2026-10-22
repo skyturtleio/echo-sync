@@ -5,6 +5,7 @@ import type { Registry, SyncTable } from "echo-sync"
 import engine from "./migrations/001_engine.ts"
 import grantIdCheck from "./migrations/002_grant_id_check.ts"
 import ledgerAckedAt from "./migrations/003_ledger_acked_at.ts"
+import * as Telemetry from "../../internal/Telemetry.ts"
 
 /** Migrator history table (DESIGN.md §4). */
 export const migrationsTable = "echo_sync.migrations"
@@ -34,7 +35,7 @@ export const migrate = Effect.gen(function* () {
     }),
     table: migrationsTable
   })
-})
+}).pipe(Telemetry.boundary)
 
 /**
  * `echo_sync.log.table_name` is the unqualified table name (the SyncTable name on the wire), so
@@ -97,7 +98,7 @@ export const attach = (table: SyncTable.AnySyncTable, options?: { readonly schem
           FOR EACH STATEMENT EXECUTE FUNCTION echo_sync.reject_truncate()`
       })
     )
-  })
+  }).pipe(Telemetry.boundary)
 
 /** A table with change capture attached, as recorded in `echo_sync.log.table_name`. */
 export interface SyncedTable {
@@ -115,7 +116,7 @@ export const syncedTables = Effect.gen(function* () {
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE t.tgfoid = 'echo_sync.echo_sync_capture_changes'::regproc
     ORDER BY c.relname`
-})
+}).pipe(Telemetry.boundary)
 
 /** A registry table and the schema of its captured relation. */
 export interface Resolved {
