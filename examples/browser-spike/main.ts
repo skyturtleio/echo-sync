@@ -53,8 +53,29 @@ const log = (line: string) => {
 
 const netKey = `${appId}/${profile}`
 
-const spawnRouter = (name: string) =>
-  new SharedWorker(new URL("./router.worker.ts", import.meta.url), { type: "module", name })
+// Fault injection on this tab's *first* router SharedWorker only (later reconnects are untouched):
+// `holdRouterOut` queues what the tab posts to it, `holdRouterIn` buffers what it receives from it, both
+// until `echo.flushRouter()`. They model a router message delayed across a router death.
+let routerSpawns = 0
+const heldRouterOut: Array<() => void> = []
+const heldRouterIn: Array<() => void> = []
+const spawnRouter = (name: string) => {
+  const router = new SharedWorker(new URL("./router.worker.ts", import.meta.url), { type: "module", name })
+  routerSpawns++
+  if (routerSpawns === 1 && params.has("holdRouterOut")) {
+    const post = router.port.postMessage.bind(router.port)
+    Object.defineProperty(router.port, "postMessage", {
+      value: (message: unknown, options: StructuredSerializeOptions) => heldRouterOut.push(() => post(message, options))
+    })
+  }
+  if (routerSpawns === 1 && params.has("holdRouterIn")) {
+    const add = router.port.addEventListener.bind(router.port)
+    Object.defineProperty(router.port, "addEventListener", {
+      value: (type: string, listener: EventListener) => add(type, (event) => heldRouterIn.push(() => listener(event)))
+    })
+  }
+  return router
+}
 
 // Fault-injection flags (`crashAfterCommit`, `failOpen`) are forwarded to this tab's leader candidate only.
 const spawnLeader = (name: string) => {
@@ -310,6 +331,13 @@ const echo = {
         resolve()
       })
     }),
+  routerSpawns: () => routerSpawns,
+  routerHeld: () => ({ out: heldRouterOut.length, in: heldRouterIn.length }),
+  /** Deliver everything `holdRouterOut` / `holdRouterIn` held, in order (synchronously). */
+  flushRouter: () => {
+    for (const deliver of heldRouterOut.splice(0)) deliver()
+    for (const deliver of heldRouterIn.splice(0)) deliver()
+  },
   /** Fault injection: replay a leader announcement for `leaderId` to the router, as a delayed relay would. */
   forgeLeaderAnnouncement: (leaderId: string) => {
     const router = spawnRouter(`echo:${appId}:${profile}:router`)

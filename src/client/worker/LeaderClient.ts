@@ -577,7 +577,14 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     let router: SharedWorker | undefined
     const onRouterMessage = (event: MessageEvent) => {
       const message: unknown = event.data
-      if (isFromRouter(message)) connect(message.leaderId, message.port)
+      if (!isFromRouter(message)) return
+      // Already connected (or handshaking) to this epoch: a second Connected for it, e.g. a late one from a
+      // dead router instance, must not displace the live connection.
+      if (active?.leaderId === message.leaderId) {
+        message.port.close()
+        return
+      }
+      connect(message.leaderId, message.port)
     }
     /** Announce this tab's worker as leader `leaderId` to the current router, over a fresh port pair. */
     const announce = (leaderId: string) => {
@@ -645,7 +652,9 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
             )
           )
           if (router !== undefined) {
-            announce(message.leaderId)
+            // Reconnect rather than announce on the current port: the router may have died before this tab was
+            // ever connected, and then no connected epoch ends to trigger a reconnect.
+            reconnectRouter()
           } else {
             const channel = new MessageChannel()
             const direct: ToLeader = { _tag: "Connect", tabId, port: channel.port1 }

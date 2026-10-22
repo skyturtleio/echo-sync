@@ -30,15 +30,19 @@ tab B ──spawns──▶ leader-candidate worker B (queued on the leader lock
   is generic (no UA check):
   - A router instance posts `RouterStarted` on the BroadcastChannel `echo:<appId>:<profile>:router` when it
     gets its first `Hello`.
-  - Every tab, on `RouterStarted` or when a leader epoch it was connected to ends, constructs a new
-    SharedWorker (which relaunches a dead router) and sends `Hello` again; the tab whose worker holds the
-    live epoch also re-announces `Leader` over a fresh port pair (`RouterPort` to its worker).
+  - Every tab, on `RouterStarted`, when a leader epoch it was connected to ends, or when its own worker is
+    elected, constructs a new SharedWorker (which relaunches a dead router) and sends `Hello` again; the tab
+    whose worker holds the live epoch also re-announces `Leader` over a fresh port pair (`RouterPort` to its
+    worker). Reconnecting on its own election covers a successor that was never connected: if the router
+    died before its first `Connected`, no connected epoch ends to trigger a reconnect.
   - Idempotent on a live router: `Hello` carries `connectedTo` (the leader the tab is already connected
     to), and the router never links a tab twice to the same leader, so no connection is displaced and no
-    request or stream fails. A re-announcement goes through the same `accept` epoch-lock fence as any
-    other. Old router ports stay open so a `Connected` already in flight on one is still delivered.
+    request or stream fails. Across router instances the tab dedups itself: a `Connected` for the epoch it is
+    already connected or handshaking to (e.g. a late one from a dead instance) is ignored and its port
+    closed. A re-announcement goes through the same `accept` epoch-lock fence as any other. Old router ports stay open so a `Connected` already in flight on one is still delivered.
   - Bound (accepted for v1): a tab keeps one router port for each reconnect for its lifetime, so it holds
-    at most 1 + router relaunches + leader epoch ends it has seen. The count grows with browser and user
+    at most 2 + router relaunches + leader epoch ends it has seen (the 2: its first connect and its own
+    worker's election, which happens at most once). The count grows with browser and user
     events, not with traffic. The router likewise keeps one queued tab-lock watcher per `Hello`, and all of
     them are released when the tab dies. A constant bound would need the router to acknowledge `Hello`
     before an old port can be closed; deferred.
@@ -285,7 +289,7 @@ needed to keep the invariant.
 | Chrome / Edge desktop | 69+ | yes | 102+ | `shared-worker` | Documentation (MDN / caniuse); not run here |
 | Chrome Android | yes | historically **no** | yes | `single-tab` | Documentation; the runtime check decides |
 | Firefox desktop | 96+ | yes | 111+ | `shared-worker` | Documentation; not run here |
-| WebKit (Playwright 1.64.1, WebKit 27.2, Linux GTK, headless) | yes | yes, **but dies with its creating tab** (recovered since ws/router-relaunch) | yes (persistent context only) | `shared-worker` | **Run here**: scenarios 30/32 (the 2 CDP checks skipped) and slice 12/12 since ws/router-relaunch; the 2 failures are WebKit bug 289686, see "WebKit smoke" |
+| WebKit (Playwright 1.64.1, WebKit 27.2, Linux GTK, headless) | yes | yes, **but dies with its creating tab** (recovered since ws/router-relaunch) | yes (persistent context only) | `shared-worker` | **Run here**: scenarios 30/32 (the 2 CDP checks skipped) and slice 12/12 since ws/router-relaunch; the 2 failures are a closed tab's leader worker staying alive in a long wasm query (cause not identified), see "WebKit smoke" |
 | Safari macOS / iOS | 15.4+ | 16+ (re-added) | 15.2+ (`createSyncAccessHandle`), full sync API later | `shared-worker` expected | Documentation; desktop WebKit run above, not Safari itself |
 | Language runtime (ES2023: `Array.prototype.toSorted`, used by core) | — | — | — | — | Chrome/Edge 110+, Firefox 115+, Safari 16+ |
 
@@ -352,15 +356,17 @@ no-SharedWorker fallback. No SharedArrayBuffer or COOP/COEP is needed: the page 
 isolated (`crossOriginIsolated` false, `SharedArrayBuffer` undefined) and everything above runs. FTS5 is
 absent here exactly as in Chromium (same wasm build, see below).
 
-A leader worker busy inside a long wasm query **outlives its tab** ([WebKit bug
-289686](https://bugs.webkit.org/show_bug.cgi?id=289686): non-yielding wasm survives `terminate()`). The smoke
-misread this: the in-flight request does fail `LeaderLost`, but only minutes later, when the query ends.
-Measured after the router fix: with the handover scenario's 10⁹-row recursive query in flight, the closed
+A leader worker busy inside a long wasm query **outlives its tab** (observed under Playwright WebKit 27.2 on
+Linux GTK; cause not identified). The smoke missed this: the in-flight request does fail `LeaderLost`, but
+only later, when the query ends. Measured after the router fix: with the handover scenario's 10⁹-row recursive query in flight, the closed
 tab's worker keeps the leader and epoch locks exclusive for more than 50 s and no new leader is elected;
 without that query a new leader serves 0.76 s after the close. Ownership stays single (the stuck worker
 still holds the lock); the cost is unavailability until the query yields, so long queries on the leader are
 a WebKit availability risk. No library fix is possible from inside the worker: nothing that signals the
-tab's death can be observed while wasm runs synchronously.
+tab's death can be observed while wasm runs synchronously. Possibly related to [WebKit bug
+289686](https://bugs.webkit.org/show_bug.cgi?id=289686) (non-yielding wasm survives `terminate()`), but that
+report is marked RESOLVED FIXED (Aug 2026) and says a full tab close ended the worker there, so the id is not
+the established cause. Needs a check on real Safari.
 
 ### Findings
 
@@ -390,7 +396,7 @@ tab's death can be observed while wasm runs synchronously.
 | Scenario | WebKit | Error / cause |
 |---|---|---|
 | single owner across 4 tabs | pass | |
-| single owner after handover | **fail** (residual) | since ws/router-relaunch: bug 289686, the closed leader's worker stays alive in the in-flight 10⁹-row query and keeps the leader lock (passes without that query; failed at the smoke from finding 1 too) |
+| single owner after handover | **fail** (residual) | since ws/router-relaunch: the closed leader tab's worker stays alive in the in-flight 10⁹-row query and keeps the leader/epoch locks ~50 s (cause not identified, possibly related to WebKit 289686; needs real Safari) (passes without that query; failed at the smoke from finding 1 too) |
 | handover: in-flight request → `LeaderLost` | pass | |
 | handover: open subscription → `LeaderLost` | pass | |
 | handover: lost enqueue retried, lands once | pass since ws/router-relaunch | failed at the smoke: retry never found a leader (finding 1) |
@@ -409,7 +415,7 @@ tab's death can be observed while wasm runs synchronously.
 | reset (7 checks) | pass | |
 | presence: entry while open; across handover | pass | |
 | identity `.` refused | pass | |
-| router killed while tabs connected (2 checks) | skipped | Chromium only (CDP); WebKit kills the router itself in the handover scenarios |
+| router killed while tabs connected, before a successor's first `Connected`, late duplicate `Connected` (4 checks) | skipped | Chromium only (CDP); WebKit kills the router itself in the handover scenarios |
 | slice S1–S4, S6–S8 (two clients, rejection, revoke/re-grant, server restart, offline, conflicts, delete/edit) | pass | |
 | slice S5: leader closed while its push is held | pass since ws/router-relaunch | failed at the smoke: the next leader never got a route (finding 1) |
 
@@ -555,7 +561,10 @@ Invariants checked:
 4b. Router killed while tabs are connected (Chromium only: `cdp/kill-router.ts` ends the SharedWorker
    through the DevTools protocol): a new tab relaunches it and is served by the same leader, the connected
    tabs keep their connection and open subscription, and after the leader tab then closes both remaining
-   tabs are served by one new leader. Skipped under `WEBKIT=1` (no CDP); there the handover scenarios kill
+   tabs are served by one new leader. Router killed before a successor's first `Connected` (its `Hello` held by
+   `?holdRouterOut`): the newly elected tab reconnects and is served. A late `Connected` for the leader a tab
+   is already connected to (buffered by `?holdRouterIn` from the killed instance): ignored, the open
+   subscription stays open. Skipped under `WEBKIT=1` (no CDP); there the handover scenarios kill
    the router naturally.
 5. Crash after commit: the leader dies after committing an enqueue but before responding, while two tabs
    enqueue that same `mutationId` simultaneously; both retries return the committed seq, there is one row,

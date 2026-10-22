@@ -530,6 +530,59 @@ const s = await echo.status(); const i = await echo.info(); return { ...s, serve
     { pass: (((map(.leaderId) | unique) as $ids | ($ids | length) == 1 and $ids[0] != $old and $ids[0] != null)
             and (map(select(.isLeaderTab)) | length) == 1 and all(.[]; .served == .leaderId)), statuses: . }' <<<"$after")"
   for t in "$RA" "$RB" "$RC"; do [ "$t" = "$RL" ] || ab tab close "$t" >/dev/null; done
+
+  # A successor elected before its first Connected: B's Hello to the first router is held, that router is
+  # killed and the leader tab A closes, so B is elected without ever having been connected (no epoch end to
+  # react to). B must reconnect on its own election: relaunch the router, Hello, re-announce.
+  APP="router-elect-$RUN"
+  EA=$(open_tab "$BASE/?app=$APP")
+  ea=$(ev <<<"$SERVED")
+  EB=$(open_tab "$BASE/?app=$APP&holdRouterOut")
+  ev <<<'await echo.until(() => echo.routerHeld().out >= 1); return true' >/dev/null
+  killed=$(bun "$(dirname "$0")/cdp/kill-router.ts" "$(ab get cdp-url)" "echo:$APP:default:router")
+  ab tab close "$EA" >/dev/null
+  ab tab "$EB" >/dev/null
+  eb=$(ev <<<"const elected = await echo.until(async () => (await echo.status()).isLeaderTab)
+echo.flushRouter()
+const served = await echo.until(async () => {
+  const s = await echo.status()
+  const i = await Promise.race([echo.info(), new Promise((r) => setTimeout(() => r({ ok: false }), 1000))])
+  return s.leaderId !== undefined && i.ok && i.value.leaderId === s.leaderId ? s : undefined
+})
+return { elected: elected === true, served: served ?? null, spawns: echo.routerSpawns() }")
+  check "router killed before a successor's first Connected: the newly elected leader tab reconnects and is served by its own leader" \
+    "$(jq -nc --argjson k "${killed:-null}" --argjson a "$ea" --argjson b "$eb" '
+      { pass: ($k.killed > 0 and $b.elected and $b.served != null and $b.served.isLeaderTab and $b.served.leaderId != $a.leaderId),
+        killed: $k, a: $a, b: $b }')"
+  ab tab close "$EB" >/dev/null
+
+  # A Connected for the epoch a tab is already connected to, delivered late from a dead router instance:
+  # B's first Connected (from R0) is buffered, R0 is killed, C relaunches it (R1) and R1 links B to the same
+  # leader. The late R0 Connected is then delivered; it must not displace B's live connection.
+  APP="router-dup-$RUN"
+  DA=$(open_tab "$BASE/?app=$APP")
+  da=$(ev <<<"$SERVED")
+  DB=$(open_tab "$BASE/?app=$APP&holdRouterIn")
+  ev <<<'await echo.until(() => echo.routerHeld().in >= 1); return true' >/dev/null
+  killed=$(bun "$(dirname "$0")/cdp/kill-router.ts" "$(ab get cdp-url)" "echo:$APP:default:router")
+  DC=$(open_tab "$BASE/?app=$APP")
+  ev <<<"$SERVED" >/dev/null
+  ab tab "$DB" >/dev/null
+  db=$(ev <<<"$SERVED")
+  db2=$(ev <<<"window.dsub = echo.subscribe(['SELECT 1 AS n'], []); await echo.until(() => dsub.emissions.length >= 1)
+const held = echo.routerHeld().in
+echo.flushRouter()
+const i = await echo.info()
+// Displacement fails the open subscription with LeaderLost; give it a moment to surface.
+await echo.until(() => dsub.ended !== undefined, 1500)
+const s = await echo.status()
+return { held, info: i.ok ? i.value.leaderId : null, leaderId: s.leaderId ?? null, subEnded: dsub.ended ?? null, emissions: dsub.emissions.length }")
+  check "a late Connected for the leader a tab is already connected to (from a dead router instance) is ignored: the open subscription stays open" \
+    "$(jq -nc --argjson k "${killed:-null}" --argjson a "$da" --argjson b "$db" --argjson b2 "$db2" '
+      { pass: ($k.killed > 0 and $b.served == $a.leaderId and $b2.held >= 1 and $b2.info == $a.leaderId
+               and $b2.leaderId == $a.leaderId and $b2.subEnded == null),
+        killed: $k, a: $a, b: $b, after: $b2 }')"
+  for t in "$DA" "$DB" "$DC"; do ab tab close "$t" >/dev/null; done
 fi
 
 # ── identities that would escape the storage namespace are refused up front ──────────────────────────
