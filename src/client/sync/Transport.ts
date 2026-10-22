@@ -21,7 +21,7 @@
 import { Cause, Context, Effect, Layer, Predicate, Schema, type Scope, Stream } from "effect"
 import { FetchHttpClient, type Headers, HttpClient, HttpClientError, HttpClientRequest } from "effect/http"
 import { RpcClient, type RpcClientError, RpcSerialization } from "effect/rpc"
-import { type Ids, Protocol } from "echo-sync"
+import { type AccessScope, type Ids, Protocol } from "echo-sync"
 import type * as Presence from "./Presence.ts"
 import type * as Engine from "./Engine.ts"
 
@@ -98,11 +98,13 @@ const acquire = (headers: Effect.Effect<Headers.Input>) =>
  * clock, DESIGN §6 Liveness), and the stream it returns sends the request with exactly those.
  */
 export interface SyncTransport extends Engine.Transport<TransportError> {
+  /** `principal`: the replica's, asserted to the server like the engine's push and pull (DESIGN §16.21). */
   readonly pokes: (
-    clientId: Ids.ClientId
+    clientId: Ids.ClientId,
+    principal: AccessScope.PrincipalId
   ) => Effect.Effect<Stream.Stream<typeof Protocol.PokesElement.Type, unknown>, CredentialsUnavailable>
   /** `Protocol.PresenceRpcs` on the same mount (the server merges both groups, DESIGN §12). */
-  readonly presence: (clientId: Ids.ClientId) => Presence.Upstream<PresenceError>
+  readonly presence: (clientId: Ids.ClientId, principal: AccessScope.PrincipalId) => Presence.Upstream<PresenceError>
 }
 
 export type PresenceError =
@@ -136,22 +138,24 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
     pull: (request) => client.pull(request).pipe(defectsAs((message) => new PullProtocolError({ message }))),
 
     // Any end of this stream (failure, defect, completion) is handled by reconnecting (followPokes).
-    pokes: (clientId) =>
+    pokes: (clientId, principal) =>
       headers === undefined
-        ? Effect.succeed(client.pokes({ clientId }))
+        ? Effect.succeed(client.pokes({ clientId, principal }))
         : Effect.map(acquire(headers), (prepared) =>
-            client.pokes({ clientId }).pipe(Stream.provideService(PreparedHeaders, prepared))
+            client.pokes({ clientId, principal }).pipe(Stream.provideService(PreparedHeaders, prepared))
           ),
 
-    presence: (clientId) => ({
+    presence: (clientId, principal) => ({
       // Prepare-then-stream like `pokes`, so the leader's `idleTimeout` starts at send.
       room: (payload) =>
         headers === undefined
-          ? Effect.succeed(presenceClient.room({ clientId, ...payload }))
+          ? Effect.succeed(presenceClient.room({ clientId, principal, ...payload }))
           : Effect.map(acquire(headers), (prepared) =>
-              presenceClient.room({ clientId, ...payload }).pipe(Stream.provideService(PreparedHeaders, prepared))
+              presenceClient
+                .room({ clientId, principal, ...payload })
+                .pipe(Stream.provideService(PreparedHeaders, prepared))
             ),
-      track: (payload) => presenceClient.track({ clientId, ...payload })
+      track: (payload) => presenceClient.track({ clientId, principal, ...payload })
     })
   }
 })

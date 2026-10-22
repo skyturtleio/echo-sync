@@ -298,9 +298,142 @@ it.effect("a transport built with headers sends them on push, pull and the pokes
       )
       yield* t.push(batch(1))
       yield* t.pull({ clientId: Ids.ClientId.make("c"), cursor: null, continuation: Option.none() })
-      yield* Stream.runHead(Stream.unwrap(t.pokes(Ids.ClientId.make("c"))))
+      yield* Stream.runHead(Stream.unwrap(t.pokes(Ids.ClientId.make("c"), AccessScope.PrincipalId.make("alice"))))
     }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
     expect(seen).toEqual({ push: "alice", pull: "alice", pokes: "alice" })
+  }).pipe(Effect.scoped)
+)
+
+/**
+ * The request payloads of the `Protocol` before DESIGN §16.21 added `principal`, frozen here (not
+ * derived from the current schemas): what a deployed pre-change server decodes.
+ */
+const PreviousRpcs = RpcGroup.make(
+  Rpc.make("push", {
+    payload: {
+      clientId: Ids.ClientId,
+      clientVersion: Schema.optionalKey(Protocol.ClientVersion),
+      mutations: Schema.NonEmptyArray(Protocol.PushMutation).check(Schema.isMaxLength(100))
+    },
+    success: Protocol.PushResponse
+  }),
+  Rpc.make("pull", {
+    payload: {
+      clientId: Ids.ClientId,
+      clientVersion: Schema.optionalKey(Protocol.ClientVersion),
+      cursor: Ids.Cursor,
+      continuation: Schema.OptionFromNullOr(Protocol.PullContinuation)
+    },
+    success: Protocol.PullResponse
+  }),
+  Rpc.make("pokes", { payload: { clientId: Ids.ClientId }, success: Protocol.PokesElement, stream: true }),
+  Rpc.make("room", {
+    payload: {
+      clientId: Ids.ClientId,
+      room: AccessScope.AccessScopeId,
+      tabId: Protocol.TabId,
+      state: Schema.Json,
+      revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+    },
+    success: Protocol.RoomElement,
+    stream: true
+  }),
+  Rpc.make("track", {
+    payload: {
+      clientId: Ids.ClientId,
+      room: AccessScope.AccessScopeId,
+      tabId: Protocol.TabId,
+      state: Schema.Json,
+      revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+    }
+  })
+)
+
+it.effect("a pre-§16.21 server serves push, pull, pokes, room and track that assert the replica principal", () =>
+  Effect.gen(function* () {
+    const alice = AccessScope.PrincipalId.make("alice")
+    const room = AccessScope.AccessScopeId.make("r")
+    // The keys of each payload as the previous server decoded it.
+    const decoded: Record<string, ReadonlyArray<string>> = {}
+    const record = (rpc: string, payload: object) =>
+      Effect.sync(() => void (decoded[rpc] = Object.keys(payload).toSorted()))
+    const app = RpcServer.layerHttp({ group: PreviousRpcs, path: "/rpc", protocol: "http" }).pipe(
+      Layer.provide([
+        PreviousRpcs.toLayer({
+          push: (request) =>
+            Effect.as(record("push", request), {
+              results: request.mutations.map((m) => ({
+                mutationId: m.mutationId,
+                position,
+                outcome: { _tag: "Applied" as const }
+              }))
+            }),
+          pull: (request) =>
+            Effect.as(
+              record("pull", request),
+              Schema.decodeUnknownSync(Protocol.PullDone)({
+                _tag: "PullDone",
+                changes: [],
+                acks: [],
+                nextCursor: "1",
+                expiredThrough: 0
+              })
+            ),
+          pokes: (payload) => Stream.as(Stream.fromEffect(record("pokes", payload)), { _tag: "poke" as const }),
+          room: (payload) =>
+            Stream.as(Stream.fromEffect(record("room", payload)), { _tag: "snapshot" as const, room, entries: [] }),
+          track: (payload) => record("track", payload)
+        }),
+        RpcSerialization.layerNdjson
+      ])
+    )
+    const web = HttpRouter.toWebHandler(app, { disableLogger: true })
+    yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
+    // What this client put on the wire: every request line names the replica principal.
+    const lines: Array<string> = []
+    const fetch = Object.assign(
+      async (input: URL | RequestInfo, init?: RequestInit) => {
+        const request = new Request(input, init)
+        lines.push(...(await request.clone().text()).trim().split("\n"))
+        return web.handler(request)
+      },
+      { preconnect: globalThis.fetch.preconnect }
+    )
+    const clientId = Ids.ClientId.make("c")
+    yield* Effect.gen(function* () {
+      const t = yield* Transport.make.pipe(Effect.provide(Transport.layerProtocolHttp("http://echo.test/rpc")))
+      const join = { room, tabId: Protocol.TabId.make("tab"), state: null, revision: 0 }
+      expect((yield* t.push({ ...batch(1), principal: alice })).results).toHaveLength(1)
+      expect((yield* t.pull({ clientId, principal: alice, cursor: null, continuation: Option.none() }))._tag).toBe(
+        "PullDone"
+      )
+      expect(Option.isSome(yield* Stream.runHead(Stream.unwrap(t.pokes(clientId, alice))))).toBe(true)
+      const presence = t.presence(clientId, alice)
+      expect(Option.isSome(yield* Stream.runHead(Stream.unwrap(presence.room(join))))).toBe(true)
+      yield* presence.track({ ...join, revision: 1 })
+    }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+    const Message = Schema.Struct({
+      _tag: Schema.String,
+      tag: Schema.optionalKey(Schema.String),
+      payload: Schema.optionalKey(Schema.Struct({ principal: Schema.optionalKey(Schema.String) }))
+    })
+    const sent = lines
+      .map((line) => Schema.decodeUnknownSync(Schema.fromJsonString(Message))(line))
+      .filter((m) => m._tag === "Request")
+    expect(sent.map((m) => [m.tag, m.payload?.principal])).toEqual([
+      ["push", "alice"],
+      ["pull", "alice"],
+      ["pokes", "alice"],
+      ["room", "alice"],
+      ["track", "alice"]
+    ])
+    expect(decoded).toEqual({
+      push: ["clientId", "mutations"],
+      pull: ["clientId", "continuation", "cursor"],
+      pokes: ["clientId"],
+      room: ["clientId", "revision", "room", "state", "tabId"],
+      track: ["clientId", "revision", "room", "state", "tabId"]
+    })
   }).pipe(Effect.scoped)
 )
 
@@ -426,7 +559,7 @@ it.effect(
       const { state, seen, transport: t, fetch } = yield* credentials
       yield* Effect.gen(function* () {
         // Built once, like the leader's `connect`; each run is one (re)connect.
-        const pokes = Stream.unwrap(t.pokes(Ids.ClientId.make("c")))
+        const pokes = Stream.unwrap(t.pokes(Ids.ClientId.make("c"), AccessScope.PrincipalId.make("alice")))
         yield* t.push(batch(1))
         yield* t.pull(pullRequest)
         yield* Stream.runHead(pokes)
@@ -572,7 +705,7 @@ it.live(
       const wakes = { n: 0 }
       yield* Effect.forkChild(
         SyncLoop.followPokes({
-          connect: t.pokes(Ids.ClientId.make("c")),
+          connect: t.pokes(Ids.ClientId.make("c"), AccessScope.PrincipalId.make("alice")),
           wake: Effect.sync(() => void wakes.n++),
           idleTimeout: "100 millis",
           retryDelay: "1 second"

@@ -446,12 +446,16 @@ const program = (
       })
       yield* Effect.forkScoped(sync.run)
       yield* Effect.forkScoped(
-        SyncLoop.followPokes({ connect: transport.pokes(clientId), wake: sync.wake, idleTimeout: options.idleTimeout })
+        SyncLoop.followPokes({
+          connect: transport.pokes(clientId, actor),
+          wake: sync.wake,
+          idleTimeout: options.idleTimeout
+        })
       )
       yield* sync.wake
       loop = sync
       presence = Presence.make({
-        upstream: transport.presence(clientId),
+        upstream: transport.presence(clientId, actor),
         isFatal: Transport.isFatalPresence,
         idleTimeout: options.idleTimeout
       })

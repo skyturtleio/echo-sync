@@ -300,7 +300,10 @@ export interface Engine<TE> {
 
 export const make = <TE>(options: {
   readonly clientId: Ids.ClientId
-  /** The principal this client acts as; optimistic role checks read its replica grants. */
+  /**
+   * The principal this client acts as; optimistic role checks read its replica grants. Every push and
+   * pull asserts it to the server (DESIGN §16.21).
+   */
   readonly actor: AccessScope.PrincipalId
   readonly storage: SyncStorage
   /** The client's tables; pull changes for tables it does not know are skipped. */
@@ -366,6 +369,7 @@ export const make = <TE>(options: {
               const response = yield* transport.push({
                 clientId,
                 clientVersion,
+                principal: options.actor,
                 mutations: Arr.map(batch, ({ envelope }) => ({
                   mutationId: envelope.mutationId,
                   seq: envelope.seq,
@@ -430,7 +434,13 @@ export const make = <TE>(options: {
               Effect.all({ meta: storage.meta, staged: storage.staged })
             )
             const continuation = Option.fromNullishOr(staged.at(-1)?.continuation)
-            const request: Protocol.PullRequest = { clientId, clientVersion, cursor: pullFrom(meta), continuation }
+            const request: Protocol.PullRequest = {
+              clientId,
+              clientVersion,
+              principal: options.actor,
+              cursor: pullFrom(meta),
+              continuation
+            }
             const page = yield* transport.pull(request).pipe(
               Effect.map(Option.some<Protocol.PullResponse>),
               // Generic `TE` defeats `catchTag`'s tag extraction, so narrow by class.

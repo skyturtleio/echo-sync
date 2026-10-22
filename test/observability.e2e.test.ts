@@ -547,7 +547,7 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
         const follower = yield* Effect.forkChild(
           SyncLoop.followPokes({
             connect: rpc
-              .pokes(Ids.ClientId.make("device"))
+              .pokes(Ids.ClientId.make("device"), actor)
               .pipe(Effect.map((stream) => stream.pipe(Stream.provideService(FetchHttpClient.Fetch, fetch)))),
             wake: Deferred.succeed(first, undefined)
           })
