@@ -10,29 +10,61 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import type * as Scope from "effect/Scope"
 import type * as Stream from "effect/Stream"
-import { type Rpc, RpcClient, type RpcClientError, type RpcGroup, type RpcSchema } from "effect/rpc"
+import type * as Schema from "effect/Schema"
+import { RpcClient } from "effect/rpc"
+import type { RpcClientError } from "effect/rpc/RpcClientError"
 import type { WorkerError } from "effect/workers/WorkerError"
-import { LeaderRpcs } from "./LeaderRpcs.ts"
+import type { Errors, Protocol, Query } from "echo-sync"
+import type { LocallyRejected } from "../sync/Engine.ts"
+import type { SyncStatus } from "../sync/SyncLoop.ts"
+import * as LeaderRpcs from "./LeaderRpcs.ts"
 import * as Platform from "./platform.ts"
 
-type Rpcs = RpcGroup.Rpcs<typeof LeaderRpcs>
+type PresencePayload = typeof LeaderRpcs.PresencePayload.Type
 
-/** One leader's `LeaderRpcs`, each call as the tab uses it; a transport failure is `RpcClientError`. */
-export type LeaderConnection = {
-  readonly [Current in Rpcs as Current["_tag"]]: (
-    input: Rpc.PayloadConstructor<Current>
-  ) => Current extends Rpc.Rpc<
-    infer _Tag,
-    infer _Payload,
-    infer Success,
-    infer Error,
-    infer _Middleware,
-    infer _Requires
+/**
+ * One leader's `LeaderRpcs` as the tab calls them; a transport failure is `RpcClientError`. The browser
+ * default below assigns the real RPC client to this, so the compiler checks it against `LeaderRpcs`.
+ */
+export interface LeaderConnection {
+  readonly exec: (input: {
+    readonly sql: string
+    readonly params: LeaderRpcs.SqlParams
+  }) => Effect.Effect<LeaderRpcs.Rows, LeaderRpcs.SqlFailure | LeaderRpcs.RawExecDisabled | RpcClientError>
+  readonly enqueue: (input: {
+    readonly envelope: LeaderRpcs.OutboxEnvelope
+  }) => Effect.Effect<LeaderRpcs.Enqueued, LeaderRpcs.SqlFailure | LocallyRejected | RpcClientError>
+  readonly subscribe: (input: {
+    readonly name: string
+    readonly args: Schema.Json
+  }) => Stream.Stream<
+    Schema.Json,
+    | LeaderRpcs.SqlFailure
+    | Query.UnknownQuery
+    | Query.QueryArgsDecodeFailed
+    | Errors.RowNotFound
+    | Errors.ScopeForbidden
+    | Errors.InvalidRow
+    | RpcClientError
   >
-    ? [Success] extends [RpcSchema.Stream<infer A, infer E>]
-      ? Stream.Stream<A["Type"], E["Type"] | Error["Type"] | RpcClientError.RpcClientError>
-      : Effect.Effect<Success["Type"], Error["Type"] | RpcClientError.RpcClientError>
-    : never
+  readonly subscribeRaw: (input: {
+    readonly query: LeaderRpcs.LiveQuery
+  }) => Stream.Stream<LeaderRpcs.QueryResult, LeaderRpcs.SqlFailure | LeaderRpcs.RawExecDisabled | RpcClientError>
+  readonly leaderInfo: () => Effect.Effect<LeaderRpcs.LeaderInfo, RpcClientError>
+  readonly syncStatus: () => Stream.Stream<SyncStatus, LeaderRpcs.SyncDisabled | RpcClientError>
+  readonly requestSync: () => Effect.Effect<void, LeaderRpcs.SyncDisabled | RpcClientError>
+  readonly presence: (
+    input: PresencePayload
+  ) => Stream.Stream<Protocol.RoomSnapshot, LeaderRpcs.SyncDisabled | Protocol.Forbidden | RpcClientError>
+  readonly track: (input: PresencePayload) => Effect.Effect<void, LeaderRpcs.SyncDisabled | RpcClientError>
+  readonly notices: () => Stream.Stream<ReadonlyArray<LeaderRpcs.StoredNotice>, LeaderRpcs.SqlFailure | RpcClientError>
+  readonly dismissNotices: (input: {
+    readonly ids: ReadonlyArray<number>
+  }) => Effect.Effect<void, LeaderRpcs.SqlFailure | RpcClientError>
+  readonly exportPending: () => Effect.Effect<
+    ReadonlyArray<LeaderRpcs.PendingExport>,
+    LeaderRpcs.SqlFailure | RpcClientError
+  >
 }
 
 export interface TabPlatform {
@@ -62,7 +94,7 @@ const browser: TabPlatform = {
           Layer.provide(BrowserWorker.layer(() => port))
         )
       )
-      return yield* RpcClient.make(LeaderRpcs).pipe(Effect.provide(protocol))
+      return yield* RpcClient.make(LeaderRpcs.LeaderRpcs).pipe(Effect.provide(protocol))
     })
 }
 
