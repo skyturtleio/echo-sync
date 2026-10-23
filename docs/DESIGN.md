@@ -37,9 +37,13 @@ Goals
   catalogs (SkyTime airports). **App-agnostic (user ruling):** the same engine serves at least
   three app shapes — HeyBabe (couples sharing todos/notes), a Fasten-style personal records
   app, and the SkyTime flight-time logbook — so nothing in `src/` may assume one app's tables,
-  identity shape, UI library, or domain rules. Consumer trials (the HeyBabe port) exist to
-  surface *generic* gaps; a trial finding becomes a ruling only when stated as an engine
-  property any of those apps would need.
+  identity shape, UI library, or domain rules. Consumer ports exist to surface *generic* gaps; a
+  port finding becomes a ruling only when stated as an engine property any of those apps would
+  need. **Production consumers:** NilBurger (first cutover 2026-10-22) and HeyBabe (cutover from
+  Syncular 2026-10-23, heybabe-effect 41cf96d on engine pin dcd21c7; the import migration dropped
+  every Syncular relation in the same transaction, recovery point is the Coolify scheduled backup
+  of 03:00 UTC that day). HeyBabe is the first production consumer of presence and of scope
+  self-revocation (§16.27, §16.29).
 
 Non-goals (v1)
 
