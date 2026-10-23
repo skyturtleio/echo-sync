@@ -13,17 +13,18 @@ const rpcFailure = () =>
   })
 // The real fatal classification and core's real error, not stand-ins (reviewer question 1).
 const malformed = () =>
-  new SyncFailure.SyncTransportError({
+  new SyncFailure.PushTransportError({
     reason: new Protocol.MalformedEnvelope({
       clientId: Ids.ClientId.make("c"),
       mutationId: Ids.MutationId.make("m"),
       message: "bad envelope"
     })
   })
-const offline = () => new SyncFailure.SyncTransportError({ reason: rpcFailure() })
+const offline = () => new SyncFailure.PushTransportError({ reason: rpcFailure() })
+const pullOffline = () => new SyncFailure.PullTransportError({ reason: rpcFailure() })
 
 /** Fake engine: `pushFails` decides each push attempt's outcome; counts calls. */
-const fakeEngine = (pushFails: (attempt: number) => SyncFailure.SyncTransportError | undefined) => {
+const fakeEngine = (pushFails: (attempt: number) => SyncFailure.PushTransportError | undefined) => {
   const calls = { push: 0, pull: 0 }
   const engine: Engine.Engine = {
     mutate: () => Effect.die("unused"),
@@ -158,7 +159,7 @@ it.effect("lastSyncedAt stays null after a cycle whose pull failed, and is set b
     const engine: Engine.Engine = {
       mutate: () => Effect.die("unused"),
       push: Effect.succeed({ processed: 1, stopped: false }),
-      pull: Effect.suspend(() => (++calls.pull === 1 ? Effect.fail(offline()) : Effect.void))
+      pull: Effect.suspend(() => (++calls.pull === 1 ? Effect.fail(pullOffline()) : Effect.void))
     }
     yield* TestClock.adjust("5 seconds")
     const loop = yield* SyncLoop.make({ engine, pendingMutations: noPending })
@@ -268,7 +269,7 @@ it.effect(
           const attempt = attempts.length + 1
           attempts.push(Number(yield* Clock.currentTimeMillis))
           if (attempt === 1) return Stream.make(poke, poke) // two pokes, then a clean end
-          if (attempt === 2) return Stream.fail(offline())
+          if (attempt === 2) return Stream.fail(pullOffline())
           if (attempt === 3) return Stream.die(new Error("bad frame"))
           return Stream.as(Stream.tick("15 seconds"), heartbeat) // live: heartbeats only
         })

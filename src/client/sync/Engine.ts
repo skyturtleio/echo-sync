@@ -19,7 +19,7 @@ import { Mutation, Protocol, Store } from "../../core/index.ts"
 import type { AccessScope, Errors, Ids, Registry, SyncTable } from "../../core/index.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 import * as SyncFailure from "./SyncFailure.ts"
-import { MalformedChange, ServerOutdated, type SyncTransportError } from "./SyncFailure.ts"
+import { MalformedChange, type PullTransportError, type PushTransportError, ServerOutdated } from "./SyncFailure.ts"
 
 type PullPage = typeof Protocol.PullPage.Type
 type PullDone = typeof Protocol.PullDone.Type
@@ -93,10 +93,10 @@ export interface SyncStorage {
 
 /** The network port. Every failure is classified once, by the transport (see `SyncFailure`). */
 export interface Transport {
-  readonly push: (request: Protocol.PushRequest) => Effect.Effect<Protocol.PushResponse, SyncTransportError>
+  readonly push: (request: Protocol.PushRequest) => Effect.Effect<Protocol.PushResponse, PushTransportError>
   readonly pull: (
     request: Protocol.PullRequest
-  ) => Effect.Effect<Protocol.PullResponse, SyncTransportError | Protocol.ResnapshotRequired>
+  ) => Effect.Effect<Protocol.PullResponse, PullTransportError | Protocol.ResnapshotRequired>
 }
 
 /** The handler rejected the mutation against the local replica; nothing was saved. */
@@ -404,7 +404,7 @@ export const make = (options: {
               return response.results.length < batch.length
             }),
             "echo.push",
-            SyncFailure.outcome
+            (cause) => SyncFailure.classifyPush(cause).outcome
           )
           if (stopped) return { processed, stopped: true }
         }
@@ -471,7 +471,7 @@ export const make = (options: {
                 })
               ),
               "echo.install",
-              SyncFailure.outcome
+              (cause) => SyncFailure.classifyPull(cause).outcome
             )
             yield* Telemetry.histogram("echo.pull.pages", staged.length + 1)
             yield* Telemetry.annotate({
@@ -482,7 +482,7 @@ export const make = (options: {
           }
         }),
         "echo.pull",
-        SyncFailure.outcome
+        (cause) => SyncFailure.classifyPull(cause).outcome
       )
     )
 

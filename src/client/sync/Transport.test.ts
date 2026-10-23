@@ -25,7 +25,10 @@ interface Handlers {
  * A real RpcServer (HTTP, NDJSON) behind a web handler, and the leader's Transport talking to it
  * through `fetch`. `served` counts requests that reached the server.
  */
-const harness = <A extends SyncFailure.SyncTransportError | Protocol.ResnapshotRequired, B>(
+const harness = <
+  A extends SyncFailure.PushTransportError | SyncFailure.PullTransportError | Protocol.ResnapshotRequired,
+  B
+>(
   server: Layer.Layer<never, never, HttpRouter.HttpRouter> | "unreachable",
   body: (transport: Effect.Success<typeof Transport.make>) => Effect.Effect<B, A>
 ) =>
@@ -112,7 +115,7 @@ const failureOf = <A, E>(exit: Exit.Exit<A, E>) =>
   Exit.isSuccess(exit) ? "success" : Option.getOrElse(Exit.findErrorOption(exit), () => "defect" as const)
 
 /** Whether this failure halts a push, by the verdict `SyncLoop` acts on. */
-const isFatal = (failure: SyncFailure.PullFailure) => Option.isSome(SyncFailure.classify(Cause.fail(failure)).halt)
+const isFatal = (failure: SyncFailure.PushFailure) => Option.isSome(SyncFailure.classifyPush(Cause.fail(failure)).halt)
 
 it.effect("push failures are fatal exactly when §6 says so, classified by their real tags over a real RPC server", () =>
   Effect.gen(function* () {
@@ -171,7 +174,7 @@ it.effect("push failures are fatal exactly when §6 says so, classified by their
     for (const c of cases) {
       const { exit, served } = yield* harness(c.server, (t) => t.push(batch(c.size)))
       const failure = failureOf(exit)
-      if (!(failure instanceof SyncFailure.SyncTransportError)) throw new Error(`${c.name}: ${String(failure)}`)
+      if (!(failure instanceof SyncFailure.PushTransportError)) throw new Error(`${c.name}: ${String(failure)}`)
       const reason = failure.reason
       const tag = reason._tag === "PushIntegrityError" ? `${reason._tag}:${reason.reason}` : reason._tag
       expect({ case: c.name, tag, fatal: isFatal(failure), served }).toEqual({
@@ -231,17 +234,15 @@ it.effect(
       )
       const unavailable = failureOf(down.exit)
       expect(unavailable).toEqual(
-        new SyncFailure.SyncTransportError({ reason: new Protocol.ServerUnavailable({ message: "db down" }) })
+        new SyncFailure.PullTransportError({ reason: new Protocol.ServerUnavailable({ message: "db down" }) })
       )
-      if (unavailable instanceof SyncFailure.SyncTransportError) expect(isFatal(unavailable)).toBe(false)
 
       const noId = yield* harness(skewedPull, (t) => t.pull(request))
       const dies = yield* harness(serve({ pull: () => Effect.die(new Error("bug")) }), (t) => t.pull(request))
       for (const exit of [noId.exit, dies.exit]) {
         const failure = failureOf(exit)
-        if (!(failure instanceof SyncFailure.SyncTransportError)) throw new Error(String(failure))
+        if (!(failure instanceof SyncFailure.PullTransportError)) throw new Error(String(failure))
         expect(failure.reason).toBeInstanceOf(SyncFailure.PullProtocolError)
-        expect(isFatal(failure)).toBe(false)
       }
     }).pipe(Effect.scoped)
 )

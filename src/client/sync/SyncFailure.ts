@@ -1,9 +1,10 @@
 /**
  * Every way a sync cycle can fail, and what each failure means (DESIGN §6, §9.1).
  *
- * One closed union, classified exhaustively in one place: the public status `kind`, whether a push
- * halts, and the telemetry outcome. The transport is the only module that sees RPC and HTTP errors; it
- * builds a `SyncTransportError` whose `reason` names what happened (the innermost evidence already
+ * Two closed unions, one per direction, each classified exhaustively in one place: the public status
+ * `kind`, whether a push halts (only a push can), and the telemetry outcome. The transport is the only
+ * module that sees RPC and HTTP errors; it builds a `PushTransportError` or `PullTransportError` whose
+ * `reason` names what happened (the innermost evidence already
  * lifted out: a credential failure or an HTTP 401/403 inside an `RpcClientError`). The engine adds its
  * own local failures. `SyncLoop` and telemetry only read the verdicts here, so a new reason does not
  * compile until every verdict covers it.
@@ -47,38 +48,61 @@ export class ServerOutdated extends Schema.TaggedError<ServerOutdated>()("Server
 }) {}
 
 /**
- * What a transport failure was:
+ * Why a push failed in the transport:
  * - `CredentialsUnavailable`: `syncHeaders` raised; nothing was sent.
  * - `Unauthorized`: the server rejected the credential (its `Unauthorized`, or HTTP 401/403).
- * - `ServerUnavailable`: the server reported a transient infrastructure failure.
  * - `ClientOutdated`: compatibility policy refused this client (DESIGN §11).
- * - `MalformedEnvelope`: the server refused the push batch (DESIGN §6).
- * - `PushIntegrityError`: the batch is not a valid push request, or the push ended in a defect.
- * - `PullProtocolError`: the pull ended in a defect.
+ * - `MalformedEnvelope`: the server refused the batch (DESIGN §6). Halts push.
+ * - `PushIntegrityError`: the batch is not a valid push request, or the push ended in a defect. Halts push.
  * - `RpcClientError`: no usable RPC result (transport, HTTP, an empty or unreadable response).
  */
-export type TransportReason =
+export type PushReason =
   | CredentialsUnavailable
   | Protocol.Unauthorized
-  | Protocol.ServerUnavailable
   | Protocol.ClientOutdated
   | Protocol.MalformedEnvelope
   | PushIntegrityError
+  | RpcClientError.RpcClientError
+
+/**
+ * Why a pull or a pokes stream failed in the transport:
+ * - `CredentialsUnavailable`, `Unauthorized`, `ClientOutdated`, `RpcClientError`: as for a push.
+ * - `ServerUnavailable`: the server reported a transient infrastructure failure.
+ * - `PullProtocolError`: the pull ended in a defect.
+ */
+export type PullReason =
+  | CredentialsUnavailable
+  | Protocol.Unauthorized
+  | Protocol.ClientOutdated
+  | Protocol.ServerUnavailable
   | PullProtocolError
   | RpcClientError.RpcClientError
 
-/** The one error a sync transport fails with (`ResnapshotRequired` aside, which the engine handles). */
-export class SyncTransportError extends Data.TaggedError("SyncTransportError")<{ readonly reason: TransportReason }> {
+/** The transport's push failure. */
+export class PushTransportError extends Data.TaggedError("PushTransportError")<{ readonly reason: PushReason }> {
+  override get message(): string {
+    return `${this.reason._tag}: ${this.reason.message}`
+  }
+}
+
+/** The transport's pull or pokes failure (`ResnapshotRequired` aside, which the engine handles). */
+export class PullTransportError extends Data.TaggedError("PullTransportError")<{ readonly reason: PullReason }> {
   override get message(): string {
     return `${this.reason._tag}: ${this.reason.message}`
   }
 }
 
 /** A failure of `Engine.push`. */
-export type PushFailure = Errors.StoreUnavailable | Errors.ConstraintViolated | SyncTransportError
+export type PushFailure = Errors.StoreUnavailable | Errors.ConstraintViolated | PushTransportError
 
 /** A failure of `Engine.pull`. */
-export type PullFailure = PushFailure | Protocol.ResnapshotRequired | MalformedChange | ServerOutdated
+export type PullFailure =
+  | Errors.StoreUnavailable
+  | Errors.ConstraintViolated
+  | PullTransportError
+  | Protocol.ResnapshotRequired
+  | MalformedChange
+  | ServerOutdated
 
 /**
  * What kind of failure `lastError` reports (DESIGN §9.1), so an app can tell "sign in again"
@@ -104,35 +128,31 @@ export const SyncErrorKind = Schema.Literals([
 ])
 export type SyncErrorKind = typeof SyncErrorKind.Type
 
-/**
- * What one failure means. `halt` is set exactly for push integrity failures (DESIGN §6): pushing stops
- * for this leader, with that library-controlled reason. `outcome` is the telemetry vocabulary
- * (docs/observability.md), which names some failures more finely than `kind`.
- */
+/** What one failure means: its status kind and its telemetry outcome (docs/observability.md), which is finer. */
 interface Meaning {
   readonly kind: SyncErrorKind
   readonly outcome: string
+}
+
+/** A push failure's meaning; `halt` is the library-controlled `Halted` reason when it stops pushing (DESIGN §6). */
+interface PushMeaning extends Meaning {
   readonly halt: Option.Option<string>
 }
 
-const as = (kind: SyncErrorKind, outcome: string = kind): Meaning => ({ kind, outcome, halt: Option.none() })
-const halts = (halt: string): Meaning => ({ kind: "server", outcome: "halted", halt: Option.some(halt) })
+const meaning = (kind: SyncErrorKind, outcome: string = kind): Meaning => ({ kind, outcome })
+const continues = (kind: SyncErrorKind): PushMeaning => ({ kind, outcome: kind, halt: Option.none() })
+const halts = (halt: string): PushMeaning => ({ kind: "server", outcome: "halted", halt: Option.some(halt) })
 
-const meaningOf = (failure: PullFailure): Meaning =>
+const pushMeaning = (failure: PushFailure): PushMeaning =>
   Match.valueTags(failure, {
-    StoreUnavailable: () => as("server"),
-    ConstraintViolated: () => as("server"),
-    ResnapshotRequired: () => as("server", "resnapshot"),
-    MalformedChange: () => as("server", "malformed"),
-    ServerOutdated: () => as("server-outdated"),
-    SyncTransportError: ({ reason }) =>
+    StoreUnavailable: () => continues("server"),
+    ConstraintViolated: () => continues("server"),
+    PushTransportError: ({ reason }) =>
       Match.valueTags(reason, {
-        CredentialsUnavailable: () => as("credentials"),
-        Unauthorized: () => as("unauthorized"),
-        ServerUnavailable: () => as("unavailable"),
-        ClientOutdated: () => as("outdated"),
-        RpcClientError: () => as("network"),
-        PullProtocolError: () => as("server"),
+        CredentialsUnavailable: () => continues("credentials"),
+        Unauthorized: () => continues("unauthorized"),
+        ClientOutdated: () => continues("outdated"),
+        RpcClientError: () => continues("network"),
         MalformedEnvelope: () => halts("the server refused the push batch as malformed"),
         PushIntegrityError: (error) =>
           halts(
@@ -143,32 +163,65 @@ const meaningOf = (failure: PullFailure): Meaning =>
       })
   })
 
-export interface Verdict {
+const pullMeaning = (failure: PullFailure): Meaning =>
+  Match.valueTags(failure, {
+    StoreUnavailable: () => meaning("server"),
+    ConstraintViolated: () => meaning("server"),
+    ResnapshotRequired: () => meaning("server", "resnapshot"),
+    MalformedChange: () => meaning("server", "malformed"),
+    ServerOutdated: () => meaning("server-outdated"),
+    PullTransportError: ({ reason }) =>
+      Match.valueTags(reason, {
+        CredentialsUnavailable: () => meaning("credentials"),
+        Unauthorized: () => meaning("unauthorized"),
+        ClientOutdated: () => meaning("outdated"),
+        RpcClientError: () => meaning("network"),
+        ServerUnavailable: () => meaning("unavailable"),
+        PullProtocolError: () => meaning("server")
+      })
+  })
+
+const failures = <E>(cause: Cause.Cause<E>): ReadonlyArray<E> =>
+  cause.reasons.filter(Cause.isFailReason).map((reason) => reason.error)
+
+/**
+ * `kind` and `halt` decide the status; `outcome` names the typed failures for telemetry (interruption and
+ * defects are named by `Telemetry.outcome` before it is consulted).
+ */
+export interface PushVerdict {
   readonly kind: SyncErrorKind
-  /** The `Halted` reason when this failure stops pushing (DESIGN §6); only a push can halt. */
+  /** The `Halted` reason when this push stops pushing (DESIGN §6). */
   readonly halt: Option.Option<string>
+  readonly outcome: string
 }
 
 /**
- * Whole-cause verdict (DESIGN §6: defect > integrity > anything else), never just the first failure:
- * a defect anywhere halts a push, even beside a transient failure, since an RPC request decode failure
- * arrives as an untagged defect. A pull's caller ignores `halt` (a pull defect is transient); the
- * transport never fails a pull with a push-only reason, so a pull's kind is its first failure's. The
- * cause must not be interruption-only; interruption is the caller's to re-raise.
+ * Whole-cause verdict on a push (DESIGN §6: defect > integrity > first failure), never just its first
+ * failure: a defect anywhere halts, even beside a transient failure, since an RPC request decode failure
+ * arrives as an untagged defect. Interruption is the caller's to handle first.
  */
-export const classify = (cause: Cause.Cause<PullFailure>): Verdict => {
-  const failures = cause.reasons.filter(Cause.isFailReason).map((reason) => meaningOf(reason.error))
-  const fatal = failures.find((meaning) => Option.isSome(meaning.halt))
+export const classifyPush = (cause: Cause.Cause<PushFailure>): PushVerdict => {
+  const meanings = failures(cause).map(pushMeaning)
+  const halting = meanings.find((m) => Option.isSome(m.halt))
+  const decisive = halting ?? meanings[0]
   const dies = Cause.hasDies(cause)
-  const first = fatal ?? failures[0]
   return {
-    kind: dies || first === undefined ? "server" : first.kind,
-    halt: fatal !== undefined ? fatal.halt : dies ? Option.some("push failed with a defect") : Option.none()
+    kind: dies || decisive === undefined ? "server" : decisive.kind,
+    halt: halting !== undefined ? halting.halt : dies ? Option.some("push failed with a defect") : Option.none(),
+    outcome: decisive?.outcome ?? "server"
   }
 }
 
-/** The telemetry outcome of a typed failure cause: `halted` if any failure halts, else the first's. */
-export const outcome = (cause: Cause.Cause<PullFailure>): string => {
-  const failures = cause.reasons.filter(Cause.isFailReason).map((reason) => meaningOf(reason.error))
-  return (failures.find((meaning) => Option.isSome(meaning.halt)) ?? failures[0])?.outcome ?? "server"
+export interface PullVerdict {
+  readonly kind: SyncErrorKind
+  readonly outcome: string
+}
+
+/** Verdict on a pull: its first failure; a defect anywhere is a transient `server` failure (it never halts). */
+export const classifyPull = (cause: Cause.Cause<PullFailure>): PullVerdict => {
+  const first = failures(cause).map(pullMeaning)[0]
+  return {
+    kind: Cause.hasDies(cause) || first === undefined ? "server" : first.kind,
+    outcome: first?.outcome ?? "server"
+  }
 }

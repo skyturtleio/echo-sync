@@ -26,7 +26,7 @@ import { Array as Arr, Clock, Deferred, Effect, Fiber, Option, Order, Schema } f
 import { TestClock } from "effect/testing"
 import { RpcClientError } from "effect/rpc"
 import * as Engine from "../Engine.ts"
-import { SyncTransportError } from "../SyncFailure.ts"
+import { type PullFailure, PullTransportError, type PushFailure, PushTransportError } from "../SyncFailure.ts"
 import { Ids, ScopeGrants } from "../../../core/index.ts"
 import type { AccessScope, Mutation, Protocol, SyncTable } from "../../../core/index.ts"
 import * as MemoryStore from "../../../core/testing/MemoryStore.ts"
@@ -49,13 +49,14 @@ type PullDone = typeof Protocol.PullDone.Type
 type PullResponse = Protocol.PullResponse
 type Role = AccessScope.Role
 
-/** A lost request or response: what the transport reports when no usable RPC result arrived. */
-export const transportFailed = (during: string): SyncTransportError =>
-  new SyncTransportError({
-    reason: new RpcClientError.RpcClientError({
-      reason: new RpcClientError.RpcClientDefect({ message: `lost ${during}`, cause: null })
-    })
+const lost = (during: string) =>
+  new RpcClientError.RpcClientError({
+    reason: new RpcClientError.RpcClientDefect({ message: `lost ${during}`, cause: null })
   })
+/** A lost push request or response: what the transport reports when no usable RPC result arrived. */
+export const pushLost = (during: string) => new PushTransportError({ reason: lost(during) })
+/** A lost pull request or response. */
+export const pullLost = (during: string) => new PullTransportError({ reason: lost(during) })
 
 export class InvariantViolated extends Schema.TaggedError<InvariantViolated>()("InvariantViolated", {
   seed: Schema.Number,
@@ -256,13 +257,13 @@ export const run = (options: Options) =>
         const transport: Engine.Transport = {
           push: (request) =>
             Effect.gen(function* () {
-              if (faults && rng.chance(0.1)) return yield* transportFailed("push request")
+              if (faults && rng.chance(0.1)) return yield* pushLost("push request")
               const stopAt = faults && rng.chance(0.15) ? Option.some(rng.int(request.mutations.length)) : Option.none()
               const response = yield* server.push(request, stopAt)
               if (response.results.length < request.mutations.length) stats.transientStops++
               if (faults && rng.chance(0.15)) {
                 stats.lostResponses++
-                return yield* transportFailed("push response")
+                return yield* pushLost("push response")
               }
               return response
             }),
@@ -274,7 +275,7 @@ export const run = (options: Options) =>
                 yield* Deferred.succeed(arrived, undefined)
                 yield* Deferred.await(release)
               }
-              if (faults && rng.chance(0.15)) return yield* transportFailed("pull request")
+              if (faults && rng.chance(0.15)) return yield* pullLost("pull request")
               const response = yield* server.pull(request).pipe(
                 Effect.tapError(() =>
                   Effect.sync(() => {
@@ -282,7 +283,7 @@ export const run = (options: Options) =>
                   })
                 )
               )
-              if (faults && rng.chance(0.1)) return yield* transportFailed("pull response")
+              if (faults && rng.chance(0.1)) return yield* pullLost("pull response")
               return response
             })
         }
@@ -422,11 +423,13 @@ export const run = (options: Options) =>
     const ignoreExpected = <A, E, R>(self: Effect.Effect<A, E, R>) =>
       self.pipe(
         Effect.asVoid,
-        Effect.catch((error) =>
-          error instanceof SyncTransportError || error instanceof Engine.LocallyRejected
-            ? Effect.sync(() => note(`  ↳ ${error._tag}`))
-            : Effect.fail(error)
-        )
+        Effect.catch((error) => {
+          if (error instanceof PushTransportError || error instanceof PullTransportError) {
+            return Effect.sync(() => note(`  ↳ ${error._tag}`))
+          }
+          if (error instanceof Engine.LocallyRejected) return Effect.sync(() => note(`  ↳ ${error._tag}`))
+          return Effect.fail(error)
+        })
       )
 
     const pull = (client: Client) => (options.pullMode === "incremental" ? incrementalPull(client) : client.engine.pull)
@@ -641,7 +644,7 @@ export const run = (options: Options) =>
       Effect.gen(function* () {
         if (!client.online) return
         client.disk.crashAfterWrites = Option.some(rng.int(6))
-        const op = rng.chance(0.6) ? pullStep(client) : pushStep(client)
+        const op: Effect.Effect<void, PullFailure | PushFailure> = rng.chance(0.6) ? pullStep(client) : pushStep(client)
         note(`${client.clientId}: crash armed`)
         yield* op.pipe(
           Effect.catchDefect((defect) =>

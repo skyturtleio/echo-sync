@@ -2,7 +2,7 @@
  * The leader's sync loop (DESIGN §8, §9): runs `Engine.push` then `Engine.pull` whenever woken (local
  * enqueue, poke) and retries transient failures with backoff; `followPokes` keeps the pokes stream up.
  *
- * Fatal push (DESIGN §6, a68a727): a push failure that `SyncFailure.classify` says halts (an integrity
+ * Fatal push (DESIGN §6, a68a727): a push failure that `SyncFailure.classifyPush` says halts (an integrity
  * failure: `MalformedEnvelope`, an invalid batch, or a push defect) halts pushing for the lifetime of this
  * loop: no automatic retry, no outbox entry is released (that would leave a seq gap, §16.5). Pull keeps
  * running. The halt is surfaced through `status`, and the pending outbox stays exportable.
@@ -25,7 +25,7 @@ import {
 import type { Errors } from "echo-sync"
 import type * as Engine from "./Engine.ts"
 import * as SyncFailure from "./SyncFailure.ts"
-import { SyncErrorKind, type SyncTransportError } from "./SyncFailure.ts"
+import { type PullTransportError, SyncErrorKind } from "./SyncFailure.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
 export const PushState = Schema.Union([
@@ -94,8 +94,8 @@ const stoppedBatch: SyncError = { kind: "server", message: "the server stopped t
  * its first failure. Interruption is re-raised (the loop is stopping). The returned strings are
  * constants; the cause itself is only ever logged.
  */
-const classify = (cause: Cause.Cause<SyncFailure.PullFailure>) =>
-  Cause.hasInterrupts(cause) ? Effect.interrupt : Effect.succeed(SyncFailure.classify(cause))
+const classify = <E, V>(cause: Cause.Cause<E>, verdict: (cause: Cause.Cause<E>) => V) =>
+  Cause.hasInterrupts(cause) ? Effect.interrupt : Effect.succeed(verdict(cause))
 
 const errorOf = (kind: SyncErrorKind): SyncError => ({ kind, message: messages[kind] })
 
@@ -153,7 +153,7 @@ export const make = (options: {
         // span (which classified the batch's own cause the same way) had ended.
         const pushed = yield* Effect.exit(engine.push)
         if (Exit.isFailure(pushed)) {
-          const { kind, halt } = yield* classify(pushed.cause)
+          const { kind, halt } = yield* classify(pushed.cause, SyncFailure.classifyPush)
           if (Option.isNone(halt) && kind === "outdated") {
             yield* stopOutdated(errorOf(kind))
             return false
@@ -176,8 +176,8 @@ export const make = (options: {
       // Nothing was installed on failure. Policy refusal stops sync; other failures back off.
       const pulled = yield* Effect.exit(engine.pull)
       if (Exit.isFailure(pulled)) {
-        // A pull never halts: a pull defect is transient (`halt` is ignored).
-        const { kind } = yield* classify(pulled.cause)
+        // A pull never halts: a pull defect is transient.
+        const { kind } = yield* classify(pulled.cause, SyncFailure.classifyPull)
         if (kind === "outdated") {
           yield* stopOutdated(errorOf(kind))
           return false
@@ -235,8 +235,11 @@ export const make = (options: {
   })
 
 /** A first pull of the pokes stream that ends it (`Cause.Done`) is a clean server end, not a failure. */
-const pokesOutcome = (cause: Cause.Cause<SyncTransportError | Cause.Done>): string =>
-  Result.match(Pull.filterNoDone(cause), { onSuccess: SyncFailure.outcome, onFailure: () => "server-end" })
+const pokesOutcome = (cause: Cause.Cause<PullTransportError | Cause.Done>): string =>
+  Result.match(Pull.filterNoDone(cause), {
+    onSuccess: (failure) => SyncFailure.classifyPull(failure).outcome,
+    onFailure: () => "server-end"
+  })
 
 /**
  * Follows the server's pokes stream (DESIGN §6, §8, 81a07db): every `poke` wakes the loop, a
@@ -256,8 +259,8 @@ export const followPokes = (options: {
    * returns sends the request when run. `idleTimeout` covers only the stream (DESIGN §6 Liveness).
    */
   readonly connect: Effect.Effect<
-    Stream.Stream<{ readonly _tag: "poke" | "heartbeat" }, SyncTransportError>,
-    SyncTransportError
+    Stream.Stream<{ readonly _tag: "poke" | "heartbeat" }, PullTransportError>,
+    PullTransportError
   >
   readonly wake: Effect.Effect<void>
   readonly retryDelay?: Duration.Input
@@ -330,7 +333,7 @@ export const followPokes = (options: {
           ? "idle-timeout"
           : Exit.isSuccess(ended)
             ? "server-end"
-            : Telemetry.outcome(ended, SyncFailure.outcome)
+            : Telemetry.outcome(ended, (cause) => SyncFailure.classifyPull(cause).outcome)
       )
       yield* Telemetry.log(
         "Debug",

@@ -24,7 +24,7 @@ import * as SqlClient from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation, Protocol, Query, Registry, ScopeGrants, type Store, SyncTable } from "echo-sync"
 import * as Engine from "../sync/Engine.ts"
 import * as SqliteSyncStorage from "../sync/SqliteSyncStorage.ts"
-import { SyncTransportError } from "../sync/SyncFailure.ts"
+import { PullTransportError, PushTransportError } from "../sync/SyncFailure.ts"
 import * as SyncLoop from "../sync/SyncLoop.ts"
 import { enqueueAndWake, makeHandlers } from "./Leader.ts"
 import { type LeaderCalls, tabApi } from "./LeaderClient.ts"
@@ -504,7 +504,7 @@ it.live("a dismissed notice is gone from the notices stream, and an undismissed 
 
 /** A push integrity failure (the server refused the batch): halts push. */
 const integrity = () =>
-  new SyncTransportError({
+  new PushTransportError({
     reason: new Protocol.MalformedEnvelope({
       clientId: Ids.ClientId.make("c"),
       mutationId: Ids.MutationId.make("m"),
@@ -512,12 +512,10 @@ const integrity = () =>
     })
   })
 /** No usable RPC result: transient. */
-const offline = () =>
-  new SyncTransportError({
-    reason: new RpcClientError.RpcClientError({
-      reason: new RpcClientError.RpcClientDefect({ message: "offline", cause: null })
-    })
-  })
+const unreachable = () =>
+  new RpcClientError.RpcClientError({ reason: new RpcClientError.RpcClientDefect({ message: "offline", cause: null }) })
+const pushOffline = () => new PushTransportError({ reason: unreachable() })
+const pullOffline = () => new PullTransportError({ reason: unreachable() })
 const decodePush = Schema.decodeUnknownSync(Protocol.PushResponse)
 
 /** One replica database, shared by the successive leaders of a test (a handover keeps the file). */
@@ -706,7 +704,7 @@ it.live("requestSync during backoff runs the next cycle at once and leaves a hal
     const calls = { push: 0, pull: 0 }
     const transport: Engine.Transport = {
       push: () => Effect.suspend(() => (calls.push++, Effect.fail(integrity()))),
-      pull: () => Effect.suspend(() => (calls.pull++, Effect.fail(offline())))
+      pull: () => Effect.suspend(() => (calls.pull++, Effect.fail(pullOffline())))
     }
     // An hour of backoff: only a wake can bring the next cycle within the test's budget.
     const client = yield* syncLeader(db, transport, "1 hour")
@@ -754,7 +752,7 @@ it.live(
               return { mutationId: m.mutationId, position: String(at), outcome: { _tag: "Applied" } }
             })
             // The first push that carries a mutation commits on the server, then its response is lost.
-            return pushes === 1 ? Effect.fail(offline()) : Effect.succeed(decodePush({ results }))
+            return pushes === 1 ? Effect.fail(pushOffline()) : Effect.succeed(decodePush({ results }))
           }),
         pull: () =>
           Effect.map(Queue.take(pulls), (acked) => {

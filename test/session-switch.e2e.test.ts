@@ -10,7 +10,7 @@ import { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation, Protocol, ScopeGrants } from "echo-sync"
 import * as Engine from "../src/client/sync/Engine.ts"
 import * as SqliteSyncStorage from "../src/client/sync/SqliteSyncStorage.ts"
-import { SyncTransportError } from "../src/client/sync/SyncFailure.ts"
+import { PullTransportError, PushTransportError } from "../src/client/sync/SyncFailure.ts"
 import * as SyncLoop from "../src/client/sync/SyncLoop.ts"
 import * as Transport from "../src/client/sync/Transport.ts"
 import { layerHttp } from "../src/server/postgres/rpc.ts"
@@ -40,7 +40,7 @@ const mutations = Mutation.makeRegistry([addItem, createScope])
 
 /** The transport's classified reason, or the failure itself when it is not a transport failure. */
 const reasonOf = (failure: { readonly _tag: string }) =>
-  failure instanceof SyncTransportError ? failure.reason : failure
+  failure instanceof PushTransportError || failure instanceof PullTransportError ? failure.reason : failure
 
 /** Alice may write her scope; bob reads his own, which holds a row only he may see. */
 const seed = Effect.gen(function* () {

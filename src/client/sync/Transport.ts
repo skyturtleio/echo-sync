@@ -2,9 +2,9 @@
  * The engine's `Transport` over core's `SyncRpcs` (DESIGN §6, §8, §12), on the leader.
  *
  * This module owns the RPC client and so its error union, and is where every failure is classified
- * once: each push, pull and pokes failure becomes a `SyncFailure.SyncTransportError` whose `reason`
- * is the innermost recognized evidence (a credential failure or an HTTP 401/403 inside an
- * `RpcClientError` is that reason, never `network`). What a reason means (its status kind, whether a
+ * once: each push failure becomes a `SyncFailure.PushTransportError` and each pull and pokes failure a
+ * `SyncFailure.PullTransportError`, whose `reason` is the innermost recognized evidence (a credential
+ * failure or an HTTP 401/403 inside an `RpcClientError` is that reason, never `network`). What a reason means (its status kind, whether a
  * push halts) is decided in `SyncFailure`. A push halts (DESIGN §6, a68a727) on:
  * - core's `MalformedEnvelope`: the server refused the batch;
  * - `PushIntegrityError{invalidPayload}`: the outbox batch is not a valid `Protocol.PushRequest` before
@@ -23,7 +23,7 @@
  */
 import { Cause, Context, Effect, Layer, Predicate, Schema, type Scope, Stream } from "effect"
 import { FetchHttpClient, type Headers, HttpClient, HttpClientError, HttpClientRequest } from "effect/http"
-import { RpcClient, type RpcClientError, RpcSerialization } from "effect/rpc"
+import { RpcClient, RpcClientError, RpcSerialization } from "effect/rpc"
 import { type AccessScope, type Ids, Protocol } from "echo-sync"
 import type * as Presence from "./Presence.ts"
 import type * as Engine from "./Engine.ts"
@@ -31,31 +31,28 @@ import {
   CredentialsUnavailable,
   PullProtocolError,
   PushIntegrityError,
-  SyncTransportError,
-  type TransportReason
+  PullTransportError,
+  PushTransportError
 } from "./SyncFailure.ts"
 
 /**
- * The reason of a failure, with an `RpcClientError` replaced by the more specific evidence it wraps
- * (DESIGN §9.1): the `CredentialsUnavailable` that `layerProtocolHttp` puts inside the HTTP
- * `TransportError`, or the HTTP 401/403 that its status filter raises.
+ * `error`, or the more specific evidence an `RpcClientError` wraps (DESIGN §9.1): the
+ * `CredentialsUnavailable` that `layerProtocolHttp` puts inside the HTTP `TransportError`, or the HTTP
+ * 401/403 that its status filter raises.
  */
-const transportError = (error: TransportReason): SyncTransportError => {
-  if (error._tag !== "RpcClientError" || error.reason._tag !== "HttpError")
-    return new SyncTransportError({ reason: error })
+const lift = <E extends { readonly _tag: string }>(
+  error: E | RpcClientError.RpcClientError
+): E | RpcClientError.RpcClientError | CredentialsUnavailable | Protocol.Unauthorized => {
+  if (!(error instanceof RpcClientError.RpcClientError) || error.reason._tag !== "HttpError") return error
   const http = error.reason.cause
-  if (http instanceof HttpClientError.TransportError && http.cause instanceof CredentialsUnavailable) {
-    return new SyncTransportError({ reason: http.cause })
-  }
+  if (http instanceof HttpClientError.TransportError && http.cause instanceof CredentialsUnavailable) return http.cause
   if (
     http instanceof HttpClientError.StatusCodeError &&
     (http.response.status === 401 || http.response.status === 403)
   ) {
-    return new SyncTransportError({
-      reason: new Protocol.Unauthorized({ message: `HTTP ${http.response.status}` })
-    })
+    return new Protocol.Unauthorized({ message: `HTTP ${http.response.status}` })
   }
-  return new SyncTransportError({ reason: error })
+  return error
 }
 
 const toPushRequest = Schema.decodeUnknownEffect(Schema.toType(Protocol.PushRequest))
@@ -102,7 +99,7 @@ export interface SyncTransport extends Engine.Transport {
   readonly pokes: (
     clientId: Ids.ClientId,
     principal: AccessScope.PrincipalId
-  ) => Effect.Effect<Stream.Stream<typeof Protocol.PokesElement.Type, SyncTransportError>, SyncTransportError>
+  ) => Effect.Effect<Stream.Stream<typeof Protocol.PokesElement.Type, PullTransportError>, PullTransportError>
   /** `Protocol.PresenceRpcs` on the same mount (the server merges both groups, DESIGN §12). */
   readonly presence: (clientId: Ids.ClientId, principal: AccessScope.PrincipalId) => Presence.Upstream<PresenceError>
 }
@@ -134,25 +131,32 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
         return yield* client.push(payload)
       }).pipe(
         defectsAs((message) => new PushIntegrityError({ reason: "serverDefect", message })),
-        Effect.mapError(transportError)
+        Effect.mapError((error) => new PushTransportError({ reason: lift(error) }))
       ),
 
     // The request is built by the engine from core types; the response is decoded by the RPC client.
     pull: (request) =>
       client.pull(request).pipe(
         defectsAs((message) => new PullProtocolError({ message })),
-        Effect.mapError((error) => (error._tag === "ResnapshotRequired" ? error : transportError(error)))
+        Effect.mapError((error) =>
+          error._tag === "ResnapshotRequired" ? error : new PullTransportError({ reason: lift(error) })
+        )
       ),
 
     // Any end of this stream (failure, defect, completion) is handled by reconnecting (followPokes).
     pokes: (clientId, principal) => {
       const open = (prepared: Headers.Input | undefined) => {
-        const stream = client.pokes({ clientId, principal }).pipe(Stream.mapError(transportError))
+        const stream = client
+          .pokes({ clientId, principal })
+          .pipe(Stream.mapError((error) => new PullTransportError({ reason: lift(error) })))
         return prepared === undefined ? stream : stream.pipe(Stream.provideService(PreparedHeaders, prepared))
       }
       return headers === undefined
         ? Effect.succeed(open(undefined))
-        : acquire(headers).pipe(Effect.mapError(transportError), Effect.map(open))
+        : acquire(headers).pipe(
+            Effect.mapError((reason) => new PullTransportError({ reason })),
+            Effect.map(open)
+          )
     },
 
     presence: (clientId, principal) => ({

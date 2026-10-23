@@ -138,9 +138,9 @@ Its closed vocabulary is `ok`, `credentials`, `unauthorized`, `unavailable`, `ne
 `server-end`, `page`, `done`. Interruption takes precedence over defects, then recognized typed
 failures, then `server`. Classification is descriptive; it never supplies retry/halt policy.
 For sync operations (`echo.push`, `echo.pull`, `echo.install`, `echo.pokes`) the outcome comes
-from `SyncFailure.outcome`, the same closed classification over `SyncFailure.SyncTransportError`'s
-`reason` that decides the loop's status: `halted` when any failure in the cause halts push, otherwise
-the first failure's kind. `SyncLoop` independently classifies the whole final push cause, including
+from `SyncFailure.classifyPush` / `classifyPull`, the same closed classification over the transport
+error's `reason` that decides the loop's status: for a push, `halted` when any failure in the cause
+halts, otherwise the first failure's kind; for a pull, the first failure's kind. `SyncLoop` independently classifies the whole final push cause, including
 outer cleanup failures, so a transient batch can record `unauthorized` while a typed fatal outer
 cleanup failure makes the final status `Halted`. Interruption and defect outcomes retain precedence.
 `echo.result` carries the operation-specific success result from the same vocabulary;

@@ -32,7 +32,7 @@ const done: Protocol.PullResponse = {
   nextCursor: cursor,
   expiredThrough: Ids.SeqFloor.make(0)
 }
-const transportError = (reason: SyncFailure.TransportReason) => new SyncFailure.SyncTransportError({ reason })
+const pushError = (reason: SyncFailure.PushReason) => new SyncFailure.PushTransportError({ reason })
 const malformedEnvelope = () =>
   new Protocol.MalformedEnvelope({
     clientId: Ids.ClientId.make("device"),
@@ -121,8 +121,8 @@ it.live(
 
 it.effect("batch telemetry agrees with the loop's whole-cause decision, not the first failure", () =>
   Effect.gen(function* () {
-    const unauthorized = Cause.fail(transportError(new Protocol.Unauthorized({ message: secret })))
-    const malformed = Cause.fail(transportError(malformedEnvelope()))
+    const unauthorized = Cause.fail(pushError(new Protocol.Unauthorized({ message: secret })))
+    const malformed = Cause.fail(pushError(malformedEnvelope()))
     for (const { cause, expected } of [
       { cause: Cause.combine(unauthorized, malformed), expected: "halted" },
       { cause: Cause.combine(malformed, unauthorized), expected: "halted" },
@@ -174,7 +174,7 @@ it.effect("the whole final push cause remains authoritative, including typed cle
         let pulls = 0
         const failure = new Error(`cleanup-${secret}`)
         const { engine, storage } = yield* device({
-          push: () => Effect.fail(transportError(new Protocol.Unauthorized({ message: secret }))),
+          push: () => Effect.fail(pushError(new Protocol.Unauthorized({ message: secret }))),
           pull: () =>
             Effect.sync(() => {
               pulls++
@@ -185,7 +185,7 @@ it.effect("the whole final push cause remains authoritative, including typed cle
         const push = engine.push.pipe(
           Effect.onExit(() =>
             mode === "typed"
-              ? Effect.fail(transportError(malformedEnvelope()))
+              ? Effect.fail(pushError(malformedEnvelope()))
               : mode === "interrupt"
                 ? Effect.interrupt
                 : Effect.die(failure)
@@ -241,7 +241,7 @@ it.effect("throwing host sinks cannot change saved intent, retry deadlines, halt
             Effect.suspend(() => {
               pushes++
               return Effect.fail(
-                transportError(pushes === 1 ? new Protocol.Unauthorized({ message: secret }) : malformedEnvelope())
+                pushError(pushes === 1 ? new Protocol.Unauthorized({ message: secret }) : malformedEnvelope())
               )
             }),
           pull: () => Effect.succeed(done)
@@ -290,7 +290,7 @@ it.live("SQLite sync never exports a typed failure, defect, result or dependency
   return Effect.gen(function* () {
     let failing = false
     const { engine, storage } = yield* device({
-      push: () => Effect.fail(transportError(new Protocol.Unauthorized({ message: secret }))),
+      push: () => Effect.fail(pushError(new Protocol.Unauthorized({ message: secret }))),
       pull: () => (failing ? Effect.die(new Error(secret)) : Effect.succeed(done))
     })
     yield* engine.mutate(Ids.MutationId.make("intent"), "accept", { secret })
