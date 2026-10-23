@@ -9,9 +9,13 @@ report; do not silently diverge.
   TypeScript source (`exports` → `src/**/*.ts`). No build step, no npm publish.
 - `src/core` (shared: SyncTable, AccessScope, Mutation, Store interface, RPC contracts),
   `src/server` (Postgres + RPC handlers), `src/client` (browser leader worker, replica, outbox,
-  queries). The library is UI-framework agnostic: no adapter for any UI library lives here;
-  apps build on the `src/client` tab-side API (DESIGN §9.1). Browser code must never import
-  `src/server`.
+  queries), `src/foldkit` (the FoldKit adapter, entry point `echo-sync/foldkit`, DESIGN §16.17).
+  The engine is UI-framework agnostic: `src/core`, `src/client` and `src/server` carry no
+  framework knowledge, and every UI adapter is a separate entry point that is a thin translation
+  of the `src/client` tab-side API (DESIGN §9.1), adds no sync semantics, and imports nothing from
+  the framework (lint-enforced; FoldKit is a devDependency for `examples/foldkit` only). FoldKit
+  is the owner's standard UI stack, so its adapter ships here as the standard way FoldKit apps
+  consume the engine. Browser code must never import `src/server`.
 - Runtime: Bun. Tooling: TypeScript strict (`exactOptionalPropertyTypes`,
   `noUncheckedIndexedAccess`), `oxlint`, `oxfmt`, `vitest` + `@effect/vitest`.
 - Runtime dependencies are Effect packages only, exact-pinned to one version.
