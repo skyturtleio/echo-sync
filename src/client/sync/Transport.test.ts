@@ -5,6 +5,7 @@ import { Rpc, RpcClient, RpcGroup, RpcSerialization, RpcServer } from "effect/rp
 import { AccessScope, Ids, Mutation, Protocol, Registry } from "echo-sync"
 import * as Engine from "./Engine.ts"
 import * as MemorySyncStorage from "./testing/MemorySyncStorage.ts"
+import * as SyncFailure from "./SyncFailure.ts"
 import * as SyncLoop from "./SyncLoop.ts"
 import * as Transport from "./Transport.ts"
 
@@ -24,7 +25,7 @@ interface Handlers {
  * A real RpcServer (HTTP, NDJSON) behind a web handler, and the leader's Transport talking to it
  * through `fetch`. `served` counts requests that reached the server.
  */
-const harness = <A extends Transport.TransportError | Protocol.ResnapshotRequired, B>(
+const harness = <A extends SyncFailure.SyncTransportError | Protocol.ResnapshotRequired, B>(
   server: Layer.Layer<never, never, HttpRouter.HttpRouter> | "unreachable",
   body: (transport: Effect.Success<typeof Transport.make>) => Effect.Effect<B, A>
 ) =>
@@ -110,6 +111,9 @@ const position = Schema.decodeUnknownSync(Ids.Position)("7")
 const failureOf = <A, E>(exit: Exit.Exit<A, E>) =>
   Exit.isSuccess(exit) ? "success" : Option.getOrElse(Exit.findErrorOption(exit), () => "defect" as const)
 
+/** Whether this failure halts a push, by the verdict `SyncLoop` acts on. */
+const isFatal = (failure: SyncFailure.PullFailure) => Option.isSome(SyncFailure.classify(Cause.fail(failure)).halt)
+
 it.effect("push failures are fatal exactly when §6 says so, classified by their real tags over a real RPC server", () =>
   Effect.gen(function* () {
     const cases = [
@@ -167,13 +171,10 @@ it.effect("push failures are fatal exactly when §6 says so, classified by their
     for (const c of cases) {
       const { exit, served } = yield* harness(c.server, (t) => t.push(batch(c.size)))
       const failure = failureOf(exit)
-      const tag =
-        failure instanceof Transport.PushIntegrityError
-          ? `${failure._tag}:${failure.reason}`
-          : Schema.is(Schema.Struct({ _tag: Schema.String }))(failure)
-            ? failure._tag
-            : failure
-      expect({ case: c.name, tag, fatal: Transport.isFatalPush(failure), served }).toEqual({
+      if (!(failure instanceof SyncFailure.SyncTransportError)) throw new Error(`${c.name}: ${String(failure)}`)
+      const reason = failure.reason
+      const tag = reason._tag === "PushIntegrityError" ? `${reason._tag}:${reason.reason}` : reason._tag
+      expect({ case: c.name, tag, fatal: isFatal(failure), served }).toEqual({
         case: c.name,
         tag: c.tag,
         fatal: c.fatal,
@@ -229,16 +230,18 @@ it.effect(
         (t) => t.pull(request)
       )
       const unavailable = failureOf(down.exit)
-      expect(unavailable).toBeInstanceOf(Protocol.ServerUnavailable)
-      expect(unavailable).toEqual(new Protocol.ServerUnavailable({ message: "db down" }))
-      expect(Transport.isFatalPush(unavailable)).toBe(false)
+      expect(unavailable).toEqual(
+        new SyncFailure.SyncTransportError({ reason: new Protocol.ServerUnavailable({ message: "db down" }) })
+      )
+      if (unavailable instanceof SyncFailure.SyncTransportError) expect(isFatal(unavailable)).toBe(false)
 
       const noId = yield* harness(skewedPull, (t) => t.pull(request))
       const dies = yield* harness(serve({ pull: () => Effect.die(new Error("bug")) }), (t) => t.pull(request))
       for (const exit of [noId.exit, dies.exit]) {
         const failure = failureOf(exit)
-        expect(failure).toBeInstanceOf(Transport.PullProtocolError)
-        expect(Transport.isFatalPush(failure)).toBe(false)
+        if (!(failure instanceof SyncFailure.SyncTransportError)) throw new Error(String(failure))
+        expect(failure.reason).toBeInstanceOf(SyncFailure.PullProtocolError)
+        expect(isFatal(failure)).toBe(false)
       }
     }).pipe(Effect.scoped)
 )
@@ -594,7 +597,6 @@ const loopOver = (transport: Effect.Success<typeof Transport.make>) =>
     yield* engine.mutate(Ids.MutationId.make("m1"), "noop", {})
     const loop = yield* SyncLoop.make({
       engine,
-      isFatalPush: Transport.isFatalPush,
       pendingMutations: Stream.concat(Stream.make(1), Stream.never),
       retryDelay: "10 millis",
       maxRetryDelay: "40 millis"

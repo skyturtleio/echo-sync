@@ -18,6 +18,8 @@ import { Array as Arr, Clock, Effect, Option, Schema, Semaphore } from "effect"
 import { Mutation, Protocol, Store } from "../../core/index.ts"
 import type { AccessScope, Errors, Ids, Registry, SyncTable } from "../../core/index.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
+import * as SyncFailure from "./SyncFailure.ts"
+import { MalformedChange, ServerOutdated, type SyncTransportError } from "./SyncFailure.ts"
 
 type PullPage = typeof Protocol.PullPage.Type
 type PullDone = typeof Protocol.PullDone.Type
@@ -89,27 +91,13 @@ export interface SyncStorage {
   readonly addNotices: (notices: ReadonlyArray<Notice>) => Effect.Effect<void, StoreUnavailable>
 }
 
-export interface Transport<E> {
-  readonly push: (request: Protocol.PushRequest) => Effect.Effect<Protocol.PushResponse, E>
+/** The network port. Every failure is classified once, by the transport (see `SyncFailure`). */
+export interface Transport {
+  readonly push: (request: Protocol.PushRequest) => Effect.Effect<Protocol.PushResponse, SyncTransportError>
   readonly pull: (
     request: Protocol.PullRequest
-  ) => Effect.Effect<Protocol.PullResponse, E | Protocol.ResnapshotRequired>
+  ) => Effect.Effect<Protocol.PullResponse, SyncTransportError | Protocol.ResnapshotRequired>
 }
-
-/**
- * A pull change for a table this client knows does not decode with that table's schema. The
- * install transaction fails as a whole (no rows, acks, cursor or staging change). Per DESIGN §8
- * and §6 it is a transient pull failure: the sync loop retries with backoff, never halts.
- */
-export class MalformedChange extends Schema.TaggedError<MalformedChange>()("MalformedChange", {
-  table: Schema.String,
-  message: Schema.String
-}) {}
-
-/** A known table's server payload lacks a declared wire column. Retry, never rebuild. */
-export class ServerOutdated extends Schema.TaggedError<ServerOutdated>()("ServerOutdated", {
-  table: Schema.String
-}) {}
 
 /** The handler rejected the mutation against the local replica; nothing was saved. */
 export class LocallyRejected extends Schema.TaggedError<LocallyRejected>()("LocallyRejected", {
@@ -278,7 +266,7 @@ export interface PushResult {
   readonly stopped: boolean
 }
 
-export interface Engine<TE> {
+export interface Engine {
   /**
    * Appends to the outbox and applies optimistically in one transaction ("saved" on success).
    * `mutationId` is the caller's idempotency key: enqueuing an id the outbox knows (pending or
@@ -290,15 +278,12 @@ export interface Engine<TE> {
     args: Schema.Json
   ) => Effect.Effect<Mutation.MutationEnvelope, StoreUnavailable | LocallyRejected>
   /** Sends unprocessed outbox entries in seq order until none remain or the server stops. */
-  readonly push: Effect.Effect<PushResult, StoreUnavailable | Errors.ConstraintViolated | TE>
+  readonly push: Effect.Effect<PushResult, SyncFailure.PushFailure>
   /** Pulls until `PullDone`, staging intermediate pages, then installs the set atomically. */
-  readonly pull: Effect.Effect<
-    void,
-    StoreUnavailable | Errors.ConstraintViolated | TE | Protocol.ResnapshotRequired | MalformedChange | ServerOutdated
-  >
+  readonly pull: Effect.Effect<void, SyncFailure.PullFailure>
 }
 
-export const make = <TE>(options: {
+export const make = (options: {
   readonly clientId: Ids.ClientId
   /**
    * The principal this client acts as; optimistic role checks read its replica grants. Every push and
@@ -309,10 +294,10 @@ export const make = <TE>(options: {
   /** The client's tables; pull changes for tables it does not know are skipped. */
   readonly registry: Registry.SyncRegistry
   readonly mutations: Mutation.MutationRegistry
-  readonly transport: Transport<TE>
+  readonly transport: Transport
   /** Mutations per push request (default 50; the protocol caps a request at 100). */
   readonly pushBatchSize?: number
-}): Effect.Effect<Engine<TE>> =>
+}): Effect.Effect<Engine> =>
   Effect.gen(function* () {
     const { clientId, storage, transport } = options
     const context = { storage, mutations: options.mutations, actor: options.actor, registry: options.registry }
@@ -418,7 +403,8 @@ export const make = <TE>(options: {
               processed += response.results.length
               return response.results.length < batch.length
             }),
-            "echo.push"
+            "echo.push",
+            SyncFailure.outcome
           )
           if (stopped) return { processed, stopped: true }
         }
@@ -443,10 +429,8 @@ export const make = <TE>(options: {
             }
             const page = yield* transport.pull(request).pipe(
               Effect.map(Option.some<Protocol.PullResponse>),
-              // Generic `TE` defeats `catchTag`'s tag extraction, so narrow by class.
-              Effect.catch((error) =>
+              Effect.catchTag("ResnapshotRequired", (error) =>
                 Effect.gen(function* () {
-                  if (!(error instanceof Protocol.ResnapshotRequired)) return yield* Effect.fail(error)
                   if (request.cursor === null && Option.isNone(continuation)) return yield* error
                   // Never apply a partial set: drop it and start a snapshot from null. The
                   // replica (and its cursor) keeps serving reads until that snapshot is installed.
@@ -486,7 +470,8 @@ export const make = <TE>(options: {
                   yield* applyPageSet(context, set, response)
                 })
               ),
-              "echo.install"
+              "echo.install",
+              SyncFailure.outcome
             )
             yield* Telemetry.histogram("echo.pull.pages", staged.length + 1)
             yield* Telemetry.annotate({
@@ -496,7 +481,8 @@ export const make = <TE>(options: {
             return
           }
         }),
-        "echo.pull"
+        "echo.pull",
+        SyncFailure.outcome
       )
     )
 

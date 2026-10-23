@@ -42,7 +42,8 @@ import { RpcClientError } from "effect/rpc/RpcClientError"
 import type { LocallyRejected } from "../sync/Engine.ts"
 import type { SyncStatus } from "../sync/SyncLoop.ts"
 // Values, so apps get the runtime schemas (and their types) without RPC introspection (DESIGN §16.19).
-export { SyncError, SyncErrorKind, SyncStatus } from "../sync/SyncLoop.ts"
+export { SyncError, SyncStatus } from "../sync/SyncLoop.ts"
+export { SyncErrorKind } from "../sync/SyncFailure.ts"
 import {
   type Enqueued,
   type LeaderInfo,

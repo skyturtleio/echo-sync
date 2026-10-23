@@ -1,26 +1,31 @@
 import { expect, it } from "@effect/vitest"
-import { Cause, Clock, Deferred, Effect, Fiber, Queue, Schema, Stream } from "effect"
+import { Cause, Clock, Deferred, Effect, Fiber, Queue, Stream } from "effect"
 import { RpcClientError } from "effect/rpc"
 import { TestClock } from "effect/testing"
 import { Errors, Ids, Protocol } from "echo-sync"
-import * as Engine from "./Engine.ts"
+import type * as Engine from "./Engine.ts"
+import * as SyncFailure from "./SyncFailure.ts"
 import * as SyncLoop from "./SyncLoop.ts"
-import * as Transport from "./Transport.ts"
 
-// The real fatal rule and core's real error, not stand-ins (reviewer question 1).
-const malformed = () =>
-  new Protocol.MalformedEnvelope({
-    clientId: Ids.ClientId.make("c"),
-    mutationId: Ids.MutationId.make("m"),
-    message: "bad envelope"
+const rpcFailure = () =>
+  new RpcClientError.RpcClientError({
+    reason: new RpcClientError.RpcClientDefect({ message: "socket closed", cause: null })
   })
-type Malformed = Protocol.MalformedEnvelope
-class Offline extends Schema.TaggedError<Offline>()("Offline", {}) {}
+// The real fatal classification and core's real error, not stand-ins (reviewer question 1).
+const malformed = () =>
+  new SyncFailure.SyncTransportError({
+    reason: new Protocol.MalformedEnvelope({
+      clientId: Ids.ClientId.make("c"),
+      mutationId: Ids.MutationId.make("m"),
+      message: "bad envelope"
+    })
+  })
+const offline = () => new SyncFailure.SyncTransportError({ reason: rpcFailure() })
 
 /** Fake engine: `pushFails` decides each push attempt's outcome; counts calls. */
-const fakeEngine = (pushFails: (attempt: number) => Malformed | Offline | undefined) => {
+const fakeEngine = (pushFails: (attempt: number) => SyncFailure.SyncTransportError | undefined) => {
   const calls = { push: 0, pull: 0 }
-  const engine: Engine.Engine<Malformed | Offline> = {
+  const engine: Engine.Engine = {
     mutate: () => Effect.die("unused"),
     push: Effect.suspend(() => {
       const error = pushFails(calls.push++)
@@ -54,7 +59,7 @@ it.effect(
             : Stream.concat(Stream.make(3), Stream.never)
         )
       )
-      const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations })
+      const loop = yield* SyncLoop.make({ engine, pendingMutations })
       const seen: Array<number> = []
       yield* Effect.forkChild(
         Stream.runForEach(loop.changes, (s) => Effect.sync(() => void seen.push(s.pendingMutations)))
@@ -77,7 +82,7 @@ it.effect("a delayed first pending count holds back status and changes until it 
     const { engine } = fakeEngine(() => undefined)
     const gate = yield* Deferred.make<void>()
     const pendingMutations = Stream.unwrap(Effect.as(Deferred.await(gate), Stream.concat(Stream.make(2), Stream.never)))
-    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations })
+    const loop = yield* SyncLoop.make({ engine, pendingMutations })
     const seen: Array<number> = []
     yield* Effect.forkChild(
       Stream.runForEach(loop.changes, (s) => Effect.sync(() => void seen.push(s.pendingMutations)))
@@ -98,7 +103,7 @@ it.effect("a delayed first pending count holds back status and changes until it 
 it.effect("an integrity error halts push for good while pull keeps running", () =>
   Effect.gen(function* () {
     const { engine, calls } = fakeEngine(() => malformed())
-    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations: noPending })
+    const loop = yield* SyncLoop.make({ engine, pendingMutations: noPending })
     yield* Effect.forkChild(loop.run)
     yield* settle
     expect((yield* loop.status).push).toEqual({
@@ -126,8 +131,8 @@ it.effect("an integrity error halts push for good while pull keeps running", () 
 
 it.effect("a transient push failure is retried with backoff and clears once a cycle succeeds", () =>
   Effect.gen(function* () {
-    const { engine, calls } = fakeEngine((attempt) => (attempt < 2 ? new Offline() : undefined))
-    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations: noPending })
+    const { engine, calls } = fakeEngine((attempt) => (attempt < 2 ? offline() : undefined))
+    const loop = yield* SyncLoop.make({ engine, pendingMutations: noPending })
     yield* Effect.forkChild(loop.run)
     yield* settle
     expect(calls.push).toBe(1)
@@ -150,13 +155,13 @@ it.effect("a transient push failure is retried with backoff and clears once a cy
 it.effect("lastSyncedAt stays null after a cycle whose pull failed, and is set by the first cycle that installs", () =>
   Effect.gen(function* () {
     const calls = { pull: 0 }
-    const engine: Engine.Engine<Offline> = {
+    const engine: Engine.Engine = {
       mutate: () => Effect.die("unused"),
       push: Effect.succeed({ processed: 1, stopped: false }),
-      pull: Effect.suspend(() => (++calls.pull === 1 ? Effect.fail(new Offline()) : Effect.void))
+      pull: Effect.suspend(() => (++calls.pull === 1 ? Effect.fail(offline()) : Effect.void))
     }
     yield* TestClock.adjust("5 seconds")
-    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations: noPending })
+    const loop = yield* SyncLoop.make({ engine, pendingMutations: noPending })
     yield* Effect.forkChild(loop.run)
     yield* settle
     // The push completed but nothing was installed: not a sync.
@@ -167,28 +172,23 @@ it.effect("lastSyncedAt stays null after a cycle whose pull failed, and is set b
   })
 )
 
-const rpcFailure = () =>
-  new RpcClientError.RpcClientError({
-    reason: new RpcClientError.RpcClientDefect({ message: "socket closed", cause: null })
-  })
-
 it.effect(
   "a defect beside a transient failure halts push (whole-cause classification); a pull defect is transient",
   () =>
     Effect.gen(function* () {
       const calls = { push: 0, pull: 0 }
-      const engine: Engine.Engine<RpcClientError.RpcClientError> = {
+      const engine: Engine.Engine = {
         mutate: () => Effect.die("unused"),
         push: Effect.suspend(() => {
           calls.push++
-          return Effect.failCause(Cause.combine(Cause.fail(rpcFailure()), Cause.die(new Error("undecodable request"))))
+          return Effect.failCause(Cause.combine(Cause.fail(offline()), Cause.die(new Error("undecodable request"))))
         }),
         pull: Effect.suspend(() => {
           calls.pull++
           return Effect.die(new Error("bad page"))
         })
       }
-      const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations: noPending })
+      const loop = yield* SyncLoop.make({ engine, pendingMutations: noPending })
       const fiber = yield* Effect.forkChild(loop.run)
       yield* settle
       const status = yield* loop.status
@@ -207,15 +207,15 @@ it.effect(
 it.effect("a transient failure alone (RpcClientError) is retried, never halts", () =>
   Effect.gen(function* () {
     const calls = { push: 0 }
-    const engine: Engine.Engine<RpcClientError.RpcClientError> = {
+    const engine: Engine.Engine = {
       mutate: () => Effect.die("unused"),
       push: Effect.suspend(() => {
         calls.push++
-        return Effect.fail(rpcFailure())
+        return Effect.fail(offline())
       }),
       pull: Effect.void
     }
-    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations: noPending })
+    const loop = yield* SyncLoop.make({ engine, pendingMutations: noPending })
     yield* Effect.forkChild(loop.run)
     yield* settle
     yield* TestClock.adjust("1 second")
@@ -228,7 +228,7 @@ it.effect("a transient failure alone (RpcClientError) is retried, never halts", 
 it.effect("a pull that fails with MalformedChange is retried with backoff and never halts push", () =>
   Effect.gen(function* () {
     const calls = { push: 0, pull: 0 }
-    const engine: Engine.Engine<never> = {
+    const engine: Engine.Engine = {
       mutate: () => Effect.die("unused"),
       push: Effect.sync(() => {
         calls.push++
@@ -237,11 +237,11 @@ it.effect("a pull that fails with MalformedChange is retried with backoff and ne
       pull: Effect.suspend(() => {
         calls.pull++
         return calls.pull === 1
-          ? Effect.fail(new Engine.MalformedChange({ table: "t", message: "row does not decode" }))
+          ? Effect.fail(new SyncFailure.MalformedChange({ table: "t", message: "row does not decode" }))
           : Effect.void
       })
     }
-    const loop = yield* SyncLoop.make({ engine, isFatalPush: Transport.isFatalPush, pendingMutations: noPending })
+    const loop = yield* SyncLoop.make({ engine, pendingMutations: noPending })
     yield* Effect.forkChild(loop.run)
     yield* settle
     const failed = yield* loop.status
@@ -268,7 +268,7 @@ it.effect(
           const attempt = attempts.length + 1
           attempts.push(Number(yield* Clock.currentTimeMillis))
           if (attempt === 1) return Stream.make(poke, poke) // two pokes, then a clean end
-          if (attempt === 2) return Stream.fail(new Offline())
+          if (attempt === 2) return Stream.fail(offline())
           if (attempt === 3) return Stream.die(new Error("bad frame"))
           return Stream.as(Stream.tick("15 seconds"), heartbeat) // live: heartbeats only
         })

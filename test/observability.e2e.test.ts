@@ -14,6 +14,7 @@ import { TestClock } from "effect/testing"
 import * as Engine from "../src/client/sync/Engine.ts"
 import * as SqliteSyncStorage from "../src/client/sync/SqliteSyncStorage.ts"
 import * as SyncLoop from "../src/client/sync/SyncLoop.ts"
+import * as SyncFailure from "../src/client/sync/SyncFailure.ts"
 import * as Transport from "../src/client/sync/Transport.ts"
 import { executeBatch, handlers, layerHttp, Notifications } from "../src/server/postgres/rpc.ts"
 import { collectGarbage, expireLedger } from "../src/server/postgres/gc.ts"
@@ -31,8 +32,15 @@ const done: Protocol.PullResponse = {
   nextCursor: cursor,
   expiredThrough: Ids.SeqFloor.make(0)
 }
+const transportError = (reason: SyncFailure.TransportReason) => new SyncFailure.SyncTransportError({ reason })
+const malformedEnvelope = () =>
+  new Protocol.MalformedEnvelope({
+    clientId: Ids.ClientId.make("device"),
+    mutationId: Ids.MutationId.make("intent"),
+    message: secret
+  })
 const device = Effect.fnUntraced(
-  function* (transport: Engine.Transport<unknown>) {
+  function* (transport: Engine.Transport) {
     const sqlite = yield* SqliteClient.makeMemory({})
     yield* SqliteSyncStorage.migrate(registry).pipe(Effect.provideService(SqlClient, sqlite))
     const storage = SqliteSyncStorage.make(sqlite, registry)
@@ -63,21 +71,24 @@ it.live(
       })
       const { engine } = yield* device({
         push: () => Effect.succeed({ results: [] }),
-        pull: (): Effect.Effect<Protocol.PullResponse, unknown> =>
-          Effect.gen(function* () {
-            yield* capture
-            yield* capture.pipe(Effect.withSpan("http.dependency"))
-            yield* engine
-              .mutate(Ids.MutationId.make("nested"), "accept", {})
-              .pipe(Effect.withSpan("sql.dependency"), Effect.provideService(Tracer.ParentSpan, external))
-            yield* engine
-              .mutate(Ids.MutationId.make("rooted"), "accept", {})
-              .pipe(Effect.withSpan("dependency.root", { root: true, sampled: true }))
-            yield* engine
-              .mutate(Ids.MutationId.make("explicit-root-parent"), "accept", {})
-              .pipe(Effect.withSpan("dependency.explicit-root-parent", { root: true, parent: external }))
-            return done
-          })
+        // The nested enqueues are expected to succeed; a failure of one is the test's defect.
+        pull: (): Effect.Effect<Protocol.PullResponse> =>
+          Effect.orDie(
+            Effect.gen(function* () {
+              yield* capture
+              yield* capture.pipe(Effect.withSpan("http.dependency"))
+              yield* engine
+                .mutate(Ids.MutationId.make("nested"), "accept", {})
+                .pipe(Effect.withSpan("sql.dependency"), Effect.provideService(Tracer.ParentSpan, external))
+              yield* engine
+                .mutate(Ids.MutationId.make("rooted"), "accept", {})
+                .pipe(Effect.withSpan("dependency.root", { root: true, sampled: true }))
+              yield* engine
+                .mutate(Ids.MutationId.make("explicit-root-parent"), "accept", {})
+                .pipe(Effect.withSpan("dependency.explicit-root-parent", { root: true, parent: external }))
+              return done
+            })
+          )
       })
       yield* engine.pull.pipe(Effect.withSpan("host.parent"))
       const pull = recording.spans.find((span) => span.name === "echo.pull")
@@ -108,21 +119,14 @@ it.live(
   }
 )
 
-it.effect("batch telemetry agrees with the loop's whole-cause decision and custom fatal policy, not a tag guess", () =>
+it.effect("batch telemetry agrees with the loop's whole-cause decision, not the first failure", () =>
   Effect.gen(function* () {
-    const unauthorized = Cause.fail(new Protocol.Unauthorized({ message: secret }))
-    const malformed = Cause.fail(
-      new Protocol.MalformedEnvelope({
-        clientId: Ids.ClientId.make("device"),
-        mutationId: Ids.MutationId.make("intent"),
-        message: secret
-      })
-    )
-    for (const { cause, isFatal, expected } of [
-      { cause: Cause.combine(unauthorized, malformed), isFatal: Transport.isFatalPush, expected: "halted" },
-      { cause: Cause.combine(malformed, unauthorized), isFatal: Transport.isFatalPush, expected: "halted" },
-      { cause: Cause.fail({ _tag: "HostFatal" }), isFatal: () => true, expected: "halted" },
-      { cause: malformed, isFatal: () => false, expected: "server" }
+    const unauthorized = Cause.fail(transportError(new Protocol.Unauthorized({ message: secret })))
+    const malformed = Cause.fail(transportError(malformedEnvelope()))
+    for (const { cause, expected } of [
+      { cause: Cause.combine(unauthorized, malformed), expected: "halted" },
+      { cause: Cause.combine(malformed, unauthorized), expected: "halted" },
+      { cause: unauthorized, expected: "unauthorized" }
     ]) {
       const recording = recorder()
       yield* Effect.gen(function* () {
@@ -136,7 +140,7 @@ it.effect("batch telemetry agrees with the loop's whole-cause decision and custo
           pull: () => Effect.succeed(done)
         })
         yield* engine.mutate(Ids.MutationId.make("intent"), "accept", {})
-        const loop = yield* SyncLoop.make({ engine, isFatalPush: isFatal, pendingMutations: storage.pendingCount })
+        const loop = yield* SyncLoop.make({ engine, pendingMutations: storage.pendingCount })
         const fiber = yield* Effect.forkChild(loop.run)
         yield* Effect.repeat(Effect.yieldNow, { times: 80 })
         expect((yield* loop.status).push._tag).toBe(expected === "halted" ? "Halted" : "Active")
@@ -150,25 +154,27 @@ it.effect("batch telemetry agrees with the loop's whole-cause decision and custo
         expect(
           (yield* Metric.value(Metric.counter("echo.push.total", { attributes: { "echo.outcome": expected } }))).count
         ).toBe(1)
-        expect(
-          (yield* Metric.value(Metric.counter("echo.push.total", { attributes: { "echo.outcome": "unauthorized" } })))
-            .count
-        ).toBe(0)
+        if (expected === "halted") {
+          expect(
+            (yield* Metric.value(Metric.counter("echo.push.total", { attributes: { "echo.outcome": "unauthorized" } })))
+              .count
+          ).toBe(0)
+        }
         yield* Fiber.interrupt(fiber)
       }).pipe(Effect.scoped, Effect.provide(recording.layer))
     }
   })
 )
 
-it.effect("policy defects and the whole final push cause remain authoritative, including typed cleanup failures", () =>
+it.effect("the whole final push cause remains authoritative, including typed cleanup failures", () =>
   Effect.gen(function* () {
-    for (const mode of ["policy", "defect", "interrupt", "typed"]) {
+    for (const mode of ["defect", "interrupt", "typed"]) {
       const recording = recorder()
       yield* Effect.gen(function* () {
         let pulls = 0
-        const failure = new Error(`policy-or-cleanup-${secret}`)
+        const failure = new Error(`cleanup-${secret}`)
         const { engine, storage } = yield* device({
-          push: () => Effect.fail(new Protocol.Unauthorized({ message: secret })),
+          push: () => Effect.fail(transportError(new Protocol.Unauthorized({ message: secret }))),
           pull: () =>
             Effect.sync(() => {
               pulls++
@@ -176,32 +182,16 @@ it.effect("policy defects and the whole final push cause remain authoritative, i
             })
         })
         yield* engine.mutate(Ids.MutationId.make("intent"), "accept", {})
-        const push =
-          mode === "policy"
-            ? engine.push
-            : engine.push.pipe(
-                Effect.onExit(() =>
-                  mode === "typed"
-                    ? Effect.fail(
-                        new Protocol.MalformedEnvelope({
-                          clientId: Ids.ClientId.make("device"),
-                          mutationId: Ids.MutationId.make("intent"),
-                          message: secret
-                        })
-                      )
-                    : mode === "interrupt"
-                      ? Effect.interrupt
-                      : Effect.die(failure)
-                )
-              )
-        const loop = yield* SyncLoop.make({
-          engine: { ...engine, push },
-          isFatalPush: (error) => {
-            if (mode === "policy") throw failure
-            return mode === "typed" && Transport.isFatalPush(error)
-          },
-          pendingMutations: storage.pendingCount
-        })
+        const push = engine.push.pipe(
+          Effect.onExit(() =>
+            mode === "typed"
+              ? Effect.fail(transportError(malformedEnvelope()))
+              : mode === "interrupt"
+                ? Effect.interrupt
+                : Effect.die(failure)
+          )
+        )
+        const loop = yield* SyncLoop.make({ engine: { ...engine, push }, pendingMutations: storage.pendingCount })
         const fiber = yield* Effect.forkChild(Effect.exit(loop.run))
         yield* Effect.repeat(Effect.yieldNow, { times: 80 })
         if (mode === "defect" || mode === "typed") {
@@ -214,11 +204,7 @@ it.effect("policy defects and the whole final push cause remain authoritative, i
           const exit = yield* Fiber.join(fiber)
           expect(Exit.isFailure(exit)).toBe(true)
           if (Exit.isFailure(exit)) {
-            expect(mode === "policy" ? Cause.hasDies(exit.cause) : Cause.hasInterrupts(exit.cause)).toBe(true)
-            if (mode === "policy")
-              expect(exit.cause.reasons.some((reason) => Cause.isDieReason(reason) && reason.defect === failure)).toBe(
-                true
-              )
+            expect(Cause.hasInterrupts(exit.cause)).toBe(true)
           }
           expect(pulls).toBe(0)
         }
@@ -252,27 +238,17 @@ it.effect("throwing host sinks cannot change saved intent, retry deadlines, halt
         let pushes = 0
         const { engine, storage } = yield* device({
           push: () =>
-            Effect.suspend((): Effect.Effect<never, Protocol.Unauthorized | Protocol.MalformedEnvelope> => {
+            Effect.suspend(() => {
               pushes++
-              return pushes === 1
-                ? Effect.fail(new Protocol.Unauthorized({ message: secret }))
-                : Effect.fail(
-                    new Protocol.MalformedEnvelope({
-                      clientId: Ids.ClientId.make("device"),
-                      mutationId: Ids.MutationId.make("intent"),
-                      message: secret
-                    })
-                  )
+              return Effect.fail(
+                transportError(pushes === 1 ? new Protocol.Unauthorized({ message: secret }) : malformedEnvelope())
+              )
             }),
           pull: () => Effect.succeed(done)
         })
         const saved = yield* engine.mutate(Ids.MutationId.make("intent"), "accept", { secret })
         expect((yield* engine.mutate(Ids.MutationId.make("intent"), "accept", { other: true })).seq).toBe(saved.seq)
-        const loop = yield* SyncLoop.make({
-          engine,
-          isFatalPush: Transport.isFatalPush,
-          pendingMutations: storage.pendingCount
-        })
+        const loop = yield* SyncLoop.make({ engine, pendingMutations: storage.pendingCount })
         const fiber = yield* Effect.forkChild(loop.run)
         yield* Effect.repeat(Effect.yieldNow, { times: 80 })
         expect(pushes).toBe(1)
@@ -314,7 +290,7 @@ it.live("SQLite sync never exports a typed failure, defect, result or dependency
   return Effect.gen(function* () {
     let failing = false
     const { engine, storage } = yield* device({
-      push: () => Effect.fail(new Protocol.Unauthorized({ message: secret })),
+      push: () => Effect.fail(transportError(new Protocol.Unauthorized({ message: secret }))),
       pull: () => (failing ? Effect.die(new Error(secret)) : Effect.succeed(done))
     })
     yield* engine.mutate(Ids.MutationId.make("intent"), "accept", { secret })
@@ -500,7 +476,7 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
             )
           )
         )
-        const transport: Engine.Transport<unknown> = {
+        const transport: Engine.Transport = {
           push: (request) => rpc.push(request).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)),
           pull: (request) => rpc.pull(request).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
         }

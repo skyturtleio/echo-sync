@@ -10,6 +10,7 @@ import { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation, Protocol, ScopeGrants } from "echo-sync"
 import * as Engine from "../src/client/sync/Engine.ts"
 import * as SqliteSyncStorage from "../src/client/sync/SqliteSyncStorage.ts"
+import { SyncTransportError } from "../src/client/sync/SyncFailure.ts"
 import * as SyncLoop from "../src/client/sync/SyncLoop.ts"
 import * as Transport from "../src/client/sync/Transport.ts"
 import { layerHttp } from "../src/server/postgres/rpc.ts"
@@ -36,6 +37,10 @@ const createScope = Mutation.make("scopes.create", {
   handler: (ctx, args) => ctx.store.createScope(AccessScope.AccessScopeId.make(args.scope))
 })
 const mutations = Mutation.makeRegistry([addItem, createScope])
+
+/** The transport's classified reason, or the failure itself when it is not a transport failure. */
+const reasonOf = (failure: { readonly _tag: string }) =>
+  failure instanceof SyncTransportError ? failure.reason : failure
 
 /** Alice may write her scope; bob reads his own, which holds a row only he may see. */
 const seed = Effect.gen(function* () {
@@ -131,17 +136,16 @@ describe.skipIf(!pgAvailable)("replica principal vs. session (DESIGN §16.21) ag
         )
         const loop = yield* SyncLoop.make({
           engine,
-          isFatalPush: Transport.isFatalPush,
           pendingMutations: storage.pendingCount
         })
         const running = yield* Effect.forkScoped(provide(loop.run))
         // The engine's credential path: `unauthorized`, retried, the replica kept as is.
         const first = yield* waitFor(loop, (s) => s.lastError !== null || s.lastSyncedAt !== null)
         assert.strictEqual(Option.getOrUndefined(first)?.lastError?.kind, "unauthorized")
-        assert.instanceOf(yield* Effect.flip(provide(engine.push)), Protocol.Unauthorized)
-        assert.instanceOf(yield* Effect.flip(provide(engine.pull)), Protocol.Unauthorized)
+        assert.instanceOf(reasonOf(yield* Effect.flip(provide(engine.push))), Protocol.Unauthorized)
+        assert.instanceOf(reasonOf(yield* Effect.flip(provide(engine.pull))), Protocol.Unauthorized)
         const pokes = yield* Effect.flip(provide(Stream.runDrain(Stream.unwrap(transport.pokes(clientId, alice)))))
-        assert.instanceOf(pokes, Protocol.Unauthorized)
+        assert.instanceOf(reasonOf(pokes), Protocol.Unauthorized)
         const join = {
           room: AccessScope.AccessScopeId.make("bob-scope"),
           tabId: Protocol.TabId.make("tab"),
@@ -186,8 +190,8 @@ describe.skipIf(!pgAvailable)("replica principal vs. session (DESIGN §16.21) ag
 
         session.current = bob
         const before = { server: yield* server, local: yield* local }
-        assert.instanceOf(yield* Effect.flip(provide(engine.push)), Protocol.Unauthorized)
-        assert.instanceOf(yield* Effect.flip(provide(engine.pull)), Protocol.Unauthorized)
+        assert.instanceOf(reasonOf(yield* Effect.flip(provide(engine.push))), Protocol.Unauthorized)
+        assert.instanceOf(reasonOf(yield* Effect.flip(provide(engine.pull))), Protocol.Unauthorized)
         assert.deepStrictEqual({ server: yield* server, local: yield* local }, before)
         assert.deepStrictEqual((yield* serverRows).ledger, [])
         assert.deepStrictEqual(

@@ -465,7 +465,7 @@ it.live("a mutate queued behind a long pull install can be interrupted while it 
         state.blockReplay ? Effect.andThen(Deferred.succeed(installing, undefined), Deferred.await(gate)) : Effect.void
     })
     const add = Mutation.make("add", { args: Schema.Struct({}), handler: () => Effect.sync(() => void state.added++) })
-    const transport: Engine.Transport<never> = {
+    const transport: Engine.Transport = {
       push: () => Effect.die("unused"),
       pull: () =>
         Effect.succeed(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "5", expiredThrough: 0 }))

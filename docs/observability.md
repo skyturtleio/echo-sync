@@ -137,12 +137,12 @@ Its closed vocabulary is `ok`, `credentials`, `unauthorized`, `unavailable`, `ne
 `forbidden`, `halted`, `stopped`, `saved`, `duplicate`, `elected`, `lost`, `idle-timeout`,
 `server-end`, `page`, `done`. Interruption takes precedence over defects, then recognized typed
 failures, then `server`. Classification is descriptive; it never supplies retry/halt policy.
-For push batches driven by `SyncLoop`, its actual whole-cause classification supplies the outcome:
-`halted` when the host's `isFatalPush` halts, otherwise its closed error kind. The same classifier
-independently decides status from the whole final push cause, including outer cleanup failures;
-no cached batch decision can hide those failures. Thus a transient batch can record `unauthorized`
-while a typed fatal outer cleanup failure makes the final status `Halted`. `isFatalPush` must be
-pure and may run more than once per failure. Interruption and defect outcomes retain precedence.
+For sync operations (`echo.push`, `echo.pull`, `echo.install`, `echo.pokes`) the outcome comes
+from `SyncFailure.outcome`, the same closed classification over `SyncFailure.SyncTransportError`'s
+`reason` that decides the loop's status: `halted` when any failure in the cause halts push, otherwise
+the first failure's kind. `SyncLoop` independently classifies the whole final push cause, including
+outer cleanup failures, so a transient batch can record `unauthorized` while a typed fatal outer
+cleanup failure makes the final status `Halted`. Interruption and defect outcomes retain precedence.
 `echo.result` carries the operation-specific success result from the same vocabulary;
 `echo.reason` distinguishes first-element idle timeout from clean stream end.
 Only nonnegative safe integer counts and `echo.resnapshot: boolean` are otherwise allowed.

@@ -60,9 +60,7 @@ const scriptedPulls = (disk: MemorySyncStorage.Disk, responses: Array<Protocol.P
       push: () => Effect.die("unused"),
       pull: () => {
         const next = responses.shift()
-        return next === undefined
-          ? Effect.fail(new Simulation.TransportFailed({ during: "pull" }))
-          : Effect.succeed(next)
+        return next === undefined ? Effect.fail(Simulation.transportFailed("pull")) : Effect.succeed(next)
       }
     }
   })
@@ -179,7 +177,7 @@ describe("reconciliation simulation", () => {
           pull: () =>
             Effect.gen(function* () {
               pulls++
-              if (pulls > 1) return yield* new Simulation.TransportFailed({ during: "replacement snapshot" })
+              if (pulls > 1) return yield* Simulation.transportFailed("replacement snapshot")
               yield* Deferred.succeed(arrived, undefined)
               yield* Deferred.await(release)
               return yield* new Protocol.ResnapshotRequired({ reason: "gcHorizon" })
@@ -396,9 +394,7 @@ describe("reconciliation simulation", () => {
           push: () => Effect.die("unused"),
           pull: () => {
             const next = responses.shift() ?? Option.none()
-            return Option.isSome(next)
-              ? Effect.succeed(next.value)
-              : Effect.fail(new Simulation.TransportFailed({ during: "pull" }))
+            return Option.isSome(next) ? Effect.succeed(next.value) : Effect.fail(Simulation.transportFailed("pull"))
           }
         }
       })

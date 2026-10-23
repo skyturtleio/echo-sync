@@ -1,22 +1,25 @@
 /**
  * The engine's `Transport` over core's `SyncRpcs` (DESIGN §6, §8, §12), on the leader.
  *
- * Fatal push classification (DESIGN §6, a68a727) happens here, because this module owns the RPC
- * client and so its error union. A push is fatal (`isFatalPush`) when:
- * - the server refuses the batch with core's `MalformedEnvelope` (tag `"MalformedEnvelope"`);
- * - the outbox batch is not a valid `Protocol.PushRequest` before it is sent (an honest client cannot
- *   produce one, and the server would refuse it at payload decode): `PushIntegrityError{invalidPayload}`;
- * - the push call ends in a defect (`PushIntegrityError{serverDefect}`). On the wire this is how the
+ * This module owns the RPC client and so its error union, and is where every failure is classified
+ * once: each push, pull and pokes failure becomes a `SyncFailure.SyncTransportError` whose `reason`
+ * is the innermost recognized evidence (a credential failure or an HTTP 401/403 inside an
+ * `RpcClientError` is that reason, never `network`). What a reason means (its status kind, whether a
+ * push halts) is decided in `SyncFailure`. A push halts (DESIGN §6, a68a727) on:
+ * - core's `MalformedEnvelope`: the server refused the batch;
+ * - `PushIntegrityError{invalidPayload}`: the outbox batch is not a valid `Protocol.PushRequest` before
+ *   it is sent (an honest client cannot produce one, and the server would refuse it at payload decode);
+ * - `PushIntegrityError{serverDefect}`: the push call ended in a defect. On the wire this is how the
  *   server reports a push payload it cannot decode (`RpcServer` answers the request with
  *   `Exit.die(<formatted issue>)`; there is no failure tag for it) and how a handler defect arrives
  *   (fatal defects are broadcast as `Defect`). §6 says a defect is never retried and never ledgered, so
  *   retrying the same batch could only repeat it, and skipping it would open a seq gap.
  *
  * `ClientOutdated` is a separate compatibility stop for both directions until a new leader (§11).
- * Other errors are transient and retried by the loop: `RpcClientError` (HTTP, socket, protocol),
- * `Unauthorized` (credentials may be renewed), interruption. Every pull defect (a handler defect, or a
+ * Other reasons are transient and retried by the loop. Every pull defect (a handler defect, or a
  * response the RPC client cannot decode, which it raises as a defect) becomes the transient
- * `PullProtocolError`, so a bad page never kills the loop's fiber; core's `ResnapshotRequired` passes through for the engine to handle.
+ * `PullProtocolError`, so a bad page never kills the loop's fiber; core's `ResnapshotRequired` passes
+ * through unwrapped for the engine to handle.
  */
 import { Cause, Context, Effect, Layer, Predicate, Schema, type Scope, Stream } from "effect"
 import { FetchHttpClient, type Headers, HttpClient, HttpClientError, HttpClientRequest } from "effect/http"
@@ -24,30 +27,36 @@ import { RpcClient, type RpcClientError, RpcSerialization } from "effect/rpc"
 import { type AccessScope, type Ids, Protocol } from "echo-sync"
 import type * as Presence from "./Presence.ts"
 import type * as Engine from "./Engine.ts"
+import {
+  CredentialsUnavailable,
+  PullProtocolError,
+  PushIntegrityError,
+  SyncTransportError,
+  type TransportReason
+} from "./SyncFailure.ts"
 
-/** The push batch cannot be sent as is, or the server ended it with a defect. Fatal. */
-export class PushIntegrityError extends Schema.TaggedError<PushIntegrityError>()("PushIntegrityError", {
-  reason: Schema.Literals(["invalidPayload", "serverDefect"]),
-  message: Schema.String
-}) {}
-
-/** The pull call ended in a defect. Transient: nothing was installed. */
-export class PullProtocolError extends Schema.TaggedError<PullProtocolError>()("PullProtocolError", {
-  message: Schema.String
-}) {}
-
-export type TransportError =
-  | RpcClientError.RpcClientError
-  | Protocol.Unauthorized
-  | Protocol.MalformedEnvelope
-  | Protocol.ServerUnavailable
-  | Protocol.ClientOutdated
-  | PushIntegrityError
-  | PullProtocolError
-
-/** The fatal-push rule for `SyncLoop.make({ isFatalPush })`; storage errors are never fatal. */
-export const isFatalPush = (error: unknown): boolean =>
-  Predicate.isTagged(error, "MalformedEnvelope") || Predicate.isTagged(error, "PushIntegrityError")
+/**
+ * The reason of a failure, with an `RpcClientError` replaced by the more specific evidence it wraps
+ * (DESIGN §9.1): the `CredentialsUnavailable` that `layerProtocolHttp` puts inside the HTTP
+ * `TransportError`, or the HTTP 401/403 that its status filter raises.
+ */
+const transportError = (error: TransportReason): SyncTransportError => {
+  if (error._tag !== "RpcClientError" || error.reason._tag !== "HttpError")
+    return new SyncTransportError({ reason: error })
+  const http = error.reason.cause
+  if (http instanceof HttpClientError.TransportError && http.cause instanceof CredentialsUnavailable) {
+    return new SyncTransportError({ reason: http.cause })
+  }
+  if (
+    http instanceof HttpClientError.StatusCodeError &&
+    (http.response.status === 401 || http.response.status === 403)
+  ) {
+    return new SyncTransportError({
+      reason: new Protocol.Unauthorized({ message: `HTTP ${http.response.status}` })
+    })
+  }
+  return new SyncTransportError({ reason: error })
+}
 
 const toPushRequest = Schema.decodeUnknownEffect(Schema.toType(Protocol.PushRequest))
 /** Defects become `onDefect`; interruption and typed failures pass through unchanged. */
@@ -59,14 +68,6 @@ const defectsAs =
         ? Effect.failCause(cause)
         : Effect.fail(onDefect(Cause.pretty(cause)))
     )
-
-/**
- * `syncHeaders` raised (a defect: its error channel is `never`) while the leader was preparing a
- * request (DESIGN §9.1 Credentials). Local and transient, like a network failure: nothing was sent.
- */
-export class CredentialsUnavailable extends Schema.TaggedError<CredentialsUnavailable>()("CredentialsUnavailable", {
-  message: Schema.String
-}) {}
 
 /** The leader's `syncHeaders` for this protocol, provided by `layerProtocolHttp`; unset without one. */
 const SyncHeaders = Context.Reference<Effect.Effect<Headers.Input> | undefined>(
@@ -91,18 +92,17 @@ const PreparedHeaders = Context.Reference<Headers.Input | undefined>("echo-sync/
 const acquire = (headers: Effect.Effect<Headers.Input>) =>
   headers.pipe(defectsAs((message) => new CredentialsUnavailable({ message: `syncHeaders failed: ${message}` })))
 
-/** A `Transport` over an RPC client `Protocol` (see `layerProtocolHttp`). */
 /**
  * The engine's transport plus the pokes stream, which the leader follows with `SyncLoop.followPokes`.
  * `pokes` is prepare-then-stream: the Effect resolves this connect's headers (before any `idleTimeout`
  * clock, DESIGN §6 Liveness), and the stream it returns sends the request with exactly those.
  */
-export interface SyncTransport extends Engine.Transport<TransportError> {
+export interface SyncTransport extends Engine.Transport {
   /** `principal`: the replica's, asserted to the server like the engine's push and pull (DESIGN §16.21). */
   readonly pokes: (
     clientId: Ids.ClientId,
     principal: AccessScope.PrincipalId
-  ) => Effect.Effect<Stream.Stream<typeof Protocol.PokesElement.Type, unknown>, CredentialsUnavailable>
+  ) => Effect.Effect<Stream.Stream<typeof Protocol.PokesElement.Type, SyncTransportError>, SyncTransportError>
   /** `Protocol.PresenceRpcs` on the same mount (the server merges both groups, DESIGN §12). */
   readonly presence: (clientId: Ids.ClientId, principal: AccessScope.PrincipalId) => Presence.Upstream<PresenceError>
 }
@@ -132,18 +132,28 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
           Effect.mapError((error) => new PushIntegrityError({ reason: "invalidPayload", message: error.message }))
         )
         return yield* client.push(payload)
-      }).pipe(defectsAs((message) => new PushIntegrityError({ reason: "serverDefect", message }))),
+      }).pipe(
+        defectsAs((message) => new PushIntegrityError({ reason: "serverDefect", message })),
+        Effect.mapError(transportError)
+      ),
 
     // The request is built by the engine from core types; the response is decoded by the RPC client.
-    pull: (request) => client.pull(request).pipe(defectsAs((message) => new PullProtocolError({ message }))),
+    pull: (request) =>
+      client.pull(request).pipe(
+        defectsAs((message) => new PullProtocolError({ message })),
+        Effect.mapError((error) => (error._tag === "ResnapshotRequired" ? error : transportError(error)))
+      ),
 
     // Any end of this stream (failure, defect, completion) is handled by reconnecting (followPokes).
-    pokes: (clientId, principal) =>
-      headers === undefined
-        ? Effect.succeed(client.pokes({ clientId, principal }))
-        : Effect.map(acquire(headers), (prepared) =>
-            client.pokes({ clientId, principal }).pipe(Stream.provideService(PreparedHeaders, prepared))
-          ),
+    pokes: (clientId, principal) => {
+      const open = (prepared: Headers.Input | undefined) => {
+        const stream = client.pokes({ clientId, principal }).pipe(Stream.mapError(transportError))
+        return prepared === undefined ? stream : stream.pipe(Stream.provideService(PreparedHeaders, prepared))
+      }
+      return headers === undefined
+        ? Effect.succeed(open(undefined))
+        : acquire(headers).pipe(Effect.mapError(transportError), Effect.map(open))
+    },
 
     presence: (clientId, principal) => ({
       // Prepare-then-stream like `pokes`, so the leader's `idleTimeout` starts at send.

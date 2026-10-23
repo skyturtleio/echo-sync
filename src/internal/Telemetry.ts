@@ -269,56 +269,32 @@ export const stream = <A, E, R>(work: Stream.Stream<A, E, R>): Stream.Stream<A, 
     )
   )
 
-/** Only recognized tags are mapped; never copy a tag, error message or input into telemetry. */
-export const kind = (error: unknown): string => {
-  let current = error
-  for (let i = 0; i < 8 && current !== null && current !== undefined; i++) {
-    if (Predicate.isTagged(current, "CredentialsUnavailable")) return "credentials"
-    if (Predicate.isTagged(current, "Unauthorized")) return "unauthorized"
-    if (Predicate.isTagged(current, "ServerUnavailable")) return "unavailable"
-    if (Predicate.isTagged(current, "ClientOutdated")) return "outdated"
-    if (Predicate.isTagged(current, "ServerOutdated")) return "server-outdated"
-    if (Predicate.isTagged(current, "MalformedChange")) return "malformed"
-    if (Predicate.isTagged(current, "ResnapshotRequired")) return "resnapshot"
-    if (Predicate.isTagged(current, "LocallyRejected")) return "rejected"
-    if (Predicate.isTagged(current, "Forbidden")) return "forbidden"
-    if (Predicate.isTagged(current, "PushIntegrityError") || Predicate.isTagged(current, "MalformedEnvelope"))
-      return "halted"
-    if (Predicate.isTagged(current, "TimeoutError")) return "idle-timeout"
-    if (Predicate.isTagged(current, "Done")) return "server-end"
-    if (
-      Predicate.isTagged(current, "StatusCodeError") &&
-      Predicate.hasProperty(current, "response") &&
-      Predicate.hasProperty(current.response, "status") &&
-      (current.response.status === 401 || current.response.status === 403)
-    )
-      return "unauthorized"
-    if (Predicate.hasProperty(current, "reason") && Predicate.isObject(current.reason)) current = current.reason
-    else if (Predicate.hasProperty(current, "cause")) current = current.cause
-    else
-      return Predicate.isTagged(current, "RpcClientError") || Predicate.isTagged(error, "RpcClientError")
-        ? "network"
-        : "server"
-  }
-  return "server"
+/**
+ * The outcome of an exit. Interruption, then defects, take precedence; a typed failure is named by
+ * the operation's own closed classifier (`failure`) when it has one, otherwise by its tag. Only
+ * recognized tags are mapped; never copy a tag, error message or input into telemetry.
+ */
+export const outcome = <A, E>(exit: Exit.Exit<A, E>, failure?: (cause: Cause.Cause<E>) => string): string => {
+  if (Exit.isSuccess(exit)) return "ok"
+  if (Cause.hasInterrupts(exit.cause)) return "interrupted"
+  if (Cause.hasDies(exit.cause)) return "defect"
+  if (failure !== undefined) return failure(exit.cause)
+  const failures = exit.cause.reasons.filter(Cause.isFailReason).map((reason) => kind(reason.error))
+  return failures.includes("halted") ? "halted" : (failures[0] ?? "server")
 }
 
-export const outcome = <A, E>(exit: Exit.Exit<A, E>): string =>
-  Exit.isSuccess(exit)
-    ? "ok"
-    : Cause.hasInterrupts(exit.cause)
-      ? "interrupted"
-      : Cause.hasDies(exit.cause)
-        ? "defect"
-        : exit.cause.reasons.some((reason) => Cause.isFailReason(reason) && kind(reason.error) === "halted")
-          ? "halted"
-          : kind(exit.cause.reasons.find(Cause.isFailReason)?.error)
-
-/** Internal typed key: Engine and its SyncLoop bind the same transport error union. */
-export const pushOutcome = <E>() =>
-  Context.Reference<(cause: Cause.Cause<E>) => Effect.Effect<string>>("echo-sync/PushOutcome", {
-    defaultValue: () => (cause) => Effect.succeed(outcome(Exit.failCause(cause)))
-  })
+const kind = (error: unknown): string => {
+  if (Predicate.isTagged(error, "Unauthorized")) return "unauthorized"
+  if (Predicate.isTagged(error, "ServerUnavailable")) return "unavailable"
+  if (Predicate.isTagged(error, "ClientOutdated")) return "outdated"
+  if (Predicate.isTagged(error, "ResnapshotRequired")) return "resnapshot"
+  if (Predicate.isTagged(error, "LocallyRejected")) return "rejected"
+  if (Predicate.isTagged(error, "Forbidden")) return "forbidden"
+  if (Predicate.isTagged(error, "MalformedEnvelope")) return "halted"
+  if (Predicate.isTagged(error, "TimeoutError")) return "idle-timeout"
+  if (Predicate.isTagged(error, "Done")) return "server-end"
+  return "server"
+}
 
 export const annotate = (attributes: Record<string, unknown>) =>
   Effect.withFiber((fiber) => {
@@ -385,8 +361,15 @@ export const observeStream = <A, E, R>(work: Stream.Stream<A, E, R>, name: Name)
     ).pipe(Stream.withSpan(name))
   )
 
-/** onExit preserves the original value/cause and masks only its own bookkeeping. */
-export const observe = <A, E, R>(work: Effect.Effect<A, E, R>, name: Name): Effect.Effect<A, E, R> =>
+/**
+ * onExit preserves the original value/cause and masks only its own bookkeeping. `failure` is the
+ * operation's own closed classifier of a typed failure (see `outcome`).
+ */
+export const observe = <A, E, R>(
+  work: Effect.Effect<A, E, R>,
+  name: Name,
+  failure?: (cause: Cause.Cause<E>) => string
+): Effect.Effect<A, E, R> =>
   boundary(
     Effect.suspend(() => {
       let started = 0
@@ -395,13 +378,7 @@ export const observe = <A, E, R>(work: Effect.Effect<A, E, R>, name: Name): Effe
         return work.pipe(
           Effect.onExit((exit) =>
             Effect.gen(function* () {
-              const result =
-                Exit.isFailure(exit) &&
-                !Cause.hasInterrupts(exit.cause) &&
-                !Cause.hasDies(exit.cause) &&
-                name === "echo.push"
-                  ? yield* Effect.flatMap(pushOutcome<E>(), (classify) => classify(exit.cause))
-                  : outcome(exit)
+              const result = outcome(exit, failure)
               // A success result set inside the operation (saved/duplicate/stopped/etc.) takes precedence.
               const parent = yield* Effect.serviceOption(Tracer.ParentSpan)
               const recorded =

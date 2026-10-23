@@ -93,7 +93,7 @@ const openDatabase = (identity: Platform.ReplicaIdentity, registry: Registry.Syn
   })
 
 /** A replica without `syncUrl`: the engine never calls its transport, because no loop runs. */
-const localOnly: Engine.Transport<never> = {
+const localOnly: Engine.Transport = {
   push: () => Effect.die(new Error("echo-sync: local-only replica has no transport")),
   pull: () => Effect.die(new Error("echo-sync: local-only replica has no transport"))
 }
@@ -105,8 +105,7 @@ const localOnly: Engine.Transport<never> = {
  * no timer). A wake after a mutate that saved nothing costs one extra, coalesced cycle.
  */
 export const enqueueAndWake =
-  <TE>(engine: Engine.Engine<TE>, wake: Effect.Effect<void>) =>
-  (mutationId: Ids.MutationId, name: string, args: Schema.Json) =>
+  (engine: Engine.Engine, wake: Effect.Effect<void>) => (mutationId: Ids.MutationId, name: string, args: Schema.Json) =>
     engine.mutate(mutationId, name, args).pipe(Effect.ensuring(wake))
 
 /**
@@ -142,7 +141,7 @@ export interface HandlerOptions {
   readonly sql: SqlClient.SqlClient
   readonly reactivity: Reactivity.Reactivity
   readonly storage: SqliteSyncStorage.SqliteSyncStorage
-  readonly engine: Engine.Engine<unknown>
+  readonly engine: Engine.Engine
   readonly loop: SyncLoop.SyncLoop | undefined
   /** The leader's presence (DESIGN §9.1); `undefined` on a local-only replica, like `loop`. */
   readonly presence: Presence.Presence<Protocol.Forbidden> | undefined
@@ -499,7 +498,7 @@ const program = (
     const storage = SqliteSyncStorage.make(sql, registry)
     let loop: SyncLoop.SyncLoop | undefined
     let presence: Presence.Presence<Protocol.Forbidden> | undefined
-    let engine: Engine.Engine<unknown>
+    let engine: Engine.Engine
     if (syncUrl === undefined) {
       engine = yield* Engine.make({ clientId, actor, storage, registry, mutations, transport: localOnly })
     } else {
@@ -509,7 +508,6 @@ const program = (
       engine = yield* Engine.make({ clientId, actor, storage, registry, mutations, transport })
       const sync = yield* SyncLoop.make({
         engine,
-        isFatalPush: Transport.isFatalPush,
         pendingMutations: storage.pendingCount
       })
       yield* Effect.forkScoped(sync.run)

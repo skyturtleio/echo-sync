@@ -23,6 +23,7 @@ import { SqlClient } from "effect/sql/SqlClient"
 import { SqlError, UnknownError } from "effect/sql/SqlError"
 import { AccessScope, Ids, Mutation, Protocol } from "echo-sync"
 import * as TestClock from "effect/testing/TestClock"
+import { SyncTransportError } from "../../client/sync/SyncFailure.ts"
 import * as SyncLoop from "../../client/sync/SyncLoop.ts"
 import type { ClientPolicy } from "./pull.ts"
 import { layerHttp, sharedPokes } from "./rpc.ts"
@@ -556,9 +557,10 @@ describe.skipIf(!pgAvailable)("pokes liveness (§6)", () => {
         const seen: Array<{ readonly tag: string; readonly at: number }> = []
         const pulls = { n: 0 }
         // The leader's loop: followPokes over the real RPC stream, `wake` is what runs a pull.
-        const stream = client
-          .pokes({ clientId: Ids.ClientId.make("d") })
-          .pipe(Stream.tap((element) => Effect.sync(() => void seen.push({ tag: element._tag, at: Date.now() }))))
+        const stream = client.pokes({ clientId: Ids.ClientId.make("d") }).pipe(
+          Stream.tap((element) => Effect.sync(() => void seen.push({ tag: element._tag, at: Date.now() }))),
+          Stream.mapError((reason) => new SyncTransportError({ reason }))
+        )
         yield* Effect.forkChild(
           SyncLoop.followPokes({ connect: Effect.succeed(stream), wake: Effect.sync(() => void pulls.n++) })
         )

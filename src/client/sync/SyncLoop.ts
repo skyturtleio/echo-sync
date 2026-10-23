@@ -2,12 +2,10 @@
  * The leader's sync loop (DESIGN §8, §9): runs `Engine.push` then `Engine.pull` whenever woken (local
  * enqueue, poke) and retries transient failures with backoff; `followPokes` keeps the pokes stream up.
  *
- * Fatal push (DESIGN §6, a68a727): a push error the caller's `isFatalPush` classifies as an integrity
- * failure (`MalformedEnvelope`, or the server failing to decode the push payload) halts pushing for the
- * lifetime of this loop: no automatic retry, no outbox entry is released (that would leave a seq gap,
- * §16.5). Pull keeps running. The halt is surfaced through `status`, and the pending outbox stays
- * exportable. The engine writes nothing durable when its transport fails, so classifying in the caller
- * (who owns the transport's error union) loses nothing.
+ * Fatal push (DESIGN §6, a68a727): a push failure that `SyncFailure.classify` says halts (an integrity
+ * failure: `MalformedEnvelope`, an invalid batch, or a push defect) halts pushing for the lifetime of this
+ * loop: no automatic retry, no outbox entry is released (that would leave a seq gap, §16.5). Pull keeps
+ * running. The halt is surfaced through `status`, and the pending outbox stays exportable.
  */
 import {
   Cause,
@@ -17,15 +15,17 @@ import {
   Effect,
   Exit,
   Option,
-  Predicate,
+  Pull,
   Queue,
+  Result,
   Schema,
   Stream,
   SubscriptionRef
 } from "effect"
-import { HttpClientError } from "effect/http"
 import type { Errors } from "echo-sync"
 import type * as Engine from "./Engine.ts"
+import * as SyncFailure from "./SyncFailure.ts"
+import { SyncErrorKind, type SyncTransportError } from "./SyncFailure.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
 export const PushState = Schema.Union([
@@ -37,30 +37,6 @@ export type PushState = typeof PushState.Type
 
 export const SyncPhase = Schema.Literals(["idle", "pushing", "pulling", "backoff"])
 export type SyncPhase = typeof SyncPhase.Type
-
-/**
- * What kind of failure `lastError` reports (DESIGN §9.1), so an app can tell "sign in again"
- * from "you are offline" without parsing text:
- * - `credentials`: `syncHeaders` raised; nothing was sent.
- * - `unauthorized`: the server rejected the credential (`Unauthorized` or HTTP 401/403).
- * - `unavailable`: the server reported `ServerUnavailable`.
- * - `network`: no usable RPC result (transport, HTTP, or a response body that was empty, incomplete
- *   or unreadable after an HTTP response arrived).
- * - `server`: the fallback for any other transient failure: a stopped push batch, a pull defect, a
- *   local `StoreUnavailable`.
- * - `outdated`: compatibility policy refused this client; sync stays stopped until a new leader.
- * - `server-outdated`: a known-table payload lacks a declared column; back off without rebuilding.
- */
-export const SyncErrorKind = Schema.Literals([
-  "credentials",
-  "unauthorized",
-  "unavailable",
-  "network",
-  "server",
-  "outdated",
-  "server-outdated"
-])
-export type SyncErrorKind = typeof SyncErrorKind.Type
 
 /**
  * A failure: its kind and a library-controlled description of it (DESIGN §9.1). Never raw
@@ -97,50 +73,6 @@ export interface SyncLoop {
 }
 
 /**
- * The error and what it wraps, outermost first: an `RpcClientError`'s `reason`, an `HttpClientError`'s
- * `reason`, then each `cause` (the pinned `HttpClientErrorSchema` and `TransportError` keep the inner
- * error there). Bounded, and stops at a repeat.
- */
-const chain = (error: unknown): ReadonlyArray<unknown> => {
-  const nodes: Array<unknown> = []
-  let node: unknown = error
-  while (node !== undefined && node !== null && nodes.length < 8 && !nodes.includes(node)) {
-    nodes.push(node)
-    node =
-      Predicate.hasProperty(node, "reason") && Predicate.isObject(node.reason)
-        ? node.reason
-        : Predicate.hasProperty(node, "cause")
-          ? node.cause
-          : undefined
-  }
-  return nodes
-}
-
-const tagOf = (node: unknown): string | undefined =>
-  Predicate.hasProperty(node, "_tag") && Predicate.isString(node._tag) ? node._tag : undefined
-
-/** DESIGN §9.1 kinds, by the innermost evidence: a credential failure inside an RPC error is `credentials`. */
-const kindOf = (error: unknown): SyncErrorKind => {
-  const nodes = chain(error)
-  const tags = nodes.map(tagOf)
-  if (tags.includes("CredentialsUnavailable")) return "credentials"
-  if (tags.includes("Unauthorized")) return "unauthorized"
-  if (
-    nodes.some(
-      (node) =>
-        node instanceof HttpClientError.StatusCodeError &&
-        (node.response.status === 401 || node.response.status === 403)
-    )
-  )
-    return "unauthorized"
-  if (tags.includes("ServerUnavailable")) return "unavailable"
-  if (tags.includes("ClientOutdated")) return "outdated"
-  if (tags.includes("ServerOutdated")) return "server-outdated"
-  if (tags.includes("RpcClientError")) return "network"
-  return "server"
-}
-
-/**
  * The public text for each kind (DESIGN §9.1, 418d688): library-controlled constants. No raw error
  * message, name, unrecognized tag, string cause, URL or `Cause.pretty` ever reaches `syncStatus`, since
  * any of them can carry a token, an echoed header or a request body. Detail goes to the leader's log.
@@ -157,40 +89,18 @@ const messages: Record<SyncErrorKind, string> = {
 
 const stoppedBatch: SyncError = { kind: "server", message: "the server stopped the push batch at a transient failure" }
 
-/** The `Halted` reason, by the innermost recognized tag; same constant-only rule as `lastError`. */
-const haltReason = (error: unknown): string => {
-  const nodes = chain(error)
-  if (nodes.some((n) => tagOf(n) === "MalformedEnvelope")) return "the server refused the push batch as malformed"
-  const integrity = nodes.find((n) => tagOf(n) === "PushIntegrityError")
-  if (Predicate.hasProperty(integrity, "reason") && integrity.reason === "invalidPayload") {
-    return "the outbox batch is not a valid push request"
-  }
-  if (integrity !== undefined) return "the server ended the push with a defect"
-  return "push failed with an integrity error"
-}
-
 /**
- * Classifies a whole failure `Cause` (DESIGN §6: defect > transient > rejection), never just its
- * first `Fail`: a defect anywhere halts push, even beside a transient failure, since an RPC request
- * decode failure arrives as an untagged defect. Interruption is re-raised (the loop is stopping).
- * The returned strings are constants; the cause itself is only ever logged.
+ * The status consequences of a failure cause (DESIGN §6: defect > integrity > transient), never just
+ * its first failure. Interruption is re-raised (the loop is stopping). The returned strings are
+ * constants; the cause itself is only ever logged.
  */
-const classify = <E>(cause: Cause.Cause<E>, isFatal: ((error: E) => boolean) | undefined) =>
-  Effect.gen(function* () {
-    if (Cause.hasInterrupts(cause)) return yield* Effect.interrupt
-    const failures = cause.reasons.filter(Cause.isFailReason).map((reason) => reason.error)
-    const fatalFailure = isFatal === undefined ? undefined : failures.find(isFatal)
-    const halts = isFatal !== undefined && (Cause.hasDies(cause) || fatalFailure !== undefined)
-    const first = fatalFailure ?? failures[0]
-    const kind: SyncErrorKind = Cause.hasDies(cause) || first === undefined ? "server" : kindOf(first)
-    const halt = fatalFailure !== undefined ? haltReason(fatalFailure) : "push failed with a defect"
-    return { halts, error: { kind, message: messages[kind] } satisfies SyncError, halt }
-  })
+const classify = (cause: Cause.Cause<SyncFailure.PullFailure>) =>
+  Cause.hasInterrupts(cause) ? Effect.interrupt : Effect.succeed(SyncFailure.classify(cause))
 
-export const make = <TE>(options: {
-  readonly engine: Engine.Engine<TE>
-  /** Whether a push failure is an integrity error that must stop pushing (see module doc). */
-  readonly isFatalPush: (error: Errors.StoreUnavailable | Errors.ConstraintViolated | TE) => boolean
+const errorOf = (kind: SyncErrorKind): SyncError => ({ kind, message: messages[kind] })
+
+export const make = (options: {
+  readonly engine: Engine.Engine
   /** First retry delay after a transient failure; doubles up to `maxRetryDelay`. */
   readonly retryDelay?: Duration.Input
   readonly maxRetryDelay?: Duration.Input
@@ -239,34 +149,22 @@ export const make = <TE>(options: {
       let pushedCleanly = false
       if ((yield* SubscriptionRef.get(status)).push._tag === "Active") {
         yield* setPhase("pushing")
-        // The batch and final push have distinct causes. Apply the same pure policy to each;
-        // an outer finalizer may add failures that the batch observer could not have seen.
-        const pushed = yield* Effect.exit(
-          engine.push.pipe(
-            Effect.provideService(
-              Telemetry.pushOutcome<Errors.StoreUnavailable | Errors.ConstraintViolated | TE>(),
-              (cause) =>
-                Effect.map(Effect.exit(classify(cause, options.isFatalPush)), (result) => {
-                  // Policy defects do not alter the batch Exit. The original decision point
-                  // below still classifies the whole final cause, including outer cleanup.
-                  return Exit.isFailure(result) ? "defect" : result.value.halts ? "halted" : result.value.error.kind
-                })
-            )
-          )
-        )
+        // The whole final cause decides, including failures an outer finalizer added after the batch
+        // span (which classified the batch's own cause the same way) had ended.
+        const pushed = yield* Effect.exit(engine.push)
         if (Exit.isFailure(pushed)) {
-          const { halts, error, halt } = yield* classify(pushed.cause, options.isFatalPush)
-          if (!halts && error.kind === "outdated") {
-            yield* stopOutdated(error)
+          const { kind, halt } = yield* classify(pushed.cause)
+          if (Option.isNone(halt) && kind === "outdated") {
+            yield* stopOutdated(errorOf(kind))
             return false
           }
-          if (halts) {
+          if (Option.isSome(halt)) {
             yield* Telemetry.log("Error", "echo-sync: push halted by an integrity error", pushed.cause)
-            const halted: PushState = { _tag: "Halted", message: halt }
+            const halted: PushState = { _tag: "Halted", message: halt.value }
             yield* SubscriptionRef.update(status, (s) => ({ ...s, push: halted }))
           } else {
             yield* Telemetry.log("Debug", "echo-sync: push failed; retrying", pushed.cause)
-            transient = Option.some(error)
+            transient = Option.some(errorOf(kind))
           }
         } else if (pushed.value.stopped) {
           transient = Option.some(stoppedBatch)
@@ -278,13 +176,14 @@ export const make = <TE>(options: {
       // Nothing was installed on failure. Policy refusal stops sync; other failures back off.
       const pulled = yield* Effect.exit(engine.pull)
       if (Exit.isFailure(pulled)) {
-        const { error } = yield* classify(pulled.cause, undefined)
-        if (error.kind === "outdated") {
-          yield* stopOutdated(error)
+        // A pull never halts: a pull defect is transient (`halt` is ignored).
+        const { kind } = yield* classify(pulled.cause)
+        if (kind === "outdated") {
+          yield* stopOutdated(errorOf(kind))
           return false
         }
         yield* Telemetry.log("Debug", "echo-sync: pull failed; retrying", pulled.cause)
-        if (Option.isNone(transient) || error.kind === "server-outdated") transient = Option.some(error)
+        if (Option.isNone(transient) || kind === "server-outdated") transient = Option.some(errorOf(kind))
       }
       // `engine.pull` succeeds only once a `PullDone` set is installed.
       const syncedAt = pushedCleanly && Exit.isSuccess(pulled) ? yield* Clock.currentTimeMillis : undefined
@@ -335,6 +234,10 @@ export const make = <TE>(options: {
     }
   })
 
+/** A first pull of the pokes stream that ends it (`Cause.Done`) is a clean server end, not a failure. */
+const pokesOutcome = (cause: Cause.Cause<SyncTransportError | Cause.Done>): string =>
+  Result.match(Pull.filterNoDone(cause), { onSuccess: SyncFailure.outcome, onFailure: () => "server-end" })
+
 /**
  * Follows the server's pokes stream (DESIGN §6, §8, 81a07db): every `poke` wakes the loop, a
  * `heartbeat` only proves liveness (DESIGN §6 Liveness) and never wakes it, and the stream is
@@ -347,12 +250,15 @@ export const make = <TE>(options: {
  * right after LISTEN (DESIGN §6, aec6cd4), and that first element is what covers anything missed while
  * disconnected. Pokes are only hints (§8), so nothing here is fatal. Runs until interrupted.
  */
-export const followPokes = <E, EP>(options: {
+export const followPokes = (options: {
   /**
    * One (re)connect: the Effect prepares it (resolves credentials, DESIGN §9.1) and the stream it
    * returns sends the request when run. `idleTimeout` covers only the stream (DESIGN §6 Liveness).
    */
-  readonly connect: Effect.Effect<Stream.Stream<{ readonly _tag: "poke" | "heartbeat" }, E>, EP>
+  readonly connect: Effect.Effect<
+    Stream.Stream<{ readonly _tag: "poke" | "heartbeat" }, SyncTransportError>,
+    SyncTransportError
+  >
   readonly wake: Effect.Effect<void>
   readonly retryDelay?: Duration.Input
   readonly maxRetryDelay?: Duration.Input
@@ -400,7 +306,8 @@ export const followPokes = <E, EP>(options: {
                     connection.timedOut ? Telemetry.annotate({ "echo.reason": "idle-timeout" }) : Effect.void
                   )
                 ),
-                "echo.pokes"
+                "echo.pokes",
+                pokesOutcome
               )
             })
           )
@@ -419,7 +326,11 @@ export const followPokes = <E, EP>(options: {
       if (connection.poked) delay = base
       yield* Telemetry.count(
         "echo.pokes.reconnect.total",
-        connection.timedOut ? "idle-timeout" : Exit.isSuccess(ended) ? "server-end" : Telemetry.outcome(ended)
+        connection.timedOut
+          ? "idle-timeout"
+          : Exit.isSuccess(ended)
+            ? "server-end"
+            : Telemetry.outcome(ended, SyncFailure.outcome)
       )
       yield* Telemetry.log(
         "Debug",

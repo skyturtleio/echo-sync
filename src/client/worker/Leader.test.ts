@@ -18,12 +18,13 @@ import {
   Stream
 } from "effect"
 import * as Reactivity from "effect/reactivity/Reactivity"
-import { RpcTest } from "effect/rpc"
+import { RpcClientError, RpcTest } from "effect/rpc"
 import * as Schedule from "effect/Schedule"
 import * as SqlClient from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation, Protocol, Query, Registry, ScopeGrants, type Store, SyncTable } from "echo-sync"
 import * as Engine from "../sync/Engine.ts"
 import * as SqliteSyncStorage from "../sync/SqliteSyncStorage.ts"
+import { SyncTransportError } from "../sync/SyncFailure.ts"
 import * as SyncLoop from "../sync/SyncLoop.ts"
 import { enqueueAndWake, makeHandlers } from "./Leader.ts"
 import { type LeaderCalls, tabApi } from "./LeaderClient.ts"
@@ -58,7 +59,7 @@ it.live("an enqueue cancelled while its COMMIT runs still wakes the loop: the en
     }
     const pushed: Array<string> = []
     const pushObserved = yield* Deferred.make<void>()
-    const transport: Engine.Transport<never> = {
+    const transport: Engine.Transport = {
       push: (request) =>
         Effect.andThen(
           Effect.sync(() => void pushed.push(...request.mutations.map((m) => m.mutationId))),
@@ -84,13 +85,12 @@ it.live("an enqueue cancelled while its COMMIT runs still wakes the loop: the en
     // The loop's first cycle (nothing to push, one pull) must be over before the gate is armed, so the
     // gated transaction is the enqueue's and the loop is idle, waiting for a wake.
     const pulled = yield* Deferred.make<void>()
-    const observed: Engine.Engine<never> = {
+    const observed: Engine.Engine = {
       ...engine,
       pull: Effect.ensuring(engine.pull, Deferred.succeed(pulled, undefined))
     }
     const loop = yield* SyncLoop.make({
       engine: observed,
-      isFatalPush: () => false,
       pendingMutations: real.pendingCount
     })
     yield* Effect.forkChild(loop.run)
@@ -502,8 +502,22 @@ it.live("a dismissed notice is gone from the notices stream, and an undismissed 
 // syncStatus and requestSync (DESIGN §9.1) over leaders wired as `program` wires them
 // ---------------------------------------------------------------------------------------------
 
-class Integrity extends Schema.TaggedError<Integrity>()("Integrity", {}) {}
-class Offline extends Schema.TaggedError<Offline>()("Offline", {}) {}
+/** A push integrity failure (the server refused the batch): halts push. */
+const integrity = () =>
+  new SyncTransportError({
+    reason: new Protocol.MalformedEnvelope({
+      clientId: Ids.ClientId.make("c"),
+      mutationId: Ids.MutationId.make("m"),
+      message: "bad envelope"
+    })
+  })
+/** No usable RPC result: transient. */
+const offline = () =>
+  new SyncTransportError({
+    reason: new RpcClientError.RpcClientError({
+      reason: new RpcClientError.RpcClientDefect({ message: "offline", cause: null })
+    })
+  })
 const decodePush = Schema.decodeUnknownSync(Protocol.PushResponse)
 
 /** One replica database, shared by the successive leaders of a test (a handover keeps the file). */
@@ -538,7 +552,7 @@ const replicaDb = Effect.gen(function* () {
 /** A leader over `db` with a running sync loop and the reactive pending count, as `program` builds it. */
 const syncLeader = (
   db: Effect.Success<typeof replicaDb>,
-  transport: Engine.Transport<Integrity | Offline>,
+  transport: Engine.Transport,
   retryDelay: "1 second" | "1 hour" = "1 second",
   /** Holds back the first durable count (a slow or busy store) until it completes. */
   countGate: Effect.Effect<void> = Effect.void
@@ -555,7 +569,6 @@ const syncLeader = (
     })
     const loop = yield* SyncLoop.make({
       engine,
-      isFatalPush: (e) => e instanceof Integrity,
       pendingMutations: Stream.unwrap(Effect.as(countGate, storage.pendingCount)),
       retryDelay,
       maxRetryDelay: "1 hour"
@@ -599,7 +612,7 @@ it.live(
       const positions = new Map<string, number>()
       let next = 100
       let cursor = 1
-      const transport: Engine.Transport<Integrity | Offline> = {
+      const transport: Engine.Transport = {
         push: (request) =>
           Effect.sync(() =>
             decodePush({
@@ -691,9 +704,9 @@ it.live("requestSync during backoff runs the next cycle at once and leaves a hal
   Effect.gen(function* () {
     const db = yield* replicaDb
     const calls = { push: 0, pull: 0 }
-    const transport: Engine.Transport<Integrity | Offline> = {
-      push: () => Effect.suspend(() => (calls.push++, Effect.fail(new Integrity()))),
-      pull: () => Effect.suspend(() => (calls.pull++, Effect.fail(new Offline())))
+    const transport: Engine.Transport = {
+      push: () => Effect.suspend(() => (calls.push++, Effect.fail(integrity()))),
+      pull: () => Effect.suspend(() => (calls.pull++, Effect.fail(offline())))
     }
     // An hour of backoff: only a wake can bring the next cycle within the test's budget.
     const client = yield* syncLeader(db, transport, "1 hour")
@@ -731,7 +744,7 @@ it.live(
       let pushes = 0
       let next = 100
       let cursor = 1
-      const transport: Engine.Transport<Integrity | Offline> = {
+      const transport: Engine.Transport = {
         push: (request) =>
           Effect.suspend(() => {
             pushes++
@@ -741,7 +754,7 @@ it.live(
               return { mutationId: m.mutationId, position: String(at), outcome: { _tag: "Applied" } }
             })
             // The first push that carries a mutation commits on the server, then its response is lost.
-            return pushes === 1 ? Effect.fail(new Offline()) : Effect.succeed(decodePush({ results }))
+            return pushes === 1 ? Effect.fail(offline()) : Effect.succeed(decodePush({ results }))
           }),
         pull: () =>
           Effect.map(Queue.take(pulls), (acked) => {

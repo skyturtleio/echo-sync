@@ -69,7 +69,7 @@ const serve = Effect.fnUntraced(function* (tables: Registry.SyncRegistry, client
     { preconnect: globalThis.fetch.preconnect }
   )
   const rpc = yield* Transport.make.pipe(Effect.provide(Transport.layerProtocolHttp("http://echo.test/sync")))
-  const transport: Engine.Transport<Transport.TransportError> = {
+  const transport: Engine.Transport = {
     push: (request) => rpc.push(request).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)),
     pull: (request) => rpc.pull(request).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
   }
@@ -78,7 +78,7 @@ const serve = Effect.fnUntraced(function* (tables: Registry.SyncRegistry, client
 
 const device = Effect.fnUntraced(function* (
   tables: Registry.SyncRegistry,
-  transport: Engine.Transport<Transport.TransportError>,
+  transport: Engine.Transport,
   database?: SqliteClient.SqliteClient
 ) {
   const sqlite =
@@ -193,13 +193,14 @@ describe.skipIf(!pgAvailable)("two-direction version gate (DESIGN §16.7), real 
           })
         )
         expect(refused._tag).toBe("Failure")
-        expect(Option.getOrNull(Exit.findErrorOption(refused))?._tag).toBe("ClientOutdated")
-        expect(yield* Effect.flip(engine.push)).toBeInstanceOf(Protocol.ClientOutdated)
+        const refusal = Option.getOrNull(Exit.findErrorOption(refused))
+        expect(refusal?._tag === "SyncTransportError" && refusal.reason._tag).toBe("ClientOutdated")
+        const pushRefusal = yield* Effect.flip(engine.push)
+        expect(pushRefusal._tag === "SyncTransportError" && pushRefusal.reason).toBeInstanceOf(Protocol.ClientOutdated)
         expect(history.map((h) => h.migration)).toEqual(["001_old", "002_current"])
         expect(allowed.size).toBe(1)
         const loop = yield* SyncLoop.make({
           engine,
-          isFatalPush: Transport.isFatalPush,
           pendingMutations: storage.pendingCount
         })
         const clock = yield* TestClock.make()
@@ -226,7 +227,6 @@ describe.skipIf(!pgAvailable)("two-direction version gate (DESIGN §16.7), real 
         expect((yield* updated.storage.pending).map((p) => p.envelope)).toEqual([original, offline])
         const resumed = yield* SyncLoop.make({
           engine: updated.engine,
-          isFatalPush: Transport.isFatalPush,
           pendingMutations: updated.storage.pendingCount
         })
         const resuming = yield* Effect.forkScoped(resumed.run)
@@ -251,7 +251,6 @@ describe.skipIf(!pgAvailable)("two-direction version gate (DESIGN §16.7), real 
         const empty = yield* device(oldRegistry, transport)
         const pullLoop = yield* SyncLoop.make({
           engine: empty.engine,
-          isFatalPush: Transport.isFatalPush,
           pendingMutations: empty.storage.pendingCount
         })
         const pulling = yield* Effect.forkScoped(pullLoop.run)
@@ -275,7 +274,7 @@ describe.skipIf(!pgAvailable)("two-direction version gate (DESIGN §16.7), real 
         const older = yield* serve(registry)
         const { sent } = older
         let upstream = older.transport
-        const transport: Engine.Transport<Transport.TransportError> = {
+        const transport: Engine.Transport = {
           push: (request) => upstream.push(request),
           pull: (request) => upstream.pull(request)
         }
@@ -313,7 +312,6 @@ describe.skipIf(!pgAvailable)("two-direction version gate (DESIGN §16.7), real 
         const savedMeta = yield* storage.meta
         const loop = yield* SyncLoop.make({
           engine,
-          isFatalPush: Transport.isFatalPush,
           pendingMutations: storage.pendingCount
         })
         const clock = yield* TestClock.make()
