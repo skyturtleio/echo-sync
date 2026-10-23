@@ -12,6 +12,7 @@
 import * as Effect from "effect/Effect"
 import * as Deferred from "effect/Deferred"
 import * as Fiber from "effect/Fiber"
+import * as Queue from "effect/Queue"
 import * as Telemetry from "../../internal/Telemetry.ts"
 import { type FromRouter, isToRouter, type RouterBroadcast, type ToLeader } from "./messages.ts"
 import * as Platform from "./platform.ts"
@@ -40,7 +41,11 @@ export const router = (self: SharedWorkerScope): Effect.Effect<void> =>
     /** The leader each tab was last linked to (by this instance, or as the tab reported in `Hello`). */
     const linked = new Map<string, string>()
 
-    let announcements: Promise<void> = Promise.resolve()
+    /** Leader announcements, accepted one at a time in arrival order by one fiber owned by `scope`. */
+    const announcements = yield* Queue.unbounded<{
+      readonly replica: Platform.ReplicaIdentity
+      readonly announced: { readonly leaderId: string; readonly port: MessagePort }
+    }>()
 
     /**
      * Accept an announcement only from the current holder of its epoch lock. A dead leader's announcement
@@ -163,18 +168,7 @@ export const router = (self: SharedWorkerScope): Effect.Effect<void> =>
             const announced = { leaderId: data.leaderId, port: data.port }
             ports.add(data.port)
             // One announcement at a time, each checked against the live epoch lock when it is processed.
-            announcements = announcements.then(() => {
-              if (!open) return undefined
-              const fiber = fork(
-                accept(replica, announced).pipe(
-                  Effect.catchCause((cause) => Telemetry.log("Error", "echo router: leader announcement failed", cause))
-                )
-              )
-              if (fiber === undefined) return undefined
-              return new Promise<void>((resolve) => {
-                fiber.addObserver(() => resolve())
-              })
-            })
+            Queue.offerUnsafe(announcements, { replica, announced })
             return
           }
         }
@@ -183,6 +177,15 @@ export const router = (self: SharedWorkerScope): Effect.Effect<void> =>
       tabPort.addEventListener("message", onMessage)
       tabPort.start()
     }
+    fork(
+      Effect.forever(
+        Effect.flatMap(Queue.take(announcements), ({ replica, announced }) =>
+          accept(replica, announced).pipe(
+            Effect.catchCause((cause) => Telemetry.log("Error", "echo router: leader announcement failed", cause))
+          )
+        )
+      )
+    )
     self.addEventListener("connect", onConnect)
     yield* Effect.never.pipe(
       Effect.ensuring(

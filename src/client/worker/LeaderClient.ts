@@ -21,7 +21,6 @@
  * stream fails `LeaderUnavailable { reason: "Reset" }`, which is not a handover (never retried or
  * resubscribed); `status` reports `reset: true` and stays open. See `enterReset`.
  */
-import * as BrowserWorker from "@effect/platform-browser/BrowserWorker"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
@@ -30,6 +29,7 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Queue from "effect/Queue"
 import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
@@ -37,7 +37,6 @@ import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
 import * as Telemetry from "../../internal/Telemetry.ts"
 import { type AccessScope, type Errors, Ids, type Mutation, Protocol, type Query } from "echo-sync"
-import { RpcClient } from "effect/rpc"
 import { RpcClientError } from "effect/rpc/RpcClientError"
 import type { LocallyRejected } from "../sync/Engine.ts"
 import type { SyncStatus } from "../sync/SyncLoop.ts"
@@ -47,7 +46,6 @@ export { SyncErrorKind } from "../sync/SyncFailure.ts"
 import {
   type Enqueued,
   type LeaderInfo,
-  LeaderRpcs,
   type PendingExport,
   PresenceAlreadyOpen,
   type StoredNotice,
@@ -70,6 +68,7 @@ import {
   type ToRouter
 } from "./messages.ts"
 import * as Platform from "./platform.ts"
+import { type LeaderConnection, TabPlatform } from "./TabPlatform.ts"
 
 export interface LeaderClientConfig extends TabApiOptions {
   readonly appId: string
@@ -404,8 +403,7 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
   }
 }
 
-const makeRpcClient = RpcClient.make(LeaderRpcs)
-type Client = Effect.Success<typeof makeRpcClient>
+type Client = LeaderConnection
 
 type Connection =
   | {
@@ -427,8 +425,9 @@ const lostError = (leaderId: string, detail?: string) =>
 
 export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Service"], never, Scope.Scope> =>
   Effect.gen(function* () {
+    const platform = yield* TabPlatform
     const identity: Platform.ReplicaIdentity = { appId: config.appId, profile: config.profile }
-    const capability = Platform.tabCapability()
+    const capability = platform.capability()
     const unsupported = Platform.validateIdentity(identity) ?? capability.unsupported
     const mode: Mode =
       unsupported !== undefined ? "unsupported" : capability.sharedWorker ? "shared-worker" : "single-tab"
@@ -441,7 +440,6 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
      */
     const topology = Scope.forkUnsafe(scope)
     const context = yield* Effect.context<never>()
-    let open = true
     /** Set once by the reset signal, never cleared: no path below starts, elects or joins a leader after it. */
     let reset = false
     /**
@@ -469,16 +467,19 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     yield* Scope.addFinalizer(
       scope,
       Effect.sync(() => {
-        open = false
         for (const port of routerPorts) port.close()
         for (const port of pendingConnections) port.close()
         pendingConnections.clear()
       })
     )
-    const fork = <A, E>(effect: Effect.Effect<A, E>) => {
-      if (!open || reset || scope.state._tag === "Closed") return undefined
-      return Fiber.runIn(Effect.runForkWith(context)(effect), topology)
-    }
+    /**
+     * Whether this client may still act in the topology: not reset and its scope not closed (a scope is
+     * marked closed before its finalizers run, so this is false from the first finalizer on).
+     */
+    const live = () => !reset && scope.state._tag !== "Closed"
+    // DOM callbacks start their Effect work here: owned by `topology`, so a reset or the client's close ends it.
+    const fork = <A, E>(effect: Effect.Effect<A, E>) =>
+      live() ? Fiber.runIn(Effect.runForkWith(context)(effect), topology) : undefined
 
     // `current` is pending while no leader is connected; requests wait on it.
     let current = Deferred.makeUnsafe<Connection>()
@@ -650,8 +651,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
       // The channel name already scopes the identity; the payload is checked too, so no name collision can
       // ever close a client of another identity.
       if (!isResetSignal(message) || message.appId !== config.appId || message.profile !== config.profile) return
-      if (!open || reset || scope.state._tag === "Closed") return
-      enterReset()
+      if (live()) enterReset()
     })
     yield* Scope.addFinalizer(
       scope,
@@ -660,7 +660,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
 
     // Held for the tab's lifetime: the leader and the router drop this tab's port when it is released.
     // Waited on in a fiber owned by `topology`, so a reset during the wait dequeues the request (DESIGN §16.24).
-    const tabLockFiber = fork(Platform.holdLock(Platform.tabLockName(identity, tabId)).pipe(Scope.provide(topology)))
+    const tabLockFiber = fork(platform.holdLock(Platform.tabLockName(identity, tabId)).pipe(Scope.provide(topology)))
     if (tabLockFiber === undefined) return service
     const tabLock = yield* Fiber.await(tabLockFiber)
     if (reset) return service
@@ -671,7 +671,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
       })
       return service
     }
-    void navigator.storage.persist().catch(() => false)
+    yield* platform.persistStorage
 
     /**
      * Fail everything in flight on `connection` with a typed `LeaderLost` first, then tear down its RPC
@@ -698,7 +698,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
       // Requests wait for this connection's handshake rather than using the displaced one.
       publish(undefined)
       fork(
-        Platform.awaitLockReleased(Platform.leaderEpochLockName(identity, leaderId)).pipe(
+        platform.awaitLockReleased(Platform.leaderEpochLockName(identity, leaderId)).pipe(
           Effect.andThen(
             Effect.suspend(() => {
               const lost = active === connection
@@ -737,15 +737,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
             Effect.sync(() => port.close())
           )
           pendingConnections.delete(port)
-          const protocol = yield* Layer.buildWithScope(
-            // One port, multiplexed: a request holds its pool lease until its Exit, so the default per-item
-            // concurrency of 1 would let one open `subscribe` stream block every other request.
-            RpcClient.layerProtocolWorker({ size: 1, concurrency: Number.MAX_SAFE_INTEGER }).pipe(
-              Layer.provide(BrowserWorker.layer(() => port))
-            ),
-            connection.scope
-          )
-          const client = yield* makeRpcClient.pipe(Effect.provide(protocol), Scope.provide(connection.scope))
+          const client = yield* platform.connect(port).pipe(Scope.provide(connection.scope))
           if (active === connection) publish({ _tag: "Connected", leaderId, client, lost: connection.lost })
         }).pipe(
           // The handshake never completes if the leader died first.
@@ -771,14 +763,17 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
      * - the epoch this tab is already connected (or handshaking) to: a duplicate, which must not displace it;
      * - an epoch whose lock is not held exclusively: its leader is dead, and installing it would displace the
      *   live connection while the router, which already linked this tab to the successor, never relinks it.
+     * One fiber owned by `topology` takes them in arrival order; a port still queued when it ends is closed
+     * through `pendingConnections`.
      */
-    let routerConnects: Promise<void> = Promise.resolve()
+    const routerConnects = yield* Queue.unbounded<{ readonly leaderId: string; readonly port: MessagePort }>()
     const acceptConnected = (leaderId: string, port: MessagePort) =>
       Effect.gen(function* () {
-        const live =
+        const acceptable =
+          live() &&
           active?.leaderId !== leaderId &&
-          (yield* Platform.isLockHeld(Platform.leaderEpochLockName(identity, leaderId)))
-        if (live) connect(leaderId, port)
+          (yield* platform.isLockHeld(Platform.leaderEpochLockName(identity, leaderId)))
+        if (acceptable) connect(leaderId, port)
         else port.close()
       }).pipe(
         Effect.ensuring(
@@ -791,20 +786,16 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     const onRouterMessage = (event: MessageEvent) => {
       const message: unknown = event.data
       if (!isFromRouter(message)) return
-      if (!open || reset || scope.state._tag === "Closed") {
+      if (!live()) {
         message.port.close()
         return
       }
       pendingConnections.add(message.port)
-      routerConnects = routerConnects.then(() => {
-        if (!open || reset || scope.state._tag === "Closed") return undefined
-        const fiber = fork(acceptConnected(message.leaderId, message.port))
-        if (fiber === undefined) return undefined
-        return new Promise<void>((resolve) => {
-          fiber.addObserver(() => resolve())
-        })
-      })
+      Queue.offerUnsafe(routerConnects, { leaderId: message.leaderId, port: message.port })
     }
+    fork(
+      Effect.forever(Effect.flatMap(Queue.take(routerConnects), (next) => acceptConnected(next.leaderId, next.port)))
+    )
     /** Announce this tab's worker as leader `leaderId` to the current router, over a fresh port pair. */
     const announce = (leaderId: string) => {
       if (router === undefined) return
@@ -821,7 +812,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
      * Old router ports stay open: a `Connected` already in flight on one is still delivered.
      */
     const reconnectRouter = () => {
-      if (!open || reset || scope.state._tag === "Closed" || mode !== "shared-worker") return
+      if (!live() || mode !== "shared-worker") return
       const next = config.spawnRouter(Platform.routerName(identity))
       routerPorts.add(next.port)
       next.port.addEventListener("message", onRouterMessage)
@@ -839,7 +830,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     }
 
     worker.addEventListener("message", (event) => {
-      if (!open || reset || scope.state._tag === "Closed") return
+      if (!live()) return
       const message: unknown = event.data
       if (!isFromLeader(message)) return
       switch (message._tag) {
@@ -861,7 +852,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
           publishStatus()
           // The epoch lock is held by this worker until it dies, also when the tab outlives it.
           fork(
-            Platform.awaitLockReleased(Platform.leaderEpochLockName(identity, epoch)).pipe(
+            platform.awaitLockReleased(Platform.leaderEpochLockName(identity, epoch)).pipe(
               Effect.andThen(
                 Effect.sync(() => {
                   if (localEpoch !== epoch) return
