@@ -9,20 +9,28 @@ echo "[setup] Toolchain: Bun $(bun --version), Node $(node --version)"
 echo "[setup] Installing locked dependencies"
 time bun install --frozen-lockfile
 
-# Use Debian 12's Postgres without Docker. Keep data user-owned and snapshot-safe;
+# Match production's PostgreSQL major using the official PGDG Debian repository.
+# Keep data user-owned and snapshot-safe;
 # .agents/resume starts the supervised process after activation, never during setup.
-if [[ ! -x /usr/lib/postgresql/15/bin/initdb ]]; then
-  echo "[setup] Installing PostgreSQL 15"
+if [[ ! -x /usr/lib/postgresql/18/bin/initdb ]]; then
+  echo "[setup] Installing PostgreSQL 18"
+  sudo install -d /usr/share/postgresql-common/pgdg
+  sudo curl --fail --silent --show-error --location \
+    https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+    | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
   time sudo apt-get update
-  time sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql-15
+  time sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql-18
 fi
 
 echo "[setup] Preparing local test database"
-pgdata="$HOME/.local/share/echo-sync/postgres"
+# Versioned path: never open or overwrite a stale snapshot's PostgreSQL 15 data.
+pgdata="$HOME/.local/share/echo-sync/postgres-18"
 if [[ ! -f "$pgdata/PG_VERSION" ]]; then
   # Trust is only for this disposable, loopback-only orb database. No credentials
   # or user/thread authentication are stored in the shared project snapshot.
-  time /usr/lib/postgresql/15/bin/initdb -D "$pgdata" -U postgres --auth=trust --encoding=UTF8 --locale=C
+  time /usr/lib/postgresql/18/bin/initdb -D "$pgdata" -U postgres --auth=trust --encoding=UTF8 --locale=C
 fi
 
 echo "[setup] Ready in ${SECONDS}s (database starts on activation)"

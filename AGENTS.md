@@ -47,13 +47,14 @@ values were derived from the implementation.
 
 ## Orbs
 
-- `.agents/setup` installs frozen Bun dependencies and prepares a disposable PostgreSQL 15
-  database (Debian 12's version). Bun, Node and `agent-browser` come from the orb base image.
+- `.agents/setup` installs frozen Bun dependencies and prepares a disposable PostgreSQL 18
+  database (matching production's major, from PGDG). Bun, Node and `agent-browser` come from the orb base image.
 - `.agents/resume` ensures the local-only Postgres service in `.amp/services.yaml` is running.
   Use `bun run check` for the default checks and `bun run test:pg` for Postgres integration
   tests; the latter supplies the local connection URL. No project secrets are required.
 - The database trusts loopback connections and disables crash durability for test speed.
   Never expose it through a portal or use it for production data. Data lives outside the
-  checkout at `~/.local/share/echo-sync/postgres` and is preserved across wake/setup reruns.
+  checkout at `~/.local/share/echo-sync/postgres-18` and is preserved across wake/setup reruns.
+  Older PostgreSQL 15 data is left untouched; it cannot be opened directly by PostgreSQL 18.
 - Start the optional browser harness with `amp orb service start spike --command 'bun run spike'`
   when needed; setup does not run tests or start application servers.
