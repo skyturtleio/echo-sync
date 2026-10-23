@@ -37,7 +37,6 @@ import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
 import * as Telemetry from "../../internal/Telemetry.ts"
 import { type AccessScope, type Errors, Ids, type Mutation, Protocol, type Query } from "echo-sync"
-import { RpcClientError } from "effect/rpc/RpcClientError"
 import type { LocallyRejected } from "../sync/Engine.ts"
 import type { SyncStatus } from "../sync/SyncLoop.ts"
 // Values, so apps get the runtime schemas (and their types) without RPC introspection (DESIGN §16.19).
@@ -68,7 +67,8 @@ import {
   type ToRouter
 } from "./messages.ts"
 import * as Platform from "./platform.ts"
-import { type LeaderConnection, TabPlatform } from "./TabPlatform.ts"
+import * as LeaderRoute from "./LeaderRoute.ts"
+import { TabPlatform } from "./TabPlatform.ts"
 
 export interface LeaderClientConfig extends TabApiOptions {
   readonly appId: string
@@ -403,26 +403,6 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
   }
 }
 
-type Client = LeaderConnection
-
-type Connection =
-  | {
-      readonly _tag: "Connected"
-      readonly leaderId: string
-      readonly client: Client
-      /** Completed with the error in-flight requests fail with when this connection is displaced. */
-      readonly lost: Deferred.Deferred<LeaderUnavailable>
-    }
-  | { readonly _tag: "Unavailable"; readonly error: LeaderUnavailable }
-
-const isRpcClientError = (u: unknown): u is RpcClientError => u instanceof RpcClientError
-
-const lostError = (leaderId: string, detail?: string) =>
-  new LeaderUnavailable({
-    reason: "LeaderLost",
-    message: `leader ${leaderId} went away${detail === undefined ? "" : `: ${detail}`}`
-  })
-
 export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Service"], never, Scope.Scope> =>
   Effect.gen(function* () {
     const platform = yield* TabPlatform
@@ -440,8 +420,8 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
      */
     const topology = Scope.forkUnsafe(scope)
     const context = yield* Effect.context<never>()
-    /** Set once by the reset signal, never cleared: no path below starts, elects or joins a leader after it. */
-    let reset = false
+    /** Reset once by the reset signal, never undone: no path below starts, elects or joins a leader after it. */
+    const route = LeaderRoute.makeUnsafe()
     /**
      * Completed once a reset's close of `topology` has finished. Closing a scope detaches it from its parent
      * before its finalizers run, so a close of `scope` racing that reset close would no longer see `topology`
@@ -451,17 +431,8 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     const topologyClosed = Deferred.makeUnsafe<void>()
     yield* Scope.addFinalizer(
       scope,
-      Effect.suspend(() => (reset ? Deferred.await(topologyClosed) : Effect.void))
+      Effect.suspend(() => (route.isReset() ? Deferred.await(topologyClosed) : Effect.void))
     )
-    const resetError = new LeaderUnavailable({
-      reason: "Reset",
-      message: "resetReplica closed this client; build a new client to use the replica again"
-    })
-    /**
-     * After a reset a call that captured a connection before it fails `Reset`, never the shut-down RPC
-     * client's interruption (`RpcClient` answers `Effect.interrupt` once its scope closed) or `LeaderLost`.
-     */
-    const isResetTeardown = <E>(cause: Cause.Cause<E>) => reset && Cause.hasInterruptsOnly(cause)
     const routerPorts = new Set<MessagePort>()
     const pendingConnections = new Set<MessagePort>()
     yield* Scope.addFinalizer(
@@ -476,13 +447,11 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
      * Whether this client may still act in the topology: not reset and its scope not closed (a scope is
      * marked closed before its finalizers run, so this is false from the first finalizer on).
      */
-    const live = () => !reset && scope.state._tag !== "Closed"
+    const live = () => !route.isReset() && scope.state._tag !== "Closed"
     // DOM callbacks start their Effect work here: owned by `topology`, so a reset or the client's close ends it.
     const fork = <A, E>(effect: Effect.Effect<A, E>) =>
       live() ? Fiber.runIn(Effect.runForkWith(context)(effect), topology) : undefined
 
-    // `current` is pending while no leader is connected; requests wait on it.
-    let current = Deferred.makeUnsafe<Connection>()
     interface Active {
       readonly leaderId: string
       readonly scope: Scope.Closeable
@@ -496,68 +465,6 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
      * tab's replacement leader.
      */
     let localEpoch: string | undefined
-    const publish = (connection: Connection | undefined) => {
-      // After a reset `current` stays the `Reset` failure for good.
-      if (reset) return
-      if (Deferred.isDoneUnsafe(current)) current = Deferred.makeUnsafe()
-      if (connection !== undefined) Deferred.doneUnsafe(current, Effect.succeed(connection))
-    }
-
-    const withLeader = <A, E>(
-      f: (client: Client) => Effect.Effect<A, E | RpcClientError>
-    ): Effect.Effect<A, Exclude<E, RpcClientError> | LeaderUnavailable> =>
-      Effect.suspend(() => Deferred.await(current)).pipe(
-        Effect.flatMap((connection) =>
-          connection._tag === "Unavailable"
-            ? Effect.fail(connection.error)
-            : Effect.suspend(() =>
-                reset
-                  ? Effect.fail(resetError)
-                  : // The recorded loss runs first: a connection displaced before the call starts fails with its
-                    // reason at once, and the RPC on a closed client is never started.
-                    Effect.raceFirst(
-                      Effect.flatMap(Deferred.await(connection.lost), Effect.fail),
-                      f(connection.client).pipe(
-                        Effect.catchIf(isRpcClientError, (e) =>
-                          Effect.fail(reset ? resetError : lostError(connection.leaderId, e.message))
-                        )
-                      )
-                    )
-              ).pipe(Effect.catchCauseIf(isResetTeardown, () => Effect.fail(resetError)))
-        ),
-        Telemetry.boundary
-      )
-
-    /** A stream from the current leader that ends with `LeaderLost` when that leader goes away. */
-    const streamWithLeader = <A, E>(
-      f: (client: Client) => Stream.Stream<A, E | RpcClientError>
-    ): Stream.Stream<A, E | LeaderUnavailable> =>
-      Stream.unwrap(
-        Effect.suspend(() => Deferred.await(current)).pipe(
-          Effect.map((connection) =>
-            connection._tag === "Unavailable"
-              ? Stream.fail(connection.error)
-              : Stream.suspend(() =>
-                  // Checked when the stream starts, not only when `current` was read (DESIGN §16.24).
-                  reset
-                    ? Stream.fail(resetError)
-                    : f(connection.client).pipe(
-                        // Maps only the transport failures, keeping every other reason (a defect included): a
-                        // `Stream.catchIf` would re-fail any other error bare (DESIGN §16.23).
-                        Stream.catchCause((cause) =>
-                          Stream.failCause(
-                            Cause.map(cause, (e: E | RpcClientError): E | LeaderUnavailable =>
-                              isRpcClientError(e) ? (reset ? resetError : lostError(connection.leaderId, e.message)) : e
-                            )
-                          )
-                        ),
-                        Stream.interruptWhen(Effect.flatMap(Deferred.await(connection.lost), Effect.fail))
-                      )
-                ).pipe(Stream.catchCauseIf(isResetTeardown, () => Stream.fail(resetError)))
-          )
-        )
-      ).pipe(Telemetry.stream)
-
     const status = yield* SubscriptionRef.make<Status>({
       mode,
       tabId,
@@ -575,39 +482,45 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
         SubscriptionRef.set(status, {
           mode,
           tabId,
-          isLeaderTab: !reset && localEpoch !== undefined && (active === undefined || active.leaderId === localEpoch),
-          leaderId: reset ? undefined : active?.leaderId,
-          reset
+          isLeaderTab:
+            !route.isReset() && localEpoch !== undefined && (active === undefined || active.leaderId === localEpoch),
+          leaderId: route.isReset() ? undefined : active?.leaderId,
+          reset: route.isReset()
         })
       )
 
-    const enqueue = (envelope: OutboxEnvelope) => withLeader((client) => client.enqueue({ envelope }))
+    const enqueue = (envelope: OutboxEnvelope) => route.withLeader((client) => client.enqueue({ envelope }))
     const service = LeaderClient.of({
-      exec: (sql, params = []) => withLeader((client) => client.exec({ sql, params })),
+      exec: (sql, params = []) => route.withLeader((client) => client.exec({ sql, params })),
       enqueue,
       ...tabApi(
         {
           enqueue,
-          subscribe: (name, args) => streamWithLeader((client) => client.subscribe({ name, args })),
-          notices: streamWithLeader((client) => client.notices()),
-          dismissNotices: (ids) => withLeader((client) => client.dismissNotices({ ids })),
-          syncStatus: streamWithLeader((client) => client.syncStatus()),
-          requestSync: withLeader((client) => client.requestSync()),
+          subscribe: (name, args) => route.streamWithLeader((client) => client.subscribe({ name, args })),
+          notices: route.streamWithLeader((client) => client.notices()),
+          dismissNotices: (ids) => route.withLeader((client) => client.dismissNotices({ ids })),
+          syncStatus: route.streamWithLeader((client) => client.syncStatus()),
+          requestSync: route.withLeader((client) => client.requestSync()),
           presence: (room, state, revision) =>
-            streamWithLeader((client) => client.presence({ room, tabId: Protocol.TabId.make(tabId), state, revision })),
+            route.streamWithLeader((client) =>
+              client.presence({ room, tabId: Protocol.TabId.make(tabId), state, revision })
+            ),
           track: (room, state, revision) =>
-            withLeader((client) => client.track({ room, tabId: Protocol.TabId.make(tabId), state, revision }))
+            route.withLeader((client) => client.track({ room, tabId: Protocol.TabId.make(tabId), state, revision }))
         },
         config
       ),
-      leaderInfo: withLeader((client) => client.leaderInfo()),
-      subscribeRaw: (query) => streamWithLeader((client) => client.subscribeRaw({ query })),
-      exportPending: withLeader((client) => client.exportPending()),
+      leaderInfo: route.withLeader((client) => client.leaderInfo()),
+      subscribeRaw: (query) => route.streamWithLeader((client) => client.subscribeRaw({ query })),
+      exportPending: route.withLeader((client) => client.exportPending()),
       status: SubscriptionRef.changes(status)
     })
 
     if (unsupported !== undefined) {
-      publish({ _tag: "Unavailable", error: new LeaderUnavailable({ reason: "Unsupported", message: unsupported }) })
+      route.publish({
+        _tag: "Unavailable",
+        error: new LeaderUnavailable({ reason: "Unsupported", message: unsupported })
+      })
       return service
     }
 
@@ -624,9 +537,8 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
      * connections. Every path that could start, elect or join a leader checks `reset` first.
      */
     const enterReset = () => {
-      const error = resetError
-      publish({ _tag: "Unavailable", error })
-      reset = true
+      const error = route.resetError
+      route.reset()
       candidate?.terminate()
       localEpoch = undefined
       const connection = active
@@ -663,9 +575,9 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     const tabLockFiber = fork(platform.holdLock(Platform.tabLockName(identity, tabId)).pipe(Scope.provide(topology)))
     if (tabLockFiber === undefined) return service
     const tabLock = yield* Fiber.await(tabLockFiber)
-    if (reset) return service
+    if (route.isReset()) return service
     if (Exit.isFailure(tabLock)) {
-      publish({
+      route.publish({
         _tag: "Unavailable",
         error: new LeaderUnavailable({ reason: "Unsupported", message: `tab lock: ${String(tabLock.cause)}` })
       })
@@ -677,13 +589,13 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
      * Fail everything in flight on `connection` with a typed `LeaderLost` first, then tear down its RPC
      * client: closing the scope first would surface as interruption instead.
      */
-    const displace = (connection: Active, error: LeaderUnavailable = lostError(connection.leaderId)) => {
+    const displace = (connection: Active, error: LeaderUnavailable = LeaderRoute.lostError(connection.leaderId)) => {
       Deferred.doneUnsafe(connection.lost, Effect.succeed(error))
       fork(Effect.andThen(Effect.yieldNow, Scope.close(connection.scope, Exit.void)))
     }
 
     const connect = (leaderId: string, port: MessagePort) => {
-      if (reset) {
+      if (route.isReset()) {
         port.close()
         return
       }
@@ -696,7 +608,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
       active = connection
       publishStatus()
       // Requests wait for this connection's handshake rather than using the displaced one.
-      publish(undefined)
+      route.publish(undefined)
       fork(
         platform.awaitLockReleased(Platform.leaderEpochLockName(identity, leaderId)).pipe(
           Effect.andThen(
@@ -706,7 +618,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
                 if (lost) {
                   active = undefined
                   publishStatus()
-                  publish(undefined)
+                  route.publish(undefined)
                 }
                 displace(connection)
                 // The router may have died with that leader's tab (WebKit ends a SharedWorker with its creating
@@ -717,7 +629,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
                 ? Telemetry.observe(
                     cleanup.pipe(
                       Effect.andThen(Telemetry.count("echo.leader.loss.total", "lost")),
-                      Effect.andThen(Effect.suspend(() => Deferred.await(current))),
+                      Effect.andThen(Effect.suspend(() => route.awaitConnection)),
                       Effect.flatMap((replacement) =>
                         Telemetry.annotate({ "echo.result": replacement._tag === "Connected" ? "elected" : "lost" })
                       )
@@ -739,7 +651,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
           )
           pendingConnections.delete(port)
           const client = yield* platform.connect(port).pipe(Scope.provide(connection.scope))
-          if (active === connection) publish({ _tag: "Connected", leaderId, client, lost: connection.lost })
+          if (active === connection) route.publish({ _tag: "Connected", leaderId, client, lost: connection.lost })
         }).pipe(
           // The handshake never completes if the leader died first.
           Effect.raceFirst(Deferred.await(connection.lost)),
@@ -749,7 +661,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     }
 
     // A reset signal that arrived while this client was being built: never start a candidate for it.
-    if (reset) return service
+    if (route.isReset()) return service
     const worker = config.spawnLeader(`echo:${config.appId}:${config.profile}:leader-candidate`)
     candidate = worker
     yield* Scope.addFinalizer(
@@ -837,7 +749,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
       switch (message._tag) {
         case "Waiting": {
           if (router === undefined) {
-            publish({
+            route.publish({
               _tag: "Unavailable",
               error: new LeaderUnavailable({
                 reason: "SecondaryTabWithoutRouter",
@@ -880,7 +792,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
         }
         case "Failed": {
           if (active === undefined) {
-            publish({
+            route.publish({
               _tag: "Unavailable",
               error: new LeaderUnavailable({ reason: "LeaderFailed", message: message.message })
             })
