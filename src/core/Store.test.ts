@@ -279,7 +279,7 @@ describe("typed Store over a RowStore", () => {
     // Nor does a store acting as `*` own the * grant.
     const star = await Effect.runPromise(Effect.flip(as(everyone).delete(ScopeGrants, grantId(s1, everyone))))
     expect(star).toMatchObject({ _tag: "ScopeForbidden", required: "owner" })
-    // Own-row insert and patch stay owner-only.
+    // Own-row patch stays owner-only (own-row insert: below, after relinquishing).
     const patched = await Effect.runPromise(Effect.flip(as(r1).patch(ScopeGrants, grantId(s1, r1), { role: "owner" })))
     expect(patched).toMatchObject({ _tag: "ScopeForbidden", required: "owner" })
 
@@ -291,6 +291,9 @@ describe("typed Store over a RowStore", () => {
     const after = await Effect.runPromise(Effect.flip(writer.patch(Items, ItemId.make("i1"), { rank: 3 })))
     expect(after).toMatchObject({ _tag: "ScopeForbidden", required: "writer", held: "reader" })
     await Effect.runPromise(as(r1).delete(ScopeGrants, grantId(s1, r1)))
+    // Re-granting oneself after leaving stays owner-only.
+    const back = await Effect.runPromise(Effect.flip(as(r1).insert(ScopeGrants, grant(r1, "reader"))))
+    expect(back).toMatchObject({ _tag: "ScopeForbidden", required: "owner", held: "reader" })
 
     expect([...(mem.data.get("scope_grants")?.keys() ?? [])].toSorted()).toEqual(
       [grantId(s1, owner), grantId(s1, r2), grantId(s1, everyone)].toSorted()

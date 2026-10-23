@@ -39,6 +39,7 @@ const derived = (scope: string, principal: string) =>
 const mutate = (
   actor: string,
   mutationId: string,
+  seq: bigint,
   handler: (store: Store.EchoStore) => Effect.Effect<void, BodyError>
 ) =>
   Effect.gen(function* () {
@@ -53,10 +54,7 @@ const mutate = (
       })
       yield* handler(store)
     })
-    const { outcome } = yield* runMutation(
-      { principalId: actor, clientId: `${actor}-device`, mutationId, seq: 1n },
-      body
-    )
+    const { outcome } = yield* runMutation({ principalId: actor, clientId: `${actor}-device`, mutationId, seq }, body)
     return outcome._tag === "Applied" ? "Applied" : `Rejected:${outcome.error._tag}`
   })
 
@@ -206,12 +204,12 @@ describe.skipIf(!pgAvailable)("self-revocation of a grant (§4, §16.27)", () =>
         // Relinquishing first, then writing in the scope: the write has no grant, and the whole
         // mutation (the delete included) rolls back.
         assert.strictEqual(
-          yield* mutate("w", "leave-then-write", (store) => Effect.andThen(leave("w")(store), write(store))),
+          yield* mutate("w", "leave-then-write", 1n, (store) => Effect.andThen(leave("w")(store), write(store))),
           "Rejected:ScopeForbidden"
         )
-        assert.strictEqual(yield* mutate("r", "leave", leave("r")), "Applied")
+        assert.strictEqual(yield* mutate("r", "leave", 1n, leave("r")), "Applied")
         assert.strictEqual(
-          yield* mutate("w", "write-then-leave", (store) => Effect.andThen(write(store), leave("w")(store))),
+          yield* mutate("w", "write-then-leave", 2n, (store) => Effect.andThen(write(store), leave("w")(store))),
           "Applied"
         )
         const grants = yield* sql<{ principal_id: string }>`
