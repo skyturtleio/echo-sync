@@ -180,7 +180,7 @@ export const router = (self: SharedWorkerScope): Effect.Effect<void> =>
     fork(
       Effect.forever(
         Effect.flatMap(Queue.take(announcements), ({ replica, announced }) =>
-          accept(replica, announced).pipe(
+          Effect.suspend(() => (open ? accept(replica, announced) : Effect.void)).pipe(
             Effect.catchCause((cause) => Telemetry.log("Error", "echo router: leader announcement failed", cause))
           )
         )
