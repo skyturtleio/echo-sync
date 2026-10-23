@@ -16,7 +16,7 @@
 import { Effect, Option, Schema, Semaphore, type Stream } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
-import { type Errors, Ids, Mutation, Protocol, type Registry, type Store, SyncTable } from "echo-sync"
+import { type Errors, Ids, Mutation, Protocol, type Registry, Store, SyncTable } from "echo-sync"
 import * as Outbox from "../Outbox.ts"
 import * as SqliteRowStore from "../SqliteRowStore.ts"
 import type * as Engine from "./Engine.ts"
@@ -38,30 +38,28 @@ const StoredMeta = Schema.fromJsonString(
   Schema.Struct({ cursor: Ids.Cursor, pushedThrough: Schema.Int, resnapshot: Schema.Boolean })
 )
 
-// Our own rows failing to decode means corruption or a version skew: a defect, never retryable.
-const decode = <S extends Schema.Codec<unknown, string>>(schema: S) => {
-  const run = Schema.decodeEffect(schema)
-  return (text: string) => Effect.orDie(run(text))
-}
+// Our own rows failing to decode means corruption or a version skew: the `CorruptStorage` defect, never retryable.
+const decode =
+  <A>(schema: Schema.Decoder<A>, table: string) =>
+  (text: string): Effect.Effect<A> =>
+    Store.decodeStored(schema, table, text)
 const encode = <S extends Schema.Codec<unknown, string>>(schema: S) => {
   const run = Schema.encodeEffect(schema)
   return (value: S["Type"]) => Effect.orDie(run(value))
 }
-const decodePage = decode(StoredPage)
+const decodePage = decode(StoredPage, "echo_staged")
 const encodePage = encode(StoredPage)
-const decodeUndo = decode(StoredUndo)
-const decodeEnvelope = Schema.decodeUnknownEffect(Mutation.MutationEnvelope)
-const decodeSeq = Schema.decodeUnknownEffect(Ids.Seq)
+const decodeUndo = decode(StoredUndo, "echo_outbox")
 const encodeUndo = encode(StoredUndo)
 const encodeNotice = encode(StoredNotice)
-const decodeNotice = decode(StoredNotice)
-const decodeMeta = decode(StoredMeta)
+const decodeNotice = decode(StoredNotice, "echo_notices")
+const decodeMeta = decode(StoredMeta, "echo_meta")
 const encodeMeta = encode(StoredMeta)
 
 const initialMeta: Engine.SyncMeta = { cursor: null, pushedThrough: 0, resnapshot: false }
 
 const StoredTables = Schema.fromJsonString(Schema.Array(Schema.String))
-const decodeTables = decode(StoredTables)
+const decodeTables = decode(StoredTables, "echo_meta")
 const encodeTables = encode(StoredTables)
 const q = (name: string) => `"${name.replaceAll('"', '""')}"`
 
@@ -145,14 +143,11 @@ const encodeUndoImages = (undo: ReadonlyArray<Store.UndoImage>) =>
   encodeUndo(undo.map((image) => ({ table: image.table.name, id: image.id, before: image.before })))
 
 const toEnvelope = (entry: Outbox.OutboxEntry): Effect.Effect<Mutation.MutationEnvelope> =>
-  Effect.orDie(
-    decodeEnvelope({
-      clientId: entry.clientId,
-      mutationId: entry.mutationId,
-      seq: entry.seq,
-      name: entry.name,
-      args: entry.args
-    })
+  Store.decodeStored(
+    Mutation.MutationEnvelope,
+    "echo_outbox",
+    { clientId: entry.clientId, mutationId: entry.mutationId, seq: entry.seq, name: entry.name, args: entry.args },
+    entry.mutationId
   )
 
 /**
@@ -243,7 +238,7 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
       Effect.flatMap(run(Outbox.lookup(mutationId)), (entry) =>
         Option.isNone(entry) ? Effect.succeedNone : Effect.asSome(toEnvelope(entry.value))
       ),
-    nextSeq: Effect.flatMap(run(Outbox.nextSeq), (seq) => Effect.orDie(decodeSeq(seq))),
+    nextSeq: Effect.flatMap(run(Outbox.nextSeq), (seq) => Store.decodeStored(Ids.Seq, "sqlite_sequence", seq)),
     appendPending: (entry) =>
       Effect.gen(function* () {
         const undo = yield* encodeUndoImages(entry.undo)

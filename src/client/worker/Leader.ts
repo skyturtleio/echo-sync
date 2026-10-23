@@ -324,7 +324,7 @@ type Reset = Extract<ToLeader, { readonly _tag: "Reset" }>
 
 /** The OPFS directory for `path`, or `undefined` if some part of it does not exist. */
 const opfsDirectory = (path: string) =>
-  Platform.storageCall(`opening the OPFS directory ${path}`, async () => {
+  Platform.storageCall("opening an OPFS directory", async () => {
     let dir = await navigator.storage.getDirectory()
     for (const part of path.split("/")) {
       try {
@@ -340,8 +340,13 @@ const opfsDirectory = (path: string) =>
 const isNotFound = (cause: unknown) => cause instanceof DOMException && cause.name === "NotFoundError"
 
 /** Remove `name` from `parent`; an entry that is already gone counts as removed. */
-const removeIfPresent = (parent: FileSystemDirectoryHandle, name: string, options?: FileSystemRemoveOptions) =>
-  Platform.storageCall(`removing ${parent.name}/${name}`, () =>
+const removeIfPresent = (
+  what: string,
+  parent: FileSystemDirectoryHandle,
+  name: string,
+  options?: FileSystemRemoveOptions
+) =>
+  Platform.storageCall(`removing ${what}`, () =>
     parent.removeEntry(name, options).catch((cause: unknown) => {
       if (!isNotFound(cause)) throw cause
     })
@@ -352,7 +357,10 @@ const removeIfPresent = (parent: FileSystemDirectoryHandle, name: string, option
  * tombstone goes last, so a crash in between leaves it in place and the next leader or reset repeats this.
  */
 const removeCondemned = (parent: FileSystemDirectoryHandle, identity: Platform.ReplicaIdentity, tombstone: string) =>
-  Effect.andThen(removeIfPresent(parent, identity.profile, { recursive: true }), removeIfPresent(parent, tombstone))
+  Effect.andThen(
+    removeIfPresent("the replica directory", parent, identity.profile, { recursive: true }),
+    removeIfPresent("the reset tombstone", parent, tombstone)
+  )
 
 /**
  * Finish a reset that was interrupted after writing its tombstone (DESIGN §16.26). Call only under the
@@ -364,7 +372,7 @@ const completeInterruptedReset = (identity: Platform.ReplicaIdentity) =>
     const parent = yield* opfsDirectory(`echo-sync/${identity.appId}`)
     if (parent === undefined) return false
     const tombstone = yield* Platform.tombstoneName(identity)
-    const condemned = yield* Platform.storageCall(`looking up the reset tombstone in ${parent.name}`, () =>
+    const condemned = yield* Platform.storageCall("looking up the reset tombstone", () =>
       parent.getFileHandle(tombstone).then(
         () => true,
         (cause: unknown) => {
@@ -440,7 +448,7 @@ const reset = (message: Reset): Effect.Effect<ResetOutcome> =>
           // crash leaves the tombstone, and the next leader or reset completes the removal; before here it
           // leaves the replica intact.
           const tombstone = yield* Platform.tombstoneName(identity)
-          yield* Platform.storageCall(`writing the reset tombstone in ${parent.name}`, () =>
+          yield* Platform.storageCall("writing the reset tombstone", () =>
             parent.getFileHandle(tombstone, { create: true })
           )
           yield* removeCondemned(parent, identity, tombstone)

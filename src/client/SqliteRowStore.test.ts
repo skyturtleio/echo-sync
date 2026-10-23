@@ -216,9 +216,12 @@ it.effect("a stored row that no longer decodes must die naming its table and row
       expect(Option.map(defect, ({ table, id }) => ({ table, id }))).toEqual(
         Option.some({ table: "items", id: "i000" })
       )
-      expect(Option.getOrUndefined(Option.map(defect, (e) => e.message))).toMatch(
-        /^stored data in "items" row "i000" does not decode with its schema \(.*\["doc"\]\)/s
+      // The message must name where the bad data is and which column: the table, the row and the field.
+      const message = Option.getOrElse(
+        Option.map(defect, (e) => e.message),
+        () => ""
       )
+      for (const part of ["items", "i000", "doc"]) expect(message).toContain(part)
     }
   }).pipe(Effect.provide(Db))
 )

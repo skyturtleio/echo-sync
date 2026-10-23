@@ -18,6 +18,7 @@
 import * as Clock from "effect/Clock"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
+import { Store } from "echo-sync"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
@@ -43,13 +44,11 @@ const EntryRow = Schema.Struct({
   created_at: Schema.Number,
   released_at: Schema.NullOr(Schema.Number)
 })
-const decodeRows = Schema.decodeUnknownEffect(Schema.Array(EntryRow))
 
 const toEntries = (rows: ReadonlyArray<unknown>): Effect.Effect<ReadonlyArray<OutboxEntry>> =>
-  decodeRows(rows).pipe(
-    // A row that does not decode was written by a different engine version or corrupted; that is a
-    // defect, never something a caller can recover from by retrying.
-    Effect.orDie,
+  // A row that does not decode was written by a different engine version or corrupted: the `CorruptStorage`
+  // defect, never something a caller can recover from by retrying.
+  Effect.forEach(rows, (row) => Store.decodeStored(EntryRow, "echo_outbox", row)).pipe(
     Effect.map((decoded) =>
       decoded.map((r) => ({
         seq: r.seq,

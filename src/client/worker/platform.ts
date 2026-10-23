@@ -115,8 +115,8 @@ export const tabLockName = ({ appId, profile }: ReplicaIdentity, tabId: string):
 export const describe = (u: unknown): string => (u instanceof Error ? `${u.name}: ${u.message}` : String(u))
 
 /**
- * A browser storage call (OPFS, SQLite on OPFS, Web Crypto) failed. `operation` says what was attempted and
- * on which path; `cause` is what the browser threw, typically a `DOMException` whose `name` says why.
+ * A browser storage call (OPFS, SQLite on OPFS, Web Crypto) failed. `operation` says what was attempted, never
+ * on which path (paths name the app and profile, which errors an app may forward must not carry); `cause` is what the browser threw, typically a `DOMException` whose `name` says why.
  */
 export class BrowserStorageError extends Data.TaggedError("BrowserStorageError")<{
   readonly operation: string
@@ -282,7 +282,7 @@ export const tabCapability = (): { readonly unsupported: string | undefined; rea
  * does not crash on a handle still held by its predecessor.
  */
 export const awaitOpfsPoolFree = (directory: string): Effect.Effect<void, BrowserStorageError> =>
-  storageCall(`waiting for the OPFS pool ${directory} to be free`, async () => {
+  storageCall("waiting for the OPFS pool to be free", async () => {
     const root = await navigator.storage.getDirectory()
     let dir = root
     try {

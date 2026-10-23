@@ -162,6 +162,25 @@ export const planResult = (
   return Option.match(plan.limit, { onNone: () => ordered, onSome: (n) => ordered.slice(0, n) })
 }
 
+/** The `id` column of a stored row, when it has one. */
+const rowId = (row: unknown): string | undefined =>
+  typeof row === "object" && row !== null && "id" in row && typeof row.id === "string" ? row.id : undefined
+
+/**
+ * Decode data the engine itself stored. It was written through `schema`, so a failure is corruption of trusted
+ * storage, not a domain outcome: the `CorruptStorage` defect, naming the table and the row (`id`, by default
+ * the row's own `id` column).
+ */
+export const decodeStored = <A>(
+  schema: Schema.Decoder<A>,
+  table: string,
+  stored: unknown,
+  id: string | undefined = rowId(stored)
+): Effect.Effect<A> =>
+  Schema.decodeUnknownEffect(schema)(stored).pipe(
+    Effect.catch((cause) => Effect.die(new CorruptStorage({ table, id, cause })))
+  )
+
 // ---------------------------------------------------------------------------------------------
 // RowStore ports (implemented per dialect)
 // ---------------------------------------------------------------------------------------------
@@ -174,25 +193,6 @@ export const planResult = (
  * - reads fail only with the transient `StoreUnavailable`; writes may also fail permanently
  *   with `ConstraintViolated` when an authoritative database constraint refuses the write.
  */
-/** The `id` column of a stored row, when it has one. */
-const rowId = (row: unknown): string | undefined =>
-  typeof row === "object" && row !== null && "id" in row && typeof row.id === "string" ? row.id : undefined
-
-/**
- * Decode data the engine itself stored. It was written through `schema`, so a failure is corruption of trusted
- * storage, not a domain outcome: the `CorruptStorage` defect, naming the table and the row (`id`, by default
- * the row's own `id` column).
- */
-export const decodeStored = <S extends Schema.Decoder<unknown>>(
-  schema: S,
-  table: string,
-  stored: unknown,
-  id: string | undefined = rowId(stored)
-): Effect.Effect<S["Type"], never, S["DecodingServices"]> =>
-  Schema.decodeUnknownEffect(schema)(stored).pipe(
-    Effect.catch((cause) => Effect.die(new CorruptStorage({ table, id, cause })))
-  )
-
 export interface RowStore {
   readonly read: (table: AnySyncTable, id: string) => Effect.Effect<Option.Option<EncodedRow>, StoreUnavailable>
   /** Upsert (`Some`) or delete (`None`) the row with this id. */
