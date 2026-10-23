@@ -152,8 +152,9 @@ export interface Verdict {
 /**
  * Whole-cause verdict (DESIGN §6: defect > integrity > anything else), never just the first failure:
  * a defect anywhere halts a push, even beside a transient failure, since an RPC request decode failure
- * arrives as an untagged defect. A pull's caller ignores `halt` (a pull defect is transient). The cause
- * must not be interruption-only; interruption is the caller's to re-raise.
+ * arrives as an untagged defect. A pull's caller ignores `halt` (a pull defect is transient); the
+ * transport never fails a pull with a push-only reason, so a pull's kind is its first failure's. The
+ * cause must not be interruption-only; interruption is the caller's to re-raise.
  */
 export const classify = (cause: Cause.Cause<PullFailure>): Verdict => {
   const failures = cause.reasons.filter(Cause.isFailReason).map((reason) => meaningOf(reason.error))

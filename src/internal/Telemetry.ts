@@ -291,8 +291,6 @@ const kind = (error: unknown): string => {
   if (Predicate.isTagged(error, "LocallyRejected")) return "rejected"
   if (Predicate.isTagged(error, "Forbidden")) return "forbidden"
   if (Predicate.isTagged(error, "MalformedEnvelope")) return "halted"
-  if (Predicate.isTagged(error, "TimeoutError")) return "idle-timeout"
-  if (Predicate.isTagged(error, "Done")) return "server-end"
   return "server"
 }
 
