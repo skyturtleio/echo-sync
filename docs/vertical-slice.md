@@ -75,11 +75,10 @@ through the idle timeout and the reconnect backoff, as any client behind such a 
 ## Running it
 
 ```sh
-# Postgres 17 (in an orb: start dockerd first, e.g. amp orb service start dockerd --command 'sudo dockerd')
-docker run -d --name echo-pg -p 5432:5432 -e POSTGRES_PASSWORD=echo postgres:17
-
-amp orb service start echo-server --command 'bun examples/server/main.ts'   # or run it in a terminal
-amp orb service start spike --command 'bun run spike'                       # Vite harness on :5199
+# PostgreSQL on localhost:5432 (.agents/setup prepares one; or any server, e.g.
+#   docker run -d --name echo-pg -p 5432:5432 -e POSTGRES_PASSWORD=echo postgres:18)
+bun examples/server/main.ts &         # the slice server on :5200 (scenarios.sh needs it; slice.sh starts its own)
+bun run spike &                       # Vite harness on :5199
 
 examples/browser-spike/scenarios.sh   # the 18 substrate scenarios (real-server mode by default)
 examples/browser-spike/slice.sh       # the 12 vertical-slice checks (always real server)
@@ -101,10 +100,11 @@ leader that is still offline. A check treats the gate as in effect only once a s
 `lastError.kind === "network"`, so a halted push can never pass for offline.
 
 `ECHO_PG_URL` (default `postgres://postgres:echo@localhost:5432/postgres`), `ECHO_SLICE_DB` and
-`ECHO_SLICE_PORT` (default 5200) configure the server. slice.sh restarts the server in scenario 5 with
-`$ECHO_SERVER_STOP` and `$ECHO_SERVER_START`, which default to stopping and starting the `echo-server`
-orb service. Each run uses fresh app ids, scopes and mutation ids, so runs never interfere and the
-database can be reused.
+`ECHO_SLICE_PORT` (default 5200) configure the server. slice.sh starts `examples/server/main.ts` itself,
+restarts it in scenario 5, and stops it on exit (`ECHO_SERVER_LOG` captures its output). To run against a
+server you manage instead (for example a supervised service), start it before the run and set
+`ECHO_SERVER_START` and `ECHO_SERVER_STOP` to the commands that start and stop it. Each run uses fresh app
+ids, scopes and mutation ids, so runs never interfere and the database can be reused.
 
 ## Which server a scenario runs against
 

@@ -358,7 +358,7 @@ Caveats, all from documentation and untested here:
 
 ## WebKit smoke (DESIGN §16 browser matrix)
 
-Run on Playwright's WebKit build in the orb, against the Vite harness and examples/server with real
+Run on Playwright's WebKit build on Linux, against the Vite harness and examples/server with real
 Postgres. **This is desktop WebKit on Linux (the GTK port, headless), not Safari, and not iPhone Safari.**
 It shares WebCore and JavaScriptCore with Safari, but not Safari's process model, storage backend, or iOS's
 background suspension, so each finding below says whether it is expected to carry over.
@@ -373,7 +373,7 @@ on its own port, stopped on exit. Chromium runs are unchanged.
 ```sh
 mkdir -p ~/.cache/echo-webkit && cd ~/.cache/echo-webkit && bun add playwright@1.64.1
 bunx playwright install-deps webkit          # system libraries (apt)
-bunx playwright install webkit               # in this orb its unzip step hung: download
+bunx playwright install webkit               # if its unzip step hangs (seen on Debian 12): download
 #   https://cdn.playwright.dev/dbazure/download/playwright/builds/webkit/2370/webkit-debian-12.zip,
 #   unzip it into ~/.cache/ms-playwright/webkit-2370 and touch INSTALLATION_COMPLETE there instead
 cd -
@@ -590,7 +590,7 @@ tables and replica schema, one transaction) and builds `Engine.make` over the SQ
 
 ```sh
 bun install
-bun run spike                          # Vite harness on http://127.0.0.1:5199 (or: amp orb service start spike --command 'bun run spike')
+bun run spike                          # Vite harness on http://127.0.0.1:5199
 examples/browser-spike/scenarios.sh    # drives Chromium with agent-browser; one PASS/FAIL per invariant, non-zero exit on failure
 ```
 

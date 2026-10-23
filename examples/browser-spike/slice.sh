@@ -7,19 +7,30 @@
 # SLICE_ORDER lists the sections to run, in order; SLICE_CONTROL injects one deliberate fault that must
 # make its check fail (both documented in docs/vertical-slice.md).
 #
-# Needs the slice server and the harness running. Scenario 5 stops and restarts the server with
-# $ECHO_SERVER_STOP / $ECHO_SERVER_START (default: the `echo-server` orb service).
+# Needs the harness running. Unless $ECHO_SERVER_START is set, slice.sh starts examples/server/main.ts
+# itself (output to $ECHO_SERVER_LOG, default /dev/null) and stops it on exit. Scenario 5 stops and restarts
+# the server; set $ECHO_SERVER_START and $ECHO_SERVER_STOP to manage a server of your own instead.
 # Prints one PASS/FAIL line per invariant and a summary; exits non-zero if any failed. Every check awaits
 # the condition it asserts (echo.until); the only fixed wait is the server's downtime in scenario 5. Scenarios
 # 3 and 6 hold the server's push handler at a named gate (app.ts) until they open it through /admin/open.
 ECHO_SYNC=real
 SESSION_PREFIX=slice
 ECHO_EVIDENCE=${ECHO_EVIDENCE:-1}
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+if [ -n "${ECHO_SERVER_START:-}" ]; then
+  server_stop() { eval "$ECHO_SERVER_STOP"; }
+  server_start() { eval "$ECHO_SERVER_START"; }
+else
+  SERVER_PID=
+  server_stop() { kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; }
+  server_start() { (cd "$ROOT" && exec bun examples/server/main.ts) >>"${ECHO_SERVER_LOG:-/dev/null}" 2>&1 & SERVER_PID=$!; }
+  server_start
+  for _ in $(seq 1 100); do curl -sf "http://127.0.0.1:${ECHO_SLICE_PORT:-5200}/admin/stats" >/dev/null && break; sleep 0.1; done
+fi
 # shellcheck source=lib.sh
 source "$(dirname "$0")/lib.sh"
-ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-server_stop() { eval "${ECHO_SERVER_STOP:-amp orb service stop echo-server >/dev/null}"; }
-server_start() { eval "${ECHO_SERVER_START:-amp orb service start echo-server --command 'cd $ROOT && bun examples/server/main.ts' >/dev/null}"; }
+# lib.sh sets its own EXIT trap for the WebKit driver; keep both.
+[ -n "${ECHO_SERVER_START:-}" ] || trap 'server_stop; [ -n "${WEBKIT_PID:-}" ] && kill "$WEBKIT_PID" 2>/dev/null' EXIT
 admin() { curl -sf "$BASE/admin/$1"; }
 
 APP="slice-$RUN"

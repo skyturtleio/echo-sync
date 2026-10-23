@@ -2,7 +2,7 @@
 # Browser invariant scenarios (DESIGN §14) for the leader/router/outbox substrate, driven by agent-browser
 # against the Vite harness. Each scenario uses a fresh appId, so it starts from an empty replica.
 #
-#   bun run spike &                              # or: amp orb service start spike --command 'bun run spike'
+#   bun run spike &                              # the Vite harness
 #   examples/browser-spike/scenarios.sh [base-url]
 #
 # Prints one PASS/FAIL line per invariant and a summary; exits non-zero if any failed.

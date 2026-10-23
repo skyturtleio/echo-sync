@@ -31,13 +31,15 @@ report; do not silently diverge.
 
 ## Workflow
 
-- Work on a `ws/<name>` branch. Commit in logical steps. Push the branch when you want review.
-- When your deliverable is ready, message the reviewer thread with the branch name and a short
-  summary of what to look at and which invariants you tested. Address its findings, re-request
-  review. On approval: `git fetch`, rebase onto `origin/main`, run the full checks, and
-  fast-forward push to `main`. Never force-push `main`.
-- Message the coordinator thread at milestones, blockers, or when you believe the design needs
-  to change.
+- Work on a `ws/<name>` branch. Commit in logical steps.
+- Before merging, get an independent review of the diff (a reviewing subagent or a second model),
+  address its findings, and say in your report which DESIGN §14 invariants you tested.
+- To land: `git fetch`, rebase linearly onto `origin/main`, run `bun run check` and
+  `bun run test:pg` (plus `examples/browser-spike/scenarios.sh` and `slice.sh` when `src/client`
+  changed), then fast-forward push `main`. Never force-push `main`. No pull requests.
+- A change to engine behavior is a design change: record it in `docs/DESIGN.md` (a §16 item with
+  the problem and the ruling) in the same branch. Consumers pin a commit SHA, so an app picks up
+  a change only by bumping its pin.
 
 ## Tests
 
@@ -45,16 +47,15 @@ Test invariants (see `docs/DESIGN.md` §14). Each test's name states the failure
 Do not add per-function unit tests, snapshot tests of SQL strings, or tests whose expected
 values were derived from the implementation.
 
-## Orbs
+## Local environment
 
-- `.agents/setup` installs frozen Bun dependencies and prepares a disposable PostgreSQL 18
-  database (matching production's major, from PGDG). Bun, Node and `agent-browser` come from the orb base image.
-- `.agents/resume` ensures the local-only Postgres service in `.amp/services.yaml` is running.
-  Use `bun run check` for the default checks and `bun run test:pg` for Postgres integration
-  tests; the latter supplies the local connection URL. No project secrets are required.
-- The database trusts loopback connections and disables crash durability for test speed.
-  Never expose it through a portal or use it for production data. Data lives outside the
-  checkout at `~/.local/share/echo-sync/postgres-18` and is preserved across wake/setup reruns.
-  Older PostgreSQL 15 data is left untouched; it cannot be opened directly by PostgreSQL 18.
-- Start the optional browser harness with `amp orb service start spike --command 'bun run spike'`
-  when needed; setup does not run tests or start application servers.
+- `.agents/setup` installs locked dependencies and prepares a disposable PostgreSQL 18
+  (production's major) on `127.0.0.1:5432` with trust auth; `.agents/resume` makes sure it is
+  running. They are plain shell scripts and the only environment-specific code in the repo; any
+  machine with Bun and a PostgreSQL reachable at `ECHO_PG_URL` works the same way.
+- `bun run check` is the default gate (types, lint, format, unit tests). `bun run test:pg` runs the
+  Postgres integration tests and defaults `ECHO_PG_URL` to the local database. That database is
+  throwaway (crash durability off): never expose it or put production data in it.
+- Browser scenarios: `bun run spike` (Vite harness on :5199), then
+  `examples/browser-spike/scenarios.sh` and `slice.sh` drive Chromium through `agent-browser`;
+  see `docs/vertical-slice.md`.
