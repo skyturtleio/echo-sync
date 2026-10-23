@@ -127,7 +127,7 @@ const canonical = (tables: MemoryStore.Tables): string => {
   for (const [table, rows] of tables) {
     for (const row of rows.values()) {
       const sorted = Arr.sort(Object.keys(row), Order.String).map((k) => `${k}=${JSON.stringify(row[k])}`)
-      lines.push(`${table}/${row.id}{${sorted.join(",")}}`)
+      lines.push(`${table}/${row["id"]}{${sorted.join(",")}}`)
     }
   }
   return Arr.sort(lines, Order.String).join("\n")
@@ -477,7 +477,7 @@ export const run = (options: Options) =>
       if (Option.isNone(id)) return
       const row = yield* server.store.read(Counters, id.value)
       if (Option.isNone(row)) return
-      const value = Number(row.value.value)
+      const value = Number(row.value["value"])
       note(`server: out-of-band ${kind === 2 ? "bump" : "delete"} ${id.value}`)
       yield* server.writeDirect([
         {
@@ -495,7 +495,10 @@ export const run = (options: Options) =>
     const record = (envelope: MutationEnvelope) =>
       Effect.gen(function* () {
         const same = committed.find((e) => e.clientId === envelope.clientId && e.seq === envelope.seq)
-        if (same === undefined) return committed.push(envelope)
+        if (same === undefined) {
+          committed.push(envelope)
+          return
+        }
         if (same.mutationId !== envelope.mutationId) {
           return yield* violated(
             "a seq is never reused",

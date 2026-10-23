@@ -164,16 +164,16 @@ export const router = (self: SharedWorkerScope): Effect.Effect<void> =>
             ports.add(data.port)
             // One announcement at a time, each checked against the live epoch lock when it is processed.
             announcements = announcements.then(() => {
-              if (!open) return
+              if (!open) return undefined
               const fiber = fork(
                 accept(replica, announced).pipe(
                   Effect.catchCause((cause) => Telemetry.log("Error", "echo router: leader announcement failed", cause))
                 )
               )
-              if (fiber !== undefined)
-                return new Promise<void>((resolve) => {
-                  fiber.addObserver(() => resolve())
-                })
+              if (fiber === undefined) return undefined
+              return new Promise<void>((resolve) => {
+                fiber.addObserver(() => resolve())
+              })
             })
             return
           }

@@ -796,12 +796,12 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
       }
       pendingConnections.add(message.port)
       routerConnects = routerConnects.then(() => {
-        if (!open || reset || scope.state._tag === "Closed") return
+        if (!open || reset || scope.state._tag === "Closed") return undefined
         const fiber = fork(acceptConnected(message.leaderId, message.port))
-        if (fiber !== undefined)
-          return new Promise<void>((resolve) => {
-            fiber.addObserver(() => resolve())
-          })
+        if (fiber === undefined) return undefined
+        return new Promise<void>((resolve) => {
+          fiber.addObserver(() => resolve())
+        })
       })
     }
     /** Announce this tab's worker as leader `leaderId` to the current router, over a fresh port pair. */
