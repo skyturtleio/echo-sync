@@ -115,12 +115,12 @@ export const makeUnsafe = (): LeaderRoute => {
             connection._tag === "Unavailable"
               ? Stream.fail(connection.error)
               : Stream.suspend(() =>
-                  // Checked when the stream starts, not only when `current` was read.
+                  // Checked when the stream starts, not only when `current` was read (DESIGN §16.24).
                   isReset
                     ? Stream.fail(resetError)
                     : f(connection.client).pipe(
                         // Maps only the transport failures, keeping every other reason (a defect included): a
-                        // `Stream.catchIf` would re-fail any other error bare.
+                        // `Stream.catchIf` would re-fail any other error bare (DESIGN §16.23).
                         Stream.catchCause((cause) =>
                           Stream.failCause(
                             Cause.map(cause, (e: E | RpcClientError): E | LeaderUnavailable =>

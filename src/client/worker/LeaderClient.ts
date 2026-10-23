@@ -629,7 +629,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
                 ? Telemetry.observe(
                     cleanup.pipe(
                       Effect.andThen(Telemetry.count("echo.leader.loss.total", "lost")),
-                      Effect.andThen(Effect.suspend(() => route.awaitConnection)),
+                      Effect.andThen(route.awaitConnection),
                       Effect.flatMap((replacement) =>
                         Telemetry.annotate({ "echo.result": replacement._tag === "Connected" ? "elected" : "lost" })
                       )

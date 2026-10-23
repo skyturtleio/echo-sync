@@ -43,16 +43,28 @@ const reasonOf = <A, E>(exit: Exit.Exit<A, E>) =>
 it.effect("a request issued before any leader connects must wait for one, not fail or use a stale connection", () =>
   Effect.gen(function* () {
     const route = LeaderRoute.makeUnsafe()
-    const request = yield* Effect.forkChild(route.withLeader((client) => client.leaderInfo()))
+    const first = yield* Effect.forkChild(route.withLeader((client) => client.leaderInfo()))
     yield* Effect.yieldNow
-    expect(request.pollUnsafe()).toBeUndefined()
+    expect(first.pollUnsafe()).toBeUndefined()
+    route.publish(
+      yield* connected(
+        "a",
+        leader(() => Effect.succeed(info("a")))
+      )
+    )
+    expect(yield* Fiber.join(first)).toEqual(info("a"))
+    // A handover: `a` is withdrawn while `b` handshakes, so a request now waits for `b`, never reaches `a`.
+    route.publish(undefined)
+    const second = yield* Effect.forkChild(route.withLeader((client) => client.leaderInfo()))
+    yield* Effect.yieldNow
+    expect(second.pollUnsafe()).toBeUndefined()
     route.publish(
       yield* connected(
         "b",
         leader(() => Effect.succeed(info("b")))
       )
     )
-    expect(yield* Fiber.join(request)).toEqual(info("b"))
+    expect(yield* Fiber.join(second)).toEqual(info("b"))
   })
 )
 
@@ -110,13 +122,14 @@ it.effect(
 
       const route = LeaderRoute.makeUnsafe()
       const teardown = yield* Deferred.make<void>()
-      // The shut-down RPC client answers in-flight calls with interruption, and transport errors after.
+      // The shut-down RPC client answers the call in flight with interruption, the stream with a transport error.
+      const transport = new RpcClientError({ reason: new RpcClientDefect({ message: "closed", cause: null }) })
       route.publish(
         yield* connected(
           "a",
           leader(
             () => Effect.andThen(Deferred.await(teardown), Effect.interrupt),
-            () => Stream.fromEffect(Effect.andThen(Deferred.await(teardown), Effect.interrupt))
+            () => Stream.fromEffect(Effect.andThen(Deferred.await(teardown), Effect.fail(transport)))
           )
         )
       )
