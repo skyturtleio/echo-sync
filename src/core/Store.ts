@@ -523,7 +523,11 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
         const found = yield* rows.read(table, id)
         if (Option.isNone(found)) return yield* new RowNotFound({ table: table.name, id })
         const current = yield* decode(table, found.value)
-        yield* authorize(current.accessScopeId, requiredRole(table))
+        // Relinquishing one's own grant needs no role (DESIGN §16.27). `*` is never a real actor;
+        // excluding it keeps the `*` row owner-only even for a store built with actor `*`.
+        const ownGrant =
+          table.name === ScopeGrants.name && options.actor !== Everyone && found.value["principal_id"] === options.actor
+        if (!ownGrant) yield* authorize(current.accessScopeId, requiredRole(table))
         yield* write(table, id, found, Option.none())
       }),
 

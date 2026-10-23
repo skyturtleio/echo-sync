@@ -4,10 +4,21 @@ import { DateTime, Effect, Exit, Option } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, ScopeGrants, Store } from "echo-sync"
 import engine from "./migrations/001_engine.ts"
-import { runMutation } from "./ledger.ts"
+import { type BodyError, runMutation } from "./ledger.ts"
+import { claimScope, roleFor } from "./rpc.ts"
 import * as RowStore from "./rowStore.ts"
 import { migrate, migrationsTable, resolveTables } from "./schema.ts"
-import { emptyDatabase, EmptyDatabase, pgAvailable, registry, TestDatabase } from "./test-support.ts"
+import {
+  emptyDatabase,
+  EmptyDatabase,
+  Items,
+  pgAvailable,
+  registry,
+  Replica,
+  RowId,
+  serverView,
+  TestDatabase
+} from "./test-support.ts"
 
 /** An out-of-band grant insert (raw SQL, around the store); its exit and the error text. */
 const insertGrant = (id: string, scope: string, principal: string) =>
@@ -23,6 +34,31 @@ const insertGrant = (id: string, scope: string, principal: string) =>
 
 const derived = (scope: string, principal: string) =>
   ScopeGrants.grantId(AccessScope.AccessScopeId.make(scope), AccessScope.PrincipalId.make(principal))
+
+/** A mutation by `actor` as the RPC adapter runs it: the server's role lookup and claim; its outcome tag. */
+const mutate = (
+  actor: string,
+  mutationId: string,
+  handler: (store: Store.EchoStore) => Effect.Effect<void, BodyError>
+) =>
+  Effect.gen(function* () {
+    const body = Effect.gen(function* () {
+      const sql = yield* SqlClient
+      const rows = yield* RowStore.make(new Map((yield* resolveTables(registry)).map((t) => [t.table.name, t.schema])))
+      const { store } = Store.make(rows, {
+        actor: AccessScope.PrincipalId.make(actor),
+        roleFor: roleFor(sql, actor),
+        claimScope: claimScope(sql),
+        now: yield* DateTime.now
+      })
+      yield* handler(store)
+    })
+    const { outcome } = yield* runMutation(
+      { principalId: actor, clientId: `${actor}-device`, mutationId, seq: 1n },
+      body
+    )
+    return outcome._tag === "Applied" ? "Applied" : `Rejected:${outcome.error._tag}`
+  })
 
 describe.skipIf(!pgAvailable)("scope_grants id derivation (§4)", () => {
   it.live("a grant written around the store with an id that is not grantId(scope, principal) is rejected", () =>
@@ -138,5 +174,68 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (§4)", () => {
                  (SELECT count(*)::int FROM echo_sync.migrations) AS history`
         assert.deepStrictEqual(state, { grants: false, history: 0 })
       }).pipe(Effect.provide(emptyDatabase("ENCODING 'SQL_ASCII' TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'")))
+  )
+})
+
+const write = (store: Store.EchoStore) => store.patch(Items, RowId.make("shared"), { body: "v1" })
+
+describe.skipIf(!pgAvailable)("self-revocation of a grant (§4, §16.27)", () => {
+  it.live(
+    "a reader or writer deleting its own grant is Applied: its client is purged of the scope, the owner keeps the rows and sees the tombstone",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient
+        const scope = AccessScope.AccessScopeId.make("couple")
+        yield* sql`INSERT INTO echo_sync.access_scopes (id) VALUES (${scope})`
+        for (const [principal, role] of [
+          ["o", "owner"],
+          ["w", "writer"],
+          ["r", "reader"]
+        ] as const) {
+          yield* sql`INSERT INTO echo_sync.scope_grants (id, access_scope_id, principal_id, role, granted_at)
+                     VALUES (${derived(scope, principal)}, ${scope}, ${principal}, ${role}, now())`
+        }
+        yield* sql`INSERT INTO items (id, access_scope_id, body) VALUES ('shared', ${scope}, 'v0')`
+        const [owner, writer, reader] = ["o", "w", "r"].map((p) => new Replica(p, `${p}-device`))
+        if (owner === undefined || writer === undefined || reader === undefined) return assert.fail("replicas")
+        for (const replica of [owner, writer, reader]) yield* replica.sync()
+        assert.isTrue(reader.rows.has("items/shared") && writer.rows.has("items/shared"))
+
+        const leave = (who: string) => (store: Store.EchoStore) =>
+          store.delete(ScopeGrants.ScopeGrants, ScopeGrants.grantId(scope, AccessScope.PrincipalId.make(who)))
+        // Relinquishing first, then writing in the scope: the write has no grant, and the whole
+        // mutation (the delete included) rolls back.
+        assert.strictEqual(
+          yield* mutate("w", "leave-then-write", (store) => Effect.andThen(leave("w")(store), write(store))),
+          "Rejected:ScopeForbidden"
+        )
+        assert.strictEqual(yield* mutate("r", "leave", leave("r")), "Applied")
+        assert.strictEqual(
+          yield* mutate("w", "write-then-leave", (store) => Effect.andThen(write(store), leave("w")(store))),
+          "Applied"
+        )
+        const grants = yield* sql<{ principal_id: string }>`
+          SELECT principal_id FROM echo_sync.scope_grants WHERE access_scope_id = ${scope}`
+        assert.deepStrictEqual(
+          grants.map((g) => g.principal_id),
+          ["o"]
+        )
+
+        const before = new Map([owner, writer, reader].map((replica) => [replica, replica.received.length]))
+        for (const replica of [owner, writer, reader]) yield* replica.sync()
+        const since = (replica: Replica) => replica.received.slice(before.get(replica))
+        for (const leaver of [writer, reader]) {
+          assert.deepStrictEqual(
+            since(leaver).filter((c) => c._tag === "scopePurged"),
+            [{ _tag: "scopePurged", scopeId: scope }],
+            leaver.principalId
+          )
+          assert.deepStrictEqual([...leaver.rows.keys()], [], leaver.principalId)
+        }
+        const tombstones = since(owner).flatMap((c) => (c._tag === "tombstone" ? [c.id] : []))
+        assert.deepStrictEqual(tombstones.toSorted(), [derived(scope, "r"), derived(scope, "w")].toSorted())
+        assert.strictEqual(owner.rows.get("items/shared")?.["body"], "v1")
+        assert.deepStrictEqual(owner.view(), yield* serverView("o"))
+      }).pipe(Effect.provide(TestDatabase))
   )
 })
