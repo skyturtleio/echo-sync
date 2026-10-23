@@ -7,6 +7,7 @@ import {
   Duration,
   Effect,
   Layer,
+  Match,
   Option,
   Predicate,
   PubSub,
@@ -50,6 +51,25 @@ export interface SyncServerOptions {
    */
   readonly heartbeatInterval?: Duration.Input | undefined
 }
+
+/** The telemetry outcome of a sync handler's typed failures (docs/observability.md). */
+const protocolOutcome = Telemetry.byFailure(
+  (
+    error:
+      | Protocol.Unauthorized
+      | Protocol.MalformedEnvelope
+      | Protocol.ClientOutdated
+      | Protocol.ResnapshotRequired
+      | Protocol.ServerUnavailable
+  ) =>
+    Match.valueTags(error, {
+      Unauthorized: () => "unauthorized",
+      MalformedEnvelope: () => "halted",
+      ClientOutdated: () => "outdated",
+      ResnapshotRequired: () => "resnapshot",
+      ServerUnavailable: () => "unavailable"
+    })
+)
 
 /** `notify` channel of `echo_sync.next_position()`: one hint per committed writing transaction. */
 export const pokeChannel = "echo_sync"
@@ -416,7 +436,7 @@ export const handlers = (options: SyncServerOptions) =>
               })
             ),
             Effect.provideService(SqlClient, sql),
-            (work) => Telemetry.observe(work, "echo.server.push")
+            (work) => Telemetry.observe(work, "echo.server.push", protocolOutcome)
           ),
         pull: (request) =>
           Effect.gen(function* () {
@@ -444,7 +464,7 @@ export const handlers = (options: SyncServerOptions) =>
               })
             ),
             Effect.provideService(SqlClient, sql),
-            (work) => Telemetry.observe(work, "echo.server.pull")
+            (work) => Telemetry.observe(work, "echo.server.pull", protocolOutcome)
           ),
         pokes: ({ clientId, principal }) =>
           Stream.unwrap(
@@ -458,7 +478,7 @@ export const handlers = (options: SyncServerOptions) =>
             // A lost LISTEN connection ends the stream typed; the client reconnects on any end (§6).
             Stream.catchCause((cause) => Stream.fromEffect(toServerFailure(cause))),
             Stream.catchTag("ClientForbidden", (e) => Stream.fail(forbidden(e))),
-            (work) => Telemetry.observeStream(work, "echo.server.pokes")
+            (work) => Telemetry.observeStream(work, "echo.server.pokes", protocolOutcome)
           )
       })
     })

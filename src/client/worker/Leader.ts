@@ -478,7 +478,8 @@ const program = (
         }
         yield* Telemetry.annotate({ "echo.result": "elected" })
       }),
-      "echo.leader.election"
+      "echo.leader.election",
+      Telemetry.serverFailure
     )
     // The leader lock is held from here until this worker dies.
     const leaderId = crypto.randomUUID()

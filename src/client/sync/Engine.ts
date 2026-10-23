@@ -186,7 +186,7 @@ const rebase = <E>(
       "echo.notices_rejected": notices.filter((n) => n._tag === "Rejected").length,
       "echo.notices_unknown": notices.filter((n) => n._tag === "OutcomeUnknown").length
     })
-  }).pipe((work) => Telemetry.observe(work, "echo.rebase"))
+  }).pipe((work) => Telemetry.observe(work, "echo.rebase", Telemetry.serverFailure))
 
 /** The same wire decode gates staging and install; never persist a page that retries must re-fetch. */
 const decodeRow = (table: SyncTable.AnySyncTable, row: SyncTable.EncodedRow) =>
@@ -335,7 +335,10 @@ export const make = (options: {
             return envelope
           })
         ),
-        "echo.enqueue"
+        "echo.enqueue",
+        Telemetry.byFailure((error: StoreUnavailable | LocallyRejected) =>
+          error._tag === "LocallyRejected" ? "rejected" : "server"
+        )
       )
 
     const push = pushLock.withPermit(

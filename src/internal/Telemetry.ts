@@ -10,7 +10,6 @@ import {
   Logger,
   Metric,
   Option,
-  Predicate,
   References,
   Scope,
   Stream,
@@ -270,29 +269,28 @@ export const stream = <A, E, R>(work: Stream.Stream<A, E, R>): Stream.Stream<A, 
   )
 
 /**
- * The outcome of an exit. Interruption, then defects, take precedence; a typed failure is named by
- * the operation's own closed classifier (`failure`) when it has one, otherwise by its tag. Only
- * recognized tags are mapped; never copy a tag, error message or input into telemetry.
+ * The outcome of an exit. Interruption, then defects, take precedence; a typed failure is named by the
+ * operation's own closed classifier, `failure`. Never copy a tag, error message or input into telemetry.
  */
-export const outcome = <A, E>(exit: Exit.Exit<A, E>, failure?: (cause: Cause.Cause<E>) => string): string => {
-  if (Exit.isSuccess(exit)) return "ok"
-  if (Cause.hasInterrupts(exit.cause)) return "interrupted"
-  if (Cause.hasDies(exit.cause)) return "defect"
-  if (failure !== undefined) return failure(exit.cause)
-  const failures = exit.cause.reasons.filter(Cause.isFailReason).map((reason) => kind(reason.error))
-  return failures.includes("halted") ? "halted" : (failures[0] ?? "server")
-}
+export const outcome = <A, E>(exit: Exit.Exit<A, E>, failure: (cause: Cause.Cause<E>) => string): string =>
+  Exit.isSuccess(exit)
+    ? "ok"
+    : Cause.hasInterrupts(exit.cause)
+      ? "interrupted"
+      : Cause.hasDies(exit.cause)
+        ? "defect"
+        : failure(exit.cause)
 
-const kind = (error: unknown): string => {
-  if (Predicate.isTagged(error, "Unauthorized")) return "unauthorized"
-  if (Predicate.isTagged(error, "ServerUnavailable")) return "unavailable"
-  if (Predicate.isTagged(error, "ClientOutdated")) return "outdated"
-  if (Predicate.isTagged(error, "ResnapshotRequired")) return "resnapshot"
-  if (Predicate.isTagged(error, "LocallyRejected")) return "rejected"
-  if (Predicate.isTagged(error, "Forbidden")) return "forbidden"
-  if (Predicate.isTagged(error, "MalformedEnvelope")) return "halted"
-  return "server"
-}
+/** The classifier of an operation whose typed failures are all `server` outcomes. */
+export const serverFailure = (_cause: Cause.Cause<unknown>): string => "server"
+
+/** A classifier from a name per failure: `halted` if any failure is named so, otherwise the first's. */
+export const byFailure =
+  <E>(name: (error: E) => string) =>
+  (cause: Cause.Cause<E>): string => {
+    const failures = cause.reasons.filter(Cause.isFailReason).map((reason) => name(reason.error))
+    return failures.includes("halted") ? "halted" : (failures[0] ?? "server")
+  }
 
 export const annotate = (attributes: Record<string, unknown>) =>
   Effect.withFiber((fiber) => {
@@ -341,14 +339,18 @@ export const histogram = (name: "echo.push.batch_size" | "echo.pull.pages", n: n
   })
 
 /** Stream counterpart: the same proxy sanitizes its scoped span's exit. */
-export const observeStream = <A, E, R>(work: Stream.Stream<A, E, R>, name: Name): Stream.Stream<A, E, R> =>
+export const observeStream = <A, E, R>(
+  work: Stream.Stream<A, E, R>,
+  name: Name,
+  failure: (cause: Cause.Cause<E>) => string
+): Stream.Stream<A, E, R> =>
   stream(
     Stream.unwrap(
       Effect.map(Effect.context<R>(), (context) =>
         work.pipe(
           Stream.onExit((exit) =>
             Effect.gen(function* () {
-              const value = Exit.isSuccess(exit) ? "server-end" : outcome(exit)
+              const value = Exit.isSuccess(exit) ? "server-end" : outcome(exit, failure)
               yield* annotate({ "echo.outcome": value })
               yield* count(`${name}.total`, value)
               if (Exit.isFailure(exit)) yield* diagnostic(exit.cause)
@@ -361,12 +363,12 @@ export const observeStream = <A, E, R>(work: Stream.Stream<A, E, R>, name: Name)
 
 /**
  * onExit preserves the original value/cause and masks only its own bookkeeping. `failure` is the
- * operation's own closed classifier of a typed failure (see `outcome`).
+ * operation's own closed classifier of its typed failures (see `outcome`).
  */
 export const observe = <A, E, R>(
   work: Effect.Effect<A, E, R>,
   name: Name,
-  failure?: (cause: Cause.Cause<E>) => string
+  failure: (cause: Cause.Cause<E>) => string
 ): Effect.Effect<A, E, R> =>
   boundary(
     Effect.suspend(() => {

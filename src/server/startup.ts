@@ -44,7 +44,7 @@ export const prepare = (options: Pick<StartupOptions, "registry" | "appMigration
       yield* attach(table).pipe(Effect.catchTag("TableNameConflict", () => Effect.void))
     }
     yield* verify(options.registry)
-  }).pipe((work) => Telemetry.observe(work, "echo.server.startup"))
+  }).pipe((work) => Telemetry.observe(work, "echo.server.startup", Telemetry.serverFailure))
 
 /**
  * The sync server: `prepare`, then mount `Protocol.SyncRpcs`. The RPC layer is built only after

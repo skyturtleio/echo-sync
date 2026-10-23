@@ -722,7 +722,8 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
                         Telemetry.annotate({ "echo.result": replacement._tag === "Connected" ? "elected" : "lost" })
                       )
                     ),
-                    "echo.leader.handover"
+                    "echo.leader.handover",
+                    Telemetry.serverFailure
                   )
                 : cleanup
             })

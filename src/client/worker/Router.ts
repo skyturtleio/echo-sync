@@ -74,7 +74,8 @@ export const router = (self: SharedWorkerScope): Effect.Effect<void> =>
           ? install
           : Telemetry.observe(
               install.pipe(Effect.andThen(Telemetry.annotate({ "echo.result": "elected" }))),
-              "echo.router.handover"
+              "echo.router.handover",
+              Telemetry.serverFailure
             )
         yield* Effect.forkIn(
           Platform.awaitLockReleased(epoch).pipe(
@@ -93,7 +94,8 @@ export const router = (self: SharedWorkerScope): Effect.Effect<void> =>
                         yield* Deferred.await(next)
                         yield* Telemetry.annotate({ "echo.result": "elected" })
                       }),
-                      "echo.leader.handover"
+                      "echo.leader.handover",
+                      Telemetry.serverFailure
                     )
               )
             ),
