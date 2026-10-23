@@ -11,6 +11,7 @@ import {
 } from "./AccessScope.ts"
 import {
   type ConstraintViolated,
+  CorruptStorage,
   InvalidRow,
   RowAlreadyExists,
   RowNotFound,
@@ -173,6 +174,25 @@ export const planResult = (
  * - reads fail only with the transient `StoreUnavailable`; writes may also fail permanently
  *   with `ConstraintViolated` when an authoritative database constraint refuses the write.
  */
+/** The `id` column of a stored row, when it has one. */
+const rowId = (row: unknown): string | undefined =>
+  typeof row === "object" && row !== null && "id" in row && typeof row.id === "string" ? row.id : undefined
+
+/**
+ * Decode data the engine itself stored. It was written through `schema`, so a failure is corruption of trusted
+ * storage, not a domain outcome: the `CorruptStorage` defect, naming the table and the row (`id`, by default
+ * the row's own `id` column).
+ */
+export const decodeStored = <S extends Schema.Decoder<unknown>>(
+  schema: S,
+  table: string,
+  stored: unknown,
+  id: string | undefined = rowId(stored)
+): Effect.Effect<S["Type"], never, S["DecodingServices"]> =>
+  Schema.decodeUnknownEffect(schema)(stored).pipe(
+    Effect.catch((cause) => Effect.die(new CorruptStorage({ table, id, cause })))
+  )
+
 export interface RowStore {
   readonly read: (table: AnySyncTable, id: string) => Effect.Effect<Option.Option<EncodedRow>, StoreUnavailable>
   /** Upsert (`Some`) or delete (`None`) the row with this id. */
@@ -383,8 +403,7 @@ const checkGrantIdentity = (table: AnySyncTable, encoded: EncodedRow): Effect.Ef
 const requiredRole = (table: AnySyncTable): Role => (table.name === ScopeGrants.name ? "owner" : "writer")
 
 const decode = <T extends AnySyncTable>(table: T, row: EncodedRow): Effect.Effect<RowOf<T>> =>
-  // A stored row that fails to decode is corruption of trusted storage, not a domain outcome.
-  Effect.orDie(Schema.decodeUnknownEffect(table.wire)(row))
+  decodeStored(table.wire, table.name, row)
 
 const encode = <T extends AnySyncTable>(table: T, row: unknown): Effect.Effect<EncodedRow, InvalidRow> =>
   Schema.encodeUnknownEffect(table.wire)(row).pipe(
@@ -422,7 +441,7 @@ export const roleFromGrants =
       for (const who of [actor, Everyone]) {
         const row = yield* rows.read(ScopeGrants, grantId(scopeId, who))
         if (Option.isNone(row)) continue
-        const grant = yield* Effect.orDie(Schema.decodeUnknownEffect(ScopeGrants.wire)(row.value))
+        const grant = yield* decodeStored(ScopeGrants.wire, ScopeGrants.name, row.value)
         roles.push(grant.role)
       }
       return Option.fromNullishOr(strongest(roles))

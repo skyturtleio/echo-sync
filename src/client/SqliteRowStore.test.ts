@@ -2,9 +2,9 @@
 import "./testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { expect, it } from "@effect/vitest"
-import { Effect, Fiber, Layer, Option, Queue, Schema, Stream } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Option, Queue, Schema, Stream } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
-import { AccessScope, Registry, Store, SyncTable } from "echo-sync"
+import { AccessScope, Errors, Registry, Store, SyncTable } from "echo-sync"
 import * as Outbox from "./Outbox.ts"
 import * as SqliteRowStore from "./SqliteRowStore.ts"
 import * as SqliteSyncStorage from "./sync/SqliteSyncStorage.ts"
@@ -190,4 +190,35 @@ it.live("clearAll re-emits a live query on the cleared table, even when nothing 
       )
     )
   )
+)
+
+/** The `CorruptStorage` defect `exit` died with, if it did. */
+const corruption = <A, E>(exit: Exit.Exit<A, E>) =>
+  Option.fromNullishOr(
+    Exit.isFailure(exit)
+      ? exit.cause.reasons
+          .filter(Cause.isDieReason)
+          .map((reason) => reason.defect)
+          .find((defect): defect is Errors.CorruptStorage => defect instanceof Errors.CorruptStorage)
+      : undefined
+  )
+
+it.effect("a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError", () =>
+  Effect.gen(function* () {
+    const { sql, store } = yield* storeFor
+    const [row] = randomRows(rng(4), 1)
+    if (row === undefined) return yield* Effect.die("no row")
+    yield* store.write(Items, "i000", Option.some(row))
+    // An edit outside echo-sync that the column codec cannot read.
+    yield* sql.unsafe(`UPDATE "items" SET "doc" = 'not json' WHERE "id" = 'i000'`)
+    for (const read of [Effect.asVoid(store.read(Items, "i000")), Effect.asVoid(store.scan(Items))]) {
+      const defect = corruption(yield* Effect.exit(read))
+      expect(Option.map(defect, ({ table, id }) => ({ table, id }))).toEqual(
+        Option.some({ table: "items", id: "i000" })
+      )
+      expect(Option.getOrUndefined(Option.map(defect, (e) => e.message))).toMatch(
+        /^stored data in "items" row "i000" does not decode with its schema \(.*\["doc"\]\)/s
+      )
+    }
+  }).pipe(Effect.provide(Db))
 )

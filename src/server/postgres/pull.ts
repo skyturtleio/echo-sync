@@ -1,6 +1,6 @@
 import { Array as Arr, Effect, Option, type Order, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
-import { AccessScope, Ids, Mutation, Protocol, type Registry, type SyncTable } from "echo-sync"
+import { AccessScope, Ids, Mutation, Protocol, type Registry, Store, type SyncTable } from "echo-sync"
 import { assertPrincipal, registerClient } from "./ledger.ts"
 import { decodeRow, q, selectList } from "./rowStore.ts"
 import { type Resolved, resolveTables } from "./schema.ts"
@@ -54,7 +54,7 @@ export interface PullRequest {
   readonly limit: number
 }
 
-const decodeOutcome = Schema.decodeUnknownEffect(Schema.toCodecJson(Mutation.MutationOutcome))
+const MutationOutcomeJson = Schema.toCodecJson(Mutation.MutationOutcome)
 
 interface LogEntry {
   readonly position: bigint
@@ -243,7 +243,7 @@ export const pull = Effect.fnUntraced(function* (
         acks.push({
           mutationId: Ids.MutationId.make(row.mutation_id),
           position: Ids.Position.make(row.position),
-          outcome: yield* Effect.orDie(decodeOutcome(row.outcome))
+          outcome: yield* Store.decodeStored(MutationOutcomeJson, "echo_sync.mutations", row.outcome, row.mutation_id)
         })
       }
 

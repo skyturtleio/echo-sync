@@ -1,4 +1,4 @@
-import { Schema } from "effect"
+import { Data, Schema } from "effect"
 import { AccessScopeId, Role } from "./AccessScope.ts"
 
 /** Transient storage failure (connection, busy, serialization). Never recorded; stops the batch. */
@@ -35,6 +35,26 @@ export class ConstraintViolated extends Schema.TaggedError<ConstraintViolated>()
   constraint: Schema.NullOr(Schema.String),
   message: Schema.String
 }) {}
+
+/**
+ * A defect, never a typed failure: data the engine stored through a schema no longer decodes with it. `table`
+ * is the table (or engine table) it was read from and `id` its row or mutation id when known; `cause` is the
+ * schema's error, whose message names the offending field.
+ */
+export class CorruptStorage extends Data.TaggedError("CorruptStorage")<{
+  readonly table: string
+  readonly id: string | undefined
+  readonly cause: unknown
+}> {
+  override get message(): string {
+    const where = this.id === undefined ? `"${this.table}"` : `"${this.table}" row "${this.id}"`
+    const detail = this.cause instanceof Error ? this.cause.message : String(this.cause)
+    return (
+      `stored data in ${where} does not decode with its schema (${detail}). Something other than this ` +
+      `schema wrote it: a manual edit, a migration, or a schema change shipped without one.`
+    )
+  }
+}
 
 /** Permanent store errors a handler can produce; they become typed rejections. */
 export type StoreRejection = RowNotFound | RowAlreadyExists | ScopeForbidden | InvalidRow | ConstraintViolated

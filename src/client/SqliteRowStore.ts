@@ -30,7 +30,7 @@ export const unavailable = <A, R>(
   )
 
 const decodeRows = (table: Table, rows: ReadonlyArray<unknown>) =>
-  Effect.forEach(rows, (row) => Effect.orDie(Schema.decodeUnknownEffect(table.sqlite.row)(row)))
+  Effect.forEach(rows, (row) => Store.decodeStored(table.sqlite.row, table.name, row))
 
 const bind = (column: SyncTable.Column, value: Schema.Json): Effect.Effect<Value> =>
   Effect.orDie(Schema.encodeEffect(column.sqlite)(value))

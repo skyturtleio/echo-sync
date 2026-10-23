@@ -2,7 +2,7 @@ import * as PgTypes from "@effect/sql-pg/PgTypes"
 import { Cause, Effect, Option, Schedule, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
-import { Errors, Ids, Mutation, Protocol } from "echo-sync"
+import { Errors, Ids, Mutation, Protocol, Store } from "echo-sync"
 import { isConflictUnavailable } from "./rowStore.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
@@ -65,7 +65,6 @@ export interface LedgerOptions {
 
 const defaultConflictRetry = Schedule.exponential("10 millis").pipe(Schedule.upTo({ times: 4 }))
 
-const decodeOutcome = Schema.decodeUnknownEffect(MutationOutcomeJson)
 const encodeOutcome = Schema.encodeSync(MutationOutcomeJson)
 
 const transient = (envelope: Envelope, error: SqlError | Errors.StoreUnavailable) =>
@@ -299,7 +298,15 @@ export const runMutation = <R>(
           return expired
         }
         if (row !== undefined) {
-          const replay: Processed = { outcome: yield* Effect.orDie(decodeOutcome(row.outcome)), position: row.position }
+          const replay: Processed = {
+            outcome: yield* Store.decodeStored(
+              MutationOutcomeJson,
+              "echo_sync.mutations",
+              row.outcome,
+              envelope.mutationId
+            ),
+            position: row.position
+          }
           return replay
         }
         // Every seq ≤ the floor was processed and kept its identity, so an unknown id here is a

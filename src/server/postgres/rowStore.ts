@@ -27,7 +27,7 @@ export const selectList = (table: SyncTable.AnySyncTable, alias?: string) =>
 
 /** Postgres row → wire row through the table's own codec. Stored rows are trusted: a failure is a defect. */
 export const decodeRow = (table: SyncTable.AnySyncTable, row: unknown) =>
-  Effect.orDie(Schema.decodeUnknownEffect(table.postgres.row)(row))
+  Store.decodeStored(table.postgres.row, table.name, row)
 
 /** Wire value → bind parameter for one column (JSON columns are bound explicitly as jsonb). */
 const bindColumn = (column: SyncTable.Column, value: Schema.Json) => {
