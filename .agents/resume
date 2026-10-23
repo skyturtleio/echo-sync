@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+# Ensure is idempotent: leave a healthy database running, repair a missing process.
+# Dependencies belong to setup, not this wake hook.
+amp orb services ensure
+# A listening TCP port can precede the end of Postgres recovery. Wait at most 6s.
+for attempt in {1..5}; do
+  if /usr/lib/postgresql/15/bin/pg_isready -h 127.0.0.1 -p 5432 -U postgres -t 1; then
+    exit 0
+  fi
+  sleep 0.2
+done
+echo "[resume] Postgres did not become ready" >&2
+exit 1

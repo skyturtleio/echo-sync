@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+SECONDS=0
+
+# Bun and Node are provided by the orb base image; the repo has no runtime version pin.
+echo "[setup] Toolchain: Bun $(bun --version), Node $(node --version)"
+echo "[setup] Installing locked dependencies"
+time bun install --frozen-lockfile
+
+# Use Debian 12's Postgres without Docker. Keep data user-owned and snapshot-safe;
+# .agents/resume starts the supervised process after activation, never during setup.
+if [[ ! -x /usr/lib/postgresql/15/bin/initdb ]]; then
+  echo "[setup] Installing PostgreSQL 15"
+  time sudo apt-get update
+  time sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql-15
+fi
+
+echo "[setup] Preparing local test database"
+pgdata="$HOME/.local/share/echo-sync/postgres"
+if [[ ! -f "$pgdata/PG_VERSION" ]]; then
+  # Trust is only for this disposable, loopback-only orb database. No credentials
+  # or user/thread authentication are stored in the shared project snapshot.
+  time /usr/lib/postgresql/15/bin/initdb -D "$pgdata" -U postgres --auth=trust --encoding=UTF8 --locale=C
+fi
+
+echo "[setup] Ready in ${SECONDS}s (database starts on activation)"

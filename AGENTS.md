@@ -44,3 +44,16 @@ report; do not silently diverge.
 Test invariants (see `docs/DESIGN.md` §14). Each test's name states the failure it catches.
 Do not add per-function unit tests, snapshot tests of SQL strings, or tests whose expected
 values were derived from the implementation.
+
+## Orbs
+
+- `.agents/setup` installs frozen Bun dependencies and prepares a disposable PostgreSQL 15
+  database (Debian 12's version). Bun, Node and `agent-browser` come from the orb base image.
+- `.agents/resume` ensures the local-only Postgres service in `.amp/services.yaml` is running.
+  Use `bun run check` for the default checks and `bun run test:pg` for Postgres integration
+  tests; the latter supplies the local connection URL. No project secrets are required.
+- The database trusts loopback connections and disables crash durability for test speed.
+  Never expose it through a portal or use it for production data. Data lives outside the
+  checkout at `~/.local/share/echo-sync/postgres` and is preserved across wake/setup reruns.
+- Start the optional browser harness with `amp orb service start spike --command 'bun run spike'`
+  when needed; setup does not run tests or start application servers.
