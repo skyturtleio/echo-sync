@@ -18,6 +18,7 @@
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner"
 import * as Cause from "effect/Cause"
+import * as Data from "effect/Data"
 import type * as Context from "effect/Context"
 import * as DateTime from "effect/DateTime"
 import type * as Duration from "effect/Duration"
@@ -57,6 +58,9 @@ const toFailure = (error: SqlError): SqlFailure =>
   new SqlFailure({ message: `${error.message}: ${causeMessage(error.reason.cause)}` })
 
 const unavailable = (error: Errors.StoreUnavailable) => new SqlFailure({ message: error.message })
+
+/** This browser or this identity cannot host a leader; `message` says which requirement is missing. */
+class UnsupportedHost extends Data.TaggedError("UnsupportedHost")<{ readonly message: string }> {}
 
 const send = (endpoint: Endpoint, message: FromLeader) => endpoint.postMessage(message, { transfer: [] })
 
@@ -320,35 +324,28 @@ type Reset = Extract<ToLeader, { readonly _tag: "Reset" }>
 
 /** The OPFS directory for `path`, or `undefined` if some part of it does not exist. */
 const opfsDirectory = (path: string) =>
-  Effect.tryPromise({
-    try: async () => {
-      let dir = await navigator.storage.getDirectory()
-      for (const part of path.split("/")) {
-        try {
-          dir = await dir.getDirectoryHandle(part)
-        } catch (cause) {
-          if (cause instanceof DOMException && cause.name === "NotFoundError") return undefined
-          throw cause
-        }
+  Platform.storageCall(`opening the OPFS directory ${path}`, async () => {
+    let dir = await navigator.storage.getDirectory()
+    for (const part of path.split("/")) {
+      try {
+        dir = await dir.getDirectoryHandle(part)
+      } catch (cause) {
+        if (cause instanceof DOMException && cause.name === "NotFoundError") return undefined
+        throw cause
       }
-      return dir
-    },
-    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause)))
+    }
+    return dir
   })
-
-const toError = (cause: unknown) => (cause instanceof Error ? cause : new Error(String(cause)))
 
 const isNotFound = (cause: unknown) => cause instanceof DOMException && cause.name === "NotFoundError"
 
 /** Remove `name` from `parent`; an entry that is already gone counts as removed. */
 const removeIfPresent = (parent: FileSystemDirectoryHandle, name: string, options?: FileSystemRemoveOptions) =>
-  Effect.tryPromise({
-    try: () =>
-      parent.removeEntry(name, options).catch((cause: unknown) => {
-        if (!isNotFound(cause)) throw cause
-      }),
-    catch: toError
-  })
+  Platform.storageCall(`removing ${parent.name}/${name}`, () =>
+    parent.removeEntry(name, options).catch((cause: unknown) => {
+      if (!isNotFound(cause)) throw cause
+    })
+  )
 
 /**
  * The removal a tombstone stands for (DESIGN §16.26): the profile's directory, then the tombstone. The
@@ -367,17 +364,15 @@ const completeInterruptedReset = (identity: Platform.ReplicaIdentity) =>
     const parent = yield* opfsDirectory(`echo-sync/${identity.appId}`)
     if (parent === undefined) return false
     const tombstone = yield* Platform.tombstoneName(identity)
-    const condemned = yield* Effect.tryPromise({
-      try: () =>
-        parent.getFileHandle(tombstone).then(
-          () => true,
-          (cause: unknown) => {
-            if (isNotFound(cause)) return false
-            throw cause
-          }
-        ),
-      catch: toError
-    })
+    const condemned = yield* Platform.storageCall(`looking up the reset tombstone in ${parent.name}`, () =>
+      parent.getFileHandle(tombstone).then(
+        () => true,
+        (cause: unknown) => {
+          if (isNotFound(cause)) return false
+          throw cause
+        }
+      )
+    )
     if (!condemned) return false
     // As a leader does before opening: the interrupted reset's access handles may outlive its worker briefly.
     yield* Platform.awaitOpfsPoolFree(Platform.poolDirectory(identity))
@@ -445,7 +440,9 @@ const reset = (message: Reset): Effect.Effect<ResetOutcome> =>
           // crash leaves the tombstone, and the next leader or reset completes the removal; before here it
           // leaves the replica intact.
           const tombstone = yield* Platform.tombstoneName(identity)
-          yield* Effect.tryPromise({ try: () => parent.getFileHandle(tombstone, { create: true }), catch: toError })
+          yield* Platform.storageCall(`writing the reset tombstone in ${parent.name}`, () =>
+            parent.getFileHandle(tombstone, { create: true })
+          )
           yield* removeCondemned(parent, identity, tombstone)
         }
         return { _tag: "Done" } satisfies ResetOutcome
@@ -467,7 +464,7 @@ const program = (
   Effect.gen(function* () {
     const identity: Platform.ReplicaIdentity = { appId: init.appId, profile: init.profile }
     const invalid = Platform.validateIdentity(identity) ?? Platform.leaderHostCapability()
-    if (invalid !== undefined) return yield* Effect.fail(new Error(invalid))
+    if (invalid !== undefined) return yield* new UnsupportedHost({ message: invalid })
     const actor = yield* Schema.decodeUnknownEffect(AccessScope.PrincipalId)(init.principal)
 
     yield* Telemetry.observe(
@@ -563,7 +560,8 @@ const program = (
       Telemetry.log("Error", "echo leader candidate cannot serve", cause).pipe(
         Effect.andThen(
           Effect.sync(() => {
-            send(endpoint, { _tag: "Failed", message: String(cause) })
+            // The full cause is in the diagnostics log above; the tab gets the one failure that stopped it.
+            send(endpoint, { _tag: "Failed", message: Platform.describe(Cause.squash(cause)) })
             // A candidate that cannot serve must not linger (DESIGN §9): ending the worker guarantees that
             // anything a failed open acquired outside the scope (e.g. a half-built handle pool) and every
             // Web Lock is released, so the next queued candidate is elected.

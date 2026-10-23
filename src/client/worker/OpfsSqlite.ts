@@ -59,15 +59,14 @@ export interface OpfsSqliteConfig {
  */
 export const open = (
   config: OpfsSqliteConfig
-): Effect.Effect<(port: MessagePort) => Effect.Effect<void>, Error, Scope.Scope> =>
+): Effect.Effect<(port: MessagePort) => Effect.Effect<void>, Platform.BrowserStorageError, Scope.Scope> =>
   Effect.gen(function* () {
     const module = yield* Effect.promise(() => SQLiteESMFactory())
     const sqlite3 = WaSqlite.Factory(module)
     const vfs = yield* Effect.acquireRelease(
-      Effect.tryPromise({
-        try: () => AccessHandlePoolVFS.create(config.poolDirectory, module),
-        catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause)))
-      }),
+      Platform.storageCall(`opening the OPFS pool ${config.poolDirectory}`, () =>
+        AccessHandlePoolVFS.create(config.poolDirectory, module)
+      ),
       (pool) => Effect.promise(() => pool.close())
     )
     // The VFS only adds capacity when the directory is empty. A candidate that died mid-way through
@@ -75,10 +74,9 @@ export const open = (
     // leader would fail with SQLITE_CANTOPEN on its first write. Top the pool up instead.
     const missing = POOL_CAPACITY - vfs.getCapacity()
     if (missing > 0) {
-      yield* Effect.tryPromise({
-        try: () => vfs.addCapacity(missing),
-        catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause)))
-      })
+      yield* Platform.storageCall(`adding ${missing} files to the OPFS pool ${config.poolDirectory}`, () =>
+        vfs.addCapacity(missing)
+      )
     }
     // Platform edge: wa-sqlite reads `mxPathname` (a plain field on its VFS base class, default 64) when
     // the VFS is registered. The pool's own header holds far longer paths; see `Platform.vfsMaxPathname`.
@@ -87,7 +85,8 @@ export const open = (
     const db = yield* Effect.acquireRelease(
       Effect.try({
         try: () => sqlite3.open_v2(config.dbName, undefined, config.poolDirectory),
-        catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause)))
+        catch: (cause) =>
+          new Platform.BrowserStorageError({ operation: `opening ${config.dbName} in ${config.poolDirectory}`, cause })
       }),
       (handle) => Effect.sync(() => sqlite3.close(handle))
     )

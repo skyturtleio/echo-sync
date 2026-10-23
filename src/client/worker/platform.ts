@@ -4,6 +4,7 @@
  * SharedWorker.
  */
 /// <reference lib="webworker" />
+import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
 import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
@@ -84,13 +85,10 @@ export const poolDirectory = ({ appId, profile }: ReplicaIdentity): string => `e
  * "~", which `validateIdentity` never accepts, so it is never a profile's directory. The profile is hashed
  * (SHA-256, hex) rather than embedded so the name fits `maxSegmentBytes` for every valid profile.
  */
-export const tombstoneName = ({ profile }: ReplicaIdentity): Effect.Effect<string, Error> =>
-  Effect.tryPromise({
-    try: async () => {
-      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(profile)))
-      return `~reset-${Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("")}`
-    },
-    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause)))
+export const tombstoneName = ({ profile }: ReplicaIdentity): Effect.Effect<string, BrowserStorageError> =>
+  storageCall("hashing the profile for its reset tombstone", async () => {
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(profile)))
+    return `~reset-${Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("")}`
   })
 
 /** Exclusive lock held by exactly one leader worker per replica for its whole lifetime. */
@@ -113,14 +111,33 @@ export const leaderEpochLockName = ({ appId, profile }: ReplicaIdentity, leaderI
 export const tabLockName = ({ appId, profile }: ReplicaIdentity, tabId: string): string =>
   `echo:${appId}:${profile}:tab:${tabId}`
 
+/** `u` as one line of text: an error's name and message, anything else as a string. */
+export const describe = (u: unknown): string => (u instanceof Error ? `${u.name}: ${u.message}` : String(u))
+
+/**
+ * A browser storage call (OPFS, SQLite on OPFS, Web Crypto) failed. `operation` says what was attempted and
+ * on which path; `cause` is what the browser threw, typically a `DOMException` whose `name` says why.
+ */
+export class BrowserStorageError extends Data.TaggedError("BrowserStorageError")<{
+  readonly operation: string
+  readonly cause: unknown
+}> {
+  override get message(): string {
+    return `${this.operation} failed: ${describe(this.cause)}`
+  }
+}
+
+/** Run a browser storage promise; a rejection is a `BrowserStorageError` naming `operation`. */
+export const storageCall = <A>(operation: string, run: () => Promise<A>): Effect.Effect<A, BrowserStorageError> =>
+  Effect.tryPromise({ try: run, catch: (cause) => new BrowserStorageError({ operation, cause }) })
+
 /** The Web Locks API rejected a request for a reason other than our own cancellation. */
 export class LockError extends Schema.TaggedError<LockError>()("LockError", {
   name: Schema.String,
   message: Schema.String
 }) {}
 
-const lockError = (name: string, cause: unknown) =>
-  new LockError({ name, message: cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause) })
+const lockError = (name: string, cause: unknown) => new LockError({ name, message: describe(cause) })
 
 /**
  * Request `name` and resolve with a release function once granted (or `undefined` when `ifAvailable`
@@ -264,31 +281,30 @@ export const tabCapability = (): { readonly unsupported: string | undefined; rea
  * Web Locks, so this waits until every file in the pool can be opened; a freshly elected leader then
  * does not crash on a handle still held by its predecessor.
  */
-export const awaitOpfsPoolFree = (directory: string): Effect.Effect<void, Error> =>
-  Effect.tryPromise({
-    try: async () => {
-      const root = await navigator.storage.getDirectory()
-      let dir = root
-      try {
-        for (const part of directory.split("/")) dir = await dir.getDirectoryHandle(part)
-      } catch {
-        return
+export const awaitOpfsPoolFree = (directory: string): Effect.Effect<void, BrowserStorageError> =>
+  storageCall(`waiting for the OPFS pool ${directory} to be free`, async () => {
+    const root = await navigator.storage.getDirectory()
+    let dir = root
+    try {
+      for (const part of directory.split("/")) dir = await dir.getDirectoryHandle(part)
+    } catch {
+      return
+    }
+    // `entries()` is in the WHATWG spec and every engine that has OPFS, but not in TS's DOM lib yet.
+    // oxlint-disable-next-line typescript/consistent-type-assertions -- platform edge, see above
+    const iterable = dir as unknown as { values(): AsyncIterable<FileSystemHandle> }
+    for await (const handle of iterable.values()) {
+      if (handle instanceof FileSystemFileHandle) {
+        const access = await handle.createSyncAccessHandle()
+        access.close()
       }
-      // `entries()` is in the WHATWG spec and every engine that has OPFS, but not in TS's DOM lib yet.
-      // oxlint-disable-next-line typescript/consistent-type-assertions -- platform edge, see above
-      const iterable = dir as unknown as { values(): AsyncIterable<FileSystemHandle> }
-      for await (const handle of iterable.values()) {
-        if (handle instanceof FileSystemFileHandle) {
-          const access = await handle.createSyncAccessHandle()
-          access.close()
-        }
-      }
-    },
-    catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause)))
+    }
   }).pipe(
     Effect.retry({
       times: 100,
       schedule: Schedule.spaced("20 millis"),
-      while: (e) => e.name === "NoModificationAllowedError" || e.name === "InvalidStateError"
+      while: ({ cause }) =>
+        cause instanceof DOMException &&
+        (cause.name === "NoModificationAllowedError" || cause.name === "InvalidStateError")
     })
   )

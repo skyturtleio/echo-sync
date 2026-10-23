@@ -579,7 +579,10 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     if (Exit.isFailure(tabLock)) {
       route.publish({
         _tag: "Unavailable",
-        error: new LeaderUnavailable({ reason: "Unsupported", message: `tab lock: ${String(tabLock.cause)}` })
+        error: new LeaderUnavailable({
+          reason: "Unsupported",
+          message: `tab lock: ${Platform.describe(Cause.squash(tabLock.cause))}`
+        })
       })
       return service
     }

@@ -186,6 +186,16 @@ check "OPFS startup failure: the failed candidate releases the leader lock, the 
 ab tab close "$A" >/dev/null
 ab tab close "$B" >/dev/null
 
+# With no other tab to take over, the failure reaches the tab: it must say what failed, where, and why.
+APP="failalone-$RUN"
+A=$(open_tab "$BASE/?app=$APP&failOpen")
+ev <<<"return await echo.until(async () => (await navigator.locks.query()).held.some((l) => l.name === 'echo:$APP:default:leader'))" >/dev/null
+ev <<<"echo.release('fail-open'); return true" >/dev/null
+check "OPFS startup failure alone: the tab's LeaderFailed names the operation, the pool path and the browser's reason" "$(ev <<<"await echo.until(async () => !(await echo.exec('SELECT 1')).ok)
+const r = await echo.exec('SELECT 1')
+return { pass: !r.ok && r.error.reason === 'LeaderFailed' && r.error.message.includes('opening the OPFS pool echo-sync/$APP/default failed: NotReadableError: injected OPFS startup failure'), r }")"
+ab tab close "$A" >/dev/null
+
 # ── saved means durable ──────────────────────────────────────────────────────────────────────────────
 APP="durable-$RUN"
 T=$(open_tab "$BASE/?app=$APP")
