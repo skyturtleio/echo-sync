@@ -45,6 +45,7 @@ describe.skipIf(!pgAvailable)("Postgres statement budgets", () => {
             {
               mutationId: Ids.MutationId.make("work"),
               seq: Ids.Seq.make(1),
+              createdAt: 1_700_000_000_000,
               name: "work",
               args: { reads: n, writes: m }
             }
@@ -53,6 +54,7 @@ describe.skipIf(!pgAvailable)("Postgres statement budgets", () => {
         expect(result.results.map((r) => r.outcome._tag)).toEqual(["Applied"])
         // rpc.executeBatch: catalog 1. ledger.runMutation: BEGIN, SET, INSERT client,
         // lock SELECT, dedup SELECT, SAVEPOINT, RELEASE, INSERT ledger, COMMIT = 9.
+        // Writer-clock validation uses Effect's clock and adds no SQL statements.
         // Store.get: row + authorization = 2; patch: row + authorization + write = 3.
         // Trigger functions/log inserts are server-side work, NOT connection statements.
         expect(counter.statements).toHaveLength(10 + 2 * n + 3 * m)

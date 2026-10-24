@@ -3,7 +3,9 @@ import * as PgClient from "@effect/sql-pg/PgClient"
 import {
   Array as Arr,
   Cause,
+  Clock,
   Context,
+  DateTime,
   Duration,
   Effect,
   Exit,
@@ -26,7 +28,7 @@ import * as TestClock from "effect/testing/TestClock"
 import { PullTransportError } from "../../client/sync/SyncFailure.ts"
 import * as SyncLoop from "../../client/sync/SyncLoop.ts"
 import type { ClientPolicy } from "./pull.ts"
-import { handlers, layerHttp, Notifications, sharedPokes } from "./rpc.ts"
+import { executeBatch, handlers, layerHttp, Notifications, sharedPokes } from "./rpc.ts"
 import { grant, Items, pgAvailable, registry, RowId, TestDatabase } from "./test-support.ts"
 
 const addItem = Mutation.make("items.add", {
@@ -124,6 +126,100 @@ const writer = Effect.gen(function* () {
 })
 
 describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
+  it.live("clock checks must accept the boundary and old edits without timestamp ordering", () =>
+    Effect.gen(function* () {
+      yield* writer
+      const sql = yield* SqlClient
+      const serverNow = 1_700_000_000_000
+      const clock = yield* TestClock.make()
+      yield* clock.setTime(serverNow)
+      const stamped = Mutation.make("items.stamped", {
+        args: Schema.Struct({ id: Schema.String }),
+        handler: (ctx, args) =>
+          ctx.store.insert(Items, {
+            id: RowId.make(args.id),
+            accessScopeId: AccessScope.AccessScopeId.make("s1"),
+            body: String(DateTime.toEpochMillis(ctx.now))
+          })
+      })
+      const options = { registry, mutations: Mutation.makeRegistry([stamped]) }
+      const request = (clientId: string, createdAt: number): Protocol.PushRequest => ({
+        clientId: Ids.ClientId.make(clientId),
+        mutations: [
+          {
+            mutationId: Ids.MutationId.make(clientId),
+            seq: Ids.Seq.make(1),
+            name: stamped.name,
+            args: { id: clientId },
+            createdAt
+          }
+        ]
+      })
+      const actor = AccessScope.PrincipalId.make("p")
+      const run = (payload: Protocol.PushRequest) =>
+        executeBatch(options, actor, payload).pipe(Effect.provideService(Clock.Clock, clock))
+      const first = yield* run(request("first", serverNow + 30_000))
+      const second = yield* run(request("second", serverNow - 6 * 60 * 60 * 1000))
+      const future = request("future", serverNow + 30_001)
+      const rejected = yield* run(future)
+      assert.deepStrictEqual(first.results[0]?.outcome, { _tag: "Applied" })
+      assert.deepStrictEqual(second.results[0]?.outcome, { _tag: "Applied" })
+      assert.deepStrictEqual(rejected.results[0]?.outcome, {
+        _tag: "Rejected",
+        error: new Mutation.ClockSkew({ createdAt: serverNow + 30_001, serverNow })
+      })
+      assert.isTrue((first.results[0]?.position ?? 0n) < (second.results[0]?.position ?? 0n))
+      assert.deepStrictEqual(yield* sql`SELECT id, body FROM items ORDER BY id`, [
+        { id: "first", body: String(serverNow + 30_000) },
+        { id: "second", body: String(serverNow - 6 * 60 * 60 * 1000) }
+      ])
+      assert.deepStrictEqual(
+        yield* sql`SELECT row_id FROM echo_sync.log WHERE table_name = 'items' ORDER BY position`,
+        [{ row_id: "first" }, { row_id: "second" }]
+      )
+      // Rechecking the clock on dedup would change this verdict after the clock catches up.
+      yield* clock.setTime(serverNow + 60_000)
+      assert.deepStrictEqual(yield* run(future), rejected)
+      assert.deepStrictEqual(yield* run(request("first", serverNow + 999_999)), first)
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
+  it.live("an old client omitting createdAt must retain server time and still obey clientPolicy", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      const serverNow = 1_700_000_000_456
+      const clock = yield* TestClock.make()
+      yield* clock.setTime(serverNow)
+      const create = Mutation.make("scope.create", {
+        args: Schema.Struct({}),
+        handler: (ctx) => ctx.store.createScope(AccessScope.AccessScopeId.make("legacy"))
+      })
+      const options = { registry, mutations: Mutation.makeRegistry([create]) }
+      const request: Protocol.PushRequest = {
+        clientId: Ids.ClientId.make("legacy"),
+        mutations: [{ mutationId: Ids.MutationId.make("legacy"), seq: Ids.Seq.make(1), name: "scope.create", args: {} }]
+      }
+      const actor = AccessScope.PrincipalId.make("p")
+      const refused = yield* Effect.flip(
+        executeBatch(
+          { ...options, clientPolicy: () => Effect.fail(new Protocol.ClientOutdated({ message: "update required" })) },
+          actor,
+          request
+        )
+      )
+      assert.strictEqual(refused._tag, "ClientOutdated")
+      assert.deepStrictEqual(yield* sql`SELECT client_id FROM echo_sync.clients`, [])
+      const applied = yield* executeBatch(options, actor, request).pipe(Effect.provideService(Clock.Clock, clock))
+      assert.deepStrictEqual(applied.results[0]?.outcome, { _tag: "Applied" })
+      assert.deepStrictEqual(
+        yield* sql`SELECT (extract(epoch FROM granted_at) * 1000)::float8 AS at FROM echo_sync.scope_grants`,
+        [{ at: serverNow }]
+      )
+      const [receipt] = yield* sql<{ received_at: Date }>`SELECT received_at FROM echo_sync.mutations`
+      assert.isTrue((receipt?.received_at.getTime() ?? 0) > serverNow)
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
   it.live("a server with an invalid pageLimit dies at construction instead of producing an endless PullPage", () =>
     Effect.gen(function* () {
       for (const pageLimit of [0, -1, 0.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {

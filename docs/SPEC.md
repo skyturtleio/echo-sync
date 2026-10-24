@@ -1660,6 +1660,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 ### Retired rules
 
 - **Retired (2026-10-22):** Apps must close all tab clients before `resetReplica` (2026-10-21); engine-owned coordinated close supersedes this prerequisite (INV-BRW-7, §12).
+- **Retired (2026-10-24):** Server-time `ctx.now` for every mutation (former INV-MUT-8); writer time with a future-skew bound supersedes it except for pre-field clients (INV-MUT-11–14, §5).
 
 ### Coverage
 
@@ -1690,7 +1691,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-MUT-5 | covered | `ledger.test` "a unique violation from a stale snapshot retries to Applied instead of stopping the batch transient", "a conflict combined with a rejection is retried, and the retry's outcome is ledgered (transient beats rejection)", "… on every attempt stops the batch as transient with nothing ledgered", "a conflict combined with a programmer defect dies without retry (defect beats transient)" |
 | INV-MUT-6 | covered | `ledger.test` "a persistent unique violation is ledgered with a position instead of blocking later mutations", "a check constraint is rejected immediately without retries or partial writes" |
 | INV-MUT-7 | covered | `ledger.test` "seq < 1 is a malformed envelope: not executed, not recorded, not answered as clientExpired" |
-| INV-MUT-8 | partial | `Mutation.test` "the seeded random is a function of (clientId, mutationId), so a rebase replays identically" (client `ctx.now = createdAt` untested) |
+| INV-MUT-8 | covered | `Mutation.test` "the seeded random is a function of (clientId, mutationId), so a rebase replays identically"; `scope-create.e2e` "pull must not replace the writer timestamp with push time" |
 | INV-MUT-9 | partial | `Mutation.test` "rejects two mutations with the same name at construction" (queries untested) |
 | INV-MUT-10 | covered | `ledger.test` "a client id registered to one principal is refused to another" |
 | INV-MUT-11 | covered | `scope-create.e2e` "pull must not replace the writer timestamp with push time" |
@@ -1784,7 +1785,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PERF-6 | partial | `rpc.test` "more open pokes streams than pool connections do not block push or pull, and the server holds one LISTEN" (fan-out and notify counts unmeasured) |
 | INV-PERF-7 | covered | `perf-postgres.test` both budget tests; `perf-install.test` "install undoes P entries, writes C changes and replays P handlers without hidden statements" (SELECT-returned rows, not physical scans) |
 
-Totals: 118 invariants; 105 covered, 8 partial (INV-MUT-2, INV-MUT-8, INV-MUT-9, INV-POS-3,
+Totals: 118 invariants; 106 covered, 7 partial (INV-MUT-2, INV-MUT-9, INV-POS-3,
 INV-PULL-7, INV-PUSH-1, INV-TEL-5, INV-PERF-6), 5 untested (INV-ID-3, INV-POS-5,
 INV-PULL-8, INV-CLI-7, INV-PERF-5).
 

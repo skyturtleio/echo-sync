@@ -3,11 +3,12 @@ import "../src/client/testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { assert, describe, it } from "@effect/vitest"
 import type * as PgClient from "@effect/sql-pg/PgClient"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Clock, Context, Effect, Layer, Schema } from "effect"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
 import { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation } from "echo-sync"
+import * as TestClock from "effect/testing/TestClock"
 import * as Engine from "../src/client/sync/Engine.ts"
 import * as SqliteSyncStorage from "../src/client/sync/SqliteSyncStorage.ts"
 import * as Transport from "../src/client/sync/Transport.ts"
@@ -84,10 +85,65 @@ const setup = Effect.gen(function* () {
   const pending = Effect.map(storage.transaction(storage.pending), (entries) =>
     entries.map((e) => ({ mutationId: e.envelope.mutationId, undo: e.undo.length }))
   )
-  return { pg: Context.get(db, SqlClient), engine, replica, notices, pending, fetch }
+  return { pg: Context.get(db, SqlClient), sqlite, engine, replica, notices, pending, fetch }
 })
 
 describe.skipIf(!pgAvailable)("scope creation (SPEC §4) against the real server", () => {
+  it.live("pull must not replace the writer timestamp with push time", () =>
+    Effect.gen(function* () {
+      const { pg, sqlite, engine, fetch, pending } = yield* setup
+      const clock = yield* TestClock.make()
+      yield* Effect.gen(function* () {
+        const createdAt = (yield* Clock.currentTimeMillis) - 6 * 60 * 60 * 1000
+        yield* clock.setTime(createdAt)
+        yield* engine
+          .mutate(mid("offline-create"), "scopes.create", { scope: "offline" })
+          .pipe(Effect.provideService(Clock.Clock, clock))
+        const optimistic = yield* sqlite<{ granted_at: number }>`SELECT granted_at FROM scope_grants`
+        assert.deepStrictEqual(optimistic, [{ granted_at: createdAt }])
+        // Six hours offline must not become the push time (INV-MUT-11).
+        assert.strictEqual((yield* engine.push).processed, 1)
+        const server = yield* pg<{ at: number }>`
+          SELECT (extract(epoch FROM granted_at) * 1000)::float8 AS at FROM echo_sync.scope_grants`
+        assert.deepStrictEqual(server, [{ at: createdAt }])
+        yield* engine.pull
+        assert.deepStrictEqual(yield* sqlite`SELECT granted_at FROM scope_grants`, optimistic)
+        assert.deepStrictEqual(yield* pending, [])
+      }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
+  it.live("a future clock must reject without writes and retain the ClockSkew notice", () =>
+    Effect.gen(function* () {
+      const { pg, engine, fetch, replica, pending, notices, sqlite } = yield* setup
+      const clock = yield* TestClock.make()
+      yield* Effect.gen(function* () {
+        const beforePush = yield* Clock.currentTimeMillis
+        const createdAt = beforePush + 60_000
+        yield* clock.setTime(createdAt)
+        yield* engine
+          .mutate(mid("future-create"), "scopes.create", { scope: "future" })
+          .pipe(Effect.provideService(Clock.Clock, clock))
+        assert.deepStrictEqual((yield* replica).grants, ["future:b:owner"])
+        assert.strictEqual((yield* engine.push).processed, 1)
+        assert.deepStrictEqual(yield* pg`SELECT id FROM echo_sync.access_scopes`, [])
+        assert.deepStrictEqual(yield* pending, [{ mutationId: "future-create", undo: 1 }])
+        assert.deepStrictEqual((yield* replica).grants, ["future:b:owner"])
+        assert.deepStrictEqual(yield* notices, [])
+        yield* engine.pull
+        assert.deepStrictEqual(yield* pending, [])
+        assert.deepStrictEqual((yield* replica).grants, [])
+        assert.deepStrictEqual(yield* notices, [["future-create", "ClockSkew", null]])
+        const [saved] = yield* SqliteSyncStorage.notices(sqlite)
+        const error = saved?.notice._tag === "Rejected" ? saved.notice.error : null
+        if (error?._tag !== "ClockSkew") return assert.fail("expected ClockSkew")
+        assert.strictEqual(error.createdAt, createdAt)
+        assert.isAtLeast(error.serverNow, beforePush)
+        assert.isAtMost(error.serverNow, yield* Clock.currentTimeMillis)
+      }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
   it.live(
     "an optimistic createScope of an id the server already has is rejected ScopeForbidden, and the pull undoes the grant and the write that depended on it; a fresh id is applied and stays",
     () =>
