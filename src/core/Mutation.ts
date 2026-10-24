@@ -55,6 +55,12 @@ export class ClientExpired extends Schema.TaggedError<ClientExpired>()("ClientEx
   mutationId: MutationId
 }) {}
 
+/** The writer clock is too far ahead; no handler writes were applied (SPEC §5). */
+export class ClockSkew extends Schema.TaggedError<ClockSkew>()("ClockSkew", {
+  createdAt: Schema.Number,
+  serverNow: Schema.Number
+}) {}
+
 export const MutationRejection = Schema.Union([
   UnknownMutation,
   ArgsDecodeFailed,
@@ -64,7 +70,8 @@ export const MutationRejection = Schema.Union([
   InvalidRow,
   DomainError,
   ConstraintViolated,
-  ClientExpired
+  ClientExpired,
+  ClockSkew
 ])
 export type MutationRejection = typeof MutationRejection.Type
 

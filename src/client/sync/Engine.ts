@@ -358,9 +358,10 @@ export const make = (options: {
                 clientId,
                 clientVersion,
                 principal: options.actor,
-                mutations: Arr.map(batch, ({ envelope }) => ({
+                mutations: Arr.map(batch, ({ envelope, createdAt }) => ({
                   mutationId: envelope.mutationId,
                   seq: envelope.seq,
+                  createdAt,
                   name: envelope.name,
                   args: envelope.args
                 }))

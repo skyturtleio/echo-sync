@@ -21,10 +21,17 @@ export type ClientVersion = typeof ClientVersion.Type
 export const PushMutation = Schema.Struct({
   mutationId: MutationId,
   seq: Seq,
+  /** Original writer clock, never an ordering key. Absent only on pre-field clients (SPEC §5). */
+  createdAt: Schema.optionalKey(
+    Schema.Int.check(Schema.isBetween({ minimum: -210_866_803_200_000, maximum: 8_640_000_000_000_000 }))
+  ),
   name: Schema.String,
   args: Schema.Json
 })
 export type PushMutation = typeof PushMutation.Type
+
+/** Reject, never clamp, writer clocks further ahead than this (SPEC §18). */
+export const maxMutationFutureSkewMillis = 30_000
 
 export const PushRequest = Schema.Struct({
   clientId: ClientId,

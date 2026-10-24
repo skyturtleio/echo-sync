@@ -387,7 +387,13 @@ export const executeBatch = (
       mutationId: m.mutationId,
       seq: BigInt(m.seq),
       body: Effect.gen(function* () {
-        const now = yield* DateTime.now
+        // Inside the ledger body: known identities replay before any clock check.
+        const serverTime = yield* DateTime.now
+        const serverNow = DateTime.toEpochMillis(serverTime)
+        if (m.createdAt !== undefined && m.createdAt - serverNow > Protocol.maxMutationFutureSkewMillis) {
+          return yield* new Mutation.ClockSkew({ createdAt: m.createdAt, serverNow })
+        }
+        const now = m.createdAt === undefined ? serverTime : DateTime.makeUnsafe(m.createdAt)
         const { store } = Store.make(rowStore, {
           actor,
           roleFor: roleFor(sql, actor),
