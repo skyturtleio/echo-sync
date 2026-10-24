@@ -83,7 +83,12 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
           principalFor: (headers) =>
             headers["origin"] === "https://app.test" && headers["cookie"] === "session=http-secret"
               ? Effect.succeed(AccessScope.PrincipalId.make("http-principal"))
-              : Effect.fail(new Protocol.Unauthorized({ message: "HTTP credential or origin refused" }))
+              : Effect.fail(
+                  new Protocol.Unauthorized({
+                    reason: "authenticationRefused",
+                    message: "HTTP credential or origin refused"
+                  })
+                )
         }).pipe(Layer.provide(Layer.succeedContext(db))),
         { disableLogger: true }
       )

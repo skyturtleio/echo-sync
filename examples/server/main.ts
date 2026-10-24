@@ -53,13 +53,17 @@ const sync = Startup.layer({
     // Reject sibling origins too: same-site is not the same as same-origin.
     const site = headers["sec-fetch-site"]
     if (site === "cross-site" || site === "same-site") {
-      return Effect.fail(new Protocol.Unauthorized({ message: "cross-origin sync request" }))
+      return Effect.fail(
+        new Protocol.Unauthorized({ reason: "authenticationRefused", message: "cross-origin sync request" })
+      )
     }
     // Non-browser callers can omit Sec-Fetch-Site. Production apps must authenticate a secret
     // session cookie / bearer token here; this harness's principal header is not authentication.
     const principal = headers[principalHeader]
     return principal === undefined || principal === ""
-      ? Effect.fail(new Protocol.Unauthorized({ message: `missing ${principalHeader}` }))
+      ? Effect.fail(
+          new Protocol.Unauthorized({ reason: "authenticationRefused", message: `missing ${principalHeader}` })
+        )
       : Effect.succeed(AccessScope.PrincipalId.make(principal))
   }
 }).pipe(Layer.provide(Db))

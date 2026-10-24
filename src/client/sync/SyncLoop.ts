@@ -22,7 +22,7 @@ import {
   Stream,
   SubscriptionRef
 } from "effect"
-import type { Errors } from "echo-sync"
+import type { Errors, Protocol } from "echo-sync"
 import type * as Engine from "./Engine.ts"
 import * as SyncFailure from "./SyncFailure.ts"
 import { type PullTransportError, SyncErrorKind } from "./SyncFailure.ts"
@@ -92,12 +92,19 @@ const stoppedBatch: SyncError = { kind: "server", message: "the server stopped t
 /**
  * The status consequences of a failure cause (INV-LOOP-5: defect > integrity > transient), never just
  * its first failure. Interruption is re-raised (the loop is stopping). The returned strings are
- * constants; the cause itself is only ever logged.
+ * constants except a closed `Unauthorized.reason`, which is safe to surface; the cause itself is
+ * only ever logged.
  */
 const classify = <E, V>(cause: Cause.Cause<E>, verdict: (cause: Cause.Cause<E>) => V) =>
   Cause.hasInterrupts(cause) ? Effect.interrupt : Effect.succeed(verdict(cause))
 
-const errorOf = (kind: SyncErrorKind): SyncError => ({ kind, message: messages[kind] })
+const errorOf = (kind: SyncErrorKind, unauthorizedReason = Option.none<Protocol.UnauthorizedReason>()): SyncError => ({
+  kind,
+  message:
+    kind === "unauthorized" && Option.isSome(unauthorizedReason)
+      ? `${messages[kind]} (${unauthorizedReason.value})`
+      : messages[kind]
+})
 
 export const make = (options: {
   readonly engine: Engine.Engine
@@ -154,8 +161,9 @@ export const make = (options: {
         const pushed = yield* Effect.exit(engine.push)
         if (Exit.isFailure(pushed)) {
           const { kind, halt } = yield* classify(pushed.cause, SyncFailure.classifyPush)
+          const unauthorizedReason = SyncFailure.unauthorizedReason(pushed.cause)
           if (Option.isNone(halt) && kind === "outdated") {
-            yield* stopOutdated(errorOf(kind))
+            yield* stopOutdated(errorOf(kind, unauthorizedReason))
             return false
           }
           if (Option.isSome(halt)) {
@@ -164,7 +172,7 @@ export const make = (options: {
             yield* SubscriptionRef.update(status, (s) => ({ ...s, push: halted }))
           } else {
             yield* Telemetry.log("Debug", "echo-sync: push failed; retrying", pushed.cause)
-            transient = Option.some(errorOf(kind))
+            transient = Option.some(errorOf(kind, unauthorizedReason))
           }
         } else if (pushed.value.stopped) {
           transient = Option.some(stoppedBatch)
@@ -178,12 +186,15 @@ export const make = (options: {
       if (Exit.isFailure(pulled)) {
         // A pull never halts: a pull defect is transient.
         const { kind } = yield* classify(pulled.cause, SyncFailure.classifyPull)
+        const unauthorizedReason = SyncFailure.unauthorizedReason(pulled.cause)
         if (kind === "outdated") {
-          yield* stopOutdated(errorOf(kind))
+          yield* stopOutdated(errorOf(kind, unauthorizedReason))
           return false
         }
         yield* Telemetry.log("Debug", "echo-sync: pull failed; retrying", pulled.cause)
-        if (Option.isNone(transient) || kind === "server-outdated") transient = Option.some(errorOf(kind))
+        if (Option.isNone(transient) || kind === "server-outdated") {
+          transient = Option.some(errorOf(kind, unauthorizedReason))
+        }
       }
       // `engine.pull` succeeds only once a `PullDone` set is installed.
       const syncedAt = pushedCleanly && Exit.isSuccess(pulled) ? yield* Clock.currentTimeMillis : undefined

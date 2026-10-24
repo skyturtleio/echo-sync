@@ -109,8 +109,22 @@ export class ResnapshotRequired extends Schema.TaggedError<ResnapshotRequired>()
   reason: Schema.Literals(["gcHorizon", "unknownCursor", "staleContinuation"])
 }) {}
 
-/** The request's principal could not be established or does not own `clientId`. */
+/** Closed diagnostic vocabulary for every `Unauthorized` condition (SPEC §15). */
+export const UnauthorizedReason = Schema.Literals([
+  "authenticationRefused",
+  "principalMismatch",
+  "clientPrincipalMismatch",
+  "wildcardPrincipal",
+  "httpUnauthorized"
+])
+export type UnauthorizedReason = typeof UnauthorizedReason.Type
+
+/**
+ * The request's principal could not be established, disagrees with the replica, or does not own
+ * `clientId`. `reason` is optional on the wire so a new client can decode an old server's error.
+ */
 export class Unauthorized extends Schema.TaggedError<Unauthorized>()("Unauthorized", {
+  reason: Schema.optionalKey(UnauthorizedReason),
   message: Schema.String
 }) {}
 

@@ -1353,8 +1353,9 @@ member updates the rule and its dated rationale here (§0.2).
 ### Invariant digest
 
 - INV-ERR-1: Error tags, and the literal unions they carry (`ResnapshotRequired.reason`,
-  `PushIntegrityError.reason`, `ConstraintViolated.kind`, `LeaderUnavailable.reason`,
-  `SyncErrorKind`), are closed sets. The transport classifies by tag, never by message text.
+  `Unauthorized.reason`, `PushIntegrityError.reason`, `ConstraintViolated.kind`,
+  `LeaderUnavailable.reason`, `SyncErrorKind`), are closed sets. The transport classifies by
+  tag, never by message text.
 - INV-ERR-2: An error that wraps a cause keeps it (`CorruptStorage.cause`,
   `BrowserStorageError.cause`, `LockError`) and its message names what was attempted and where:
   `CorruptStorage` names the table and row id (INV-CLI-11), `LeaderLost` the leader id,
@@ -1374,11 +1375,27 @@ member updates the rule and its dated rationale here (§0.2).
 | tag | fields | raised by | client action |
 |---|---|---|---|
 | `ResnapshotRequired` | `reason: gcHorizon \| unknownCursor \| staleContinuation` | `pull` | non-initial request: clear staging, `resnapshot`, pull from null (INV-CLI-10); initial: transient pull failure |
-| `Unauthorized` | `message` | `push`, `pull`, `pokes`, `room`, `track` (refused authenticated `*`, principal assertion, `ClientForbidden`, app `principalFor`); also HTTP 401/403 | transient, kind `unauthorized`; presence rejoins |
+| `Unauthorized` | `reason?: …, message` | `push`, `pull`, `pokes`, `room`, `track`; also HTTP 401/403 | transient, kind `unauthorized`; presence rejoins; the safe closed `reason` is surfaced in `SyncStatus.lastError.message`, but never changes retry behavior |
 | `ClientOutdated` | `message` | app `clientPolicy` on `push`/`pull` | terminal for this leader, kind `outdated` |
 | `MalformedEnvelope` | `clientId, mutationId, message` | `push` (`seq < 1`) | push halts |
 | `ServerUnavailable` | `message` | `pull` (database failure, lost connection), `pokes` (lost `LISTEN`), `room` (grant lookup failed), declared on `track` | transient, kind `unavailable` |
 | `Forbidden` | `room` | `room`, `track` (no grant in the room's scope) | presence subscription ends |
+
+`Unauthorized.reason` is the closed diagnostic union:
+
+| reason | condition |
+|---|---|
+| `authenticationRefused` | the app's `principalFor` refuses the request |
+| `principalMismatch` | the optional replica `principal` assertion differs from the authenticated principal |
+| `clientPrincipalMismatch` | the `clientId` is already bound to another principal (`ClientForbidden`) |
+| `wildcardPrincipal` | the authenticated principal is `*` |
+| `httpUnauthorized` | the client transport receives HTTP 401 or 403 before RPC decoding |
+
+**Rationale (2026-10-24):** `Unauthorized` now carries a stable closed diagnostic reason so
+operators can distinguish authentication refusal, identity mismatch and transport refusal without
+parsing messages. The field is optional on the wire for an old server's response; new emitters
+always set it. One tag and retry behavior remain for every reason; branching client sync semantics
+by reason was rejected.
 
 #### 15.2 Mutation outcomes (`Mutation.MutationRejection`), ledgered and acked
 
@@ -1446,13 +1463,6 @@ server-outdated`.
 | `ResetFailed` | `message` | reset could not run (unsupported browser, invalid identity, non-finite `closeTimeout`, OPFS error, a throwing `spawnLeader`) |
 | `BrowserStorageError` | `operation, cause` | OPFS / Web Crypto call failed; message names the operation, never the path |
 | `LockError` | `name, message` | Web Locks rejected for a reason other than our own cancellation |
-
-### Open Questions
-
-- OQ-ERR-1: `Unauthorized` is produced by four different conditions (app `principalFor`,
-  principal assertion mismatch, `ClientForbidden`, HTTP 401/403 mapped by the transport) and
-  carries only a `message`. An app cannot tell "sign in again" from "this replica belongs to
-  another account" without reading text. Whether a `reason` literal is wanted is open.
 
 ## 16. Performance budget
 
@@ -1727,7 +1737,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-TEL-3 | covered | `observability.e2e` "throwing host sinks cannot change saved intent, retry deadlines, halt or successful installs", "closing a pulled subscription in the host context retains its own outcome and protects cleanup and the host parent" |
 | INV-TEL-4 | covered | `observability.e2e` "the whole final push cause remains authoritative, including typed cleanup failures", "batch telemetry agrees with the loop"; `SyncLoop.test` "a pokes connection the idle timeout ends must record idle-timeout, and one the server ends server-end" |
 | INV-TEL-5 | partial | `observability.e2e` "RPC request context cannot bypass sanitization for … tracerLogger events" (the Debug downgrade of interrupted causes is untested) |
-| INV-ERR-1 | partial | `Transport.test` "push failures are fatal exactly when SPEC §10 says so, classified by real tags over a real RPC server" (closedness is type-level) |
+| INV-ERR-1 | covered | `Transport.test` "Unauthorized reason schema matches the closed catalog in SPEC §15", "a server Unauthorized surfaces its diagnostic reason without changing the unauthorized verdict", "HTTP auth refusals before RPC decoding report unauthorized, retry without halting, and keep the pending mutation; other statuses stay network"; `rpc.test` "push, pull and pokes asserting another principal than the session's run no statement or policy and change no row, even for a bound client", "an app authentication refusal carries authenticationRefused through the public RPC surface", "a client bound to another principal carries clientPrincipalMismatch through the public RPC surface", "push, pull and pokes authenticated as * are Unauthorized before they bind or ledger" |
 | INV-ERR-2 | covered | `SqliteRowStore.test` "a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError"; `scenarios.sh` "OPFS startup failure alone: the tab's LeaderFailed names the operation and the browser's reason, not the app or profile path" |
 | INV-PERF-1 | covered | `ordering.test` "without the trigger's advisory lock that reader skips the earlier writer (the ordering check can fail)" (the lock is held; its throughput consequence is not measured) |
 | INV-PERF-2 | covered | `perf-postgres.test` "a pushed mutation adds only its N reads and M writes to the fixed ledger cost" |
@@ -1737,8 +1747,8 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PERF-6 | partial | `rpc.test` "more open pokes streams than pool connections do not block push or pull, and the server holds one LISTEN" (fan-out and notify counts unmeasured) |
 | INV-PERF-7 | covered | `perf-postgres.test` both budget tests; `perf-install.test` "install undoes P entries, writes C changes and replays P handlers without hidden statements" (SELECT-returned rows, not physical scans) |
 
-Totals: 113 invariants; 99 covered, 9 partial (INV-MUT-2, INV-MUT-8, INV-MUT-9, INV-POS-3,
-INV-PULL-7, INV-PUSH-1, INV-TEL-5, INV-ERR-1, INV-PERF-6), 5 untested (INV-ID-3, INV-POS-5,
+Totals: 113 invariants; 100 covered, 8 partial (INV-MUT-2, INV-MUT-8, INV-MUT-9, INV-POS-3,
+INV-PULL-7, INV-PUSH-1, INV-TEL-5, INV-PERF-6), 5 untested (INV-ID-3, INV-POS-5,
 INV-PULL-8, INV-CLI-7, INV-PERF-5).
 
 ## 18. Limits and defaults
@@ -1801,7 +1811,6 @@ INV-PULL-8, INV-CLI-7, INV-PERF-5).
 | OQ-LOOP-1 | §10 | the push halt is in memory per leader; a new leader retries the batch and halts again |
 | OQ-BRW-1 | §12 | `awaitOpfsPoolFree` bound (2 s) then `LeaderFailed` with no retry |
 | OQ-TEL-1 | §14 | closed telemetry vocabularies not asserted against a committed list |
-| OQ-ERR-1 | §15 | `Unauthorized` has no `reason`; four conditions share one tag |
 
 ## Appendix C. Browser mechanisms and verification notes (non-normative)
 

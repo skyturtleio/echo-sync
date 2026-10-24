@@ -137,7 +137,10 @@ it.effect(
       yield* Queue.fail(yield* server.nextConnection, dropped())
       yield* TestClock.adjust("1 second")
       // A credential failure (SPEC §10.3 Credentials) is retried like any other, never fatal.
-      yield* Queue.fail(yield* server.nextConnection, new Protocol.Unauthorized({ message: "expired" }))
+      yield* Queue.fail(
+        yield* server.nextConnection,
+        new Protocol.Unauthorized({ reason: "authenticationRefused", message: "expired" })
+      )
       yield* TestClock.adjust("2 seconds")
       expect(fiber.pollUnsafe()).toBeUndefined()
       yield* Queue.fail(yield* server.nextConnection, new Protocol.Forbidden({ room }))

@@ -50,7 +50,7 @@ const lift = <E extends { readonly _tag: string }>(
     http instanceof HttpClientError.StatusCodeError &&
     (http.response.status === 401 || http.response.status === 403)
   ) {
-    return new Protocol.Unauthorized({ message: `HTTP ${http.response.status}` })
+    return new Protocol.Unauthorized({ reason: "httpUnauthorized", message: `HTTP ${http.response.status}` })
   }
   return error
 }

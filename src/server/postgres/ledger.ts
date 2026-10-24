@@ -201,7 +201,12 @@ export const assertPrincipal = (
 ): Effect.Effect<void, Protocol.Unauthorized> =>
   asserted === undefined || asserted === authenticated
     ? Effect.void
-    : Effect.fail(new Protocol.Unauthorized({ message: "the replica's principal is not the authenticated principal" }))
+    : Effect.fail(
+        new Protocol.Unauthorized({
+          reason: "principalMismatch",
+          message: "the replica's principal is not the authenticated principal"
+        })
+      )
 
 /**
  * Binds a client id to its principal on first sight and refuses it to any other principal, so

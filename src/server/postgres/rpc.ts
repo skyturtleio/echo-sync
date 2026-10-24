@@ -75,14 +75,21 @@ const protocolOutcome = Telemetry.byFailure(
 export const pokeChannel = "echo_sync"
 
 const forbidden = (error: ClientForbidden) =>
-  new Protocol.Unauthorized({ message: `client ${error.clientId} belongs to another principal` })
+  new Protocol.Unauthorized({
+    reason: "clientPrincipalMismatch",
+    message: `client ${error.clientId} belongs to another principal`
+  })
 
 /** `*` grants access; it is never an authenticated actor (SPEC §4). */
 const authenticate = (principalFor: SyncServerOptions["principalFor"]) =>
   Effect.flatMap(requestHeaders, principalFor).pipe(
     Effect.filterOrFail(
       (principalId) => principalId !== AccessScope.Everyone,
-      () => new Protocol.Unauthorized({ message: "the everyone principal cannot authenticate" })
+      () =>
+        new Protocol.Unauthorized({
+          reason: "wildcardPrincipal",
+          message: "the everyone principal cannot authenticate"
+        })
     )
   )
 

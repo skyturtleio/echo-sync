@@ -117,6 +117,20 @@ const failureOf = <A, E>(exit: Exit.Exit<A, E>) =>
 /** Whether this failure halts a push, by the verdict `SyncLoop` acts on. */
 const isFatal = (failure: SyncFailure.PushFailure) => Option.isSome(SyncFailure.classifyPush(Cause.fail(failure)).halt)
 
+it("Unauthorized reason schema matches the closed catalog in SPEC §15", () => {
+  const fromSchema = Protocol.UnauthorizedReason.ast.types.map((member) => {
+    if (member._tag !== "Literal" || typeof member.literal !== "string") throw new Error("expected a string literal")
+    return member.literal
+  })
+  expect(fromSchema).toEqual([
+    "authenticationRefused",
+    "principalMismatch",
+    "clientPrincipalMismatch",
+    "wildcardPrincipal",
+    "httpUnauthorized"
+  ])
+})
+
 it.effect("push failures are fatal exactly when SPEC §10 says so, classified by real tags over a real RPC server", () =>
   Effect.gen(function* () {
     const cases = [
@@ -171,7 +185,9 @@ it.effect("push failures are fatal exactly when SPEC §10 says so, classified by
       },
       {
         name: "Unauthorized",
-        server: serve({ push: () => Effect.fail(new Protocol.Unauthorized({ message: "expired" })) }),
+        server: serve({
+          push: () => Effect.fail(new Protocol.Unauthorized({ reason: "authenticationRefused", message: "expired" }))
+        }),
         size: 1,
         tag: "Unauthorized",
         fatal: false,
@@ -486,7 +502,9 @@ const credentials = Effect.gen(function* () {
       const token = headers["authorization"] ?? "none"
       const ok = token === state.valid
       seen.push(`${rpc}:${token}${ok ? "" : ":rejected"}`)
-      return ok ? Effect.void : Effect.fail(new Protocol.Unauthorized({ message: `stale ${token}` }))
+      return ok
+        ? Effect.void
+        : Effect.fail(new Protocol.Unauthorized({ reason: "authenticationRefused", message: `stale ${token}` }))
     })
   const app = RpcServer.layerHttp({ group: Protocol.SyncRpcs, path: "/rpc", protocol: "http" }).pipe(
     Layer.provide([
@@ -777,11 +795,14 @@ it.live(
   15_000
 )
 
-it.live("a server Unauthorized is reported as kind unauthorized", () =>
+it.live("a server Unauthorized surfaces its diagnostic reason without changing the unauthorized verdict", () =>
   Effect.gen(function* () {
     const fixture = yield* credentials
     fixture.state.valid = "t2" // the client still sends t1
-    expect((yield* errorOf(fixture))?.kind).toBe("unauthorized")
+    expect(yield* errorOf(fixture)).toEqual({
+      kind: "unauthorized",
+      message: "the server rejected the credential (authenticationRefused)"
+    })
   }).pipe(Effect.scoped)
 )
 
@@ -831,7 +852,7 @@ it.live(
           expect(firstError(statuses)).toEqual(
             status === 500
               ? { kind: "network", message: "the request produced no usable response" }
-              : { kind: "unauthorized", message: "the server rejected the credential" }
+              : { kind: "unauthorized", message: "the server rejected the credential (httpUnauthorized)" }
           )
           expect(received.length).toBeGreaterThanOrEqual(4) // push and pull, then their retries
           expect(received.every((token) => token === "valid-token")).toBe(true)

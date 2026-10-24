@@ -412,6 +412,8 @@ describe.skipIf(!pgAvailable)("the replica's principal against the authenticated
           for (const exit of exits) {
             const error = refusal(exit)
             assert.strictEqual(error?._tag, "Unauthorized", String(exit))
+            if (!(error instanceof Protocol.Unauthorized)) return assert.fail(`expected Unauthorized: ${String(exit)}`)
+            assert.strictEqual(error.reason, "principalMismatch")
             messages.add(error !== undefined && "message" in error ? String(error.message) : "")
           }
           // One fixed message, naming neither principal.
@@ -450,6 +452,32 @@ describe.skipIf(!pgAvailable)("the replica's principal against the authenticated
       ])
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
+
+  it.live("an app authentication refusal carries authenticationRefused through the public RPC surface", () =>
+    Effect.gen(function* () {
+      const db = yield* Effect.context<SqlClient | PgClient.PgClient>()
+      const client = yield* connectTo(db, undefined, () =>
+        Effect.fail(new Protocol.Unauthorized({ reason: "authenticationRefused", message: "session expired" }))
+      )
+      const error = refusal(yield* Effect.exit(client.pull(pullFor("refused"))))
+      assert.strictEqual(error?._tag, "Unauthorized")
+      if (!(error instanceof Protocol.Unauthorized)) return assert.fail(`expected Unauthorized: ${String(error)}`)
+      assert.strictEqual(error.reason, "authenticationRefused")
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
+  it.live("a client bound to another principal carries clientPrincipalMismatch through the public RPC surface", () =>
+    Effect.gen(function* () {
+      const db = yield* Effect.context<SqlClient | PgClient.PgClient>()
+      const registered = yield* connectTo(db)
+      yield* registered.pull(pullFor("bound-client"))
+      const other = yield* connectTo(db, undefined, () => Effect.succeed(AccessScope.PrincipalId.make("other")))
+      const error = refusal(yield* Effect.exit(other.pull(pullFor("bound-client"))))
+      assert.strictEqual(error?._tag, "Unauthorized")
+      if (!(error instanceof Protocol.Unauthorized)) return assert.fail(`expected Unauthorized: ${String(error)}`)
+      assert.strictEqual(error.reason, "clientPrincipalMismatch")
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
 })
 
 describe.skipIf(!pgAvailable)("the everyone principal at the RPC boundary (SPEC §4)", () => {
@@ -485,7 +513,12 @@ describe.skipIf(!pgAvailable)("the everyone principal at the RPC boundary (SPEC 
         yield* Effect.exit(client.pull(pullFor("wildcard-pull"))),
         yield* Effect.exit(Stream.runHead(client.pokes({ clientId: Ids.ClientId.make("wildcard-pokes") })))
       ]
-      for (const exit of exits) assert.strictEqual(refusal(exit)?._tag, "Unauthorized", String(exit))
+      for (const exit of exits) {
+        const error = refusal(exit)
+        assert.strictEqual(error?._tag, "Unauthorized", String(exit))
+        if (!(error instanceof Protocol.Unauthorized)) return assert.fail(`expected Unauthorized: ${String(exit)}`)
+        assert.strictEqual(error.reason, "wildcardPrincipal")
+      }
       const after = yield* sql<{ clients: number; ledger: number }>`
         SELECT
           (SELECT count(*)::int FROM echo_sync.clients) AS clients,

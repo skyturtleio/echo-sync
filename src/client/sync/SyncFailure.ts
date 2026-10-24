@@ -12,7 +12,7 @@
 import { Cause, Data, Match, Option, Schema } from "effect"
 import type { Outcome } from "../../internal/Telemetry.ts"
 import type { RpcClientError } from "effect/rpc"
-import type { Errors, Protocol } from "echo-sync"
+import { type Errors, Protocol } from "echo-sync"
 
 /**
  * `syncHeaders` raised (a defect: its error channel is `never`) while the leader was preparing a
@@ -91,6 +91,18 @@ export class PullTransportError extends Data.TaggedError("PullTransportError")<{
   override get message(): string {
     return `${this.reason._tag}: ${this.reason.message}`
   }
+}
+
+/** The safe diagnostic reason an `Unauthorized` carries, if it decided a transport failure. */
+export const unauthorizedReason = (
+  cause: Cause.Cause<PushFailure | PullFailure>
+): Option.Option<Protocol.UnauthorizedReason> => {
+  for (const failure of failures(cause)) {
+    const reason =
+      failure instanceof PushTransportError || failure instanceof PullTransportError ? failure.reason : undefined
+    if (reason instanceof Protocol.Unauthorized && reason.reason !== undefined) return Option.some(reason.reason)
+  }
+  return Option.none()
 }
 
 /** A failure of `Engine.push`. */

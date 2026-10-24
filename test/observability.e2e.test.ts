@@ -121,7 +121,9 @@ it.live(
 
 it.effect("batch telemetry agrees with the loop's whole-cause decision, not the first failure", () =>
   Effect.gen(function* () {
-    const unauthorized = Cause.fail(pushError(new Protocol.Unauthorized({ message: secret })))
+    const unauthorized = Cause.fail(
+      pushError(new Protocol.Unauthorized({ reason: "authenticationRefused", message: secret }))
+    )
     const malformed = Cause.fail(pushError(malformedEnvelope()))
     for (const { cause, expected } of [
       { cause: Cause.combine(unauthorized, malformed), expected: "halted" },
@@ -174,7 +176,8 @@ it.effect("the whole final push cause remains authoritative, including typed cle
         let pulls = 0
         const failure = new Error(`cleanup-${secret}`)
         const { engine, storage } = yield* device({
-          push: () => Effect.fail(pushError(new Protocol.Unauthorized({ message: secret }))),
+          push: () =>
+            Effect.fail(pushError(new Protocol.Unauthorized({ reason: "authenticationRefused", message: secret }))),
           pull: () =>
             Effect.sync(() => {
               pulls++
@@ -241,7 +244,11 @@ it.effect("throwing host sinks cannot change saved intent, retry deadlines, halt
             Effect.suspend(() => {
               pushes++
               return Effect.fail(
-                pushError(pushes === 1 ? new Protocol.Unauthorized({ message: secret }) : malformedEnvelope())
+                pushError(
+                  pushes === 1
+                    ? new Protocol.Unauthorized({ reason: "authenticationRefused", message: secret })
+                    : malformedEnvelope()
+                )
               )
             }),
           pull: () => Effect.succeed(done)
@@ -290,7 +297,8 @@ it.live("SQLite sync never exports a typed failure, defect, result or dependency
   return Effect.gen(function* () {
     let failing = false
     const { engine, storage } = yield* device({
-      push: () => Effect.fail(pushError(new Protocol.Unauthorized({ message: secret }))),
+      push: () =>
+        Effect.fail(pushError(new Protocol.Unauthorized({ reason: "authenticationRefused", message: secret }))),
       pull: () => (failing ? Effect.die(new Error(secret)) : Effect.succeed(done))
     })
     yield* engine.mutate(Ids.MutationId.make("intent"), "accept", { secret })
@@ -450,7 +458,7 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
             headers["x-mode"] === "defect"
               ? Effect.die(new Error(secret))
               : headers["x-mode"] === "typed"
-                ? Effect.fail(new Protocol.Unauthorized({ message: secret }))
+                ? Effect.fail(new Protocol.Unauthorized({ reason: "authenticationRefused", message: secret }))
                 : Effect.succeed(actor)
         }).pipe(Layer.provide(Layer.succeedContext(db)))
         const other = HttpRouter.add(
