@@ -93,20 +93,21 @@ it.effect("request failures append no notices and ledgered rejections keep succe
     expect(local).toBeInstanceOf(Engine.LocallyRejected)
     for (const id of ["constraint", "clock", "expired"]) yield* engine.mutate(Ids.MutationId.make(id), "accept", {})
     yield* Effect.exit(engine.push)
-    expect(yield* storage.transaction(SqliteSyncStorage.notices(sqlite))).toEqual([])
-    expect(yield* storage.transaction(storage.pending)).toHaveLength(3)
+    // Inspection SQL is test-owned, not an engine operation; do not export its dependency spans.
+    expect(yield* storage.transaction(SqliteSyncStorage.notices(sqlite)).pipe(Telemetry.boundary)).toEqual([])
+    expect(yield* storage.transaction(storage.pending).pipe(Telemetry.boundary)).toHaveLength(3)
     refused = false
     yield* engine.push
-    const immediate = yield* storage.transaction(SqliteSyncStorage.notices(sqlite))
+    const immediate = yield* storage.transaction(SqliteSyncStorage.notices(sqlite)).pipe(Telemetry.boundary)
     expect(immediate.map(({ notice }) => notice._tag)).toEqual(["OutcomeUnknown"])
     yield* engine.pull
-    const retained = yield* storage.transaction(SqliteSyncStorage.notices(sqlite))
+    const retained = yield* storage.transaction(SqliteSyncStorage.notices(sqlite)).pipe(Telemetry.boundary)
     expect(retained.map(({ notice }) => notice._tag)).toEqual(["OutcomeUnknown", "Rejected", "Rejected"])
     expect(retained.flatMap(({ notice }) => (notice._tag === "Rejected" ? [notice.error] : []))).toEqual([
       new Errors.ConstraintViolated({ kind: "unique", constraint: "unique-title", message: secret }),
       new Mutation.ClockSkew({ createdAt: 40001, serverNow: 10000 })
     ])
-    expect(yield* storage.transaction(storage.pending)).toEqual([])
+    expect(yield* storage.transaction(storage.pending).pipe(Telemetry.boundary)).toEqual([])
     expect(outcomes("echo.enqueue")).toEqual(["rejected", "saved", "saved", "saved"])
     expect(outcomes("echo.push")).toEqual(["unauthorized", "ok"])
     expect(outcomes("echo.pull")).toEqual(["ok"])

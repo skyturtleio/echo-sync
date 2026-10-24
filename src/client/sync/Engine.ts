@@ -145,9 +145,12 @@ const replay = (context: Context, entry: PendingMutation) =>
   })
 
 /** The notice a released mutation leaves behind, if any. */
-const noticeFor = (envelope: Mutation.MutationEnvelope, outcome: Mutation.MutationOutcome): Option.Option<Notice> => {
+const noticeFor = (
+  envelope: Mutation.MutationEnvelope,
+  outcome: typeof Mutation.Applied.Type | Omit<Extract<Notice, { readonly _tag: "Rejected" }>, "envelope">
+): Option.Option<Notice> => {
   if (outcome._tag === "Applied") return Option.none()
-  const rejected = (error: Mutation.MutationRejection): Notice => ({ _tag: "Rejected", envelope, error })
+  const rejected = (error: typeof outcome.error): Notice => ({ _tag: "Rejected", envelope, error })
   return Option.some(
     Match.valueTags(outcome.error, {
       UnknownMutation: rejected,
@@ -159,6 +162,7 @@ const noticeFor = (envelope: Mutation.MutationEnvelope, outcome: Mutation.Mutati
       DomainError: rejected,
       ConstraintViolated: rejected,
       ClockSkew: rejected,
+      TransientExhausted: rejected,
       // Expired ledger rows were processed before, but no longer have a known outcome.
       ClientExpired: (): Notice => ({ _tag: "OutcomeUnknown", envelope })
     })
@@ -452,9 +456,8 @@ export const make = (options: {
                       if (outcome !== undefined) return Option.some(noticeFor(envelope, outcome))
                       if (exhausted && envelope.mutationId === firstMissing?.envelope.mutationId) {
                         return Option.some(
-                          Option.some({
+                          noticeFor(envelope, {
                             _tag: "Rejected",
-                            envelope,
                             error: new Mutation.TransientExhausted({
                               attempts,
                               message: "the server stopped the push batch at a transient failure"
