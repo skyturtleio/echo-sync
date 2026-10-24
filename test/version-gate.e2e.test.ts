@@ -112,7 +112,7 @@ const done = (row: SyncTable.EncodedRow): Protocol.PullResponse => ({
 
 describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Postgres and SQLite over HTTP", () => {
   it.live(
-    "compatibility control: an old client still syncs additive columns and unknown tables with default serve",
+    "unknown-table changes must not stall an old client or be lost after its registry update",
     () =>
       Effect.gen(function* () {
         const pg = yield* SqlClient
@@ -121,9 +121,10 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
         yield* pg`INSERT INTO items (id, access_scope_id, body, extra_note) VALUES ('server', 's1', 'visible', 'new')`
         yield* pg`INSERT INTO notes (id, access_scope_id, body) VALUES ('unknown', 's1', 'new table')`
         const { transport, sent } = yield* serve(newRegistry)
-        const { engine, storage } = yield* device(oldRegistry, transport)
+        const { engine, storage, sqlite } = yield* device(oldRegistry, transport)
         yield* engine.pull
         expect(yield* storage.rows.scan(Items)).toEqual([{ id: "server", access_scope_id: "s1", body: "visible" }])
+        expect((yield* storage.meta).cursor).not.toBeNull()
         yield* engine.mutate(mid("old-intent"), "items.add", { id: "old-write", body: "works" })
         expect((yield* engine.push).processed).toBe(1)
         yield* engine.pull
@@ -138,6 +139,14 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
           (yield* transport.pull({ clientId: Ids.ClientId.make("legacy"), cursor: null, continuation: Option.none() }))
             ._tag
         ).toBe("PullPage")
+        // Updating the registry changes the data hash, resetting the old cursor before the new
+        // engine pulls the snapshot that contains the previously skipped table.
+        const updated = yield* device(newRegistry, transport, sqlite)
+        expect((yield* updated.storage.meta).cursor).toBeNull()
+        yield* updated.engine.pull
+        expect(yield* updated.storage.rows.scan(Notes)).toEqual([
+          { id: "unknown", access_scope_id: "s1", body: "new table" }
+        ])
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     20_000
   )

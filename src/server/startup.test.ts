@@ -26,32 +26,36 @@ const options: Startup.StartupOptions = {
 }
 
 /** The sync server as an app mounts it, over the test database. */
-const server = Effect.map(Effect.context<SqlClient | PgClient.PgClient>(), (db) =>
-  Startup.layer(options).pipe(Layer.provide(Layer.succeedContext(db)))
-)
+const serverFor = (startupOptions: Startup.StartupOptions) =>
+  Effect.map(Effect.context<SqlClient | PgClient.PgClient>(), (db) =>
+    Startup.layer(startupOptions).pipe(Layer.provide(Layer.succeedContext(db)))
+  )
+
+const server = serverFor(options)
 
 /** One pull through a real HTTP/NDJSON RpcClient against a freshly started server. */
-const pullOnce = Effect.gen(function* () {
-  const web = HttpRouter.toWebHandler(yield* server, { disableLogger: true })
-  yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
-  const fetch: typeof globalThis.fetch = Object.assign(
-    (input: RequestInfo | URL, init?: RequestInit) => web.handler(new Request(input, init)),
-    { preconnect: globalThis.fetch.preconnect }
-  )
-  const client = yield* RpcClient.make(Protocol.SyncRpcs).pipe(
-    Effect.provide(
-      RpcClient.layerProtocolHttp({ url: "http://echo.test/sync" }).pipe(
-        Layer.provide([
-          RpcSerialization.layerNdjson,
-          FetchHttpClient.layer.pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch)(fetch)))
-        ])
+const pullOnce = (startupOptions: Startup.StartupOptions = options) =>
+  Effect.gen(function* () {
+    const web = HttpRouter.toWebHandler(yield* serverFor(startupOptions), { disableLogger: true })
+    yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
+    const fetch: typeof globalThis.fetch = Object.assign(
+      (input: RequestInfo | URL, init?: RequestInit) => web.handler(new Request(input, init)),
+      { preconnect: globalThis.fetch.preconnect }
+    )
+    const client = yield* RpcClient.make(Protocol.SyncRpcs).pipe(
+      Effect.provide(
+        RpcClient.layerProtocolHttp({ url: "http://echo.test/sync" }).pipe(
+          Layer.provide([
+            RpcSerialization.layerNdjson,
+            FetchHttpClient.layer.pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch)(fetch)))
+          ])
+        )
       )
     )
-  )
-  return yield* Effect.exit(
-    client.pull({ clientId: Ids.ClientId.make("d"), cursor: null, continuation: Option.none() })
-  )
-}).pipe(Effect.scoped)
+    return yield* Effect.exit(
+      client.pull({ clientId: Ids.ClientId.make("d"), cursor: null, continuation: Option.none() })
+    )
+  }).pipe(Effect.scoped)
 
 describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
   it.live(
@@ -125,6 +129,65 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
+  it.live(
+    "an old server must serve push and pull on an expanded database, while a new server must refuse the unmigrated schema",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient
+        const old = {
+          ...options,
+          mutations: Mutation.makeRegistry([
+            Mutation.make("noop", { args: Schema.Struct({}), handler: () => Effect.void })
+          ])
+        }
+        const expandedItems = SyncTable.make("items", {
+          id: RowId,
+          accessScopeId: AccessScope.AccessScopeId,
+          body: Schema.String,
+          extraNote: Schema.NullOr(Schema.String)
+        })
+        const next = { ...options, registry: Registry.make([expandedItems, Notes]) }
+
+        yield* sql`ALTER TABLE items ADD COLUMN extra_note text COLLATE "C"`
+        const web = HttpRouter.toWebHandler(yield* serverFor(old), { disableLogger: true })
+        yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
+        const pushed = yield* Effect.promise(async () => {
+          const response = await web.handler(
+            new Request("http://echo.test/sync", {
+              method: "POST",
+              headers: { "content-type": "text/plain" },
+              body: `${JSON.stringify({
+                _tag: "Request",
+                id: "1",
+                tag: "push",
+                payload: {
+                  clientId: "old-server-client",
+                  mutations: [{ mutationId: "old-server-push", seq: 1, name: "noop", args: {} }]
+                },
+                headers: []
+              })}\n`
+            })
+          )
+          return response.text()
+        })
+        assert.include(pushed, '"_tag":"Success"')
+        const pulled = yield* pullOnce(old)
+        if (!Exit.isSuccess(pulled))
+          return assert.fail(`old server did not serve after the database expanded: ${String(pulled.cause)}`)
+        assert.strictEqual(pulled.value._tag, "PullDone")
+
+        yield* sql`ALTER TABLE items DROP COLUMN extra_note`
+        const started = yield* Effect.exit(Startup.prepare(next))
+        if (Exit.isSuccess(started)) return assert.fail("new server started before its added column was migrated")
+        const [reason] = started.cause.reasons
+        const drift = reason !== undefined && reason._tag === "Fail" ? reason.error : undefined
+        if (drift === undefined || !("_tag" in drift) || drift._tag !== "Drift") {
+          return assert.fail(`expected Drift, got ${String(started.cause)}`)
+        }
+        assert.isTrue(drift.mismatches.some((m) => m.table === "items" && m.problem.includes("extra_note")))
+      }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
   it.live("a server whose database drifted from the registry never serves; restored, it serves", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient
@@ -146,14 +209,14 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
       const tables = drift.mismatches.filter((m) => m.problem.includes("body")).map((m) => m.table)
       assert.deepStrictEqual(tables.toSorted(), ["items", "notes"])
       // Through HTTP: no pull is ever answered (the RPC layer is never built).
-      assert.isTrue(Exit.isFailure(yield* pullOnce), "a drifted server answered a pull")
+      assert.isTrue(Exit.isFailure(yield* pullOnce()), "a drifted server answered a pull")
 
       yield* sql`ALTER TABLE items ADD COLUMN body text COLLATE "C" NOT NULL DEFAULT ''`
       yield* sql`ALTER TABLE notes ADD COLUMN body text COLLATE "C" NOT NULL DEFAULT ''`
-      const served = yield* pullOnce
+      const served = yield* pullOnce()
       if (!Exit.isSuccess(served)) return assert.fail(`restored server did not serve: ${String(served.cause)}`)
       assert.strictEqual(served.value._tag, "PullDone")
-    }).pipe(Effect.provide(TestDatabase))
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
   it.live(

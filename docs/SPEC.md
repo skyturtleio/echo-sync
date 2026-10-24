@@ -663,10 +663,6 @@ upsert entries, for payloads; one ack `SELECT`; `COMMIT`; after the transaction,
   `ResnapshotRequired{unknownCursor}` for `cursor > head` should be added is open; the
   `gc.test.ts` test "a cursor the server never completed a page set at is refused rather than
   trusted" covers the missing-row path only.
-- OQ-PULL-2: Unknown-table changes are skipped by the client at debug level (§9.3). A client on
-  an old registry therefore installs `nextCursor` past rows it never stored; it relies on the
-  `dataHash` rebuild when the app updates. The retired design text said this is intended; the
-  code confirms it; no test covers it.
 - OQ-PULL-3: `pageLimit` is not validated. A value of `0` makes every pull answer a `PullPage`
   at the same position forever (INV-PULL-8). Whether the server should refuse it at construction
   is open.
@@ -769,6 +765,10 @@ replay set goes through one function, `rebase`.
   cleared, pending undo images emptied; the outbox, `pushedThrough` and notices survive. An
   `indexHash`-only change recreates indexes and keeps rows and cursor. A rebuild interrupted at
   any scheduler boundary leaves the old replica or the new one, never a mix.
+- INV-CLI-13: An install MUST skip a change whose table is absent from the registry at Debug,
+  without preventing the rest of the page set from installing or its cursor from advancing. A
+  later `dataHash` rebuild for a registry that gains that table MUST reset the cursor so the
+  replacement snapshot delivers its rows.
 
 ### Details
 
@@ -1184,6 +1184,9 @@ mismatch it refuses to serve. The client rebuilds its replica from a `dataHash` 
 - INV-SCH-7: `attach` MUST own its transaction (refused inside any ambient transaction, whatever
   its isolation level) and MUST install the capture trigger and the truncate guard together or not at
   all.
+- INV-SCH-8: Extra live columns are tolerated, so a server whose registry predates an additive
+  migration MUST serve push and pull against the expanded database. A server whose registry
+  declares a missing added column MUST fail startup with `Drift` until that migration runs.
 
 ### Details
 
@@ -1229,14 +1232,6 @@ The leader's `migrate` (`SqliteSyncStorage`) creates the engine tables, migrates
 forward (the `undo` column is added to a database created by the first outbox DDL, pending rows
 kept), and compares `replica_data_hash` / `replica_table_ddl` / `replica_index_hash` with the
 registry (INV-CLI-12).
-
-### Open Questions
-
-- OQ-SCH-1: The generated `NOT NULL`-with-default step adds the default and drops it in the same
-  migration, so a server running the *previous* code between the two statements never observes
-  a column it does not know with a default it cannot see. There is no test that a deploy of the
-  new server before the migration (the order §0.2 requires for wire fields) tolerates the added
-  column: the engine reads only declared columns, so it should, but it is untested.
 
 ## 14. Telemetry
 
@@ -1605,6 +1600,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-CLI-10 | covered | `Simulation.test` "ResnapshotRequired after a suspended pull keeps seqs, pushedThrough and cursor written meanwhile"; `gc.test` "a page set interrupted mid row walk whose position GC passed must resnapshot instead of resuming" |
 | INV-CLI-11 | covered | `SqliteRowStore.test` "a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError" |
 | INV-CLI-12 | covered | `SqliteSyncStorage.test` "an index-only change keeps rows and cursor; a data-shape change rebuilds and resets them together", "a data-shape migration interrupted at any scheduler boundary leaves the old replica or the new one, never a mix" |
+| INV-CLI-13 | covered | `version-gate.e2e` "unknown-table changes must not stall an old client or be lost after its registry update" |
 | INV-LOOP-1 | covered | `SyncLoop.test` "a transient push failure is retried with backoff and clears once a cycle succeeds"; `Leader.test` "requestSync during backoff runs the next cycle at once and leaves a halted push halted" |
 | INV-LOOP-2 | covered | `SyncLoop.test` "lastSyncedAt stays null after a cycle whose pull failed, and is set by the first cycle that installs"; `Leader.test` "a push whose response is lost keeps the entry pending until the pull installs its ack, and that cycle sets no lastSyncedAt" |
 | INV-LOOP-3 | covered | `SyncLoop.test` "an integrity error halts push for good while pull keeps running"; `scenarios.sh` "sync: MalformedEnvelope halts push; pull and pokes reconnects continue; pending export unaffected", "sync: after handover the new leader pushes once, halts again, and still exports the entry" |
@@ -1637,6 +1633,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-SCH-5 | covered | `capture.test` "attaching a second table with an already-synced name in another schema is refused", "attach with a schema name differing only in case from an attached one is refused, not installed twice", "concurrent attaches of one table name from two schemas cannot both succeed"; `startup.test` "a table captured in two schemas fails startup with one Drift naming both, with every other mismatch", "a search_path that resolves the table name to an uncaptured relation fails startup with a Drift" |
 | INV-SCH-6 | covered | `startup.test` "prepare run concurrently by several instances succeeds for all of them", "concurrent first starts on an empty database all succeed and run the app migration exactly once" |
 | INV-SCH-7 | covered | `capture.test` "attach inside a caller's REPEATABLE READ transaction is refused (its stale snapshot would admit a duplicate name)", "an attach that fails between its two triggers leaves the table neither captured nor half-guarded" |
+| INV-SCH-8 | covered | `startup.test` "an old server must serve push and pull on an expanded database, while a new server must refuse the unmigrated schema" |
 | INV-TEL-1 | covered | `startup.test` "startup's internal steps (verify, its per-table checks) must never hand the host a span other than echo.server.startup"; `observability.e2e` "sync propagates exported IDs and sampling through suppressed spans and preserves an explicit external parent" |
 | INV-TEL-2 | covered | `observability.e2e` "SQLite sync never exports a typed failure, defect, result or dependency span containing secret inputs", "RPC request context cannot bypass sanitization for typed failures, defects, SQL spans or tracerLogger events", "direct server batches and maintenance cannot export returned identities or fail from a throwing tracer" |
 | INV-TEL-3 | covered | `observability.e2e` "throwing host sinks cannot change saved intent, retry deadlines, halt or successful installs", "closing a pulled subscription in the host context retains its own outcome and protects cleanup and the host parent" |
@@ -1651,7 +1648,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PERF-5 | untested | — |
 | INV-PERF-6 | partial | `rpc.test` "more open pokes streams than pool connections do not block push or pull, and the server holds one LISTEN" (fan-out and notify counts unmeasured) |
 
-Totals: 108 invariants; 91 covered, 9 partial (INV-MUT-2, INV-MUT-8, INV-MUT-9, INV-POS-3,
+Totals: 110 invariants; 93 covered, 9 partial (INV-MUT-2, INV-MUT-8, INV-MUT-9, INV-POS-3,
 INV-PULL-7, INV-PUSH-1, INV-TEL-5, INV-ERR-1, INV-PERF-6), 8 untested (INV-ID-3, INV-POS-5,
 INV-PULL-8, INV-CLI-7, INV-PERF-2, INV-PERF-3, INV-PERF-4, INV-PERF-5).
 
@@ -1711,12 +1708,10 @@ INV-PULL-8, INV-CLI-7, INV-PERF-2, INV-PERF-3, INV-PERF-4, INV-PERF-5).
 | OQ-MUT-1 | §5 | no bound on a persistently transient mutation blocking a client's queue |
 | OQ-MUT-2 | §5 | `createdAt` not on the wire; `ctx.now` differs between client and server |
 | OQ-PULL-1 | §7 (Q2) | no explicit `cursor ≤ head` fence; recovery after restore relies on the missing `client_scopes` row |
-| OQ-PULL-2 | §7 | unknown-table changes skipped at install advance the cursor past rows never stored; untested |
 | OQ-PULL-3 | §7 | `pageLimit` unvalidated; `0` loops forever |
 | OQ-CLI-1 | §9 (Q3) | every install is a full rebase; no incremental path |
 | OQ-LOOP-1 | §10 | the push halt is in memory per leader; a new leader retries the batch and halts again |
 | OQ-BRW-1 | §12 | `awaitOpfsPoolFree` bound (2 s) then `LeaderFailed` with no retry |
-| OQ-SCH-1 | §13 | new-server-before-migration tolerance of an added column untested |
 | OQ-TEL-1 | §14 | closed telemetry vocabularies not asserted against a committed list |
 | OQ-ERR-1 | §15 | `Unauthorized` has no `reason`; four conditions share one tag |
 | OQ-PERF-1 | §16 | no statement counters; only install/rebase timers |
