@@ -171,14 +171,14 @@ order of intents.
 | Name | Definition | Where it lives |
 |---|---|---|
 | `Position` | bigint ≥ 0, branded; decimal string on the wire | `Ids.ts`; `echo_sync.log.position`, `mutations.position`, `client_scopes.position` |
-| `Cursor` | `Position \| null`; `null` = the client holds nothing | `echo_meta.cursor` (client), `echo_sync.clients.cursor` (server, last presented) |
+| `Cursor` | `Position \| null`; `null` = the client holds nothing | `echo_meta` key `sync_meta` (client), `echo_sync.clients.cursor` (server, last presented) |
 | `ClientId` | non-empty string; the client generates `crypto.randomUUID()` once and stores it in `echo_meta` | `echo_sync.clients.client_id` |
 | `MutationId` | non-empty string, chosen by the caller of `enqueue`, `crypto.randomUUID()` by `mutate` | `echo_outbox.mutation_id`, `echo_sync.mutations.mutation_id` |
 | `Seq` | integer ≥ 1, SQLite `AUTOINCREMENT` in `echo_outbox`, never reused | `echo_outbox.seq`, `echo_sync.mutations.seq` |
 | `SeqFloor` | integer ≥ 0, the highest expired `seq` of a client | `echo_sync.clients.expired_through` |
-| `PrincipalId` | non-empty string; `*` is the wildcard grantee and is never an actor | `scope_grants.principal_id`, `clients.principal_id` |
+| `PrincipalId` | non-empty string; `*` is the wildcard grantee, refused as the actor of `createScope` and unable to relinquish the `*` grant; the engine does not otherwise reject `*` as an authenticated principal (a `principalFor` returning `*` is served) | `scope_grants.principal_id`, `clients.principal_id` |
 | `AccessScopeId` | non-empty string | `access_scopes.id`, every synced row's `access_scope_id` |
-| `TabId` | string; presence entry key with the client id | wire only |
+| `TabId` | non-empty branded string; presence entry key with the client id | wire only |
 
 **Expiry floors.** Each client has two floors in `echo_sync.clients`: `expired_through` (a
 `SeqFloor`, the highest `seq` whose ledger row's outcome was reclaimed) and `expired_position`
@@ -211,9 +211,9 @@ synced table is `scope_grants` (§4).
   SQLite `BINARY`, and the in-memory reference comparator (`Store.compareText`). Index order is
   one definition across dialects: declared key columns ascending with NULL first, then `id`.
 - INV-TBL-3: `dataHash` MUST change exactly when the storage shape changes (table name, column
-  set, column kind, nullability) and MUST NOT change for indexes, documentation annotations,
-  field order, refinements, brands or nested JSON schema changes. `indexHash` covers the index
-  set.
+  set, column kind, nullability) and MUST NOT change for indexes, unique sets, documentation
+  annotations, field order, refinements, brands or nested JSON schema changes. `indexHash` covers
+  the index set and the unique sets, so a unique-set change does not rebuild the replica.
 - INV-TBL-4: A stored or pulled row MUST be the canonical wire re-encoding of the decoded value:
   excess keys dropped, values normalized; every store round-trips every leaf type at its
   boundaries, `null`, and the empty string unchanged.
@@ -231,15 +231,20 @@ synced table is `scope_grants` (§4).
 | double | `Number` with `isFinite` | number | `double precision` | `REAL` |
 | boolean | `Boolean`, boolean literals | boolean | `boolean` | `INTEGER CHECK (c IN (0, 1))` |
 | timestamp | `Schema.Date`, `Schema.DateTimeUtc` | epoch ms number | `timestamptz` | `INTEGER` (epoch ms) |
-| json | `Struct`, `Array`, `Tuple`, `Record`, non-literal `Union` | JSON value | `jsonb` | `TEXT` (JSON) |
+| json | `Struct`, `Array`, `Tuple`, `Record`, `Suspend`, a `Union` with a non-literal member or mixing literal kinds (a `Union` of same-kind literals is that kind) | JSON value | `jsonb` | `TEXT` (JSON) |
 
 `NullOr(x)` makes a column nullable. Rejected at declaration: bare `Schema.Number`, `BigInt`,
 `Symbol`, `Undefined`/optional keys at the top level, `Unknown`/`Any`, `Enum`, other declarations
-(`Uint8Array`, …), an encoded-side default under `NullOr`. Optional keys inside a JSON column are
-allowed. Timestamps are stored as epoch milliseconds and MUST lie in the `timestamptz` range.
+(`Uint8Array`, …), an encoded-side default under `NullOr`, a non-integer number literal, a field
+that is only `Null`, a nullable `id` or `accessScopeId`, an index that is empty, names `id`, or
+repeats a field. Optional keys inside a JSON column are allowed. Timestamps are stored as epoch
+milliseconds and MUST lie in `[−210 866 803 200 000, 8 640 000 000 000 000]` (the `timestamptz`
+lower bound to the JS `Date` upper bound). An integer column crosses the wire as a JS `number`
+(`Number(bigint)`), so a value beyond 2^53 written by a script is not exact on the wire.
 
 **Hashes.** `dataHash` and `indexHash` are FNV-1a 64 over the canonical JSON of the manifest's
-data part (name, sorted columns with kind and nullability, unique sets) and index part. The
+data part (name, sorted columns with kind and nullability) and index part (indexes, unique
+sets). The
 registry's combined `dataHash` is the client's `clientVersion.dataHash`; a change of it rebuilds
 the replica (§9.6).
 
@@ -294,8 +299,9 @@ Tables (`src/server/postgres/migrations/001`): `echo_sync.access_scopes(id PK)`,
 `echo_sync.scope_grants(id PK, access_scope_id FK → access_scopes ON DELETE CASCADE,
 principal_id, role CHECK IN (reader, writer, owner), UNIQUE (access_scope_id, principal_id))`.
 The wire table is `scope_grants` with fields `id`, `accessScopeId`, `principalId`, `role`,
-`grantedAt` (a timestamp; `createScope` stamps it with the mutation's `ctx.now`, so a rebase replays
-it exactly).
+`grantedAt` (a timestamp; `createScope` stamps it with the handler's `ctx.now`, which on the client
+is the outbox entry's `createdAt` and on the server is the server clock at execution, so the
+optimistic value is replaced by the server's at install).
 
 A grant's `accessScopeId` is the scope it grants and also the scope the grant row lives in, so a
 grantee pulls the grant row itself. Revoking a grant removes the row; the next pull emits
@@ -309,7 +315,11 @@ rejection with the encoded payload; an undeclared one is a defect.
 
 ### Open Questions
 
-None.
+- OQ-ACL-1: `*` is refused only as the actor of `createScope` and as the subject of a
+  self-revocation. Nothing in `assertPrincipal`, `registerClient` or the RPC layer refuses `*`
+  as the authenticated principal, so an app whose `principalFor` returns `*` is served with every
+  row readable. The retired design text called `*` "never an actor"; whether the engine should
+  refuse it at the request boundary is open.
 
 ## 5. Mutations and the ledger
 
@@ -331,8 +341,8 @@ was recorded at. The ledger is what makes a push idempotent and what a pull acks
   InvalidRow | DomainError | ConstraintViolated | ClientExpired`. Every outcome carries a
   `Position`.
 - INV-MUT-3: Classification is over the whole cause of a handler run: a defect anywhere is a
-  defect (the request dies; nothing is ledgered); otherwise a `StoreUnavailable` or `SqlError`
-  anywhere is transient (`MutationTransient`; nothing is ledgered); otherwise the first domain
+  defect (the request dies; nothing is ledgered); otherwise a `StoreUnavailable` or a `SqlError`
+  other than an integrity violation (INV-MUT-6) anywhere is transient (`MutationTransient`; nothing is ledgered); otherwise the first domain
   failure in cause order is the rejection, and every domain failure in the cause MUST encode or
   the run dies. An error the mutation did not declare is a defect, never a `DomainError`.
 - INV-MUT-4: A rejected mutation MUST leave none of its writes behind (body in a savepoint) and
@@ -345,11 +355,14 @@ was recorded at. The ledger is what makes a push idempotent and what a pull acks
 - INV-MUT-6: A unique violation that survives the retries is a permanent
   `Rejected{ConstraintViolated{unique, constraint}}`, recorded in a fresh transaction with the
   same identity check and the same conflict retry but with the body replaced by the rejection;
-  a `CHECK` violation is `ConstraintViolated{other}` at once, without retries.
+  any other integrity violation (SQLSTATE `23xxx` except `23505`: `CHECK`, `NOT NULL`, foreign
+  key, exclusion) is `ConstraintViolated{other, constraint: null}` at once, without retries.
 - INV-MUT-7: `seq < 1` is `MalformedEnvelope` for the whole push: checked for every envelope
   before any body runs; nothing executed, nothing ledgered, not answered as `ClientExpired`.
 - INV-MUT-8: The seeded random available to a handler is a function of `(clientId, mutationId)`
-  only, so a rebase replays identically; `ctx.now` is the envelope's `createdAt`.
+  only, so a rebase replays identically; on the client `ctx.now` is the outbox entry's
+  `createdAt` (stable across rebases); on the server it is `DateTime.now` at execution, since
+  `createdAt` is not on the wire.
 - INV-MUT-9: A registry MUST refuse two mutations (or two queries) with one name at
   construction.
 - INV-MUT-10: A client id registered to one principal MUST be refused to another
@@ -385,12 +398,13 @@ reclaimed by `expireLedger` (§11) while its identity was kept.
 transaction per mutation in order; the first `MutationTransient` stops the batch and the
 response is the processed prefix. A defect dies and the push ends as a server defect (§8).
 
-**Statements per pushed mutation (happy path, no conflict, k row writes):** `SET TRANSACTION`,
-`INSERT clients`, `SELECT clients FOR UPDATE`, `SELECT mutations`, `SAVEPOINT`, the handler's
+**Statements per pushed mutation (happy path, no conflict, k row writes):** `BEGIN`, `SET
+TRANSACTION`, `INSERT clients`, `SELECT clients FOR UPDATE`, `SELECT mutations`, `SAVEPOINT`, the handler's
 statements (one `SELECT` on `scope_grants` per authorization, one read and one write per row;
 each write fires the capture trigger, which runs `next_position()` and inserts one log row, two
-for a scope or id move), `RELEASE SAVEPOINT`, `INSERT mutations … RETURNING`, `COMMIT`. Per push
-request, in addition: the principal lookup and one catalog query (`resolveTables`).
+for a scope or id move), `RELEASE SAVEPOINT` (`ROLLBACK TO SAVEPOINT` on a rejected body),
+`INSERT mutations … RETURNING`, `COMMIT`. Per push request, in addition: the principal lookup and
+one catalog query (`resolveTables`).
 
 ### Open Questions
 
@@ -398,6 +412,11 @@ request, in addition: the principal lookup and one catalog query (`resolveTables
   client pushes the remainder on its next cycle after backoff; a persistently transient mutation
   (for example one whose handler always hits `StoreUnavailable`) blocks every later entry of
   that client indefinitely. The code has no bound on this; whether a bound is wanted is open.
+- OQ-MUT-2: `createdAt` is not on the wire, so a handler's `ctx.now` is the outbox entry's
+  `createdAt` on the client and the server clock on the server (INV-MUT-8). Any value derived
+  from it (`scope_grants.grantedAt`, an app's own timestamps) differs between the optimistic
+  write and the authoritative row until install. The retired design text implied the two agree;
+  whether `createdAt` should travel with the envelope is open.
 
 ## 6. Positions and the ordering invariant
 
@@ -415,8 +434,8 @@ numbers are not what orders them; the advisory lock inside `next_position()` is.
 - INV-POS-2: Every write to a captured table MUST produce a log entry: the capture trigger is
   `AFTER ROW INSERT|UPDATE|DELETE`, and `TRUNCATE` is refused by a `BEFORE STATEMENT` trigger.
   Writes from outside any mutation (scripts, cascades) are captured like any other.
-- INV-POS-3: A log entry carries identity only (`table_name, row_id, access_scope_id, op`), never
-  the payload. A change of `id` or `access_scope_id` is logged as `delete` of the old identity
+- INV-POS-3: A log entry carries identity only (`table_name, row_id, access_scope_id, op`, plus
+  `txid` and `committed_at` defaults that GC keys on), never the payload. A change of `id` or `access_scope_id` is logged as `delete` of the old identity
   and `upsert` of the new.
 - INV-POS-4: `next_position()` MUST `pg_notify('echo_sync', '')` on every allocation, so a
   committed change produces a poke after commit (§10.1).
@@ -475,12 +494,14 @@ rest. Payloads are always the current row.
   tables by name, rows by `id COLLATE "C"`, keyset-continued by `after = (table, rowId)`) complete
   before any log entry is read; log entries are read in position order, `> position` and in
   readable scopes, with `LIMIT budget + 1` to detect the end.
-- INV-PULL-8: The page budget (`limit`, default `pageLimit` 500, ≥ 1) counts upserts and
+- INV-PULL-8: The page budget (`limit`, default `pageLimit` 500) counts upserts and
   tombstones only; `scopePurged` entries are free. A walk page never exceeds the remaining
-  budget.
+  budget. `pageLimit ≥ 1` is an unvalidated precondition: with `0` no walk and no log read runs
+  and every page is a `PullPage` at the same position, forever.
 - INV-PULL-9: Payloads MUST be read from the current row through the table's codec, restricted to
-  declared columns; a log entry whose row is gone, or whose current `access_scope_id` is not
-  readable, MUST be delivered as a tombstone, never as a payload.
+  declared columns; a log entry whose row is gone, whose current `access_scope_id` is not
+  readable, or whose table is no longer attached and registered (`resolveTables`), MUST be
+  delivered as a tombstone, never as a payload.
 - INV-PULL-10: Acks delivered by a page are the client's ledger rows with
   `position ∈ (ackFloor, nextPosition]` and `outcome IS NOT NULL`, where `ackFloor` is the
   resumed position, else the cursor, else −1. An expired row (outcome `NULL`) is never acked.
@@ -518,7 +539,8 @@ sorted by name). `position = base ?? head`.
 
 INV-PULL-4 then INV-PULL-7. `walkPage(tables, scope, after, budget)` reads, per table in name
 order starting at `after.table`, `SELECT … WHERE access_scope_id = scope AND id > after.rowId
-ORDER BY id COLLATE "C" LIMIT remaining`. When a walk completes its scope moves from `walking`
+ORDER BY id COLLATE "C" LIMIT remaining + 1` (the extra row is the lookahead that decides
+whether the table is exhausted; at most `remaining` are delivered). When a walk completes its scope moves from `walking`
 to `scopes` (held). Only when `walking` is empty is the log read.
 
 #### 7.4 Cursor ahead of head
@@ -572,11 +594,14 @@ only the last mention wins.
 
 #### 7.7 Statements per pull page
 
-State query (`gc_horizon`, head, `expired_through`); `client_scopes` lookup; readable grants;
-catalog (`resolveTables`); one `SELECT` per table per walk page touched; one log `SELECT`; one
-`SELECT` per table for payloads of log entries; one ack `SELECT`; after the transaction, up to
-four writes (`DELETE client_scopes`, `UPDATE clients`, `UPDATE mutations`, `INSERT client_scopes`).
-Plus, per request, the principal lookup, `clientPolicy` and `registerClient`.
+`BEGIN`; `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`; state query
+(`gc_horizon`, head, `expired_through`); `client_scopes` lookup (only when `cursor` is non-null);
+readable grants; catalog (`resolveTables`); one `SELECT` per table per walk page touched; one log
+`SELECT` (only when no walk is in progress and budget remains); one `SELECT` per table that has
+upsert entries, for payloads; one ack `SELECT`; `COMMIT`; after the transaction, three writes when
+`cursor` is non-null (`DELETE client_scopes`, `UPDATE clients`, `UPDATE mutations`) and one
+`INSERT client_scopes` on `PullDone`. Plus, per request, the principal lookup, `clientPolicy` and
+`registerClient`.
 
 ### Open Questions
 
@@ -590,6 +615,9 @@ Plus, per request, the principal lookup, `clientPolicy` and `registerClient`.
   an old registry therefore installs `nextCursor` past rows it never stored; it relies on the
   `dataHash` rebuild when the app updates. The retired design text said this is intended; the
   code confirms it; no test covers it.
+- OQ-PULL-3: `pageLimit` is not validated. A value of `0` makes every pull answer a `PullPage`
+  at the same position forever (INV-PULL-8). Whether the server should refuse it at construction
+  is open.
 
 ## 8. Push
 
@@ -605,10 +633,10 @@ prefix's outcomes with positions. Push never installs data; the pull after it ac
 - INV-PUSH-2: The server MUST answer with the processed prefix in order; fewer results than
   mutations means a transient stop at the first missing one, never an error, and the client
   retries from there.
-- INV-PUSH-3: Infrastructure failures before or during a batch (lost connection, a defect in
-  `principalFor`) MUST reach the client as a short or empty `results` list, never as a defect
-  the client would halt on; a defect from a handler is a server defect and halts the client's
-  push (INV-LOOP-3).
+- INV-PUSH-3: A `SqlError`, failed or died, anywhere in authentication or the batch (lost
+  connection, pool exhausted) MUST reach the client as a short or empty `results` list, never as
+  a defect the client would halt on; any other defect, from `principalFor` or a handler, is a
+  server defect and halts the client's push (INV-LOOP-3).
 - INV-PUSH-4: Request-level refusals are `Unauthorized`, `MalformedEnvelope`, `ClientOutdated`;
   `MalformedEnvelope` executes and records nothing.
 - INV-PUSH-5: Headers used by `principalFor` MUST be the real HTTP request headers, never
@@ -660,7 +688,8 @@ replay set goes through one function, `rebase`.
 - INV-CLI-5: `seq` is allocated by SQLite `AUTOINCREMENT` and never reused, including after a
   release, a prune, a reopen or a rolled-back allocation.
 - INV-CLI-6: The outbox never holds an entry whose ledger position is `≤` the installed cursor
-  (a push result at such a position is released at once, INV-PUSH-6).
+  (a push result at such a position, or with outcome `Rejected{ClientExpired}` whatever its
+  position, is released at once, INV-PUSH-6).
 - INV-CLI-7: `pushedThrough` advances only on push responses, never at install: an entry below
   a released one may need to be re-sent so a push response's position releases it.
 - INV-CLI-8: Released rows are kept as markers (`released_at`) for `defaultReleasedRetentionMillis`
@@ -687,10 +716,12 @@ replay set goes through one function, `rebase`.
 
 #### 9.1 Storage
 
-SQLite tables, all `STRICT` except the outbox: `echo_meta(key, value)` (`cursor`,
-`pushed_through`, `resnapshot`, `client_id`, `engine_schema_version`, `replica_data_hash`,
-`replica_table_ddl`, `replica_index_hash`), `echo_outbox(seq AUTOINCREMENT PK, client_id,
-mutation_id UNIQUE, name, args, created_at, released_at, undo)`, `echo_staged(ord, page)` (the
+SQLite tables, all `STRICT` except the outbox: `echo_meta(key, value)` with keys `sync_meta`
+(one JSON value `{cursor, pushedThrough, resnapshot}`), `client_id`, `engine_schema_version`,
+`replica_tables`, `replica_data_hash`, `replica_table_ddl`, `replica_index_hash`;
+`echo_outbox(seq AUTOINCREMENT PK, client_id, mutation_id UNIQUE, name, args, created_at,
+released_at, undo TEXT NOT NULL DEFAULT '[]')` (`undo` is engine schema step 2; a stored
+`engine_schema_version` above the engine's own step count is a defect, not a rebuild), `echo_staged(ord, page)` (the
 `PullPage` JSON as received), `echo_notices(id, notice)`. The replica tables are the registry's
 SQLite DDL. The storage has one permit: every transaction, including a long install, excludes
 every other; a `mutate` queued behind an install can be interrupted while it waits and its
@@ -719,13 +750,16 @@ See Q3. Formally, for one rebase with pending set `P` (before release), undo ima
 | step | store operations |
 |---|---|
 | undo all | `U` writes (restore each pre-image) |
-| install | `C` changes; per upsert: 1 decode, 1 encode, 1 write; per tombstone: 1 write; per purge: 1 statement per table |
+| install | `C` changes; per upsert: 1 wire decode, 1 wire encode, 1 SQLite-row encode, 1 write; per tombstone: 1 write; per purge: 1 statement per table |
 | settle | `|P|` map lookups; `|R|` releases; one notice insert per rejected/unknown |
 | replay all | `Σ_{m∈P∖R} H(m)` handler operations + `|P∖R|` undo writes |
 
 Push-covered rebase: `C = 0`, same undo and replay terms. Staging adds one decode per upsert of a
-known table per page received (INV-CLI-9), so an upsert is decoded twice and encoded once
-between arrival and the replica.
+known table per page received (INV-CLI-9), so an upsert is decoded twice (staging, install) and
+encoded twice (wire canonical form in `Engine.ts`, then the table's `sqlite.row` codec in
+`SqliteRowStore.write`) between arrival and the replica. Every undo restore is also one
+`sqlite.row` encode. Reading the pending outbox (`storage.pending`) decodes each entry's `undo`
+JSON, so the read itself is `|P|` decodes.
 
 #### 9.5 Notices
 
@@ -760,8 +794,9 @@ a leader-owned, server-fenced room membership with process-local state on the se
   transient failure starts at `retryDelay` (1 s), doubles to `maxRetryDelay` (30 s) and resets on
   a clean cycle; a wake during backoff runs the next cycle at once. Wakes are coalesced (sliding
   queue of 1).
-- INV-LOOP-2: `lastSyncedAt` is set only by a cycle whose push ran cleanly (or did not need to)
-  and whose pull installed a `PullDone`; it stays null otherwise.
+- INV-LOOP-2: `lastSyncedAt` is set only by a cycle in which push was `Active`, ran without a
+  failure or a stopped batch, and whose pull installed a `PullDone`; it does not advance while
+  push is `Halted`, even though pulls keep installing.
 - INV-LOOP-3: Push halts (`push: Halted{message}`, in memory for this leader) on
   `MalformedEnvelope`, `PushIntegrityError{invalidPayload | serverDefect}`, or any defect in the
   push cause; pull keeps running; `requestSync` never clears a halt; `exportPending` stays
@@ -774,9 +809,12 @@ a leader-owned, server-fenced room membership with process-local state on the se
   a pull defect, `StoreUnavailable`, `ConstraintViolated`, `MalformedChange`,
   `ResnapshotRequired` on an initial request).
 - INV-LOOP-5: Classification is over the whole cause: for push, a defect beats a halting failure
-  beats the first failure; for pull, a defect is transient `server`.
-- INV-LOOP-6: `SyncStatus` strings carry no secret: every `lastError.message` is a constant per
-  kind; the `Halted` message is library text.
+  beats the first failure; for pull, a defect is transient `server`. When push and pull both fail
+  transiently in one cycle, `lastError` is push's, unless pull's kind is `server-outdated`, which
+  overrides.
+- INV-LOOP-6: `SyncStatus` strings carry no secret: every `lastError.message` is drawn from a
+  closed set of library constants (one per kind, plus the stopped-batch text for kind `server`);
+  the `Halted` message is library text.
 - INV-LOOP-7: Pokes: every stream element that is a `Poke` wakes the loop; a `Heartbeat` never
   does. The stream is reconnected after any end (failure, defect, clean end, or no element for
   `idleTimeout` = 45 s) with backoff 1 s → 30 s, reset once a connection delivered a poke.
@@ -848,9 +886,10 @@ outcomes of old acked ledger rows and raises each client's floors. Identities ar
 
 ### Invariant digest
 
-- INV-GC-1: `collectGarbage` deletes log entries with `committed_at < now − retention` up to the
-  highest such position and sets `engine_state.gc_horizon` to that position, in one
-  transaction. It MUST NOT delete ledger rows or `client_scopes` rows.
+- INV-GC-1: `collectGarbage` deletes every log entry with `position ≤ max(position WHERE
+  committed_at < now − retention)`, a position prefix (so the horizon is gap-free even if
+  `committed_at` were not monotone in position), and sets `engine_state.gc_horizon` to that
+  position, in one transaction. It MUST NOT delete ledger rows or `client_scopes` rows.
 - INV-GC-2: A client whose base position is below `gc_horizon` is told `gcHorizon` and
   resnapshots; a client at head is unaffected. A page set interrupted mid-walk or mid-log whose
   position GC passed MUST resnapshot instead of resuming.
@@ -861,7 +900,7 @@ outcomes of old acked ledger rows and raises each client's floors. Identities ar
 - INV-GC-4: Expiry clears `outcome` and `acked_at`, keeps the identity, and raises
   `clients.expired_through` to the highest expired `seq` and `expired_position` to the highest
   expired position, forward only. The expired set MUST be a `seq` prefix of the client's rows:
-  if a surviving row has `seq <` the new floor the job dies and rolls back.
+  if a row with an outcome survives at `seq ≤` the new floor the job dies and rolls back.
 - INV-GC-5: Floors are permanent: no job deletes a client's floor or identities.
 - INV-GC-6: Expiring the newest ledger row MUST NOT move head back (INV-PULL-12).
 
@@ -894,8 +933,10 @@ replica.
   `…:leader:<leaderId>` (epoch), `…:tab:<tabId>`, `…:router`, reset channel `…:reset`, tombstone
   `echo-sync/<appId>/~reset-<sha256hex(profile)>`.
 - INV-BRW-2: At most one leader per identity holds the database: election is the leader Web
-  Lock (`tryHoldLock` then `holdLock`, reporting `Waiting`/`Elected`/`Failed`); the leader then
-  takes its epoch lock, completes any interrupted reset (tombstone), and opens the pool.
+  Lock (`tryHoldLock` then `holdLock`; `Waiting` is reported only when the first try fails,
+  `Elected` once the database is open and the leader serves, `Failed` on any startup failure);
+  the leader then takes its epoch lock, completes any interrupted reset (tombstone), and opens
+  the pool.
 - INV-BRW-3: Leader loss is detected only through the epoch lock's release, never by waiting on
   a dead port. The router accepts a leader announcement only while the epoch lock is held.
 - INV-BRW-4: Handover: in-flight requests fail `LeaderUnavailable{LeaderLost}`; requests issued
@@ -945,6 +986,13 @@ replica.
                                             └──────────────────────────────────────────────┘
 ```
 
+A fourth, non-terminal state is **unavailable**: the route publishes `Unavailable{error}` and
+every request fails at once with that error until a later leader announcement publishes
+`Connected` again (only `reset` is terminal). It is entered from: `Waiting` received while no
+router exists (`SecondaryTabWithoutRouter`; superseded if this tab's own worker wins and sends
+`Elected`); `Failed` received before any connection existed (`LeaderFailed`; a `Failed` after a
+connection is ignored); and failure to take the tab lock (`Unsupported`, message `tab lock: …`).
+
 #### 12.2 Leader lifecycle
 
 `leaderWorker(self, options)`: validate identity → election (INV-BRW-2) → epoch lock →
@@ -968,7 +1016,8 @@ kills the `SharedWorker` with its creating tab) is repopulated by the tabs.
 
 ### Open Questions
 
-- OQ-BRW-1: The pre-election `awaitOpfsPoolFree` retry (100 × 20 ms = 2 s) is a bound on how
+- OQ-BRW-1: The `awaitOpfsPoolFree` retry inside `openConnection` (after election and the epoch
+  lock; 100 × 20 ms = 2 s) is a bound on how
   long a dead leader's access handles may linger; what happens after it elapses is a
   `LeaderFailed`, which tabs surface as `LeaderUnavailable{LeaderFailed}` and do not retry.
   Whether a longer bound or a retry is wanted is open.
@@ -988,7 +1037,9 @@ mismatch it refuses to serve. The client rebuilds its replica from a `dataHash` 
 
 - INV-SCH-1: The generator (`Migrate.plan`) MUST emit DDL only for safe changes: create table,
   add a nullable column, add a `NOT NULL` column with an intent default (added with the default,
-  which is then dropped), `NOT NULL` → nullable (`DROP NOT NULL`), index add, drop or change.
+  which is then dropped), `NOT NULL` → nullable (`DROP NOT NULL`), index add, drop or change. A
+  new `NOT NULL` column without an intent default is added nullable plus a `TODO(migration)` for
+  the backfill and `SET NOT NULL`; nullable → `NOT NULL` on an existing column is a TODO only.
   Renames, column and table drops, lossy kind changes, unique-set changes and backfills MUST
   become commented `TODO(migration)` steps, never DDL, whatever the intent says.
 - INV-SCH-2: A step that depends on a table or column whose rename, drop or kind change is a
@@ -1009,8 +1060,8 @@ mismatch it refuses to serve. The client rebuilds its replica from a `dataHash` 
   starts on an empty database: the schema bootstrap takes advisory lock `7305797848413072997`,
   attaches serialize on `7305797848413072996`, the migrators lock their history tables, `verify`
   only reads; the app migration runs exactly once.
-- INV-SCH-7: `attach` MUST own its transaction (refused inside a caller's `REPEATABLE READ`
-  transaction) and MUST install the capture trigger and the truncate guard together or not at
+- INV-SCH-7: `attach` MUST own its transaction (refused inside any ambient transaction, whatever
+  its isolation level) and MUST install the capture trigger and the truncate guard together or not at
   all.
 
 ### Details
@@ -1162,8 +1213,12 @@ member is recorded in `docs/DECISIONS.md` (§0.2).
   `PushIntegrityError.reason`, `ConstraintViolated.kind`, `LeaderUnavailable.reason`,
   `SyncErrorKind`), are closed sets. The transport classifies by tag, never by message text.
 - INV-ERR-2: An error that wraps a cause keeps it (`CorruptStorage.cause`,
-  `BrowserStorageError.cause`, `LockError`) and its message names what was attempted, never a
-  path, id, header or credential that an app may forward.
+  `BrowserStorageError.cause`, `LockError`) and its message names what was attempted and where:
+  `CorruptStorage` names the table and row id (INV-CLI-11), `LeaderLost` the leader id,
+  `Unsupported` the offending identity segment, storage failures the driver's message. A message
+  never carries a header value, cookie, URL or credential. Error messages are for the app's
+  diagnostics, not for `SyncStatus` (INV-LOOP-6), which is the only engine string meant for a
+  screen.
 
 ### Details
 
@@ -1175,7 +1230,7 @@ member is recorded in `docs/DECISIONS.md` (§0.2).
 | `Unauthorized` | `message` | `push`, `pull`, `pokes`, `room`, `track` (principal assertion, `ClientForbidden`, app `principalFor`); also HTTP 401/403 | transient, kind `unauthorized`; presence rejoins |
 | `ClientOutdated` | `message` | app `clientPolicy` on `push`/`pull` | terminal for this leader, kind `outdated` |
 | `MalformedEnvelope` | `clientId, mutationId, message` | `push` (`seq < 1`) | push halts |
-| `ServerUnavailable` | `message` | `pull` (database failure, lost connection), `pokes` (lost `LISTEN`) | transient, kind `unavailable` |
+| `ServerUnavailable` | `message` | `pull` (database failure, lost connection), `pokes` (lost `LISTEN`), `room` (grant lookup failed), declared on `track` | transient, kind `unavailable` |
 | `Forbidden` | `room` | `room`, `track` (no grant in the room's scope) | presence subscription ends |
 
 #### 15.2 Mutation outcomes (`Mutation.MutationRejection`), ledgered and acked
@@ -1280,13 +1335,15 @@ batches, page limits and retention against them.
   the tables touched. Plus per request: principal lookup, `clientPolicy`, `registerClient`.
 - INV-PERF-4: Per install (§9.4, Q3): one SQLite transaction holding the storage's single permit
   for `U` undo writes + `C` change writes + `Σ H(m)` replay operations + `|P∖R|` undo writes;
-  every upsert of a known table is decoded twice (staging and install) and encoded once; one
-  `clearAll` statement per replica table when the set started from null.
+  every upsert of a known table is decoded twice (staging and install) and encoded twice (wire,
+  then `sqlite.row`); one `clearAll` statement per replica table when the set started from null.
 - INV-PERF-5: Per push batch on the client (`Engine.push` loops batches until the pending set
   is drained or a batch is stopped): one storage transaction reading `meta` and the whole
-  pending outbox, one RPC with at most `min(pushBatchSize ?? 50, 100)` entries, one storage
-  transaction advancing `pushedThrough` that also runs a full rebase with `C = 0` (INV-PERF-4
-  without the install term) when any result is covered (INV-PUSH-6).
+  pending outbox (`|P|` undo decodes), one RPC with at most `min(pushBatchSize ?? 50, 100)`
+  entries, and, only when the response holds at least one result, one storage transaction
+  advancing `pushedThrough` that also runs a full rebase with `C = 0` (INV-PERF-4 without the
+  install term) when any result is covered (INV-PUSH-6). A response with zero results (stopped
+  at the first entry) advances nothing.
 - INV-PERF-6: Pokes are one `LISTEN` per server process shared by every subscriber, plus a
   heartbeat tick per `heartbeatInterval` per stream; a poke fans out to every stream in the
   process only (§10). A commit costs one `pg_notify` per position allocated (INV-POS-4), i.e.
@@ -1362,10 +1419,10 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-MUT-2 | partial | `Transport.test` "a processed push returns core's result; a rejection keeps its class and fields" (closedness of the set is type-level only) |
 | INV-MUT-3 | covered | `Mutation.test` "a domain failure combined with a defect dies with the defect, never a Rejected outcome", "StoreUnavailable alongside a domain failure stays transient, never a permanent rejection", "an unencodable domain failure next to a valid one dies, in either order, never a DomainError"; `ledger.test` "a rejection combined with a defect is not ledgered as an ordinary rejection" |
 | INV-MUT-4 | covered | `ledger.test` "a rejected mutation records its outcome and leaves none of its writes behind" |
-| INV-MUT-5 | covered | `ledger.test` "a unique violation from a stale snapshot retries to Applied instead of stopping the batch transient", "a conflict combined with a rejection is retried, and the retry's verdict is the outcome", "a conflict combined with a programmer defect dies without retry (defect beats transient)" |
+| INV-MUT-5 | covered | `ledger.test` "a unique violation from a stale snapshot retries to Applied instead of stopping the batch transient", "a conflict combined with a rejection is retried, and the retry's outcome is ledgered (transient beats rejection)", "… on every attempt stops the batch as transient with nothing ledgered", "a conflict combined with a programmer defect dies without retry (defect beats transient)" |
 | INV-MUT-6 | covered | `ledger.test` "a persistent unique violation is ledgered with a position instead of blocking later mutations", "a check constraint is rejected immediately without retries or partial writes" |
 | INV-MUT-7 | covered | `ledger.test` "seq < 1 is a malformed envelope: not executed, not recorded, not answered as clientExpired" |
-| INV-MUT-8 | partial | `Mutation.test` "the seeded random is a function of (clientId, mutationId), so a rebase replays identically" (`ctx.now = createdAt` untested) |
+| INV-MUT-8 | partial | `Mutation.test` "the seeded random is a function of (clientId, mutationId), so a rebase replays identically" (client `ctx.now = createdAt` untested) |
 | INV-MUT-9 | partial | `Mutation.test` "rejects two mutations with the same name at construction" (queries untested) |
 | INV-MUT-10 | covered | `ledger.test` "a client id registered to one principal is refused to another" |
 | INV-POS-1 | covered | `ordering.test` "a reader pulling after a later writer commits never skips an earlier writer still in flight", "without the trigger's advisory lock that reader skips the earlier writer (the ordering check can fail)", "a reader advancing its cursor during many random out-of-order commits never misses a change (stress)" |
@@ -1386,7 +1443,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PULL-11 | covered | `gc.test` "re-pulling from the previous cursor after a lost PullDone yields the same converged state", "ledger rows written before migration 003 come through it unstamped and are never expired until a pull acks them" |
 | INV-PULL-12 | covered | `gc.test` "expiring the newest ledger row never moves the head back: a cursor at its position does not regress and a page set resumed at it continues" |
 | INV-PULL-13 | covered | `gc.test` "a client whose cursor GC passed must resnapshot and then converges; a client at head is unaffected"; `Simulation.test` "ResnapshotRequired after a suspended pull keeps seqs, pushedThrough and cursor written meanwhile" |
-| INV-PUSH-1 | untested | — (the wire `isMaxLength(100)` is schema-level; the 50 default and the clamp have no test) |
+| INV-PUSH-1 | partial | `Transport.test` "the outbox batch is not a valid PushRequest (101 mutations)" (the cap); the 50 default and the `min(…, 100)` clamp have no test |
 | INV-PUSH-2 | covered | `ledger.test` "a batch stops at a transient failure without recording it, and its resubmission continues in order"; `Transport.test` "a push batch the server stopped is reported as kind server" |
 | INV-PUSH-3 | covered | `rpc.test` "a connection lost mid-batch is a short results list, never a defect the client would halt on", "an infrastructure defect in principalFor is a transient stop (empty results), not a push failure" |
 | INV-PUSH-4 | covered | `ledger.test` "seq < 1 is a malformed envelope…"; `scenarios.sh` "sync: MalformedEnvelope halts push; pull and pokes reconnects continue; pending export unaffected"; `version-gate.e2e` "a client below the generated floor stops retrying, can mutate offline, and delivers the original intents after update" |
@@ -1397,7 +1454,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-CLI-3 | covered | `Store.test` "undo images restore the exact prior state after a handler that fails midway"; `scope-create.e2e` "an optimistic createScope of an id the server already has is rejected ScopeForbidden, and the pull undoes the grant and the write that depended on it; a fresh id is applied and stays", "when only the creation is processed and rejected, a dependent mutation stays pending with no optimistic effect…" |
 | INV-CLI-4 | covered | `Outbox.test` "an enqueue retried after its original was released returns the original seq and is not pending"; `Leader.test` "mutate retried across LeaderLost after the lost leader committed leaves exactly one outbox row", "an enqueue cancelled while its COMMIT runs still wakes the loop"; Simulation invariant "enqueue is idempotent on mutationId" |
 | INV-CLI-5 | covered | `SqliteSyncStorage.test` "nextSeq starts at 1 and never reuses a seq, even after its released row is pruned"; `Outbox.test` "pruning released rows keeps pending ones and never lets a seq be reused"; `Simulation.test` "an allocator that reuses a released entry's seq is caught by the never-reused check" |
-| INV-CLI-6 | untested | — |
+| INV-CLI-6 | covered | `Simulation.ts` invariant "pending set never holds an acked mutation", checked on every step of `Simulation.test` random schedules (no test shows the check biting) |
 | INV-CLI-7 | untested | — |
 | INV-CLI-8 | covered | `Outbox.test` "released rows inside the retention window are not pruned"; `expiry.e2e` "a tab's enqueue retried after its reply was lost, the released marker pruned (24 h) and the ledger row expired (7 d) gets a fresh seq and is answered ClientExpired at the original position…" |
 | INV-CLI-9 | covered | `Simulation.test` "a known-table row missing declared keys is server-outdated: no ack, cursor or staging change"; `version-gate.e2e` "a newer client preserves valid staging on server-outdated and converges without rebuilding when the server catches up"; `SyncLoop.test` "a pull that fails with MalformedChange is retried with backoff and never halts push" |
@@ -1450,8 +1507,9 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PERF-5 | untested | — |
 | INV-PERF-6 | partial | `rpc.test` "more open pokes streams than pool connections do not block push or pull, and the server holds one LISTEN" (fan-out and notify counts unmeasured) |
 
-Totals: 103 invariants; 84 covered, 9 partial, 10 untested (INV-ID-3, INV-POS-5, INV-PULL-8,
-INV-PUSH-1, INV-CLI-6, INV-CLI-7, INV-PERF-2, INV-PERF-3, INV-PERF-4, INV-PERF-5).
+Totals: 108 invariants; 91 covered, 9 partial (INV-MUT-2, INV-MUT-8, INV-MUT-9, INV-POS-3,
+INV-PULL-7, INV-PUSH-1, INV-TEL-5, INV-ERR-1, INV-PERF-6), 8 untested (INV-ID-3, INV-POS-5,
+INV-PULL-8, INV-CLI-7, INV-PERF-2, INV-PERF-3, INV-PERF-4, INV-PERF-5).
 
 ## 18. Limits and defaults
 
@@ -1460,7 +1518,7 @@ INV-PUSH-1, INV-CLI-6, INV-CLI-7, INV-PERF-2, INV-PERF-3, INV-PERF-4, INV-PERF-5
 | `wireVersion` | 1 | `Protocol.ts` | no |
 | push batch size | `min(pushBatchSize ?? 50, 100)` | `Engine.ts` | `pushBatchSize` |
 | `PushRequest.mutations` | 1 … 100 | `Protocol.ts` | no |
-| `pageLimit` (upserts + tombstones per page) | 500, ≥ 1 | `rpc.ts` | `pageLimit` |
+| `pageLimit` (upserts + tombstones per page) | 500; `≥ 1` is an unvalidated precondition (INV-PULL-8) | `rpc.ts` | `pageLimit` |
 | server `heartbeatInterval` (pokes and presence) | 15 s | `rpc.ts` | yes; must stay below clients' `idleTimeout` |
 | client `idleTimeout` (pokes stream, presence stream, presence send) | 45 s | `SyncLoop.ts`, `Presence.ts` | yes; must exceed `heartbeatInterval` |
 | sync loop backoff | 1 s doubling to 30 s, reset on a clean cycle | `SyncLoop.ts` | `retryDelay`, `maxRetryDelay` |
@@ -1471,6 +1529,7 @@ INV-PUSH-1, INV-CLI-6, INV-CLI-7, INV-PERF-2, INV-PERF-3, INV-PERF-4, INV-PERF-5
 | conflict retry (server mutation) | `Schedule.exponential("10 millis")` up to 4 retries (5 attempts) | `ledger.ts` | `conflictRetry` |
 | `LISTEN` reconnect backoff | `min(50 ms · 2^n, 5 s)`, reset once confirmed | `rpc.ts` | no |
 | presence revocation watch restart | 1 s | `rpc.ts` | no |
+| pending-count stream restart (leader) | 1 s after any failure, forever | `SyncLoop.ts` | no |
 | ledger expiry retention | default 7 d, minimum 48 h | `gc.ts` | `retention` |
 | log GC retention | caller-supplied (no default) | `gc.ts` | argument |
 | released-row marker retention | 24 h | `Outbox.ts` | `pruneReleased(retentionMillis)` |
@@ -1504,9 +1563,12 @@ INV-PUSH-1, INV-CLI-6, INV-CLI-7, INV-PERF-2, INV-PERF-3, INV-PERF-4, INV-PERF-5
 
 | ID | section | question |
 |---|---|---|
+| OQ-ACL-1 | §4 | `*` is not refused as an authenticated principal |
 | OQ-MUT-1 | §5 | no bound on a persistently transient mutation blocking a client's queue |
+| OQ-MUT-2 | §5 | `createdAt` not on the wire; `ctx.now` differs between client and server |
 | OQ-PULL-1 | §7 (Q2) | no explicit `cursor ≤ head` fence; recovery after restore relies on the missing `client_scopes` row |
 | OQ-PULL-2 | §7 | unknown-table changes skipped at install advance the cursor past rows never stored; untested |
+| OQ-PULL-3 | §7 | `pageLimit` unvalidated; `0` loops forever |
 | OQ-CLI-1 | §9 (Q3) | every install is a full rebase; no incremental path |
 | OQ-LOOP-1 | §10 | the push halt is in memory per leader; a new leader retries the batch and halts again |
 | OQ-BRW-1 | §12 | `awaitOpfsPoolFree` bound (2 s) then `LeaderFailed` with no retry |
