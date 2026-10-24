@@ -14,6 +14,36 @@
     }
   },
   {
+    "json": "{\"clientId\":\"9007199254740993\",\"epoch\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":null}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "epoch": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": null
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"epoch\":null,\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":null}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "epoch": null,
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": null
+        }
+      ]
+    }
+  },
+  {
     "json": "{\"clientId\":\"9007199254740993\",\"clientVersion\":{\"dataHash\":\"9007199254740993\",\"wireVersion\":1},\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":null}]}",
     "value": {
       "clientId": "9007199254740993",

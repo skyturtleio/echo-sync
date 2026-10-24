@@ -61,5 +61,34 @@
       "_tag": "ClientOutdated",
       "message": "9007199254740993"
     }
+  },
+  {
+    "json": "{\"_tag\":\"ResnapshotRequired\",\"reason\":\"gcHorizon\"}",
+    "value": {
+      "_tag": "ResnapshotRequired",
+      "reason": "gcHorizon"
+    }
+  },
+  {
+    "json": "{\"_tag\":\"ResnapshotRequired\",\"epoch\":\"9007199254740993\",\"reason\":\"gcHorizon\"}",
+    "value": {
+      "_tag": "ResnapshotRequired",
+      "epoch": "9007199254740993",
+      "reason": "gcHorizon"
+    }
+  },
+  {
+    "json": "{\"_tag\":\"ResnapshotRequired\",\"reason\":\"unknownCursor\"}",
+    "value": {
+      "_tag": "ResnapshotRequired",
+      "reason": "unknownCursor"
+    }
+  },
+  {
+    "json": "{\"_tag\":\"ResnapshotRequired\",\"reason\":\"staleContinuation\"}",
+    "value": {
+      "_tag": "ResnapshotRequired",
+      "reason": "staleContinuation"
+    }
   }
 ]

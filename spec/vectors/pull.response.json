@@ -9,6 +9,16 @@
     }
   },
   {
+    "json": "{\"_tag\":\"PullPage\",\"epoch\":\"9007199254740993\",\"changes\":[],\"acks\":[],\"continuation\":\"9007199254740993\"}",
+    "value": {
+      "_tag": "PullPage",
+      "epoch": "9007199254740993",
+      "changes": [],
+      "acks": [],
+      "continuation": "9007199254740993"
+    }
+  },
+  {
     "json": "{\"_tag\":\"PullPage\",\"changes\":[{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{}}],\"acks\":[],\"continuation\":\"9007199254740993\"}",
     "value": {
       "_tag": "PullPage",
@@ -814,6 +824,17 @@
     "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
     "value": {
       "_tag": "PullDone",
+      "changes": [],
+      "acks": [],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"epoch\":\"9007199254740993\",\"changes\":[],\"acks\":[],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "epoch": "9007199254740993",
       "changes": [],
       "acks": [],
       "nextCursor": "9007199254740993",

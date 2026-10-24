@@ -7,6 +7,14 @@
     }
   },
   {
+    "json": "{\"_tag\":\"ResnapshotRequired\",\"epoch\":\"9007199254740993\",\"reason\":\"gcHorizon\"}",
+    "value": {
+      "_tag": "ResnapshotRequired",
+      "epoch": "9007199254740993",
+      "reason": "gcHorizon"
+    }
+  },
+  {
     "json": "{\"_tag\":\"ResnapshotRequired\",\"reason\":\"unknownCursor\"}",
     "value": {
       "_tag": "ResnapshotRequired",
