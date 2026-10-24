@@ -1,4 +1,4 @@
-# Getting started: the server side
+# Getting started: wiring a server to the SPEC
 
 > Consumer guide for SPEC §3, §4, §5, §8 and §13 (wiring a server). Non-normative: where this page disagrees with
 > [`docs/SPEC.md`](SPEC.md), the SPEC wins and the disagreement is a SPEC Open Question.
@@ -7,9 +7,9 @@
 This page covers how a consumer app wires the Echo Sync server: its tables, its mutations, its
 app migrations, startup, and the request principal. The worked example is
 [examples/server/main.ts](../examples/server/main.ts). It serves the harness app
-(examples/browser-spike/app.ts) and is what scenarios.sh and slice.sh run against
-(docs/vertical-slice.md). `docs/SPEC.md` is the contract, and docs/server-substrate.md describes how
-the server is built.
+(examples/browser-spike/app.ts) and is what scenarios.sh and slice.sh run against (run instructions
+in `AGENTS.md`). [`SPEC.md`](SPEC.md) is the contract; its non-normative appendices explain
+the implementation mechanisms.
 
 The server needs **PostgreSQL 15+** (SPEC §13) and runs on Bun. Import core from `echo-sync`
 and the server from `echo-sync/server`.
@@ -95,7 +95,7 @@ The hash includes system tables such as `scope_grants`, exactly as the client's 
 does; the snapshot's `tables` still holds only app manifests. Pre-gate snapshots without history
 remain readable; no hashes are invented for earlier releases. History starts at your next
 generated migration. Always use `generate`, not `snapshotOf`, to rewrite the committed file.
-See [the server policy hook](server-substrate.md#client-compatibility-policy) for deriving an
+See [the server policy hook](SPEC.md#d4-client-policy-example) for deriving an
 accepted floor from these entries. The default is serve: an additive rollout needs no policy.
 
 ## 4. Startup and serving
@@ -144,7 +144,7 @@ Other options are `pageLimit`, the number of pull rows per page (default 500), a
 Log GC (`Postgres.collectGarbage(retention)`) and ledger expiry (`Postgres.expireLedger({ retention })`,
 default 7 days, at least 48 h) are not scheduled by `Startup`. Run them from your own job if you want
 a retention horizon; without ledger expiry the ledger grows with every mutation
-(docs/server-substrate.md, GC and Ledger expiry; examples/server runs ledger expiry hourly).
+(SPEC §11; examples/server runs ledger expiry hourly).
 
 ## 5. Headers and the principal
 

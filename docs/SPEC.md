@@ -21,8 +21,9 @@ A MUST that the current implementation violates is recorded as an Open Question,
 
 Names in `code font` are identifiers in the source: tables (`echo_sync.mutations`), schema tags
 (`ResnapshotRequired`), options (`pageLimit`) and functions (`next_position()`). Source paths are
-relative to the repository root. `DESIGN §x` citations in source comments refer to the retired
-`docs/DESIGN.md` numbering; they are not references into this document.
+relative to the repository root. `SPEC §x` citations refer to this document; `DECISIONS n`
+refers to the numbered ruling in `docs/DECISIONS.md`. Appendices C–E are non-normative
+implementation and verification notes, not additional contracts.
 
 ### 0.2 Versioning
 
@@ -1576,3 +1577,358 @@ INV-PULL-8, INV-CLI-7, INV-PERF-2, INV-PERF-3, INV-PERF-4, INV-PERF-5).
 | OQ-TEL-1 | §14 | closed telemetry vocabularies not asserted against a committed list |
 | OQ-ERR-1 | §15 | `Unauthorized` has no `reason`; four conditions share one tag |
 | OQ-PERF-1 | §16 | no statement counters; only install/rebase timers |
+
+## Appendix C. Browser mechanisms and verification notes (non-normative)
+
+These notes explain §9, §10 and §12; they add no invariants. Commands for the harness live in
+`AGENTS.md`. Historical observations below are evidence from earlier runs, not guarantees for
+other browsers or a claim that those runs were repeated during documentation consolidation.
+
+### C.1 Ports, locks and OPFS
+
+The router creates a fresh `MessageChannel` per tab, transferring one end with `Connect` to
+the leader and the other with `Connected` to the tab. Tab↔leader traffic uses Effect's worker
+RPC protocol and `BrowserWorkerRunner.layerMessagePort`. Workers are spawned by tabs, not by
+the SharedWorker, so no nested workers are required. Epoch and tab death watchers acquire
+locks in shared mode; acceptance checks count only exclusive holders, not those watchers.
+Connections are objects: a displaced connection completes its lost signal before closing its
+RPC scope, and a late handshake or watcher acts only on the still-active connection.
+
+On `RouterStarted`, connected-epoch loss, or its own worker's election, a tab constructs the
+SharedWorker again and sends `Hello`; the elected tab re-announces over a fresh port pair.
+`Hello.connectedTo` prevents redundant links on a live router. Across router instances the
+tab serializes acceptance and checks the epoch, ignoring and closing duplicate/dead ports.
+Old router ports remain open to receive already-transferred connections. The accepted v1
+bound per tab is 2 + router relaunches + observed leader epoch ends; the router also keeps a
+queued tab-lock watcher per `Hello`, released on tab death. A constant bound would need a
+`Hello` acknowledgement before closing old ports.
+
+The stock `OpfsWorker.run` uses a fixed VFS name `opfs`, hence one origin-wide directory of
+exclusive sync access handles. Independent identities then contend for that pool.
+`OpfsSqlite.ts` instead implements the same internal port protocol with a per-identity pool.
+Re-verify that protocol on every `@effect/sql-sqlite-wasm` upgrade. Wasm load, pool creation and
+`open_v2` finish before waiting on the ready protocol: the SQL client's ready wait is
+uninterruptible, so an open failure must be raised before it. The pool is topped up to six
+files even when nonempty; the VFS otherwise grows only an empty pool, and interrupted creation
+can leave too little capacity for the next write. Access handles can outlive the dead
+worker's locks briefly (OQ-BRW-1).
+
+Lock waits abort queued requests on interruption and release a grant racing with the abort.
+The cancellation argument currently relies on Effect's default scheduler entering the
+uninterruptible hold region synchronously after grant. A custom scheduler yielding there
+(or before a shared watcher releases its grant) could retain a granted lock until agent death;
+scheduler-independent resolver cleanup remains deferred.
+
+The storage permit serializes transactions but is not fair: a releasing fiber can barge ahead
+of a waiter. Await each enqueue to order one tab's calls; concurrent calls have no promised
+relative order. `exec` and notices use `admit` (permit, no extra transaction); query emissions
+and engine operations use storage transactions. Raw writes bypass outbox and undo capture.
+
+Closing the tab client's scope terminates its candidate immediately, without worker
+finalizers or a drain/flush. A committed enqueue remains in OPFS; an abandoned HTTP push may
+or may not commit on the server. The successor reconciles the persisted outbox and ledger,
+not the old request's lifetime. Complete-value streams re-subscribe rather than resume a
+result version and may repeat their last value; raw subscriptions leave re-subscription to
+the caller. Slice S5 accepts either server crash outcome and reports handler starts; it
+requires one ledger row and eventual release, not proof that the abandoned request rolled back.
+
+Reset reuses the app's `spawnLeader` and leader OPFS host with a `Reset` message rather than
+`Init`, without migrating. `discardPending` never opens the database, allowing corrupt or
+partially removed replicas to be removed. Otherwise open/count failure is closed (`ResetFailed`).
+The close timeout includes asynchronous lock grant, so even a free lock can exceed a zero
+budget. A late grant is immediately released. The reset signal is an event, not a durable
+marker: a client built later queues behind the reset and can open afresh. A refused pending
+decision leaves existing clients reset but data intact; notices go with the replica, and only
+the outbox guards deletion. The tombstone uses Web Crypto SHA-256 and an identity-excluded
+`~` prefix. Sibling directories and tombstones are independent.
+
+### C.2 Browser evidence and limits
+
+The API support figures below are documentation-derived unless a run is explicitly named.
+Runtime capability checks, not browser detection, select the mode (§12).
+
+| browser | documented API availability / evidence |
+|---|---|
+| Chrome/Edge desktop | Web Locks 69+, OPFS sync handles 102+, SharedWorker; headless Chromium scenarios exercised here historically |
+| Chrome Android | Web Locks and OPFS; historically no SharedWorker, hence single-tab fallback; not device-tested |
+| Firefox desktop | Web Locks 96+, OPFS sync handles 111+, module SharedWorker 114+; not run here |
+| Safari macOS/iOS | Web Locks 15.4+, SharedWorker re-added in 16, sync handles 15.2+ with later fully synchronous methods; not device-tested |
+| Playwright 1.64.1 / WebKit 27.2, Linux GTK headless | persistent-context OPFS, Web Locks and SharedWorker exercised; not Safari's process/storage model |
+
+The effective language baseline is Chrome/Edge 110, Firefox 115, Safari 16, because core uses
+ES2023 `toSorted`; storage APIs alone do not set the minimum. Older Safari 15.x handles had
+async `getSize`/`flush`/`close`, unsupported by AccessHandlePoolVFS. Module workers need
+Safari 15+. The leader checks `createSyncAccessHandle` itself and reports an open failure
+rather than waiting forever.
+
+The Linux WebKit run exercised election, OPFS durability and ordering, port transfers,
+reactivity, streaming sync/presence, offline reload, conflicts, reset and fallback without
+cross-origin isolation or SharedArrayBuffer. The pinned wa-sqlite 0.1.2 / SQLite 3.47.0 build
+has JSON functions (`json_extract` works), but no FTS5 (`no such module: fts5`, no
+`ENABLE_FTS5` compile option). The browser SharedWorker lifetime probe still fails on WebKit
+after router recovery was fixed: it tests the browser, not our recovery.
+
+Historical WebKit results after router recovery were 30/32 substrate checks (two failures)
+and 12/12 slice checks, with Chromium-only CDP checks skipped. A closed tab's leader executing
+the handover scenario's 10⁹-row synchronous wasm query retained leader/epoch locks for over
+50 s; without that query a successor served after 0.76 s. The single-owner assertion then
+failed and the following stale-announcement assertion lacked a new leader id. Neither was
+an extra owner: long synchronous wasm caused unavailability. The cause is unidentified;
+[WebKit 289686](https://bugs.webkit.org/show_bug.cgi?id=289686) is only a possible relation,
+not an established explanation. The worker cannot observe a death signal while wasm blocks.
+Real Safari needs a separate check. Router-kill CDP tests are skipped under WebKit; normal
+handover there naturally exercises router death.
+
+WebKit's 255-byte OPFS segment limit was reproduced (256 bytes fail `UnknownError`, 127
+two-byte characters succeed, 128 fail), unlike Chromium's acceptance of 480-byte names.
+Validation now rejects oversized segments before OPFS. Safari sharing that limit is expected,
+not verified. Desktop GTK WebKit is not evidence for iOS eviction, background suspension,
+process-per-tab hosting or private browsing. Documentation says iOS best-effort origin
+eviction/ITP can delete both replica and pending outbox, `persist()` is heuristic (including
+Home Screen use), and the full Storage API is available from 17; see
+[WebKit storage policy](https://webkit.org/blog/14403/updates-to-storage-policy/).
+Private/ephemeral contexts lack OPFS; background suspension can retain locks until process
+death. Recheck these and SharedWorker hosting on real iPhone/macOS Safari before relying on them.
+
+### C.3 What the harness proves
+
+Scenarios use fresh app ids and await asserted conditions (`echo.until`); concurrent phases
+rendezvous on BroadcastChannel barriers, not wall-clock timers subject to background throttling.
+Vite pre-scans worker entries and the scripts warm up a page to avoid cold-start reloads.
+`window.echo` is the scripting surface; failures return `{ ok: false, error }` for tag/reason
+assertions. Faults include commit-before-reply worker death, OPFS-open failure, muted reset
+signals, reset death before tombstone or mid-removal, forged announcements and held router
+messages. The fake RPC endpoint always rejects push with `MalformedEnvelope`, answers empty
+pull and ends pokes after one poke; it is separate from the real-server checks.
+
+The emission sanity check (two tables kept equal by a trigger) still passes if its read
+transaction is removed, because its statements already run back-to-back; it is not proof of
+snapshot isolation. `Leader.test` covers that contract (INV-BRW-6). Browser hard-kill checks
+cover enqueues that resolved; the commit-before-reply fault plus simultaneous same-id retries
+covers the lost response. Slice offline checks wait for an actual `network` failure, not merely
+a halted push. Conflict/rejection checks compare Postgres, both replicas and existing live
+queries, and scan emission history so a transient leak cannot pass on final state alone.
+S4 has no resync timer: silently dead proxy responses recover only through idle detection plus
+reconnect backoff (§10). Scenario descriptions and assertions live beside the scripts; §17
+is the contract-to-test registry.
+
+## Appendix D. Postgres mechanisms and verification notes (non-normative)
+
+These notes explain §3–§8, §10, §11 and §13 without changing their contracts.
+
+### D.1 Composition and storage
+
+`schema.ts` owns attach/catalog discovery and `resolveTables`; `ledger.ts` owns mutations and
+client binding; `pull.ts` owns pages/continuations; `rowStore.ts` owns row codecs; `gc.ts` owns
+maintenance. `rpc.ts` composes transport-neutral `principalFor`, `executeBatch`, `pull`,
+`pushFailures` and `serverFailures`. The HTTP layer merges `SyncRpcs` and `PresenceRpcs` on one
+path with NDJSON; it must accept the client HTTP protocol's trailing slash. RPC handlers need
+the actual HTTP request context and defect if it is missing; another transport composes the
+neutral steps using its own trusted boundary headers. `executeBatch` and `pull` require
+`SqlClient`; failure combinators preserve their input requirements.
+
+The HTTP protocol decodes the body before `principalFor`: the callback is not a pre-decoder
+body-size gate. A stream authenticates at open, not continuously, so a live heartbeat does
+not bound how long an expired credential remains honoured. A reconnect obtains new headers.
+The pinned RPC implementation preserves the real HTTP request context when forking handlers,
+for buffered and streaming responses alike. `examples/server` rejects cross-site and
+same-site fetch metadata before reading its dev principal; sibling origins are not same-origin.
+Origin/fetch metadata policy does not replace credentials: non-browser callers can omit it.
+
+Push applies `pushFailures` across authentication and execution; SQL infrastructure failure
+therefore yields an empty/short processed prefix, not a fatal push defect. `executeBatch`
+already applies that mapping idempotently. `serverFailures` maps SQL anywhere in a pull cause
+to `ServerUnavailable`, except when a non-SQL defect must remain a defect. Pokes uses stream
+operators with first-typed-failure reduction, unlike the effect combinator's composite-cause
+preservation. `ClientForbidden` maps to `Unauthorized` and interrupts pass through.
+
+Wire-row writes encode each column; JSON uses `PgTypes.jsonb`. Reads decode only declared
+columns; a captured table outside the registry has no payload and its log entries become
+tombstones. Scope grant DDL adds the access-scope FK, role CHECK and principal index beyond
+the core SyncTable manifest. The verifier does not inspect engine-internal CHECK/FK constraints;
+migration history, not a startup catalog assertion, guarantees them. The ledger takes locks
+in client-row → engine-position order. `ConstraintError` exposes no constraint name in the
+pinned driver, unlike `UniqueViolation`. A SQL defect from failed savepoint/rollback cleanup
+is transient and not a conflict retry. Whole-cause retry flags are computed before
+`Effect.retry`, whose own filter considers only the first typed failure.
+
+### D.2 Notification and presence internals
+
+`layerNotifications` supplies one `Notifications` service to sync and presence. Per-stream
+`LISTEN` would pin one pool connection each and eventually block push/pull. Each listener
+attempt has its own scope, released before backoff. A capacity-one sliding notification
+PubSub coalesces commits; a separate heartbeat PubSub prevents a heartbeat sliding out a poke.
+Heartbeats have fixed cadence even on busy streams, not an inactivity-reset timer.
+
+Presence uses a `Ref` of rooms and capacity-one change PubSubs; snapshots are freshly read
+after change ticks. Each entry has a Deferred identifying its lifetime: replacement completes
+the old one's signal and its release cannot remove the new one. Heartbeats merge beside the
+change subscription only after the first snapshot. Track update/announcement is uninterruptible.
+Revocation checks `(room, principal)` pairs with one indexed query per coalesced commit and
+skips it when no rooms exist. An installation gate covers member-read through removal, but
+never stream I/O or admission. Join checks grants before and after installation; an end signal
+already completed takes precedence over admission's result. A snapshot read before removal
+may still arrive, but one read afterwards is never emitted to that entry. Re-grant itself
+does not recreate an entry; reconnect performs admission again.
+
+### D.3 Evidence and cost caveats
+
+Ledger lost-response tests discard a completed response; they do not inject a crash after
+commit before reply. Backend termination during the body or before cleanup is real, and
+verifies rollback/uncertain outcome handling. Concurrent scope creators exercise the 40001
+retry (one applied, one forbidden, three body attempts). Ordering retains a no-lock variant
+that demonstrably misses a change. Other deliberate mutations caught during development
+removed walks, current-scope payload filtering, savepoints, client locking, continuation
+bounds, attach locking/atomicity, or whole-cause classification; used READ COMMITTED for
+mutations; returned undeclared columns; or changed ordering/JSON binding. The conformance and
+integration suites caught these rather than merely accepting the correct implementation.
+
+Historical ledger simulations (40 seeds × 400 steps, counting each seed's first violation):
+
+| model | floors | late retries | double apply | never released | pass |
+|---|---|---|---|---|---|
+| identities deleted | no | off | 14 | 23 | 3 |
+| identities deleted | no | on | 23 | 14 | 3 |
+| identities deleted | yes | off | 0 | 0 | 40 |
+| identities deleted | yes | on | 13 | 0 | 27 |
+| identities kept, no receipt release | yes | on | 0 | 3 | 37 |
+| identities kept, ClientExpired released on receipt | yes | on | 0 | 0 | 40 |
+
+The kept-identity model also passed 120 seeds. The real Postgres expiry E2E covers the
+time-dependent late retry after 24 h marker pruning and 7 d outcome expiry (DECISIONS 5).
+Each mutation retains roughly 50–80 bytes of identity/index entries permanently; only outcome
+payloads are reclaimed. PostgreSQL 15+ is needed by the verifier's
+`pg_index.indnullsnotdistinct`; the engine schema alone needs PG14's replaceable triggers.
+Integration suites create and drop fresh databases; `bun run test:pg` supplies the local URL.
+
+### D.4 Client policy example
+
+An app can derive a table-shape floor from generated history (§0.2, §13):
+
+```ts
+import { Effect } from "effect"
+import { Migrate, Protocol } from "echo-sync"
+import { Postgres } from "echo-sync/server"
+
+const manifest = Migrate.decodeSnapshot(await Bun.file("migrations/manifest.json").text())
+const floor = 3 // accept every recorded manifest since 003, not only the latest hash
+const accepted = new Set((manifest.history ?? [])
+  .filter((entry) => Number(entry.migration.split("_")[0]) >= floor)
+  .map((entry) => entry.dataHash))
+const clientPolicy: Postgres.ClientPolicy = (version) =>
+  version !== undefined && version.wireVersion === Protocol.wireVersion && accepted.has(version.dataHash)
+    ? Effect.void
+    : Effect.fail(new Protocol.ClientOutdated({ message: "update required" }))
+// Pass clientPolicy alongside registry, mutations and principalFor to Startup.layer / layerHttp.
+```
+
+This example refuses an absent version; the default serves it. Pre-gate clients cannot decode
+the refusal or acquire new stop/status behavior retroactively. Version numbers decode as
+arbitrary nonnegative integers so policy can choose its range. Raise a floor before a
+non-additive column change, including writing nulls after relaxing NOT NULL; otherwise an old
+client can misdiagnose the change as server-outdated. This floor covers table shapes, not
+mutation names/args: keep names while queued clients exist and evolve args with unions/upcasts.
+Removing a name or making args incompatible produces retained UnknownMutation/ArgsDecodeFailed
+not an outdated stop. A separate mutation-registry floor remains unimplemented.
+
+## Appendix E. Telemetry mechanisms and host integration (non-normative)
+
+These notes explain §14; its vocabularies and privacy invariants remain authoritative.
+
+### E.1 Runtime integration
+
+No exporter, SDK, queue, sampling or flush policy ships with the engine. An unconfigured
+native tracer still allocates spans and Effect keeps its in-memory metric registry. Hosts
+can run `leaderWorker(self, options)` or `router(self)` with layers providing `Tracer.Tracer`,
+`Logger.CurrentLoggers`, `References.MinimumLogLevel` and `Metric.CurrentMetricAttributes`.
+The default `runLeaderWorker` / `runRouter` fork those same lazy scoped programs. Install host
+telemetry separately in every realm (leader, router, tab) and in server startup, maintenance
+and actual request execution; a tab's runtime does not cross a worker boundary. Interrupting
+the program finalizes engine ports, fibers, locks and replica; the host owns termination and
+browser handle release may finish asynchronously.
+
+Routine loggers must discard diagnostics even with Debug enabled; a separate opt-in logger
+can retain them under a sensitive-data policy. `Logger.Options` has a fiber, not an annotations
+snapshot:
+
+```ts
+const routineLogger = Logger.make((options) => {
+  if (options.fiber.getRef(References.CurrentLogAnnotations)["echo.diagnostics"] === true) return
+  // Export options.message and host-approved metadata, never the diagnostic cause.
+})
+```
+
+Compose the host runtime around `Startup.layer` and on request fibers; serving is not part
+of the startup span. `Postgres.layerHttp` places a route-scoped boundary before automatic
+RPC spans/context merge, leaving unrelated routes alone. Direct batch, ledger, pull,
+maintenance, schema/migration and row-store entry points also suppress dependency telemetry
+without inventing new span names. Host-authored SQL outside engine operations is host-owned.
+The engine does not parse traceparent, baggage or forwarded headers; the host chooses trusted
+parents. Host metric attributes, annotations and parent metadata must not contain secrets.
+
+### E.2 Context, parents and sink isolation
+
+Leader OPFS, sync, poke and per-tab RPC fibers are scoped to the leader; pending-count is a
+child of the loop; presence and timeout/pull fibers use subscription scopes. Router callback
+runners capture guarded references with `runForkWith` and attach with `Fiber.runIn`; epoch
+watchers use the long-lived router scope, not the short announcement fiber. Tab connection,
+epoch, deferred close and serialized acceptance runners similarly belong to the client's
+scope; status publication uses `runSyncWith` on captured context. Check closure before
+`runForkWith`, which evaluates synchronously, not only before attaching the fiber.
+
+The boundary replaces tracer/loggers only; minimum log level, metric registry/attributes and
+other host references inherit normally. Suppressed spans propagate the nearest exported
+ancestor's IDs and sampling. Explicit external parents terminate traversal, as do effective
+roots on suppressed ancestors; an explicit parent beats `root: true`. Captured boundary-parent
+fallback applies only at the boundary. Streams capture context for both execution and owned
+scope closure: channel service provision alone cannot protect finalizers closed by a host.
+Outcome finalizers also capture their actual operation span.
+
+Span proxies forward `Exit.void` at end. Merely capturing `Effect.exit` inside `withSpan`
+would not protect an interruption outside that capture: pinned `useSpan`'s finalizer receives
+the original exit. `observe` classifies in `onExit` inside `withSpan`; no additional
+interruptibility mask is introduced. Each sink creation, attribute, end, logger and metric
+update is guarded independently. Failed creation uses a non-exporting local span, other
+deliveries are dropped, and failures are not recursively logged. Host callbacks must be
+bounded and nonblocking: synchronous blocked JavaScript cannot be isolated. The promise is
+unchanged commit/retry/halt decisions, not wall-clock immunity.
+
+### E.3 Signal interpretation
+
+| span | operation-specific interpretation beyond the vocabulary in §14 |
+|---|---|
+| `echo.enqueue` | transaction through commit; duplicate is not saved; interruption does not imply a masked commit rolled back |
+| `echo.push` | one nonempty attempted batch including credentials and response bookkeeping; empty/halted cycles emit none; each retry is new |
+| `echo.pull` | one set attempt through install, including resumed staging and internal resnapshots; success counts the installed set plus PullDone, failure the last observed set including staging |
+| `echo.install` | transaction after PullDone, even empty; push halt does not suppress it |
+| `echo.rebase` | inside install or push-covered release; completion alone is not proof of commit; empty replay counts zero |
+| `echo.pokes` | credential preparation through first chunk or establishment failure; later termination uses the reconnect counter |
+| `echo.leader.election` | lock wait ends elected before database open; interrupted candidates are not elected |
+| `echo.leader.handover` | surviving observer's loss/recovery through replacement; no dead-worker tenure span |
+| `echo.router.handover` | accepted live announcement; stale/duplicate announcements emit none |
+| `echo.server.startup` | prepare through verification; Drift is server, idempotent startup ok |
+| `echo.server.push` | authenticated batch including internal retries; empty batch ok with zero counts |
+| `echo.server.pull` | authenticated page, result page/done; empty done still done |
+| `echo.server.pokes` | subscription, clean end server-end and teardown interrupted |
+
+There are no presence-operation or per-mutation server spans and no independent install/rebase
+retry policy. Classification describes the operation, not loop policy: the whole final push
+cause can include an outer cleanup failure that halts a loop after a transient batch span.
+`echo.result` is the successful operation result; `echo.reason` distinguishes idle timeout
+from clean end. The leader-loss counter is per surviving observer, not globally exactly once.
+Without a host runtime attribute the pending gauge is last-writer across workers, not a sum.
+Batch histograms include credential failures before send; page histograms count only installed
+sets. Timers include failure/interruption and Effect adds `time_unit=milliseconds`.
+
+Routine log levels: unknown-table skips, push/pull retry, presence retry and pokes reconnect
+are Debug; integrity halt, candidate failure and router/tab watcher/acceptance failures are
+Error; pending-count restart, revocation-watch restart and interrupted-reset completion are
+Warn. Interrupt-related lines are always Debug. Only the shared routine/diagnostics helpers
+call `Effect.log*` directly.
+
+`test/observability.e2e.test.ts` covers real SQLite/Postgres HTTP with typed/defect canaries,
+`tracerLogger`, metrics/hierarchy, 999/1000 ms retry boundaries, diagnostics, direct maintenance
+and unrelated routes. Subscription closure from host context checks protected cleanup and
+interrupted/defect outcomes; removing either context capture makes that regression fail.
+The browser observability script separately exercises OPFS, worker RPC, inherited attributes,
+late callbacks and lock release; it does not replace the substrate/slice gates.
