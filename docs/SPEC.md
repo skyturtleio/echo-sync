@@ -849,9 +849,9 @@ pending on top and recaptures undo).
 - OQ-CLI-1: A full rebase per install (Q3) has no incremental path. Whether an install should
   skip undo/replay for entries whose rows the set does not touch is a design question; nothing in
   the correctness contract constrains it beyond INV-CLI-1. The measured baseline and exact
-  counter gates are in §16: 5 pending / 50 changes took 50.07 ms (103 statements), and
-  500 pending / 5,000 changes took 567.45 ms (9,508 statements), under Bun/wa-sqlite memory VFS.
-  Keep this open for the owner: a large install blocks other storage work for roughly half a
+  counter gates are in §16: 5 pending / 50 changes took 49.41 ms (103 statements), and
+  500 pending / 5,000 changes took 651.39 ms (9,508 statements), under Bun/wa-sqlite memory VFS.
+  Keep this open for the owner: a large install blocks other storage work for over half a
   second in this run, but all pending targets overlap the page set, so selective replay would
   not skip any of them. Measure disjoint/dependency-heavy workloads and OPFS before deciding;
   changing the algorithm must consciously revise those cost gates.
@@ -1551,7 +1551,7 @@ currently use **two** SELECTs (undo images then envelopes), each returning P row
 
 #### Install measurement receipts (2026-10-24)
 
-Clean source: [`e2d8e807fa73ee9032364b23ff1060777a138fd9`](https://github.com/skyturtleio/echo-sync/commit/e2d8e807fa73ee9032364b23ff1060777a138fd9).
+Clean source: [`9ba93ee7b2724da172ba883e17eecbff9439d60e`](https://github.com/skyturtleio/echo-sync/commit/9ba93ee7b2724da172ba883e17eecbff9439d60e).
 Command: `bun test/perf-install.ts` (refuses a dirty tree and prints its source SHA).
 Environment: Bun 1.3.10, Linux x86_64 Amp orb, Effect/sqlite-wasm 4.0.5,
 wa-sqlite 0.1.2 / SQLite 3.47.0, in-memory VFS. This is the allowed Bun fallback: isolating
@@ -1561,10 +1561,11 @@ No browser/network/OPFS latency is claimed.
 
 | pending P | changes C | staged pages (≤500 upserts each) | install wall time | statements | SELECT-returned rows |
 |---|---|---|---|---|---|
-| 5 | 50 | 1 | 50.074384 ms | 103 | 32 |
-| 500 | 5,000 | 10 | 567.447760 ms | 9,508 | 3,011 |
+| 5 | 50 | 1 | 49.405144 ms | 103 | 32 |
+| 500 | 5,000 | 10 | 651.389598 ms | 9,508 | 3,011 |
 
-One run per workload, small then large in one process; no statistical confidence or speedup
+These receipts replace pre-rebase runs, so the quoted source is an ancestor of landed main.
+One run per workload at this source, small then large in one process; no statistical confidence or speedup
 claim. Both start with a non-null cursor, no acks, one writer grant and P independent pending
 increments (100 → 103); the page set overlaps every pending target (authoritative 200 → 203
 after replay). Timed region is the one install transaction, from just before BEGIN through
@@ -1796,7 +1797,7 @@ INV-PULL-8, INV-CLI-7, INV-PERF-5).
 | OQ-MUT-2 | §5 | `createdAt` not on the wire; `ctx.now` differs between client and server |
 | OQ-PULL-1 | §7 (Q2) | no explicit `cursor ≤ head` fence; recovery after restore relies on the missing `client_scopes` row |
 | OQ-PULL-2 | §7 | unknown-table changes skipped at install advance the cursor past rows never stored; untested |
-| OQ-CLI-1 | §9 (Q3), §16 | full rebase: 50.07 ms for 5/50, 567.45 ms for 500/5,000 pending/changes (Bun memory VFS); algorithm decision remains open |
+| OQ-CLI-1 | §9 (Q3), §16 | full rebase: 49.41 ms for 5/50, 651.39 ms for 500/5,000 pending/changes (Bun memory VFS); algorithm decision remains open |
 | OQ-LOOP-1 | §10 | the push halt is in memory per leader; a new leader retries the batch and halts again |
 | OQ-BRW-1 | §12 | `awaitOpfsPoolFree` bound (2 s) then `LeaderFailed` with no retry |
 | OQ-TEL-1 | §14 | closed telemetry vocabularies not asserted against a committed list |
