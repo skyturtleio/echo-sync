@@ -44,7 +44,7 @@ implementation and verification notes, not additional contracts.
   a MUST in this document changes. A breaking change MUST bump `wireVersion` when it concerns the
   wire, MUST ship a migration when it concerns the Postgres schema, and MUST update the rule
   and its dated rationale in this document in the same branch. Additive fields marked optional on the wire
-  (`clientVersion`, `principal`) are not breaking.
+  (`clientVersion`, `principal`, mutation `createdAt`) are not breaking.
 - **Error vocabulary is closed.** The tags in §15 and the literal unions they carry
   (`ResnapshotRequired.reason`, `SyncErrorKind`, `LeaderUnavailable.reason`, telemetry names and
   outcomes) are part of the contract; adding a member is a design change recorded in a dated
@@ -345,8 +345,8 @@ Tables (`src/server/postgres/migrations/001`): `echo_sync.access_scopes(id PK)`,
 principal_id, role CHECK IN (reader, writer, owner), UNIQUE (access_scope_id, principal_id))`.
 The wire table is `scope_grants` with fields `id`, `accessScopeId`, `principalId`, `role`,
 `grantedAt` (a timestamp; `createScope` stamps it with the handler's `ctx.now`, which on the client
-is the outbox entry's `createdAt` and on the server is the server clock at execution, so the
-optimistic value is replaced by the server's at install).
+is the outbox entry's `createdAt` and on the server is the same writer timestamp (§5), so the
+optimistic timestamp is preserved at install; pre-field clients retain server-time behavior).
 
 A grant's `accessScopeId` is the scope it grants and also the scope the grant row lives in, so a
 grantee pulls the grant row itself. Revoking a grant removes the row; the next pull emits
@@ -379,7 +379,7 @@ was recorded at. The ledger is what makes a push idempotent and what a pull acks
   including under concurrent submission.
 - INV-MUT-2: Outcomes are the closed set `Applied | Rejected{error}` with `error` one of
   `UnknownMutation | ArgsDecodeFailed | RowNotFound | RowAlreadyExists | ScopeForbidden |
-  InvalidRow | DomainError | ConstraintViolated | ClientExpired`. Every outcome carries a
+  InvalidRow | DomainError | ConstraintViolated | ClientExpired | ClockSkew`. Every outcome carries a
   `Position`.
 - INV-MUT-3: Classification is over the whole cause of a handler run: a defect anywhere is a
   defect (the request dies; nothing is ledgered); otherwise a `StoreUnavailable` or a `SqlError`
@@ -409,8 +409,7 @@ was recorded at. The ledger is what makes a push idempotent and what a pull acks
   before any body runs; nothing executed, nothing ledgered, not answered as `ClientExpired`.
 - INV-MUT-8: The seeded random available to a handler is a function of `(clientId, mutationId)`
   only, so a rebase replays identically; on the client `ctx.now` is the outbox entry's
-  `createdAt` (stable across rebases); on the server it is `DateTime.now` at execution, since
-  `createdAt` is not on the wire.
+  `createdAt` (stable across rebases).
 - INV-MUT-9: A registry MUST refuse two mutations (or two queries) with one name at
   construction.
 - INV-MUT-10: A client id registered to one principal MUST be refused to another
@@ -421,7 +420,33 @@ was recorded at. The ledger is what makes a push idempotent and what a pull acks
   presence request checks it, with the replica-principal assertion optional on the wire for
   compatibility with earlier peers (§7.1).
 
+- INV-MUT-11: A pushed mutation's `createdAt` MUST be the client's original epoch-ms timestamp;
+  the server MUST use it as handler `ctx.now`, unchanged, including arbitrarily old offline
+  edits. Pull MUST NOT change a timestamp written optimistically from that same `ctx.now`.
+- INV-MUT-12: A new mutation more than 30,000 ms ahead of the server clock MUST be ledgered
+  `Rejected{ClockSkew{createdAt, serverNow}}` without running its handler. Exactly the bound
+  is accepted. The client MUST settle it on the covering ack and retain a rejection notice.
+  Known identities still replay their original verdict before any clock check.
+- INV-MUT-13: `createdAt` MUST NOT participate in ordering: positions, ledger and log order
+  come only from the server sequence, never the writer's clock. Reversed writer timestamps
+  MUST NOT reverse sequential pushes.
+- INV-MUT-14: An omitted `createdAt` MUST retain legacy server-time `ctx.now`. Absence MUST
+  NOT infer compatibility or bypass the app's `clientPolicy` (§0, §13).
+
+**Rationale (2026-10-24):** Following Jazz's writer-timestamp pattern, carry the original clock
+to avoid optimistic/pulled timestamp drift and preserve offline edit time; reject rather than
+clamp future clocks so misconfiguration cannot poison application `updatedAt` ordering.
+Thirty seconds tolerates modest clock drift without admitting substantially future-dated
+writes; old timestamps are legitimate offline work. Optional wire presence preserves old
+clients under the existing version policy instead of imposing a new engine version gate.
+
 ### Details
+
+`createdAt` is an optional-on-wire integer epoch-ms field in the timestamp range of §3; new
+clients always send it. The server compares it to its execution clock before invoking the
+handler (inside the ledger body, after deduplication). Its own time remains independently
+recorded in the ledger's `received_at` and the log's server timestamp; no new SQL is required
+and §16 statement budgets are unchanged.
 
 **Ledger row** (`migrations/001`, `003`): `mutations(client_id, mutation_id) PK, seq bigint,
 position bigint UNIQUE, outcome jsonb NULL, received_at, acked_at NULL`, with indexes on
@@ -465,11 +490,6 @@ one catalog query (`resolveTables`).
   client pushes the remainder on its next cycle after backoff; a persistently transient mutation
   (for example one whose handler always hits `StoreUnavailable`) blocks every later entry of
   that client indefinitely. The code has no bound on this; whether a bound is wanted is open.
-- OQ-MUT-2: `createdAt` is not on the wire, so a handler's `ctx.now` is the outbox entry's
-  `createdAt` on the client and the server clock on the server (INV-MUT-8). Any value derived
-  from it (`scope_grants.grantedAt`, an app's own timestamps) differs between the optimistic
-  write and the authoritative row until install. The retired design text implied the two agree;
-  whether `createdAt` should travel with the envelope is open.
 
 ## 6. Positions and the ordering invariant
 
@@ -684,6 +704,9 @@ upsert entries, for payloads; one ack `SELECT`; `COMMIT`; after the transaction,
 
 A push sends the client's pending outbox entries in `seq` order and receives the processed
 prefix's outcomes with positions. Push never installs data; the pull after it acks.
+Each new-client envelope carries its original `createdAt` for handler `ctx.now` (§5), not for
+ordering: position, ledger and log are ordered only by the server's sequence. Old clients
+omitting it receive legacy server-time behavior, subject to the same `clientPolicy`.
 
 ### Invariant digest
 
@@ -1418,6 +1441,7 @@ by reason was rejected.
 | `DomainError` | `mutation, error: Json` | a declared domain error, encoded with the mutation's `error` schema |
 | `ConstraintViolated` | `kind: unique \| other, constraint, message` | an authoritative database constraint (INV-MUT-6) |
 | `ClientExpired` | `mutationId` | answered at or below the client's expiry floor (§11); the effect, if any, is installed; outcome unknown |
+| `ClockSkew` | `createdAt, serverNow` (epoch ms) | writer timestamp exceeds server time by more than 30 s; no handler writes; retained rejection notice (INV-MUT-12) |
 
 #### 15.3 Core store and registry errors (`src/core/Errors.ts`, `Query.ts`, `Mutation.ts`)
 
@@ -1669,6 +1693,10 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-MUT-8 | partial | `Mutation.test` "the seeded random is a function of (clientId, mutationId), so a rebase replays identically" (client `ctx.now = createdAt` untested) |
 | INV-MUT-9 | partial | `Mutation.test` "rejects two mutations with the same name at construction" (queries untested) |
 | INV-MUT-10 | covered | `ledger.test` "a client id registered to one principal is refused to another" |
+| INV-MUT-11 | covered | `scope-create.e2e` "pull must not replace the writer timestamp with push time" |
+| INV-MUT-12 | covered | `scope-create.e2e` "a future clock must reject without writes and retain the ClockSkew notice"; `rpc.test` "clock checks must accept the boundary and old edits without timestamp ordering" |
+| INV-MUT-13 | covered | `rpc.test` "clock checks must accept the boundary and old edits without timestamp ordering" |
+| INV-MUT-14 | covered | `rpc.test` "an old client omitting createdAt must retain server time and still obey clientPolicy" |
 | INV-POS-1 | covered | `ordering.test` "a reader pulling after a later writer commits never skips an earlier writer still in flight", "without the trigger's advisory lock that reader skips the earlier writer (the ordering check can fail)", "a reader advancing its cursor during many random out-of-order commits never misses a change (stress)" |
 | INV-POS-2 | covered | `capture.test` "TRUNCATE on a synced table fails instead of silently bypassing the log", "writes from outside any mutator (scripts, cascades) are captured like any other" |
 | INV-POS-3 | partial | `scopes.test` "a scope move deletes the row for old-scope readers and delivers it to new-scope readers" (payload-free log rows untested) |
@@ -1756,7 +1784,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PERF-6 | partial | `rpc.test` "more open pokes streams than pool connections do not block push or pull, and the server holds one LISTEN" (fan-out and notify counts unmeasured) |
 | INV-PERF-7 | covered | `perf-postgres.test` both budget tests; `perf-install.test` "install undoes P entries, writes C changes and replays P handlers without hidden statements" (SELECT-returned rows, not physical scans) |
 
-Totals: 114 invariants; 101 covered, 8 partial (INV-MUT-2, INV-MUT-8, INV-MUT-9, INV-POS-3,
+Totals: 118 invariants; 105 covered, 8 partial (INV-MUT-2, INV-MUT-8, INV-MUT-9, INV-POS-3,
 INV-PULL-7, INV-PUSH-1, INV-TEL-5, INV-PERF-6), 5 untested (INV-ID-3, INV-POS-5,
 INV-PULL-8, INV-CLI-7, INV-PERF-5).
 
@@ -1765,6 +1793,7 @@ INV-PULL-8, INV-CLI-7, INV-PERF-5).
 | name | value | where | tunable |
 |---|---|---|---|
 | `wireVersion` | 1 | `Protocol.ts` | no |
+| mutation future-clock skew bound | 30,000 ms (strictly greater rejects) | `Protocol.maxMutationFutureSkewMillis`, `rpc.ts` | no |
 | push batch size | `min(pushBatchSize ?? 50, 100)` | `Engine.ts` | `pushBatchSize` |
 | `PushRequest.mutations` | 1 … 100 | `Protocol.ts` | no |
 | `pageLimit` (upserts + tombstones per page) | 500; configured value must be a positive safe integer (INV-PULL-14) | `rpc.ts` | `pageLimit` |
@@ -1813,7 +1842,6 @@ INV-PULL-8, INV-CLI-7, INV-PERF-5).
 | ID | section | question |
 |---|---|---|
 | OQ-MUT-1 | §5 | no bound on a persistently transient mutation blocking a client's queue |
-| OQ-MUT-2 | §5 | `createdAt` not on the wire; `ctx.now` differs between client and server |
 | OQ-PULL-1 | §7 (Q2) | no explicit `cursor ≤ head` fence; recovery after restore relies on the missing `client_scopes` row |
 | OQ-PULL-2 | §7 | unknown-table changes skipped at install advance the cursor past rows never stored; untested |
 | OQ-CLI-1 | §9 (Q3), §16 | full rebase: 49.41 ms for 5/50, 651.39 ms for 500/5,000 pending/changes (Bun memory VFS); algorithm decision remains open |
