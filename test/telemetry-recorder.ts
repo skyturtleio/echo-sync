@@ -16,7 +16,11 @@ export interface RecordedSpan {
   readonly exit: Exit.Exit<unknown, unknown>
 }
 
-export const recorder = (throws: "none" | "create" | "attribute" | "end" | "logger" = "none", sampled?: boolean) => {
+export const recorder = (
+  throws: "none" | "create" | "attribute" | "end" | "logger" = "none",
+  sampled?: boolean,
+  received: Array<RecordedSpan> = []
+) => {
   const spans: Array<RecordedSpan> = []
   const logs: Array<{ diagnostics: boolean; message: unknown; cause: string }> = []
   const registry: Metric.MetricRegistry = new Map()
@@ -27,7 +31,7 @@ export const recorder = (throws: "none" | "create" | "attribute" | "end" | "logg
     }
     override end(time: bigint, exit: Exit.Exit<unknown, unknown>) {
       super.end(time, exit)
-      spans.push({
+      const recorded: RecordedSpan = {
         name: this.name,
         spanId: this.spanId,
         traceId: this.traceId,
@@ -44,7 +48,9 @@ export const recorder = (throws: "none" | "create" | "attribute" | "end" | "logg
         links: this.links.length,
         annotations: this.annotations.mapUnsafe.size,
         exit
-      })
+      }
+      spans.push(recorded)
+      received.push(recorded)
       if (throws === "end") throw new Error("host end sink failed")
     }
   }

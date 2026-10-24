@@ -1396,6 +1396,21 @@ request span, for instance) is shielded behind an `engine boundary` `SafeSpan` s
 annotations never land on it. `observeStream` applies the same to a stream, with `server-end` as
 the outcome of a clean end.
 
+Named `Effect.fn` MUST remain internal to an established boundary; exported entry points use
+plain functions or `fnUntraced`. The lightweight `telemetry-entrypoints.test` syntax check in
+`bun run check` rejects named `Effect.fn` export declarations; it does not analyze aliases or
+data flow. The observability e2e run also checks every received engine span against
+`Telemetry.Name` and requires `Exit.void`, excluding only its explicit host-owned control spans
+(INV-TEL-1, INV-TEL-3).
+
+**Rationale (2026-10-24):** Effect 4.0.5's `makeFn` applies pipeables before wrapping their result
+in `useSpan`, which creates and captures the caller's span before the boundary executes: the
+probe `Effect.fn("Exported.entry")(failingBody, boundary)` exported that name and its raw failure,
+whereas `observe(entry(), "echo.server.startup", serverFailure)` exported only the approved name
+with `echo.outcome=server` and `Exit.void`. A filtering or no-op tracer installed inside the
+boundary therefore cannot replace the placement convention; retain it with cheap checks rather
+than adding wrappers or changing entrypoints without gaining an unconditional guarantee.
+
 ### Open Questions
 
 None.
@@ -1805,9 +1820,9 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-SCH-6 | covered | `startup.test` "prepare run concurrently by several instances succeeds for all of them", "concurrent first starts on an empty database all succeed and run the app migration exactly once" |
 | INV-SCH-7 | covered | `capture.test` "attach inside a caller's REPEATABLE READ transaction is refused (its stale snapshot would admit a duplicate name)", "an attach that fails between its two triggers leaves the table neither captured nor half-guarded" |
 | INV-SCH-8 | covered | `startup.test` "an old server must serve push and pull on an expanded database, while a new server must refuse the unmigrated schema" |
-| INV-TEL-1 | covered | `startup.test` "startup's internal steps (verify, its per-table checks) must never hand the host a span other than echo.server.startup"; `observability.e2e` "sync propagates exported IDs and sampling through suppressed spans and preserves an explicit external parent" |
+| INV-TEL-1 | covered | `startup.test` "startup's internal steps (verify, its per-table checks) must never hand the host a span other than echo.server.startup"; `observability.e2e` "sync propagates exported IDs and sampling through suppressed spans and preserves an explicit external parent", "engine spans across the e2e run never export an unregistered name or a raw failure cause"; `telemetry-entrypoints.test` "exported symbols cannot open named Effect.fn spans outside their boundary" |
 | INV-TEL-2 | covered | `observability.e2e` "SQLite sync never exports a typed failure, defect, result or dependency span containing secret inputs", "RPC request context cannot bypass sanitization for typed failures, defects, SQL spans or tracerLogger events", "direct server batches and maintenance cannot export returned identities or fail from a throwing tracer" |
-| INV-TEL-3 | covered | `observability.e2e` "throwing host sinks cannot change saved intent, retry deadlines, halt or successful installs", "closing a pulled subscription in the host context retains its own outcome and protects cleanup and the host parent" |
+| INV-TEL-3 | covered | `observability.e2e` "throwing host sinks cannot change saved intent, retry deadlines, halt or successful installs", "closing a pulled subscription in the host context retains its own outcome and protects cleanup and the host parent", "engine spans across the e2e run never export an unregistered name or a raw failure cause" |
 | INV-TEL-4 | covered | `observability.e2e` "the whole final push cause remains authoritative, including typed cleanup failures", "batch telemetry agrees with the loop's whole-cause decision, not the first failure"; `SyncLoop.test` "a pokes connection the idle timeout ends must record idle-timeout, and one the server ends server-end" |
 | INV-TEL-5 | partial | `observability.e2e` "RPC request context cannot bypass sanitization for typed failures, defects, SQL spans or tracerLogger events" (the Debug downgrade of interrupted causes is untested) |
 | INV-TEL-6 | covered | `vocabularies.test` "telemetry, wire errors and client failure or notice vocabularies cannot drift from SPEC §14–15" |

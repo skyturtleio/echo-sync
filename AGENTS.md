@@ -38,7 +38,10 @@ verification appendices) and `getting-started.md` (the human how-to).
   non-exported functions that always run inside `Telemetry.boundary` may use `Effect.fn`, with a name
   that is not a `Telemetry.Name`: it opens its span in the caller's tracer, outside its own pipeables, so
   on an exported entry point the span and its failure cause would reach the host's exporter. Exported
-  entry points (`leaderWorker`, `router`, `verify`, …) stay plain functions or `fnUntraced`. Spans the
+  entry points (`leaderWorker`, `router`, `verify`, …) stay plain functions or `fnUntraced`;
+  `test/telemetry-entrypoints.test.ts` checks named `Effect.fn` export declarations in `bun run check`.
+  This lightweight syntax check is not alias/data-flow analysis; review still checks internal placement.
+  The observability e2e suite checks received engine span names and sanitized exits (SPEC §14.2). Spans the
   host may see are created only by `Telemetry.observe`/`observeStream`, with names from `Telemetry.Name`.
 
 ## Workflow

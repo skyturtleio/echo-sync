@@ -19,7 +19,13 @@ import * as Transport from "../src/client/sync/Transport.ts"
 import { executeBatch, handlers, layerHttp, Notifications } from "../src/server/postgres/rpc.ts"
 import { collectGarbage, expireLedger } from "../src/server/postgres/gc.ts"
 import { pgAvailable, registry, TestDatabase } from "../src/server/postgres/test-support.ts"
-import { recorder, serialized } from "./telemetry-recorder.ts"
+import * as Telemetry from "../src/internal/Telemetry.ts"
+import { recorder as makeRecorder, serialized, type RecordedSpan } from "./telemetry-recorder.ts"
+
+// Keep every delivery, including spans cleared by individual scenarios and throwing end sinks.
+const received: RecordedSpan[] = []
+const recorder = (throws?: Parameters<typeof makeRecorder>[0], sampled?: boolean) =>
+  makeRecorder(throws, sampled, received)
 
 const secret = "canary-header-arg-principal-defect-721994"
 const cursor = Ids.Position.make(819273645564738291n)
@@ -554,4 +560,14 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
     },
     30_000
   )
+})
+
+it("engine spans across the e2e run never export an unregistered name or a raw failure cause", () => {
+  // These three spans are deliberately host-owned controls, not engine emissions.
+  const hostNames = new Set(["host.parent", "host.subscription", "host.route"])
+  const engineSpans = received.filter((span) => !hostNames.has(span.name))
+  const allowed = new Set<string>(Telemetry.spanNames)
+  expect(engineSpans.length).toBeGreaterThan(0)
+  expect([...new Set(engineSpans.map((span) => span.name))].filter((name) => !allowed.has(name))).toEqual([])
+  expect(engineSpans.filter((span) => !Exit.isSuccess(span.exit) || span.exit.value !== undefined)).toEqual([])
 })

@@ -17,7 +17,7 @@ import {
 } from "effect"
 
 /** Every engine span the host's tracer may see; all other spans stay inside the boundary. */
-const spanNames = [
+export const spanNames = [
   "echo.enqueue",
   "echo.push",
   "echo.pull",
