@@ -205,7 +205,7 @@ order of intents.
 | `MutationId` | non-empty string, chosen by the caller of `enqueue`, `crypto.randomUUID()` by `mutate` | `echo_outbox.mutation_id`, `echo_sync.mutations.mutation_id` |
 | `Seq` | integer ≥ 1, SQLite `AUTOINCREMENT` in `echo_outbox`, never reused | `echo_outbox.seq`, `echo_sync.mutations.seq` |
 | `SeqFloor` | integer ≥ 0, the highest expired `seq` of a client | `echo_sync.clients.expired_through` |
-| `PrincipalId` | non-empty string; `*` is the wildcard grantee, refused as the actor of `createScope` and unable to relinquish the `*` grant; the engine does not otherwise reject `*` as an authenticated principal (a `principalFor` returning `*` is served) | `scope_grants.principal_id`, `clients.principal_id` |
+| `PrincipalId` | non-empty string; `*` is the wildcard grantee, never an authenticated principal or mutation actor, and unable to relinquish the `*` grant | `scope_grants.principal_id`, `clients.principal_id` |
 | `AccessScopeId` | non-empty string | `access_scopes.id`, every synced row's `access_scope_id` |
 | `TabId` | non-empty branded string; presence entry key with the client id | wire only |
 
@@ -330,6 +330,14 @@ reach clients through pull like any other row, and a mutation may change them.
   unbounded rows; pushing readability and the limit into every row store bounds the query
   while retaining `Store.planResult` as the shared conformance reference.
 
+- INV-ACL-8: The request boundary for every RPC (`push`, `pull`, `pokes`, `room`, `track`) MUST
+  refuse an authenticated principal `*` with `Unauthorized` before client registration, locking,
+  grant lookup, ledger work or presence mutation.
+
+  **Rationale (2026-10-24):** `*` denotes all grantees, not an actor; admitting it made every
+  wildcard-granted row readable. The boundary refusal was chosen over treating `*` as a special
+  low-privilege actor because it fails closed before any durable or process-local state changes.
+
 ### Details
 
 Tables (`src/server/postgres/migrations/001`): `echo_sync.access_scopes(id PK)`,
@@ -352,11 +360,7 @@ rejection with the encoded payload; an undeclared one is a defect.
 
 ### Open Questions
 
-- OQ-ACL-1: `*` is refused only as the actor of `createScope` and as the subject of a
-  self-revocation. Nothing in `assertPrincipal`, `registerClient` or the RPC layer refuses `*`
-  as the authenticated principal, so an app whose `principalFor` returns `*` is served with every
-  row readable. The retired design text called `*` "never an actor"; whether the engine should
-  refuse it at the request boundary is open.
+None.
 
 ## 5. Mutations and the ledger
 
@@ -545,8 +549,7 @@ rest. Payloads are always the current row.
   readable scopes, with `LIMIT budget + 1` to detect the end.
 - INV-PULL-8: The page budget (`limit`, default `pageLimit` 500) counts upserts and
   tombstones only; `scopePurged` entries are free. A walk page never exceeds the remaining
-  budget. `pageLimit ≥ 1` is an unvalidated precondition: with `0` no walk and no log read runs
-  and every page is a `PullPage` at the same position, forever.
+  budget.
 - INV-PULL-9: Payloads MUST be read from the current row through the table's codec, restricted to
   declared columns; a log entry whose row is gone, whose current `access_scope_id` is not
   readable, or whose table is no longer attached and registered (`resolveTables`), MUST be
@@ -563,15 +566,22 @@ rest. Payloads are always the current row.
   row MUST NOT move head back (it is included through `expired_position`).
 - INV-PULL-13: A null cursor is a full snapshot: the client holds nothing, every readable scope is
   walked, and the log position starts at the head of the first page.
+- INV-PULL-14: Server construction MUST reject a configured `pageLimit` that is not a positive
+  safe integer as a defect; it MUST NOT clamp or serve it. An omitted `pageLimit` is 500.
+
+  **Rationale (2026-10-24):** A zero limit emits an unchanged `PullPage` forever. Failing at
+  construction follows `Store.checkLimit`: a caller configuration defect is clearer than a
+  hidden clamp or a runtime protocol loop.
 
 ### Details
 
 #### 7.1 Request and policy
 
-`PullRequest{clientId, clientVersion?, principal?, cursor, continuation?}`. The server runs
-`assertPrincipal` (INV-PULL-1), the app's `clientPolicy` (`ClientOutdated`), `registerClient`,
-then decodes the continuation (failure → `staleContinuation`; identity mismatch →
-`staleContinuation`).
+`PullRequest{clientId, clientVersion?, principal?, cursor, continuation?}`. At server
+construction, configured `pageLimit` is checked by INV-PULL-14. At the request boundary the
+server refuses authenticated `*` (INV-ACL-8), then runs `assertPrincipal` (INV-PULL-1), the app's
+`clientPolicy` (`ClientOutdated`), `registerClient`, then decodes the continuation (failure →
+`staleContinuation`; identity mismatch → `staleContinuation`).
 
 #### 7.2 The snapshot
 
@@ -663,9 +673,10 @@ upsert entries, for payloads; one ack `SELECT`; `COMMIT`; after the transaction,
   `ResnapshotRequired{unknownCursor}` for `cursor > head` should be added is open; the
   `gc.test.ts` test "a cursor the server never completed a page set at is refused rather than
   trusted" covers the missing-row path only.
-- OQ-PULL-3: `pageLimit` is not validated. A value of `0` makes every pull answer a `PullPage`
-  at the same position forever (INV-PULL-8). Whether the server should refuse it at construction
-  is open.
+- OQ-PULL-2: Unknown-table changes are skipped by the client at debug level (§9.3). A client on
+  an old registry therefore installs `nextCursor` past rows it never stored; it relies on the
+  `dataHash` rebuild when the app updates. The retired design text said this is intended; the
+  code confirms it; no test covers it.
 
 ## 8. Push
 
@@ -1356,7 +1367,7 @@ member updates the rule and its dated rationale here (§0.2).
 | tag | fields | raised by | client action |
 |---|---|---|---|
 | `ResnapshotRequired` | `reason: gcHorizon \| unknownCursor \| staleContinuation` | `pull` | non-initial request: clear staging, `resnapshot`, pull from null (INV-CLI-10); initial: transient pull failure |
-| `Unauthorized` | `message` | `push`, `pull`, `pokes`, `room`, `track` (principal assertion, `ClientForbidden`, app `principalFor`); also HTTP 401/403 | transient, kind `unauthorized`; presence rejoins |
+| `Unauthorized` | `message` | `push`, `pull`, `pokes`, `room`, `track` (refused authenticated `*`, principal assertion, `ClientForbidden`, app `principalFor`); also HTTP 401/403 | transient, kind `unauthorized`; presence rejoins |
 | `ClientOutdated` | `message` | app `clientPolicy` on `push`/`pull` | terminal for this leader, kind `outdated` |
 | `MalformedEnvelope` | `clientId, mutationId, message` | `push` (`seq < 1`) | push halts |
 | `ServerUnavailable` | `message` | `pull` (database failure, lost connection), `pokes` (lost `LISTEN`), `room` (grant lookup failed), declared on `track` | transient, kind `unavailable` |
@@ -1554,6 +1565,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-ACL-5 | covered | `Store.test` "scope_grants DDL makes duplicate (scope, principal) grants unrepresentable in storage", "two grants for one (scope, principal) cannot both be written, nor can a patch change the pair"; `grants.test` "a grant written around the store with an id that is not grantId(scope, principal) is rejected" |
 | INV-ACL-6 | covered | Conformance "createScope writes exactly the actor's owner grant on a fresh id; an existing id is ScopeForbidden{owner} with nothing written; the actor * is refused before any claim"; `scopeCreate.test` "two concurrent creators of one scope id get exactly one Applied and one ScopeForbidden{owner}, never two owners", "a scope whose grants were all revoked is never fresh again; a rejected mutation's claim rolls back with it" |
 | INV-ACL-7 | covered | Conformance "a limited range with a readable-scope constraint returns the first n readable rows in index order, not the readable rows among the first n"; `Conformance.test` "the scoped-limit check catches stores that do not push the scope filter under the limit" |
+| INV-ACL-8 | covered | `rpc.test` "push, pull and pokes authenticated as * are Unauthorized before they bind or ledger"; `presence.test` "room and track authenticated as * are Unauthorized and install no presence entry" |
 | INV-MUT-1 | covered | `ledger.test` "a resubmitted envelope (lost response) returns the recorded outcome and position without re-executing", "concurrent submissions of one envelope run the body once and agree on outcome and position", "concurrent duplicates from an already-registered client commit one effect and one ledger row" |
 | INV-MUT-2 | partial | `Transport.test` "a processed push returns core's result; a rejection keeps its class and fields" (closedness of the set is type-level only) |
 | INV-MUT-3 | covered | `Mutation.test` "a domain failure combined with a defect dies with the defect, never a Rejected outcome", "StoreUnavailable alongside a domain failure stays transient, never a permanent rejection", "an unencodable domain failure next to a valid one dies, in either order, never a DomainError"; `ledger.test` "a rejection combined with a defect is not ledgered as an ordinary rejection" |
@@ -1582,6 +1594,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PULL-11 | covered | `gc.test` "re-pulling from the previous cursor after a lost PullDone yields the same converged state", "ledger rows written before migration 003 come through it unstamped and are never expired until a pull acks them" |
 | INV-PULL-12 | covered | `gc.test` "expiring the newest ledger row never moves the head back: a cursor at its position does not regress and a page set resumed at it continues" |
 | INV-PULL-13 | covered | `gc.test` "a client whose cursor GC passed must resnapshot and then converges; a client at head is unaffected"; `Simulation.test` "ResnapshotRequired after a suspended pull keeps seqs, pushedThrough and cursor written meanwhile" |
+| INV-PULL-14 | covered | `rpc.test` "a server with pageLimit 0 dies at construction instead of producing an endless PullPage" |
 | INV-PUSH-1 | partial | `Transport.test` "the outbox batch is not a valid PushRequest (101 mutations)" (the cap); the 50 default and the `min(…, 100)` clamp have no test |
 | INV-PUSH-2 | covered | `ledger.test` "a batch stops at a transient failure without recording it, and its resubmission continues in order"; `Transport.test` "a push batch the server stopped is reported as kind server" |
 | INV-PUSH-3 | covered | `rpc.test` "a connection lost mid-batch is a short results list, never a defect the client would halt on", "an infrastructure defect in principalFor is a transient stop (empty results), not a push failure" |
@@ -1648,7 +1661,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PERF-5 | untested | — |
 | INV-PERF-6 | partial | `rpc.test` "more open pokes streams than pool connections do not block push or pull, and the server holds one LISTEN" (fan-out and notify counts unmeasured) |
 
-Totals: 110 invariants; 93 covered, 9 partial (INV-MUT-2, INV-MUT-8, INV-MUT-9, INV-POS-3,
+Totals: 112 invariants; 95 covered, 9 partial (INV-MUT-2, INV-MUT-8, INV-MUT-9, INV-POS-3,
 INV-PULL-7, INV-PUSH-1, INV-TEL-5, INV-ERR-1, INV-PERF-6), 8 untested (INV-ID-3, INV-POS-5,
 INV-PULL-8, INV-CLI-7, INV-PERF-2, INV-PERF-3, INV-PERF-4, INV-PERF-5).
 
@@ -1659,7 +1672,7 @@ INV-PULL-8, INV-CLI-7, INV-PERF-2, INV-PERF-3, INV-PERF-4, INV-PERF-5).
 | `wireVersion` | 1 | `Protocol.ts` | no |
 | push batch size | `min(pushBatchSize ?? 50, 100)` | `Engine.ts` | `pushBatchSize` |
 | `PushRequest.mutations` | 1 … 100 | `Protocol.ts` | no |
-| `pageLimit` (upserts + tombstones per page) | 500; `≥ 1` is an unvalidated precondition (INV-PULL-8) | `rpc.ts` | `pageLimit` |
+| `pageLimit` (upserts + tombstones per page) | 500; configured value must be a positive safe integer (INV-PULL-14) | `rpc.ts` | `pageLimit` |
 | server `heartbeatInterval` (pokes and presence) | 15 s | `rpc.ts` | yes; must stay below clients' `idleTimeout` |
 | client `idleTimeout` (pokes stream, presence stream, presence send) | 45 s | `SyncLoop.ts`, `Presence.ts` | yes; must exceed `heartbeatInterval` |
 | sync loop backoff | 1 s doubling to 30 s, reset on a clean cycle | `SyncLoop.ts` | `retryDelay`, `maxRetryDelay` |
@@ -1704,11 +1717,10 @@ INV-PULL-8, INV-CLI-7, INV-PERF-2, INV-PERF-3, INV-PERF-4, INV-PERF-5).
 
 | ID | section | question |
 |---|---|---|
-| OQ-ACL-1 | §4 | `*` is not refused as an authenticated principal |
 | OQ-MUT-1 | §5 | no bound on a persistently transient mutation blocking a client's queue |
 | OQ-MUT-2 | §5 | `createdAt` not on the wire; `ctx.now` differs between client and server |
 | OQ-PULL-1 | §7 (Q2) | no explicit `cursor ≤ head` fence; recovery after restore relies on the missing `client_scopes` row |
-| OQ-PULL-3 | §7 | `pageLimit` unvalidated; `0` loops forever |
+| OQ-PULL-2 | §7 | unknown-table changes skipped at install advance the cursor past rows never stored; untested |
 | OQ-CLI-1 | §9 (Q3) | every install is a full rebase; no incremental path |
 | OQ-LOOP-1 | §10 | the push halt is in memory per leader; a new leader retries the batch and halts again |
 | OQ-BRW-1 | §12 | `awaitOpfsPoolFree` bound (2 s) then `LeaderFailed` with no retry |

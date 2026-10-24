@@ -26,7 +26,7 @@ import * as TestClock from "effect/testing/TestClock"
 import { PullTransportError } from "../../client/sync/SyncFailure.ts"
 import * as SyncLoop from "../../client/sync/SyncLoop.ts"
 import type { ClientPolicy } from "./pull.ts"
-import { layerHttp, sharedPokes } from "./rpc.ts"
+import { handlers, layerHttp, Notifications, sharedPokes } from "./rpc.ts"
 import { grant, Items, pgAvailable, registry, RowId, TestDatabase } from "./test-support.ts"
 
 const addItem = Mutation.make("items.add", {
@@ -124,6 +124,32 @@ const writer = Effect.gen(function* () {
 })
 
 describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
+  it.live("a server with an invalid pageLimit dies at construction instead of producing an endless PullPage", () =>
+    Effect.gen(function* () {
+      for (const pageLimit of [0, -1, 0.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+        const options = {
+          registry,
+          mutations,
+          principalFor: () => Effect.succeed(AccessScope.PrincipalId.make("p")),
+          pageLimit
+        }
+        const exit = yield* Effect.exit(
+          Layer.build(handlers(options).pipe(Layer.provide([TestDatabase, Layer.succeed(Notifications)(Stream.empty)])))
+        )
+        assert.isTrue(
+          Exit.isFailure(exit) &&
+            exit.cause.reasons.some(
+              (reason) =>
+                Cause.isDieReason(reason) &&
+                reason.defect instanceof RangeError &&
+                reason.defect.message === `pageLimit requires a positive safe integer, got ${pageLimit}`
+            ),
+          String(exit)
+        )
+      }
+    })
+  )
+
   it.live("a pushed mutation's result position and outcome reach the client and come back as its ack", () =>
     Effect.gen(function* () {
       yield* writer
@@ -422,6 +448,50 @@ describe.skipIf(!pgAvailable)("the replica's principal against the authenticated
         { client_id: "old-pull", principal_id: bob },
         { client_id: "old-push", principal_id: bob }
       ])
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+})
+
+describe.skipIf(!pgAvailable)("the everyone principal at the RPC boundary (SPEC §4)", () => {
+  it.live("push, pull and pokes authenticated as * are Unauthorized before they bind or ledger", () =>
+    Effect.gen(function* () {
+      const db = yield* Effect.context<SqlClient | PgClient.PgClient>()
+      const sql = yield* SqlClient
+      const counts = { statements: 0 }
+      const counting = new Proxy(sql, {
+        apply: (target, self, args) => {
+          counts.statements++
+          return Reflect.apply(target, self, args)
+        },
+        get: (target, key, receiver) => {
+          const value = Reflect.get(target, key, receiver)
+          return (key === "unsafe" || key === "withTransaction") && typeof value === "function"
+            ? (...args: ReadonlyArray<unknown>) => {
+                counts.statements++
+                return Reflect.apply(value, target, args)
+              }
+            : value
+        }
+      })
+      const client = yield* connectTo(Context.add(db, SqlClient, counting), undefined, () =>
+        Effect.succeed(AccessScope.Everyone)
+      )
+      const before = yield* sql<{ clients: number; ledger: number }>`
+        SELECT
+          (SELECT count(*)::int FROM echo_sync.clients) AS clients,
+          (SELECT count(*)::int FROM echo_sync.mutations) AS ledger`
+      const exits = [
+        yield* Effect.exit(client.push(pushFor("wildcard-push"))),
+        yield* Effect.exit(client.pull(pullFor("wildcard-pull"))),
+        yield* Effect.exit(Stream.runHead(client.pokes({ clientId: Ids.ClientId.make("wildcard-pokes") })))
+      ]
+      for (const exit of exits) assert.strictEqual(refusal(exit)?._tag, "Unauthorized", String(exit))
+      const after = yield* sql<{ clients: number; ledger: number }>`
+        SELECT
+          (SELECT count(*)::int FROM echo_sync.clients) AS clients,
+          (SELECT count(*)::int FROM echo_sync.mutations) AS ledger`
+      assert.deepStrictEqual(after, before)
+      assert.strictEqual(counts.statements, 0)
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 })

@@ -77,6 +77,21 @@ export const pokeChannel = "echo_sync"
 const forbidden = (error: ClientForbidden) =>
   new Protocol.Unauthorized({ message: `client ${error.clientId} belongs to another principal` })
 
+/** `*` grants access; it is never an authenticated actor (SPEC §4). */
+const authenticate = (principalFor: SyncServerOptions["principalFor"]) =>
+  Effect.flatMap(requestHeaders, principalFor).pipe(
+    Effect.filterOrFail(
+      (principalId) => principalId !== AccessScope.Everyone,
+      () => new Protocol.Unauthorized({ message: "the everyone principal cannot authenticate" })
+    )
+  )
+
+/** `pageLimit` is a positive safe integer: zero would make every pull page forever. */
+const checkPageLimit = (pageLimit: number | undefined): Effect.Effect<void> =>
+  pageLimit === undefined || (Number.isSafeInteger(pageLimit) && pageLimit > 0)
+    ? Effect.void
+    : Effect.die(new RangeError(`pageLimit requires a positive safe integer, got ${pageLimit}`))
+
 const serverUnavailable = (error: SqlError) =>
   new Protocol.ServerUnavailable({ message: `${error.reason._tag}: ${error.message}` })
 
@@ -415,73 +430,78 @@ const requestHeaders = Effect.gen(function* () {
  * a defect for a server bug (the client halts push on any defect, INV-LOOP-3).
  */
 export const handlers = (options: SyncServerOptions) =>
-  Protocol.SyncRpcs.toLayer(
-    Effect.gen(function* () {
-      const sql = yield* SqlClient
-      const pokes = yield* Notifications
-      return Protocol.SyncRpcs.of({
-        push: (request) =>
-          Effect.gen(function* () {
-            const actor = yield* options.principalFor(yield* requestHeaders)
-            return yield* executeBatch(options, actor, request)
-          }).pipe(
-            pushFailures,
-            Effect.tap((response) =>
-              Telemetry.annotate({
-                "echo.batch_size": request.mutations.length,
-                "echo.processed": response.results.length,
-                "echo.applied": response.results.filter((r) => r.outcome._tag === "Applied").length,
-                "echo.rejected": response.results.filter((r) => r.outcome._tag === "Rejected").length,
-                "echo.result": response.results.length < request.mutations.length ? "stopped" : "ok"
-              })
-            ),
-            Effect.provideService(SqlClient, sql),
-            (work) => Telemetry.observe(work, "echo.server.push", protocolOutcome)
-          ),
-        pull: (request) =>
-          Effect.gen(function* () {
-            const principalId = yield* options.principalFor(yield* requestHeaders)
-            return yield* pull(
-              options.registry,
-              {
-                principalId,
-                clientId: request.clientId,
-                clientVersion: request.clientVersion,
-                principal: request.principal,
-                cursor: request.cursor,
-                continuation: request.continuation,
-                limit: options.pageLimit ?? 500
-              },
-              options.clientPolicy
-            )
-          }).pipe(
-            serverFailures,
-            Effect.tap((response) =>
-              Telemetry.annotate({
-                "echo.result": response._tag === "PullDone" ? "done" : "page",
-                "echo.changes": response.changes.length,
-                "echo.acks": response.acks.length
-              })
-            ),
-            Effect.provideService(SqlClient, sql),
-            (work) => Telemetry.observe(work, "echo.server.pull", protocolOutcome)
-          ),
-        pokes: ({ clientId, principal }) =>
-          Stream.unwrap(
-            Effect.gen(function* () {
-              const principalId = yield* options.principalFor(yield* requestHeaders)
-              yield* assertPrincipal(principalId, principal)
-              yield* registerClient(principalId, clientId)
-              return pokes
-            }).pipe(Effect.provideService(SqlClient, sql))
-          ).pipe(
-            // A lost LISTEN connection ends the stream typed; the client reconnects on any end (INV-LOOP-7).
-            Stream.catchCause((cause) => Stream.fromEffect(toServerFailure(cause))),
-            Stream.catchTag("ClientForbidden", (e) => Stream.fail(forbidden(e))),
-            (work) => Telemetry.observeStream(work, "echo.server.pokes", protocolOutcome)
-          )
-      })
-    })
+  Layer.unwrap(
+    Effect.as(
+      checkPageLimit(options.pageLimit),
+      Protocol.SyncRpcs.toLayer(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient
+          const pokes = yield* Notifications
+          return Protocol.SyncRpcs.of({
+            push: (request) =>
+              Effect.gen(function* () {
+                const actor = yield* authenticate(options.principalFor)
+                return yield* executeBatch(options, actor, request)
+              }).pipe(
+                pushFailures,
+                Effect.tap((response) =>
+                  Telemetry.annotate({
+                    "echo.batch_size": request.mutations.length,
+                    "echo.processed": response.results.length,
+                    "echo.applied": response.results.filter((r) => r.outcome._tag === "Applied").length,
+                    "echo.rejected": response.results.filter((r) => r.outcome._tag === "Rejected").length,
+                    "echo.result": response.results.length < request.mutations.length ? "stopped" : "ok"
+                  })
+                ),
+                Effect.provideService(SqlClient, sql),
+                (work) => Telemetry.observe(work, "echo.server.push", protocolOutcome)
+              ),
+            pull: (request) =>
+              Effect.gen(function* () {
+                const principalId = yield* authenticate(options.principalFor)
+                return yield* pull(
+                  options.registry,
+                  {
+                    principalId,
+                    clientId: request.clientId,
+                    clientVersion: request.clientVersion,
+                    principal: request.principal,
+                    cursor: request.cursor,
+                    continuation: request.continuation,
+                    limit: options.pageLimit ?? 500
+                  },
+                  options.clientPolicy
+                )
+              }).pipe(
+                serverFailures,
+                Effect.tap((response) =>
+                  Telemetry.annotate({
+                    "echo.result": response._tag === "PullDone" ? "done" : "page",
+                    "echo.changes": response.changes.length,
+                    "echo.acks": response.acks.length
+                  })
+                ),
+                Effect.provideService(SqlClient, sql),
+                (work) => Telemetry.observe(work, "echo.server.pull", protocolOutcome)
+              ),
+            pokes: ({ clientId, principal }) =>
+              Stream.unwrap(
+                Effect.gen(function* () {
+                  const principalId = yield* authenticate(options.principalFor)
+                  yield* assertPrincipal(principalId, principal)
+                  yield* registerClient(principalId, clientId)
+                  return pokes
+                }).pipe(Effect.provideService(SqlClient, sql))
+              ).pipe(
+                // A lost LISTEN connection ends the stream typed; the client reconnects on any end (INV-LOOP-7).
+                Stream.catchCause((cause) => Stream.fromEffect(toServerFailure(cause))),
+                Stream.catchTag("ClientForbidden", (e) => Stream.fail(forbidden(e))),
+                (work) => Telemetry.observeStream(work, "echo.server.pokes", protocolOutcome)
+              )
+          })
+        })
+      )
+    )
   )
 
 /**
@@ -547,7 +567,7 @@ export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor"
         room: (payload) =>
           Stream.unwrap(
             Effect.gen(function* () {
-              const principalId = yield* options.principalFor(yield* requestHeaders)
+              const principalId = yield* authenticate(options.principalFor)
               yield* assertPrincipal(principalId, payload.principal)
               if (!(yield* holdsRoom(principalId, payload.room))) {
                 return yield* new Protocol.Forbidden({ room: payload.room })
@@ -557,7 +577,7 @@ export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor"
           ),
         track: (payload) =>
           Effect.gen(function* () {
-            const principalId = yield* options.principalFor(yield* requestHeaders)
+            const principalId = yield* authenticate(options.principalFor)
             yield* assertPrincipal(principalId, payload.principal)
             yield* presence.track({ principalId, ...payload })
           })

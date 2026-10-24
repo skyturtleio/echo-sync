@@ -634,6 +634,22 @@ describe("presence state (SPEC §10)", () => {
 })
 
 describe.skipIf(!pgAvailable)("presence over the sync mount (SPEC §10)", () => {
+  it.live("room and track authenticated as * are Unauthorized and install no presence entry", () =>
+    Effect.gen(function* () {
+      yield* grant("p", "s1")
+      const connect = yield* server
+      const everyone = yield* connect("*")
+      const joined = yield* Effect.exit(Stream.runDrain(everyone.room(payload("wildcard", "room"))))
+      const tracked = yield* Effect.exit(everyone.track(payload("wildcard", "track", "unseen", 1)))
+      assert.deepStrictEqual(tagOf(joined), Option.some("Unauthorized"))
+      assert.deepStrictEqual(tagOf(tracked), Option.some("Unauthorized"))
+
+      const observer = yield* open(yield* connect("p"), payload("c0", "watch"))
+      yield* until(observer.snapshots, ["p/c0/watch=null"])
+      assert.isFalse(observer.seen.flat().some((value) => value.includes("wildcard") || value.includes("unseen")))
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
   it.live(
     "a presence entry is dropped when its room stream ends: a client that goes away over HTTP is removed for everyone",
     () =>
