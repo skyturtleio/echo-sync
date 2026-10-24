@@ -69,7 +69,7 @@ const byKey = (a: Protocol.PresenceEntry, b: Protocol.PresenceEntry) =>
  * Process-local presence state (SPEC §10): a `Ref` of rooms plus a `PubSub` per room. A room
  * exists while it has an entry. Authorization is the caller's (the RPC handlers).
  *
- * Every `join` stream also carries a `heartbeat` every `heartbeatInterval` (DECISIONS 13).
+ * Every `join` stream also carries a `heartbeat` every `heartbeatInterval` (SPEC §10.2).
  * Heartbeats come from the stream's own timer, merged beside the room's change subscription, so
  * a heartbeat can never slide out a pending change tick, and they read and change no room state.
  */
@@ -210,7 +210,7 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
         ),
 
       /**
-       * Revocation (DECISIONS 13): asks `holds` which `(room, principal)` pairs with an open
+       * Revocation (SPEC §10.2): asks `holds` which `(room, principal)` pairs with an open
        * stream still hold the room's scope, then, for each pair that does not, removes every entry
        * of that principal in that room in one step, ends each of those streams `Forbidden`, and
        * announces the removal once. The installation gate is held throughout, so no entry is

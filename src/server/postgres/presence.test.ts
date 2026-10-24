@@ -679,7 +679,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (SPEC §10)", () => 
   )
 
   it.live(
-    "a join or track asserting another replica principal than the session's is Unauthorized and changes no entry (DECISIONS 21)",
+    "a join or track asserting another replica principal than the session's is Unauthorized and changes no entry (SPEC §5)",
     () =>
       Effect.gen(function* () {
         yield* grant("p", "s1")

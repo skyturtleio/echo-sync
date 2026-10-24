@@ -16,7 +16,7 @@ import * as Transport from "../src/client/sync/Transport.ts"
 import { layerHttp } from "../src/server/postgres/rpc.ts"
 import { grant, Items, pgAvailable, registry, RowId, TestDatabase } from "../src/server/postgres/test-support.ts"
 
-// First-registration account binding (DECISIONS 21) end to end: a replica created for alice whose
+// First-registration account binding (SPEC §5) end to end: a replica created for alice whose
 // browser session is bob's. The real Postgres server over HTTP + NDJSON, the real Transport, and the
 // real Engine and SyncLoop over SQLite. Runs only with ECHO_PG_URL.
 
@@ -116,7 +116,7 @@ const setup = Effect.gen(function* () {
 const waitFor = (loop: SyncLoop.SyncLoop, predicate: (s: SyncLoop.SyncStatus) => boolean) =>
   Stream.runHead(Stream.filter(loop.changes, predicate)).pipe(Effect.timeout("10 seconds"))
 
-describe.skipIf(!pgAvailable)("replica principal vs. session (DECISIONS 21) against the real server", () => {
+describe.skipIf(!pgAvailable)("replica principal vs. session (SPEC §5) against the real server", () => {
   it.live(
     "a fresh replica first synced under another principal's session binds no client, ledgers nothing and installs none of its data",
     () =>

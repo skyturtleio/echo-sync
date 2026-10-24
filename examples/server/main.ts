@@ -169,7 +169,7 @@ const server = Bun.serve({
     return web.handler(request)
   }
 })
-// Ledger expiry (DECISIONS 5): the app's server schedules it. Hourly, default 7-day retention;
+// Ledger expiry (SPEC §11): the app's server schedules it. Hourly, default 7-day retention;
 // a failed run is logged and the next one retries.
 admin.runFork(
   Effect.repeat(

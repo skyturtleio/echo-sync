@@ -433,7 +433,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
     Effect.gen(function* () {
       const sql = yield* SqlClient
       yield* runMutation(env("m1", 1n), Effect.void)
-      // No v1 job raises the floor (DECISIONS 5); raise it by hand.
+      // No v1 job raises the floor (SPEC §11); raise it by hand.
       yield* sql`UPDATE echo_sync.clients SET expired_through = 2, expired_position = 41 WHERE client_id = 'c1'`
       const expired = yield* runMutation(env("m2", 2n), appendEffect("x"))
       assert.deepStrictEqual(expired, {

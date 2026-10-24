@@ -257,7 +257,7 @@ const check = <X, A>(
       readonly fails: ReadonlyArray<string> | undefined
       readonly dies: ReadonlyArray<string>
     }> = [
-      // DECISIONS 23: Fail(X)+Die must not collapse to Fail(X) on its way to the consumer.
+      // INV-BRW-4: Fail(X)+Die must not collapse to Fail(X) on its way to the consumer.
       { first: Cause.combine(Cause.fail(typed), Cause.die("bug")), opens: 1, fails: ["X"], dies: ["bug"] },
       // A plain LeaderLost resubscribes: the consumer gets the next leader's emission and no error.
       { first: Cause.fail(lostTransport), opens: 2, fails: undefined, dies: [] },

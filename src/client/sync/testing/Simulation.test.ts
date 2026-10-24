@@ -137,7 +137,7 @@ describe("reconciliation simulation", () => {
 
   it.effect(
     // Late enqueue retries of pruned ids run here too: the server keeps every expired identity
-    // (DECISIONS 5), so a retry under a fresh seq above the floor is still recognised.
+    // (SPEC §11), so a retry under a fresh seq above the floor is still recognised.
     "ledger GC'd while a client is behind, with late retries of pruned ids: processed intents are released by the floor or the kept identity, never re-executed",
     () =>
       Effect.gen(function* () {

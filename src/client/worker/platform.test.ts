@@ -37,7 +37,7 @@ it.live(
   () =>
     Effect.gen(function* () {
       // The holder's release and the waiter's deadline race at every offset around the deadline; whichever wins,
-      // a waiter that answers `false` must not be granted the lock later (DECISIONS 24 reset `closeTimeout`).
+      // a waiter that answers `false` must not be granted the lock later (INV-BRW-7 reset `closeTimeout`).
       for (let offset = -3; offset <= 3; offset++) {
         const name = `test:${crypto.randomUUID()}`
         const holder = yield* Scope.make()

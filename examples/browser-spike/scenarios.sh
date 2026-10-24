@@ -348,7 +348,7 @@ ab tab close "$T" >/dev/null
 # The bound, from the pinned AccessHandlePoolVFS: a stored path ("/" + SQLite's file name) must stay under
 # its 512-byte header, and the longest file name is "<db>-journal". So the longest db name is
 # 512 - 1 - 1 - 8 = 502 characters, i.e. appId + profile = 502 - len("echo-sync//.db") = 488. Each of them is
-# also an OPFS directory name, at most 255 UTF-8 bytes (WebKit's limit, DECISIONS 1): 233 + 255.
+# also an OPFS directory name, at most 255 UTF-8 bytes (WebKit's limit, SPEC §12): 233 + 255.
 pad() { printf '%s' "$1"; printf "${2}%.0s" $(seq 1 $(($3 - ${#1}))); }
 APP=$(pad "bound-$RUN" a 233)
 PROFILE=$(pad "" p 255)
@@ -385,7 +385,7 @@ check "the longest database path the pool holds (appId 233 + profile 255) opens 
 # Profile "a" syncs with the fake server, whose push always halts, so its entry stays pending. Profile "b"
 # is a sibling identity of the same app. The resets run from a tab of an unrelated app (no client for "a").
 # A's page never hears the reset signal (`ignoreReset`, as an old build or a frozen tab), so its leader lives
-# on through the first reset (DECISIONS 24).
+# on through the first reset (INV-BRW-7).
 APP="reset-$RUN"
 A=$(open_tab "$BASE/?app=$APP&profile=a&syncUrl=$BASE/fake-sync/rpc&ignoreReset")
 a0=$(ev <<<'await echo.ready(); const e = await echo.enqueue({ mutationId: "pending-a", name: "t", args: {} }); const i = await echo.info(); return { ok: e.ok, clientId: i.ok ? i.value.clientId : null }')
@@ -454,7 +454,7 @@ return { pass: !s.ok && s.error._tag === 'ResetFailed' && s.error.message.includ
   && !p.ok && p.error._tag === 'ResetFailed' && p.error.message.includes('injected postMessage failure'), s, p }")"
 ab tab close "$R" >/dev/null
 
-# ── reset durability across a crash (DECISIONS 26): an engine-owned tombstone ──────────────────────
+# ── reset durability across a crash (INV-BRW-8): an engine-owned tombstone ──────────────────────
 # Profiles "a" and "b" of one app each hold a row and a pending write (the fake server's push halts). Resets
 # with discardPending run from a tab of an unrelated app and are interrupted at a crash point inside their
 # worker (`echo.resetReplica(…, fault)`, leader.worker.ts), which terminates the worker there: before the
@@ -539,7 +539,7 @@ const app = await echo.opfsList('echo-sync/$APP')
 return { pass: before.includes(tombstone) && r.ok && !r.interrupted && app !== null && !app.includes('b') && !app.includes(tombstone) && app.includes('a'), r, before, app }")"
 ab tab close "$R" >/dev/null
 
-# ── coordinated reset (DECISIONS 24): resetReplica closes the identity's clients itself ─────────────
+# ── coordinated reset (INV-BRW-7): resetReplica closes the identity's clients itself ─────────────
 # Two tabs hold clients of one identity (the leader in one of them) and a third holds a sibling profile. One
 # of the two calls resetReplica with no app-side preparation. On main this fails ReplicaInUse (nothing closes
 # the leader), or, in single-tab mode, the queued candidate is elected and re-creates the replica.
@@ -639,7 +639,7 @@ for t in "$P" "$Q"; do ab tab close "$t" >/dev/null; done
 # The client's scope closed while the reset's own close of the client's topology is in progress (`closeOnReset`
 # forks it in the task that delivers the signal): once that scope close completes, every lock the page held or
 # queued is gone. Smoke coverage only: the race needs the topology close to suspend after it detached from the
-# client's scope, which the harness cannot force, so this check also passes without the fix (DECISIONS 24). The deterministic
+# client's scope, which the harness cannot force, so this check also passes without the fix (INV-BRW-7). The deterministic
 # regression is the LeaderClient.test.ts invariant with a gated tab-lock release.
 APP="coord-close-$RUN"
 P=$(open_tab "$BASE/?app=$APP&closeOnReset")

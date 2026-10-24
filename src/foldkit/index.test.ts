@@ -1,5 +1,5 @@
 /**
- * The FoldKit adapter (DECISIONS 17) over the real tab-side semantics (`LeaderClient.tabApi`, SPEC §12.3),
+ * The FoldKit adapter (SPEC §1) over the real tab-side semantics (`LeaderClient.tabApi`, SPEC §12.3),
  * with the leader calls faked. FoldKit's runtime is not needed: its contracts are plain `Stream`/`Effect`.
  */
 import { expect, it } from "@effect/vitest"

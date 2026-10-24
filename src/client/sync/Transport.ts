@@ -95,7 +95,7 @@ const acquire = (headers: Effect.Effect<Headers.Input>) =>
  * clock, INV-LOOP-8), and the stream it returns sends the request with exactly those.
  */
 export interface SyncTransport extends Engine.Transport {
-  /** `principal`: the replica's, asserted to the server like the engine's push and pull (DECISIONS 21). */
+  /** `principal`: the replica's, asserted to the server like the engine's push and pull (SPEC §5). */
   readonly pokes: (
     clientId: Ids.ClientId,
     principal: AccessScope.PrincipalId

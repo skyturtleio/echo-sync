@@ -566,7 +566,7 @@ export const run = (options: Options) =>
           }
           // Marker pruned: the duplicate gets a fresh seq. The server still knows the id: its
           // ledger entry answers it, or, once expired, its kept identity answers ClientExpired
-          // (DECISIONS 5), so it never executes again, with or without ledger expiry.
+          // (SPEC §11), so it never executes again, with or without ledger expiry.
           {
             note(`${client.clientId}: retry enqueue of released ${original.mutationId} (pruned)`)
             return yield* ignoreExpected(

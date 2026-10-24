@@ -354,7 +354,7 @@ const removeIfPresent = (
   )
 
 /**
- * The removal a tombstone stands for (DECISIONS 26): the profile's directory, then the tombstone. The
+ * The removal a tombstone stands for (INV-BRW-8): the profile's directory, then the tombstone. The
  * tombstone goes last, so a crash in between leaves it in place and the next leader or reset repeats this.
  */
 const removeCondemned = (parent: FileSystemDirectoryHandle, identity: Platform.ReplicaIdentity, tombstone: string) =>
@@ -364,7 +364,7 @@ const removeCondemned = (parent: FileSystemDirectoryHandle, identity: Platform.R
   )
 
 /**
- * Finish a reset that was interrupted after writing its tombstone (DECISIONS 26). Call only under the
+ * Finish a reset that was interrupted after writing its tombstone (INV-BRW-8). Call only under the
  * identity's leader lock and before anything opens the pool. `true` if a tombstone was found; the directory
  * and the tombstone are then both gone, so the pool opened next is a fresh, empty replica.
  */
@@ -400,12 +400,12 @@ const countUnreleased = Effect.fn("Leader.countUnreleased")(function* (sql: SqlC
 })
 
 /**
- * `resetReplica`'s worker half (SPEC §12, DECISIONS 24). Takes the leader lock once the identity's clients have
+ * `resetReplica`'s worker half (SPEC §12). Takes the leader lock once the identity's clients have
  * let go of it, waiting at most the reset's `closeTimeout`; it never gets it from a live leader. Under it,
  * without `discardPending`, it opens the database through the leader's own OPFS host (no migration), counts
  * the outbox and closes the database and the pool; any failure there is `ResetFailed` with nothing removed.
  * With `discardPending` it never opens the database. Then it writes the identity's tombstone, removes
- * `echo-sync/<appId>/<profile>`, removes the tombstone (DECISIONS 26) and releases the lock last. A candidate
+ * `echo-sync/<appId>/<profile>`, removes the tombstone (INV-BRW-8) and releases the lock last. A candidate
  * of a client built after the signal that queued meanwhile is elected only after the directory is gone, so it
  * creates a fresh replica. A tombstone found under the lock means an earlier reset was interrupted after its
  * decision: the removal is completed and the answer is `Done`, with no pending count.
@@ -419,7 +419,7 @@ const reset: (message: Reset) => Effect.Effect<ResetOutcome> = Effect.fn("Leader
     return yield* Effect.scoped(
       Effect.gen(function* () {
         // The tab broadcast the reset signal before sending `Reset`, so every honouring client is terminating its
-        // candidate (DECISIONS 24). Wait for the lock at most `closeTimeoutMillis`; a holder that does not let
+        // candidate (INV-BRW-7). Wait for the lock at most `closeTimeoutMillis`; a holder that does not let
         // go in time (an old build, a frozen tab) is `ReplicaInUse` and nothing is touched. A grant after the
         // deadline is released at once (`holdLockWithin`), so this worker never holds the lock it gave up on.
         const lock = Platform.leaderLockName(identity)
@@ -427,7 +427,7 @@ const reset: (message: Reset) => Effect.Effect<ResetOutcome> = Effect.fn("Leader
         // timeout too short for even a free lock's (asynchronous) grant answers `ReplicaInUse`, never a deletion.
         if (!(yield* Platform.holdLockWithin(lock, message.closeTimeoutMillis)))
           return { _tag: "ReplicaInUse" } satisfies ResetOutcome
-        // An earlier reset already passed its pending decision and condemned this replica (DECISIONS 26):
+        // An earlier reset already passed its pending decision and condemned this replica (INV-BRW-8):
         // finish its removal and count nothing.
         if (yield* completeInterruptedReset(identity)) return { _tag: "Done" } satisfies ResetOutcome
         if ((yield* opfsDirectory(poolDirectory)) === undefined) return { _tag: "Done" } satisfies ResetOutcome
@@ -445,7 +445,7 @@ const reset: (message: Reset) => Effect.Effect<ResetOutcome> = Effect.fn("Leader
         }
         const parent = yield* opfsDirectory(`echo-sync/${identity.appId}`)
         if (parent !== undefined) {
-          // The decision is made: record it durably before touching the directory (DECISIONS 26). From here a
+          // The decision is made: record it durably before touching the directory (INV-BRW-8). From here a
           // crash leaves the tombstone, and the next leader or reset completes the removal; before here it
           // leaves the replica intact.
           const tombstone = yield* Platform.tombstoneName(identity)
@@ -494,7 +494,7 @@ const program = Effect.fn("Leader.program")(
     // The leader lock is held from here until this worker dies.
     const leaderId = crypto.randomUUID()
     yield* Platform.holdLock(Platform.leaderEpochLockName(identity, leaderId))
-    // Before the pool is opened (DECISIONS 26): a replica condemned by an interrupted reset is never served; its
+    // Before the pool is opened (INV-BRW-8): a replica condemned by an interrupted reset is never served; its
     // removal is completed here and the database below starts fresh, with a new clientId.
     if (yield* completeInterruptedReset(identity)) {
       yield* Telemetry.log("Warn", "echo leader completed the removal of a replica condemned by an interrupted reset")

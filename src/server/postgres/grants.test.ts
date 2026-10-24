@@ -177,7 +177,7 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (INV-ACL-5)", () => {
 
 const write = (store: Store.EchoStore) => store.patch(Items, RowId.make("shared"), { body: "v1" })
 
-describe.skipIf(!pgAvailable)("self-revocation of a grant (SPEC §4, DECISIONS 27)", () => {
+describe.skipIf(!pgAvailable)("self-revocation of a grant (SPEC §4)", () => {
   it.live(
     "a reader or writer deleting its own grant is Applied: its client is purged of the scope, the owner keeps the rows and sees the tombstone",
     () =>

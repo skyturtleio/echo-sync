@@ -37,7 +37,7 @@ if (flags.has("failOpen")) {
 
 const resetFault = flags.get("resetFault")
 if (resetFault !== null) {
-  // Crash points inside a reset worker (DECISIONS 26), set by `echo.resetReplica(…, fault)` on the reset's
+  // Crash points inside a reset worker (INV-BRW-8), set by `echo.resetReplica(…, fault)` on the reset's
   // worker only. At the point, the worker posts on `faultChannel` and stops making progress; the tab then
   // interrupts the reset, which terminates this worker there. `beforeTombstone`: the creation of an engine-owned
   // "~" entry (the tombstone) never starts. `midRemoval`: the recursive removal of a profile directory deletes

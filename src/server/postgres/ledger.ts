@@ -190,7 +190,7 @@ const classify = (
 }
 
 /**
- * The request's replica principal against the authenticated one (DECISIONS 21): equal or absent
+ * The request's replica principal against the authenticated one (SPEC §5): equal or absent
  * (a client that predates the field) passes; anything else fails before the request binds a
  * client or does any grant, ledger or presence work. An assertion only: the actor is always the
  * authenticated principal, and the message names neither.
@@ -286,7 +286,7 @@ export const runMutation = <R>(
         const row = recorded[0]
         // An expired row (outcome cleared, identity kept): processed before, outcome reclaimed.
         // Answered at its own position whatever seq this attempt carries, so a retry enqueued
-        // under a fresh seq after the client forgot the id is never executed again (DECISIONS 5).
+        // under a fresh seq after the client forgot the id is never executed again (SPEC §11).
         if (row !== undefined && row.outcome === null) {
           const expired: Processed = {
             outcome: {
@@ -310,7 +310,7 @@ export const runMutation = <R>(
           return replay
         }
         // Every seq ≤ the floor was processed and kept its identity, so an unknown id here is a
-        // different id under an already-processed seq: the floor answers it (DECISIONS 5), never
+        // different id under an already-processed seq: the floor answers it (SPEC §11), never
         // the body. A known id was answered above at its own position, whatever its seq.
         if (envelope.seq <= client.expired_through) {
           const expired: Processed = {

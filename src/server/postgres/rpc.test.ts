@@ -310,7 +310,7 @@ const pushFor = (clientId: string, principal?: AccessScope.PrincipalId) => ({
 const refusal = (exit: Exit.Exit<unknown, { readonly _tag: string }>) =>
   Exit.isFailure(exit) ? Option.getOrUndefined(Exit.findErrorOption(exit)) : undefined
 
-describe.skipIf(!pgAvailable)("the replica's principal against the authenticated session (DECISIONS 21)", () => {
+describe.skipIf(!pgAvailable)("the replica's principal against the authenticated session (SPEC §5)", () => {
   const alice = AccessScope.PrincipalId.make("alice-replica-principal")
   const bob = AccessScope.PrincipalId.make("bob-session-principal")
   /**

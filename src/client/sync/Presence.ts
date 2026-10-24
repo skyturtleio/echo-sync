@@ -1,5 +1,5 @@
 /**
- * The leader's presence (SPEC §10.3, DECISIONS 13). Each tab subscription is one upstream
+ * The leader's presence (SPEC §10.3). Each tab subscription is one upstream
  * `room` stream on the leader, kept up the way `followPokes` keeps the pokes stream up:
  *
  * - A `heartbeat` proves the connection alive and is never forwarded; only snapshots are.

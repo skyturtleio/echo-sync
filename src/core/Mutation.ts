@@ -48,7 +48,7 @@ export class DomainError extends Schema.TaggedError<DomainError>()("DomainError"
 }) {}
 
 /**
- * Terminal (DECISIONS 5): the server answered a `seq ≤` its expiry floor for this client. The
+ * Terminal (SPEC §11): the server answered a `seq ≤` its expiry floor for this client. The
  * mutation was processed at some point; its outcome is unknown, its effect (if any) is installed.
  */
 export class ClientExpired extends Schema.TaggedError<ClientExpired>()("ClientExpired", {
@@ -86,7 +86,7 @@ export type MutationEnvelope = typeof MutationEnvelope.Type
 /**
  * A mutation that left the outbox without being applied as intended, retained for inspection
  * (SPEC §9.5): `Rejected`, processed and rejected with a typed error; `OutcomeUnknown`, processed
- * with an unknown outcome (its ledger row expired before the ack was pulled, DECISIONS 5), its effect,
+ * with an unknown outcome (its ledger row expired before the ack was pulled, SPEC §11), its effect,
  * if any, in the installed replica. Stored by the client and sent over the tab RPC.
  */
 export const Notice = Schema.Union([

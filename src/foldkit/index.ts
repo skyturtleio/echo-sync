@@ -1,5 +1,5 @@
 /**
- * FoldKit adapter (DECISIONS 17): a thin translation of the `echo-sync/client` tab-side API (SPEC §12.3)
+ * FoldKit adapter (SPEC §1): a thin translation of the `echo-sync/client` tab-side API (SPEC §12.3)
  * into the two shapes FoldKit runs, with no sync semantics of its own.
  *
  * - Streams (`subscribe`, `syncStatus`, `notices`, `status`) are `Stream<message, never, R>`, for a
@@ -16,7 +16,7 @@
  * Command. A typed error becomes `onFailure({ _tag: "Error", error })`; a defect (also one alongside a typed
  * error) becomes
  * `onFailure({ _tag: "Defect" })`, carrying nothing of the cause and logging nothing (a cause can hold header
- * values, URLs or SQLite text; SPEC §10, DECISIONS 20). An interruption-only cause stays an interruption, so
+ * values, URLs or SQLite text; SPEC §10, SPEC §14). An interruption-only cause stays an interruption, so
  * FoldKit tearing a Subscription or Command down never yields a message.
  *
  * Termination: `onFailure` is the terminal element of an adapter stream. The tab client already absorbs

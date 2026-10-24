@@ -85,7 +85,7 @@ export interface Bound {
  * the wire and a `Date` for Postgres.
  *
  * Scope and limit are part of the plan so the store stops after `limit` readable rows instead of
- * scanning past unreadable ones (DECISIONS 8):
+ * scanning past unreadable ones (SPEC §4):
  * - `readableBy` (`Some(principals)`): only rows whose `access_scope_id` has a `scope_grants` row
  *   for one of `principals` (every role satisfies `reader`, so any grant makes a scope readable),
  *   read in the same transaction as the rows; `None` = no scope constraint;
@@ -542,7 +542,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
         const found = yield* rows.read(table, id)
         if (Option.isNone(found)) return yield* new RowNotFound({ table: table.name, id })
         const current = yield* decode(table, found.value)
-        // Relinquishing one's own grant needs no role (DECISIONS 27). `*` is never a real actor;
+        // Relinquishing one's own grant needs no role (INV-ACL-4). `*` is never a real actor;
         // excluding it keeps the `*` row owner-only even for a store built with actor `*`.
         const ownGrant =
           table.name === ScopeGrants.name && options.actor !== Everyone && found.value["principal_id"] === options.actor

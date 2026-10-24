@@ -318,7 +318,7 @@ export const sharedPokes = (
 
 /**
  * The process's single `LISTEN` (`sharedPokes`), shared by the sync handlers (each `pokes` stream)
- * and the presence handlers (revocation, DECISIONS 13). Each run of the stream is one
+ * and the presence handlers (revocation, SPEC §10.2). Each run of the stream is one
  * subscription: an immediate `poke`, then one per committed writing transaction, plus heartbeats.
  */
 export class Notifications extends Context.Service<
@@ -344,7 +344,7 @@ export const layerNotifications = (options: Pick<SyncServerOptions, "heartbeatIn
  * failure before the first mutation (catalog read) is an empty result list, and `runBatch` turns
  * one inside the batch into a short list, so a defect always means a server bug (the client halts
  * push on any defect). A client id bound to another principal, or a `request.principal` that is not
- * `actor` (DECISIONS 21, checked first), fails `Unauthorized`.
+ * `actor` (SPEC §5, checked first), fails `Unauthorized`.
  */
 export const executeBatch = (
   options: Pick<SyncServerOptions, "registry" | "mutations" | "ledger" | "clientPolicy">,
@@ -490,7 +490,7 @@ export const handlers = (options: SyncServerOptions) =>
  * on join and again once the entry is installed (`Presence.join`'s `admit`); `track` only changes
  * an entry the same principal holds, so it needs no grant lookup of its own.
  *
- * Revocation (DECISIONS 13): every notification on the shared `LISTEN` (one per committed
+ * Revocation (SPEC §10.2): every notification on the shared `LISTEN` (one per committed
  * writing transaction, grant changes included, plus one when each subscription starts) re-checks
  * every `(room, principal)` with an open stream against `scope_grants` in one query, and
  * `Presence.reevaluate` removes and ends `Forbidden` the ones that no longer hold the scope. A

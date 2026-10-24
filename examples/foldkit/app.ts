@@ -1,5 +1,5 @@
 /**
- * Typecheck-only FoldKit consumer of `echo-sync/foldkit` (DECISIONS 17): the adapter's streams and effects
+ * Typecheck-only FoldKit consumer of `echo-sync/foldkit` (SPEC §1): the adapter's streams and effects
  * must fit FoldKit's own `Subscription`, `Command` and `ManagedResource` types, both with the client held by
  * a ManagedResource (NilBurger) and as the static `LeaderClient` service (HeyBabe). Not run.
  */

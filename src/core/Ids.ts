@@ -24,6 +24,6 @@ export type MutationId = typeof MutationId.Type
 export const Seq = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).pipe(Schema.brand("echo-sync/Seq"))
 export type Seq = typeof Seq.Type
 
-/** Ledger-expiry floor (DECISIONS 5): highest expired `Seq`, `0` when nothing expired. */
+/** Ledger-expiry floor (SPEC §11): highest expired `Seq`, `0` when nothing expired. */
 export const SeqFloor = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(Schema.brand("echo-sync/SeqFloor"))
 export type SeqFloor = typeof SeqFloor.Type

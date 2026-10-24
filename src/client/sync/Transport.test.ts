@@ -316,8 +316,8 @@ it.effect("a transport built with headers sends them on push, pull and the pokes
 )
 
 /**
- * The request payloads of the `Protocol` before DECISIONS 21 added `principal`, frozen here (not
- * derived from the current schemas): what a deployed pre-change server decodes.
+ * The request payloads before the replica-principal assertion (SPEC §5), frozen here (not derived from
+ * the current schemas): what a deployed pre-change server decodes.
  */
 const PreviousRpcs = RpcGroup.make(
   Rpc.make("push", {
@@ -360,7 +360,7 @@ const PreviousRpcs = RpcGroup.make(
   })
 )
 
-it.effect("a pre-DECISIONS-21 server serves push, pull, pokes, room and track that assert the replica principal", () =>
+it.effect("an older server serves push, pull, pokes, room and track that assert the replica principal", () =>
   Effect.gen(function* () {
     const alice = AccessScope.PrincipalId.make("alice")
     const room = AccessScope.AccessScopeId.make("r")

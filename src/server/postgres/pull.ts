@@ -46,7 +46,7 @@ export interface PullRequest {
   readonly principalId: string
   readonly clientId: string
   readonly clientVersion?: Protocol.ClientVersion | undefined
-  /** The wire's replica principal (DECISIONS 21): checked against `principalId`, never used as it. */
+  /** The wire's replica principal (SPEC §5): checked against `principalId`, never used as it. */
   readonly principal?: string | undefined
   readonly cursor: bigint | null
   readonly continuation: Option.Option<string>
@@ -254,7 +254,7 @@ export const pull = Effect.fnUntraced(function* (
             acks,
             nextCursor: Ids.Position.make(nextPosition),
             // Number() is exact only up to Number.MAX_SAFE_INTEGER; that matches SeqFloor being an
-            // Int (DECISIONS 5). Raised only by `expireLedger`.
+            // Int (SPEC §11). Raised only by `expireLedger`.
             expiredThrough: Ids.SeqFloor.make(Number(state.expired_through))
           }
         : {
@@ -285,7 +285,7 @@ export const pull = Effect.fnUntraced(function* (
     yield* sql`
       DELETE FROM echo_sync.client_scopes WHERE client_id = ${request.clientId} AND position < ${request.cursor}`
     yield* sql`UPDATE echo_sync.clients SET cursor = ${request.cursor} WHERE client_id = ${request.clientId}`
-    // Ledger expiry (DECISIONS 5): presenting a cursor the server completed a set at proves
+    // Ledger expiry (SPEC §11): presenting a cursor the server completed a set at proves
     // the client installed every ack at or below it, so those rows are acked from now. Only the
     // first stamp counts; a row is never expired before it has one.
     yield* sql`

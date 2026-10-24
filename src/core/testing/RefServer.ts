@@ -10,7 +10,7 @@
  *   every readable scope and then continues with the log.
  * - Log and ledger are independently GC-able; ledger GC clears an entry's outcome but keeps its
  *   identity, and keeps a per-client floor, so resubmissions (under any seq) are answered
- *   `ClientExpired` instead of re-executed (DECISIONS 5).
+ *   `ClientExpired` instead of re-executed (SPEC §11).
  * - Mutations run through the same `Mutation.runHandler` (core `Store.make` + `Mutation.run`)
  *   the client runs optimistically, against the server's rows and grants.
  *
@@ -43,7 +43,7 @@ interface LogEntry {
 interface LedgerEntry {
   readonly position: Position
   readonly seq: number
-  /** `null` once expired: the identity stays, the outcome is reclaimed (DECISIONS 5). */
+  /** `null` once expired: the identity stays, the outcome is reclaimed (SPEC §11). */
   readonly outcome: MutationOutcome | null
 }
 
@@ -76,7 +76,7 @@ export const make = (options: { readonly pageSize: number }) => {
   const principals = new Map<string, AccessScope.PrincipalId>()
   /** `client_scopes`: scopes held by a client as of each completed pull, by `nextCursor`. */
   const clientScopes = new Map<string, Map<Position, ReadonlySet<string>>>()
-  /** Highest `seq` per client whose ledger row was GC'd (DECISIONS 5 floor). */
+  /** Highest `seq` per client whose ledger row was GC'd (SPEC §11 floor). */
   const ledgerFloor = new Map<string, { readonly seq: number; readonly position: Position }>()
   const continuations = new Map<string, Continuation>()
   const history = new Map<Position, MemoryStore.Tables>([[0n, new Map()]])
@@ -334,7 +334,7 @@ export const make = (options: { readonly pageSize: number }) => {
       log = log.filter((entry) => entry.position > through)
       if (through > logFloor) logFloor = through
     },
-    /** Expires ledger entries with position ≤ `through`: outcome cleared, identity kept (DECISIONS 5). */
+    /** Expires ledger entries with position ≤ `through`: outcome cleared, identity kept (SPEC §11). */
     gcLedger: (through: Position) => {
       for (const [clientId, entries] of ledger) {
         for (const [id, entry] of entries) {

@@ -19,7 +19,7 @@ export class SqlFailure extends Schema.TaggedError<SqlFailure>()("SqlFailure", {
  * The leader that was serving this request went away (tab closed / worker crashed) or no leader can be
  * reached. The request may or may not have been applied: `enqueue` is idempotent on `mutationId`, so it
  * is safe to retry; `exec` is only safe to retry if the statement is.
- * `Reset`: `resetReplica` closed this tab client (DECISIONS 24); terminal, never retried. Build a new client.
+ * `Reset`: `resetReplica` closed this tab client (INV-BRW-7); terminal, never retried. Build a new client.
  */
 export class LeaderUnavailable extends Schema.TaggedError<LeaderUnavailable>()("LeaderUnavailable", {
   reason: Schema.Literals(["LeaderLost", "LeaderFailed", "Unsupported", "SecondaryTabWithoutRouter", "Reset"]),

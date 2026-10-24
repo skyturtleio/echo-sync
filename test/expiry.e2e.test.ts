@@ -17,7 +17,7 @@ import { expireLedger } from "../src/server/postgres/gc.ts"
 import { layerHttp } from "../src/server/postgres/rpc.ts"
 import { grant, Items, pgAvailable, registry, RowId, TestDatabase } from "../src/server/postgres/test-support.ts"
 
-// The DECISIONS 5 expiry floor end to end: the real Postgres server (RPC adapter over HTTP + NDJSON), the
+// The SPEC §11 expiry floor end to end: the real Postgres server (RPC adapter over HTTP + NDJSON), the
 // real Transport, and the real Engine over SQLite. Runs only with ECHO_PG_URL (bun run test:pg).
 
 const addItem = Mutation.make("items.add", {
@@ -111,7 +111,7 @@ const restore = (into: SqlClient, copy: Effect.Success<ReturnType<typeof backup>
     )
   )
 
-describe.skipIf(!pgAvailable)("expiry floor (DECISIONS 5) against the real server", () => {
+describe.skipIf(!pgAvailable)("expiry floor (SPEC §11) against the real server", () => {
   it.live(
     "a pending, never-acked mutation at or below the server's raised floor becomes OutcomeUnknown on the next pull (released, not re-pushed, no ledger row); one above the floor stays pending and pushes",
     () =>
@@ -141,7 +141,7 @@ describe.skipIf(!pgAvailable)("expiry floor (DECISIONS 5) against the real serve
           assert.deepStrictEqual(yield* items, ["i1", "i2", "i3"]) // i2 and i3 are optimistic
 
           // Synthetic fixture standing in for expiry: the floor is raised past m2 by hand. A compliant
-          // retention floor (DECISIONS 5: never above the client's last presented cursor, only after the
+          // retention floor (SPEC §11: never above the client's last presented cursor, only after the
           // released-row window) could not cover a never-pushed m2, so this proves the protocol and the
           // client's settlement of an expired seq, not a legal retention lifecycle.
           yield* pg`UPDATE echo_sync.clients SET expired_through = 2,

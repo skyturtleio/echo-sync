@@ -4,7 +4,7 @@
  *
  * Fatal push (INV-LOOP-3): a push failure that `SyncFailure.classifyPush` says halts (an integrity
  * failure: `MalformedEnvelope`, an invalid batch, or a push defect) halts pushing for the lifetime of this
- * loop: no automatic retry, no outbox entry is released (that would leave a seq gap, DECISIONS 5). Pull keeps
+ * loop: no automatic retry, no outbox entry is released (that would leave a seq gap, SPEC §11). Pull keeps
  * running. The halt is surfaced through `status`, and the pending outbox stays exportable.
  */
 import {

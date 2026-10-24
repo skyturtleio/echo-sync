@@ -54,7 +54,7 @@ export default Effect.gen(function* () {
       client_id text PRIMARY KEY,
       principal_id text NOT NULL,
       cursor bigint,
-      -- DECISIONS 5 expiry floor: seq ≤ expired_through is answered Rejected{clientExpired} at
+      -- SPEC §11 expiry floor: seq ≤ expired_through is answered Rejected{clientExpired} at
       -- expired_position (the highest expired ledger row). No v1 job raises them.
       expired_through bigint NOT NULL DEFAULT 0,
       expired_position bigint NOT NULL DEFAULT 0,

@@ -17,7 +17,7 @@
  * - Raw `subscribeRaw` streams terminate with `LeaderUnavailable { reason: "LeaderLost" }`;
  *   the caller re-subscribes and receives a fresh full result from the new leader.
  *
- * Reset (DECISIONS 24): `resetReplica`'s signal puts the client into a terminal state. Every request and
+ * Reset (INV-BRW-7): `resetReplica`'s signal puts the client into a terminal state. Every request and
  * stream fails `LeaderUnavailable { reason: "Reset" }`, which is not a handover (never retried or
  * resubscribed); `status` reports `reset: true` and stays open. See `enterReset`.
  */
@@ -39,7 +39,7 @@ import * as Telemetry from "../../internal/Telemetry.ts"
 import { type AccessScope, type Errors, Ids, type Mutation, Protocol, type Query } from "echo-sync"
 import type { LocallyRejected } from "../sync/Engine.ts"
 import type { SyncStatus } from "../sync/SyncLoop.ts"
-// Values, so apps get the runtime schemas (and their types) without RPC introspection (DECISIONS 19).
+// Values, so apps get the runtime schemas (and their types) without RPC introspection (SPEC §10).
 export { SyncError, SyncStatus } from "../sync/SyncLoop.ts"
 export { SyncErrorKind } from "../sync/SyncFailure.ts"
 import {
@@ -96,7 +96,7 @@ export interface Status {
   readonly isLeaderTab: boolean
   readonly leaderId: string | undefined
   /**
-   * `resetReplica` closed this client (DECISIONS 24): terminal. Its leader candidate is terminated, every
+   * `resetReplica` closed this client (INV-BRW-7): terminal. Its leader candidate is terminated, every
    * request fails `LeaderUnavailable { reason: "Reset" }`, and no leader is started or joined for it again
    * (`isLeaderTab` false, `leaderId` undefined). Build a new client to use the replica again.
    */
@@ -203,7 +203,7 @@ const isLeaderLost = (e: unknown): e is LeaderUnavailable => e instanceof Leader
 const lostBackoff = Schedule.spaced("50 millis")
 
 /**
- * Only a cause whose failures are all `LeaderLost` and that has no defect is a handover (DECISIONS 23): a
+ * Only a cause whose failures are all `LeaderLost` and that has no defect is a handover (INV-BRW-4): a
  * defect means the leader died of a bug, which a silent resubscription would hide.
  */
 const isHandover = <E>(cause: Cause.Cause<E>): boolean =>
@@ -415,7 +415,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     const scope = yield* Effect.scope
     /**
      * Everything that keeps this client in the topology: the tab lock, lock watchers, router acceptance and
-     * leader connections. Closed by a reset (DECISIONS 24), which releases or dequeues every lock this tab
+     * leader connections. Closed by a reset (INV-BRW-7), which releases or dequeues every lock this tab
      * held or waited on; the client itself stays usable until `scope` closes, failing every request.
      */
     const topology = Scope.forkUnsafe(scope)
@@ -530,7 +530,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     // `reconnectRouter`.
     let router: SharedWorker | undefined
     /**
-     * The terminal reset state (DECISIONS 24), entered synchronously on the signal. Requests waiting for a
+     * The terminal reset state (INV-BRW-7), entered synchronously on the signal. Requests waiting for a
      * leader and those in flight fail `Reset` (not `LeaderLost`, so nothing retries or resubscribes), the
      * candidate is terminated (the browser releases its leader and epoch locks and drops a queued leader
      * request), and closing `topology` releases the tab lock, dequeues every lock watcher and closes the
@@ -571,7 +571,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     )
 
     // Held for the tab's lifetime: the leader and the router drop this tab's port when it is released.
-    // Waited on in a fiber owned by `topology`, so a reset during the wait dequeues the request (DECISIONS 24).
+    // Waited on in a fiber owned by `topology`, so a reset during the wait dequeues the request (INV-BRW-7).
     const tabLockFiber = fork(platform.holdLock(Platform.tabLockName(identity, tabId)).pipe(Scope.provide(topology)))
     if (tabLockFiber === undefined) return service
     const tabLock = yield* Fiber.await(tabLockFiber)

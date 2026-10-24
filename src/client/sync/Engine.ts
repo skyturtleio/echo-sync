@@ -287,7 +287,7 @@ export const make = (options: {
   readonly clientId: Ids.ClientId
   /**
    * The principal this client acts as; optimistic role checks read its replica grants. Every push and
-   * pull asserts it to the server (DECISIONS 21).
+   * pull asserts it to the server (SPEC §5).
    */
   readonly actor: AccessScope.PrincipalId
   readonly storage: SyncStorage

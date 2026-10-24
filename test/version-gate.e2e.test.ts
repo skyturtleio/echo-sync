@@ -110,7 +110,7 @@ const done = (row: SyncTable.EncodedRow): Protocol.PullResponse => ({
   expiredThrough: Ids.SeqFloor.make(0)
 })
 
-describe.skipIf(!pgAvailable)("two-direction version gate (DECISIONS 7), real Postgres and SQLite over HTTP", () => {
+describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Postgres and SQLite over HTTP", () => {
   it.live(
     "compatibility control: an old client still syncs additive columns and unknown tables with default serve",
     () =>

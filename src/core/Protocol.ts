@@ -31,7 +31,7 @@ export const PushRequest = Schema.Struct({
   /** Absent only for pre-gate clients; never infer compatibility from absence. */
   clientVersion: Schema.optionalKey(ClientVersion),
   /**
-   * The principal this replica acts as (DECISIONS 21). A consistency assertion, never a credential:
+   * The principal this replica acts as (SPEC §5). A consistency assertion, never a credential:
    * the server refuses the request `Unauthorized` unless it equals the authenticated principal, and
    * never uses it as the actor. Absent only for clients that predate it.
    */
@@ -76,7 +76,7 @@ export type Ack = typeof Ack.Type
 export const PullRequest = Schema.Struct({
   clientId: ClientId,
   clientVersion: Schema.optionalKey(ClientVersion),
-  /** As on `PushRequest` (DECISIONS 21). */
+  /** As on `PushRequest` (SPEC §5). */
   principal: Schema.optionalKey(PrincipalId),
   cursor: Cursor,
   continuation: Schema.OptionFromNullOr(PullContinuation)
@@ -94,7 +94,7 @@ export const PullDone = Schema.TaggedStruct("PullDone", {
   changes: Schema.Array(Change),
   acks: Schema.Array(Ack),
   nextCursor: Position,
-  /** The server's ledger-expiry floor for this client (DECISIONS 5); 0 when nothing expired. */
+  /** The server's ledger-expiry floor for this client (SPEC §11); 0 when nothing expired. */
   expiredThrough: SeqFloor
 })
 export const PullResponse = Schema.Union([PullPage, PullDone])
@@ -158,7 +158,7 @@ export const SyncRpcs = RpcGroup.make(
     error: Schema.Union([ResnapshotRequired, ServerUnavailable, Unauthorized, ClientOutdated])
   }),
   Rpc.make("pokes", {
-    /** `principal` as on `PushRequest` (DECISIONS 21). */
+    /** `principal` as on `PushRequest` (SPEC §5). */
     payload: { clientId: ClientId, principal: Schema.optionalKey(PrincipalId) },
     success: PokesElement,
     error: Schema.Union([ServerUnavailable, Unauthorized]),
@@ -192,7 +192,7 @@ export type RoomSnapshot = typeof RoomSnapshot.Type
 /**
  * One `room` stream element: a `RoomSnapshot` (the first element of every stream that installed its
  * entry; a superseded join, with a revision lower than the stored entry's, ends with no element) or a
- * `Heartbeat` (DECISIONS 13, SPEC §10), which is never a snapshot and
+ * `Heartbeat` (SPEC §10.2), which is never a snapshot and
  * changes no room state.
  */
 export const RoomElement = Schema.Union([RoomSnapshot, Heartbeat])
@@ -201,7 +201,7 @@ export type RoomElement = typeof RoomElement.Type
 /** The entry's identity and state. `room` is an access scope the principal must be able to read. */
 export const PresencePayload = Schema.Struct({
   clientId: ClientId,
-  /** As on `PushRequest` (DECISIONS 21); not part of the entry. */
+  /** As on `PushRequest` (SPEC §5); not part of the entry. */
   principal: Schema.optionalKey(PrincipalId),
   room: AccessScopeId,
   tabId: TabId,
