@@ -666,7 +666,9 @@ it.live(
 
       // Cycle 1 ends; cycle 2 pushes m1 (Applied above the cursor: pushed, not installed) and parks in pull.
       yield* Queue.offer(pulls, [])
-      const pushed = yield* awaitStatus(emissions, (s) => s.phase === "pulling" && s.lastSyncedAt !== null)
+      const pushed = yield* awaitStatus(emissions, (s) => s.phase === "pulling" && positions.has("m1"))
+      // The first install found unsent intent, so it scheduled delivery without claiming sync.
+      expect(pushed.lastSyncedAt).toBeNull()
       expect(pushed.pendingMutations).toBe(1)
       expect(positions.has("m1")).toBe(true)
 

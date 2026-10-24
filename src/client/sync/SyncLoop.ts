@@ -198,7 +198,7 @@ export const make = (options: {
       } else if (pulled.value?.retryPush && (yield* SubscriptionRef.get(status)).push._tag === "Active") {
         // A restore can make an already-pushed entry eligible again during pull. No server
         // write or future poke is guaranteed, so the loop must schedule its delivery itself.
-        transient = Option.some(stoppedBatch)
+        if (Option.isNone(transient)) transient = Option.some(stoppedBatch)
         pushedCleanly = false
       }
       // `engine.pull` succeeds only once a `PullDone` set is installed.

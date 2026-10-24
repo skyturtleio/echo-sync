@@ -195,11 +195,15 @@ it.effect("an integrity error halts push for good while pull keeps running", () 
 it.effect("a transient push failure is retried with backoff and clears once a cycle succeeds", () =>
   Effect.gen(function* () {
     const { engine, calls } = fakeEngine((attempt) => (attempt < 2 ? offline() : undefined))
-    const loop = yield* SyncLoop.make({ engine, pendingMutations: noPending })
+    const loop = yield* SyncLoop.make({
+      engine: { ...engine, pull: Effect.map(engine.pull, () => ({ retryPush: calls.push < 3 })) },
+      pendingMutations: noPending
+    })
     yield* Effect.forkChild(loop.run)
     yield* settle
     expect(calls.push).toBe(1)
-    expect((yield* loop.status).lastError).not.toBeNull()
+    // Eligible pending intent must not replace the actual connection failure with "server".
+    expect((yield* loop.status).lastError?.kind).toBe("network")
     yield* TestClock.adjust("999 millis")
     expect(calls.push).toBe(1)
     yield* TestClock.adjust("1 millis")

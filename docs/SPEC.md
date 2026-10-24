@@ -784,7 +784,7 @@ omitting it receive legacy server-time behavior, subject to the same `clientPoli
   a defect the client would halt on; any other defect, from `principalFor` or a handler, is a
   server defect and halts the client's push (INV-LOOP-3).
 - INV-PUSH-4: Request-level refusals are `Unauthorized`, `MalformedEnvelope`, `ClientOutdated`
-  and the epoch-carrying `ResnapshotRequired` (INV-PULL-14, INV-CLI-13); `MalformedEnvelope`
+  and the epoch-carrying `ResnapshotRequired` (INV-PULL-15, INV-CLI-14); `MalformedEnvelope`
   and the epoch refusal execute and record nothing.
 - INV-PUSH-5: Headers used by `principalFor` MUST be the real HTTP request headers, never
   per-message RPC headers a body could forge.
@@ -848,7 +848,7 @@ replay set goes through one function, `rebase`.
   position, is released at once, INV-PUSH-6).
 - INV-CLI-7: `pushedThrough` advances only on push responses, never at install: an entry below
   a released one may need to be re-sent so a push response's position releases it. A history
-  resnapshot resets it to zero (INV-CLI-13); ordinary GC resnapshots preserve it.
+  resnapshot resets it to zero (INV-CLI-14); ordinary GC resnapshots preserve it.
 - INV-CLI-8: Released rows are kept as markers (`released_at`) for `defaultReleasedRetentionMillis`
   = 24 h, so an `enqueue` retried after its original was released adds no intent; the leader
   prunes them at open.
@@ -860,7 +860,7 @@ replay set goes through one function, `rebase`.
 - INV-CLI-10: `ResnapshotRequired` on a request that was not the initial one (non-null cursor
   or a continuation) clears staging, sets `meta.resnapshot`, and continues the loop from a null
   cursor; the replica and its cursor keep serving reads until the snapshot installs. On an
-  initial request it is a pull failure, except for a history fence carrying `epoch` (INV-CLI-13).
+  initial request it is a pull failure, except for a history fence carrying `epoch` (INV-CLI-14).
 - INV-CLI-11: A stored row that no longer decodes, or stored engine data that does not decode,
   is `CorruptStorage` (a defect naming the table and row id), never a bare schema error.
 - INV-CLI-12: A registry whose `dataHash` or table DDL differs from the stored one rebuilds the
@@ -983,8 +983,8 @@ a leader-owned, server-fenced room membership with process-local state on the se
   a clean cycle; a wake during backoff runs the next cycle at once. Wakes are coalesced (sliding
   queue of 1).
 - INV-LOOP-2: `lastSyncedAt` is set only by a cycle in which push was `Active`, ran without a
-  failure or a stopped batch, and whose pull installed a `PullDone`; it does not advance while
-  push is `Halted`, even though pulls keep installing.
+  failure or a stopped batch, and whose pull installed a `PullDone` with no eligible unsent
+  entries remaining; it does not advance while push is `Halted`, even though pulls keep installing.
 - INV-LOOP-3: Push halts (`push: Halted{message}`, in memory for this leader) on
   `MalformedEnvelope`, `PushIntegrityError{invalidPayload | serverDefect}`, or any defect in the
   push cause; pull keeps running; `requestSync` never clears a halt; `exportPending` stays
@@ -1660,11 +1660,11 @@ batches, page limits and retention against them.
   `SET TRANSACTION`, `INSERT clients`, `SELECT clients FOR UPDATE`, `SELECT mutations`,
   `SAVEPOINT`, `RELEASE SAVEPOINT`, `INSERT mutations … RETURNING`, `COMMIT`, plus the
   handler's row reads, writes and authorizations. For `N` typed `get`s and `M` same-scope
-  `patch`es: `9 + 2N + 3M`. `executeBatch` adds one catalog query per request. App principal
+  `patch`es: `9 + 2N + 3M`. `executeBatch` adds one epoch and one catalog query per request. App principal
   lookup/policy SQL is outside this engine budget. Trigger-side `next_position()` and log
   inserts are additional server work, not connection statements. Retries repeat the transaction.
-- INV-PERF-3: Per pull request (§7.7): `8 + h + w + l + t + 3h + d` connection statements,
-  including registration and controls. The fixed 8 are register, BEGIN, SET, state, readable
+- INV-PERF-3: Per pull request (§7.7): `9 + h + w + l + t + 3h + d` connection statements,
+  including registration and controls. The fixed 9 are epoch, register, BEGIN, SET, state, readable
   grants, catalog, acks, COMMIT; `h = 1` for non-null cursor (held lookup and three cursor
   writes), `w` is walk SELECTs, `l = 1` if the log is read, `t` is payload-table SELECTs,
   `d = 1` on PullDone (held insert). App principal lookup/policy SQL is excluded.
@@ -1672,7 +1672,9 @@ batches, page limits and retention against them.
   for `U` undo writes + `C` change writes + `Σ H(m)` replay operations + `|P∖R|` outbox undo
   updates; one `clearAll` statement per replica table when the set started from null. For the
   increment fixture below, no settlements and a non-null cursor: exactly `8 + C + 9P`
-  statements, including staged read, bookkeeping and controls.
+  statements, including staged read, bookkeeping and controls. `Engine.pull` additionally
+  checks current epoch before install (one meta SELECT), then reads installed meta and pending
+  eligibility (three SELECTs, `1 + 2P` returned rows) to schedule restored intent without a wake.
 - INV-PERF-5: Per push batch on the client (`Engine.push` loops batches until the pending set
   is drained or a batch is stopped): one storage transaction reading `meta` and the whole
   pending outbox (`|P|` undo decodes), one RPC with at most `min(pushBatchSize ?? 50, 100)`
@@ -1692,6 +1694,10 @@ batches, page limits and retention against them.
 from trigger-internal work instead of counting both as round trips; the old push shorthand
 mixed those units and the old pull shorthand omitted conditional controls/bookkeeping.
 Keep test-only instrumentation and derive every expected count from the ownership path.
+
+**Rationale (2026-10-24):** The history fence adds one singleton epoch SELECT per sync request
+before any writes. The install wrapper's metadata and pending reads prevent stale-response
+installation and stranded restored intent; the full-rebase fixture itself is unchanged.
 
 ### Details
 
@@ -1719,11 +1725,11 @@ physical scans or codec invocations. Production code is unchanged.
 
 | fixed operation | connection statements | SELECT-returned rows |
 |---|---|---|
-| one new pushed mutation, N gets / M same-scope patches; one own writer grant, no Everyone grant, three catalog tables | `10 + 2N + 3M`: N=0/M=0 → 10; N=2/M=3 → 23 | `4 + 2N + 2M`: 4 / 14 |
-| empty completed pull, non-null cursor, one held/readable scope | 14 | 6 |
-| completed log pull, same state, K=3 distinct upserts in one table | 15 (one batched payload query) | `6 + 2K` = 12 |
-| initial scope walk, K=3 items, one grant, empty notes, limit 100 | 13 | `6 + K` = 9 |
-| initial scope walk, same rows, limit 2 (unfinished) | 9 | 8 (includes one item lookahead) |
+| one new pushed mutation, N gets / M same-scope patches; one own writer grant, no Everyone grant, three catalog tables | `11 + 2N + 3M`: N=0/M=0 → 11; N=2/M=3 → 24 | `5 + 2N + 2M`: 5 / 15 |
+| empty completed pull, non-null cursor, one held/readable scope | 15 | 7 |
+| completed log pull, same state, K=3 distinct upserts in one table | 16 (one batched payload query) | `7 + 2K` = 13 |
+| initial scope walk, K=3 items, one grant, empty notes, limit 100 | 14 | `7 + K` = 10 |
+| initial scope walk, same rows, limit 2 (unfinished) | 10 | 9 (includes one item lookahead) |
 | install P=3 increment entries / C=7 counter upserts, one staged page, no acks | `8 + 9P + C` = 42 | `6P + 1 + pages` = 20 |
 | same install from null, with grant included in snapshot | 45 (two table clears + grant write) | 20 |
 

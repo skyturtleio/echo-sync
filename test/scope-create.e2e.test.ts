@@ -94,6 +94,7 @@ describe.skipIf(!pgAvailable)("scope creation (SPEC §4) against the real server
       const { pg, sqlite, engine, fetch, pending } = yield* setup
       const clock = yield* TestClock.make()
       yield* Effect.gen(function* () {
+        yield* engine.pull
         const createdAt = (yield* Clock.currentTimeMillis) - 6 * 60 * 60 * 1000
         yield* clock.setTime(createdAt)
         yield* engine
@@ -118,6 +119,7 @@ describe.skipIf(!pgAvailable)("scope creation (SPEC §4) against the real server
       const { pg, engine, fetch, replica, pending, notices, sqlite } = yield* setup
       const clock = yield* TestClock.make()
       yield* Effect.gen(function* () {
+        yield* engine.pull
         const beforePush = yield* Clock.currentTimeMillis
         const createdAt = beforePush + 60_000
         yield* clock.setTime(createdAt)
