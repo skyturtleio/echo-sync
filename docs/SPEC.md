@@ -463,6 +463,25 @@ Thirty seconds tolerates modest clock drift without admitting substantially futu
 writes; old timestamps are legitimate offline work. Optional wire presence preserves old
 clients under the existing version policy instead of imposing a new engine version gate.
 
+- INV-MUT-15: After 8 consecutive transient answers for one mutation, the client MUST release
+  it through a transactional rebase with a `Rejected{TransientExhausted}` notice, undoing its
+  optimistic effect and continuing with later entries. This is client policy, not a ledgered
+  server outcome; the replica MUST still equal replay(pending, server@cursor).
+- INV-MUT-16: A mutation answered transient only 7 times and then applied MUST be acked
+  normally, without an exhaustion notice. Counts are per mutation, in memory for this leader;
+  an ack or leader restart resets them (like OQ-LOOP-1's halt).
+- INV-MUT-17: Only a usable short push response counts, for its first missing mutation.
+  Network failures, lost responses, credentials/auth failures and local storage failures MUST
+  NOT advance the count or reset prior transient answers. The underlying server error is not
+  on the wire; the last observable error is the short-prefix transient-stop classification.
+
+  **Rationale (2026-10-24):** Eight answers allow seven backoff intervals (1 + 2 + 4 + 8 + 16 +
+  30 + 30 = 91 seconds with defaults, plus request time) for recovery without letting one
+  persistently transient intent block FIFO forever. This is an answer bound, not a wall-clock
+  deadline: wakes can shorten it and network loss or leader restarts can extend it; indefinite
+  retries were rejected. Existing short responses also cover infrastructure failures, so the
+  notice retains that evidence rather than inventing an underlying error or changing the server.
+
 ### Details
 
 `createdAt` is an optional-on-wire integer epoch-ms field in the timestamp range of §3; new
@@ -509,10 +528,7 @@ one catalog query (`resolveTables`).
 
 ### Open Questions
 
-- OQ-MUT-1: `runBatch` returns the processed prefix on the first `MutationTransient`. The
-  client pushes the remainder on its next cycle after backoff; a persistently transient mutation
-  (for example one whose handler always hits `StoreUnavailable`) blocks every later entry of
-  that client indefinitely. The code has no bound on this; whether a bound is wanted is open.
+None.
 
 ## 6. Positions and the ordering invariant
 
@@ -761,7 +777,9 @@ omitting it receive legacy server-time behavior, subject to the same `clientPoli
 
 `Engine.push` sends batches in a loop, each batch the first `batchSize` pending entries with
 `seq > pushedThrough`, until no such entry remains or a batch is stopped (fewer results than
-mutations); a stopped batch ends the push for this cycle and the loop backs off (§10). The
+mutations); a stopped batch ends the push for this cycle and the loop backs off (§10), except
+that exhaustion (INV-MUT-15) releases the first missing entry and continues the queue. The
+cycle still reports a stop and cannot advance `lastSyncedAt` (INV-LOOP-2). The
 client validates the batch against `PushRequest` before sending (`PushIntegrityError
 {invalidPayload}` halts: the outbox holds something the wire refuses). `syncHeaders` is
 evaluated once per request; a failure there is `CredentialsUnavailable` (nothing sent).
@@ -791,7 +809,8 @@ replay set goes through one function, `rebase`.
   are restored in reverse `seq` order; the base is installed; each pending entry is released if
   the base settles it (its ack is in the set, or `seq ≤ expiredThrough`), else its handler is
   re-run and its fresh undo images stored. A replay that is rejected locally keeps the entry
-  queued with no optimistic effect (empty undo); only the server's verdict removes it.
+  queued with no optimistic effect (empty undo); only the server's verdict or transient
+  exhaustion (INV-MUT-15) removes it.
 - INV-CLI-4: `mutate` is one storage transaction: lookup by `mutationId` (a known id, pending or
   released, returns the original `seq` and runs nothing), `nextSeq`, run the handler with
   `createdAt = now`, store undo images, append. A `LocallyRejected` run saves nothing. The
@@ -880,6 +899,14 @@ JSON, so the read itself is `|P|` decodes.
 #### 9.5 Notices
 
 `Notice = Rejected{envelope, error} | OutcomeUnknown{envelope}`. The engine only appends;
+`error` also permits the client-only `TransientExhausted{attempts, message}` (§5, §15).
+Exhaustion uses the normal rebase with no install: undo all pending effects in reverse order,
+release the exhausted entry with its notice, then replay the rest with fresh undo images.
+It does not itself advance `pushedThrough`. Counts reset on ack or leader restart, not on
+network loss. An integrity halt still prevents push attempts and exhaustion; `requestSync`
+does not clear a halt. A cycle observing exhaustion still reports a stopped batch even if
+it successfully pushes the next entry, so `lastSyncedAt` does not advance until a clean cycle.
+
 `dismissNotices(ids)` is the only removal and ignores unknown ids. `decodeNotice` types a stored
 notice by its mutation: a `DomainError` payload round-trips to the declared error type; a notice
 of another mutation, or one its schemas cannot read, is `NoticeMismatch`, never a value or a
@@ -1501,6 +1528,7 @@ by reason was rejected.
 | `UnknownQuery` | `name` | typed | tab `query` of an unregistered name |
 | `QueryArgsDecodeFailed` | `name, message` | typed | |
 | `NoticeMismatch` | `mutation, name, message` | typed | `decodeNotice` against the wrong mutation |
+| `TransientExhausted` | `attempts, message` | client-only retained rejection | 8 transient answers; message retains the last observable error: `the server stopped the push batch at a transient failure`; never a server outcome |
 | `DuplicateMutation` / `DuplicateQuery` | `name` | construction `Error` | registry refuses two of one name (INV-MUT-9) |
 
 #### 15.4 Server-only (`src/server`)
@@ -1748,6 +1776,9 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-MUT-12 | covered | `scope-create.e2e` "a future clock must reject without writes and retain the ClockSkew notice"; `rpc.test` "clock checks must accept the boundary and old edits without timestamp ordering" |
 | INV-MUT-13 | covered | `rpc.test` "clock checks must accept the boundary and old edits without timestamp ordering" |
 | INV-MUT-14 | covered | `rpc.test` "an old client omitting createdAt must retain server time and still obey clientPolicy" |
+| INV-MUT-15 | covered | `Simulation.test` "eight transient answers release only the exhausted effect and push the next entry", "a forever-transient mutation cannot prevent simulation convergence or corrupt the replica" |
+| INV-MUT-16 | covered | `Simulation.test` "seven transient answers followed by applied do not discard the mutation", "a leader restart resets transient answers without discarding intent" |
+| INV-MUT-17 | covered | `Simulation.test` "network failures between transient answers do not exhaust the mutation early" |
 | INV-POS-1 | covered | `ordering.test` "a reader pulling after a later writer commits never skips an earlier writer still in flight", "without the trigger's advisory lock that reader skips the earlier writer (the ordering check can fail)", "a reader advancing its cursor during many random out-of-order commits never misses a change (stress)" |
 | INV-POS-2 | covered | `capture.test` "TRUNCATE on a synced table fails instead of silently bypassing the log", "writes from outside any mutator (scripts, cascades) are captured like any other" |
 | INV-POS-3 | partial | `scopes.test` "a scope move deletes the row for old-scope readers and delivers it to new-scope readers" (payload-free log rows untested) |
@@ -1854,6 +1885,7 @@ machine-verifiable literal test-title citations.
 | server `heartbeatInterval` (pokes and presence) | 15 s | `rpc.ts` | yes; must stay below clients' `idleTimeout` |
 | client `idleTimeout` (pokes stream, presence stream, presence send) | 45 s | `SyncLoop.ts`, `Presence.ts` | yes; must exceed `heartbeatInterval` |
 | sync loop backoff | 1 s doubling to 30 s, reset on a clean cycle | `SyncLoop.ts` | `retryDelay`, `maxRetryDelay` |
+| consecutive transient answers per mutation | 8 (91 s of default backoff before exhaustion, plus request time; wakes/restarts/network loss alter elapsed time) | `Engine.ts` | no; per-leader memory |
 | pokes reconnect backoff | 1 s doubling to 30 s, reset once a poke arrived | `SyncLoop.ts` | `retryDelay`, `maxRetryDelay` |
 | presence rejoin backoff (leader) | 1 s doubling to 30 s | `Presence.ts` | `retryDelay`, `maxRetryDelay` |
 | presence send deadline (tab → leader) | 45 s | `LeaderClient.ts` | `presenceSendTimeout` |
@@ -1895,7 +1927,6 @@ machine-verifiable literal test-title citations.
 
 | ID | section | question |
 |---|---|---|
-| OQ-MUT-1 | §5 | no bound on a persistently transient mutation blocking a client's queue |
 | OQ-PULL-1 | §7 (Q2) | no explicit `cursor ≤ head` fence; recovery after restore relies on the missing `client_scopes` row |
 | OQ-PULL-2 | §7 | unknown-table changes skipped at install advance the cursor past rows never stored; untested |
 | OQ-CLI-1 | §9 (Q3), §16 | full rebase: 49.41 ms for 5/50, 651.39 ms for 500/5,000 pending/changes (Bun memory VFS); algorithm decision remains open |
