@@ -95,7 +95,7 @@ const transientScenario = (scenario: {
       },
       transport: {
         push: (request: Protocol.PushRequest) =>
-          Effect.suspend(() => {
+          Effect.suspend((): ReturnType<Engine.Transport["push"]> => {
             if (network) return Effect.fail(Simulation.pushLost("request"))
             if (request.mutations[0].mutationId === id("blocked")) {
               answers++
@@ -249,6 +249,80 @@ describe("reconciliation simulation", () => {
         }
       }),
     60_000
+  )
+
+  it.effect(
+    "epoch refusals and stale short responses cannot exhaust pending intent or reset real transient answers",
+    () =>
+      Effect.gen(function* () {
+        for (const { delayed, priorAnswers } of [
+          { delayed: false, priorAnswers: 7 },
+          { delayed: true, priorAnswers: 3 },
+          { delayed: true, priorAnswers: 7 }
+        ]) {
+          const server = RefServer.make({ pageSize: 100, epochs: true })
+          server.register(clientId, principal("p"))
+          yield* server.writeDirect([
+            { table: ScopeGrants.ScopeGrants, id: grantId, row: Option.some(grant) },
+            { table: Counters, id: "x", row: Option.some(counter) }
+          ])
+          const restoreBackup = server.checkpoint()
+          const disk = MemorySyncStorage.makeDisk()
+          const arrived = yield* Deferred.make<void>()
+          const release = yield* Deferred.make<void>()
+          let hold = false
+          const engine = yield* Engine.make({
+            ...engineOptions,
+            storage: MemorySyncStorage.make(disk),
+            transport: {
+              push: (request) =>
+                Effect.gen(function* () {
+                  const response = yield* server.push(request, Option.some(0))
+                  if (hold) {
+                    hold = false
+                    yield* Deferred.succeed(arrived, undefined)
+                    yield* Deferred.await(release)
+                  }
+                  return response
+                }),
+              pull: server.pull
+            }
+          })
+          yield* engine.pull
+          yield* engine.mutate(id("pending"), "increment", { id: "x", by: 11 })
+          for (let attempt = 0; attempt < priorAnswers; attempt++) yield* engine.push
+          if (delayed) {
+            hold = true
+            const pushed = yield* Effect.forkChild(engine.push)
+            yield* Deferred.await(arrived)
+            restoreBackup()
+            yield* engine.pull
+            yield* Deferred.succeed(release, undefined)
+            yield* Fiber.join(pushed)
+          } else {
+            for (let restore = 0; restore < 9; restore++) {
+              restoreBackup()
+              yield* engine.push
+              yield* engine.pull
+            }
+          }
+          assert.lengthOf(disk.notices, 0)
+          assert.lengthOf(disk.outbox, 1)
+          assert.equal(valueOf(disk, "x"), 11)
+          // Only genuine accepted answers reach the threshold, including empty non-exhausting replies.
+          for (let attempt = priorAnswers; attempt < 7; attempt++) {
+            yield* engine.push
+            assert.lengthOf(disk.outbox, 1)
+            assert.lengthOf(disk.notices, 0)
+          }
+          yield* engine.push
+          assert.lengthOf(disk.outbox, 0)
+          assert.lengthOf(disk.notices, 1)
+          assert.equal(valueOf(disk, "x"), 0)
+          const notice = disk.notices[0]
+          assert.equal(notice?._tag === "Rejected" ? notice.error._tag : undefined, "TransientExhausted")
+        }
+      })
   )
 
   it.effect(

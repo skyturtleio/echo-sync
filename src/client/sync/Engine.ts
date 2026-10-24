@@ -402,10 +402,15 @@ export const make = (options: {
                   Effect.catchTag("ResnapshotRequired", (error) =>
                     Effect.gen(function* () {
                       if (error.epoch !== undefined) yield* resetEpoch(error.epoch, meta.epoch)
-                      return { results: [] }
+                      return undefined
                     })
                   )
                 )
+              // A history refusal is not a usable short response and must never exhaust intent.
+              if (response === undefined) {
+                yield* Telemetry.annotate({ "echo.result": "stopped" })
+                return true
+              }
               // `results` is the processed prefix of the request, in request (= seq) order.
               const firstMissing = batch[response.results.length]
               const attempts =
@@ -413,52 +418,52 @@ export const make = (options: {
               const exhausted = attempts >= 8
               if (firstMissing !== undefined) sawTransient = true
               const through = batch[response.results.length - 1]?.envelope.seq
-              if (through !== undefined || exhausted) {
-                yield* storage.transaction(
-                  Effect.gen(function* () {
-                    const current = yield* storage.meta
-                    if ((current.epoch ?? null) !== (meta.epoch ?? null) || current.resnapshot) return
-                    // INV-PUSH-6 corollary: an outcome at a position ≤ the installed cursor is already in
-                    // the replica, and no later pull will ack it (acks cover (cursor, nextCursor]).
-                    // This is how a duplicate enqueued after its original was released terminates.
-                    // Second corollary: `Rejected{ClientExpired}` answers an expired identity, which
-                    // no pull ever acks, so it is released on receipt whatever its position (after a
-                    // rebuild the cursor is null); its effect, if any, arrives with the next pull.
-                    const cursor = current.cursor
-                    const covered = new Map(
-                      response.results
-                        .filter(
-                          (result) =>
-                            (cursor !== null && result.position <= cursor) ||
-                            (result.outcome._tag === "Rejected" && result.outcome.error._tag === "ClientExpired")
-                        )
-                        .map((result) => [result.mutationId, result.outcome])
-                    )
-                    if (covered.size > 0 || exhausted) {
-                      yield* rebase(context, Effect.void, (envelope) => {
-                        const outcome = covered.get(envelope.mutationId)
-                        if (outcome !== undefined) return Option.some(noticeFor(envelope, outcome))
-                        if (exhausted && envelope.mutationId === firstMissing?.envelope.mutationId) {
-                          return Option.some(
-                            Option.some({
-                              _tag: "Rejected",
-                              envelope,
-                              error: new Mutation.TransientExhausted({
-                                attempts,
-                                message: "the server stopped the push batch at a transient failure"
-                              })
+              const accepted = yield* storage.transaction(
+                Effect.gen(function* () {
+                  const current = yield* storage.meta
+                  if ((current.epoch ?? null) !== (meta.epoch ?? null) || current.resnapshot) return false
+                  // INV-PUSH-6 corollary: an outcome at a position ≤ the installed cursor is already in
+                  // the replica, and no later pull will ack it (acks cover (cursor, nextCursor]).
+                  // This is how a duplicate enqueued after its original was released terminates.
+                  // Second corollary: `Rejected{ClientExpired}` answers an expired identity, which
+                  // no pull ever acks, so it is released on receipt whatever its position (after a
+                  // rebuild the cursor is null); its effect, if any, arrives with the next pull.
+                  const cursor = current.cursor
+                  const covered = new Map(
+                    response.results
+                      .filter(
+                        (result) =>
+                          (cursor !== null && result.position <= cursor) ||
+                          (result.outcome._tag === "Rejected" && result.outcome.error._tag === "ClientExpired")
+                      )
+                      .map((result) => [result.mutationId, result.outcome])
+                  )
+                  if (covered.size > 0 || exhausted) {
+                    yield* rebase(context, Effect.void, (envelope) => {
+                      const outcome = covered.get(envelope.mutationId)
+                      if (outcome !== undefined) return Option.some(noticeFor(envelope, outcome))
+                      if (exhausted && envelope.mutationId === firstMissing?.envelope.mutationId) {
+                        return Option.some(
+                          Option.some({
+                            _tag: "Rejected",
+                            envelope,
+                            error: new Mutation.TransientExhausted({
+                              attempts,
+                              message: "the server stopped the push batch at a transient failure"
                             })
-                          )
-                        }
-                        return Option.none()
-                      })
-                    }
-                    if (through !== undefined) {
-                      yield* storage.setMeta({ ...current, pushedThrough: Math.max(current.pushedThrough, through) })
-                    }
-                  })
-                )
-              }
+                          })
+                        )
+                      }
+                      return Option.none()
+                    })
+                  }
+                  if (through !== undefined) {
+                    yield* storage.setMeta({ ...current, pushedThrough: Math.max(current.pushedThrough, through) })
+                  }
+                  return true
+                })
+              )
+              if (!accepted) return true
               // Publish counts only after bookkeeping commits: a local rollback must not count.
               for (const result of response.results) transientAnswers.delete(result.mutationId)
               if (firstMissing !== undefined) {

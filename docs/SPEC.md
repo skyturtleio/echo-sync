@@ -462,7 +462,8 @@ clients under the existing version policy instead of imposing a new engine versi
   normally, without an exhaustion notice. Counts are per mutation, in memory for this leader;
   an ack or leader restart resets them (like OQ-LOOP-1's halt).
 - INV-MUT-17: Only a usable short push response counts, for its first missing mutation.
-  Network failures, lost responses, credentials/auth failures and local storage failures MUST
+  Network failures, lost responses, credentials/auth failures, history refusals, stale-epoch
+  responses and local storage failures MUST
   NOT advance the count or reset prior transient answers. The underlying server error is not
   on the wire; the last observable error is the short-prefix transient-stop classification.
 
@@ -472,6 +473,10 @@ clients under the existing version policy instead of imposing a new engine versi
   deadline: wakes can shorten it and network loss or leader restarts can extend it; indefinite
   retries were rejected. Existing short responses also cover infrastructure failures, so the
   notice retains that evidence rather than inventing an underlying error or changing the server.
+
+  **Rationale (2026-10-24):** An epoch refusal did not attempt the mutation, and a response from
+  invalidated history says nothing about its new execution. Neither may exhaust pending intent
+  or erase genuine transient answers; validate the response epoch before publishing counts.
 
 ### Details
 
@@ -1678,10 +1683,10 @@ batches, page limits and retention against them.
 - INV-PERF-5: Per push batch on the client (`Engine.push` loops batches until the pending set
   is drained or a batch is stopped): one storage transaction reading `meta` and the whole
   pending outbox (`|P|` undo decodes), one RPC with at most `min(pushBatchSize ?? 50, 100)`
-  entries, and, only when the response holds at least one result, one storage transaction
-  advancing `pushedThrough` that also runs a full rebase with `C = 0` (INV-PERF-4 without the
-  install term) when any result is covered (INV-PUSH-6). A response with zero results (stopped
-  at the first entry) advances nothing.
+  entries, and one storage transaction checking the current epoch for every usable response.
+  It advances `pushedThrough` when results are present and runs a full rebase with `C = 0`
+  (INV-PERF-4 without the install term) when a result is covered (INV-PUSH-6) or an entry exhausts.
+  A response with zero results advances no watermark but still reads meta before counting it.
 - INV-PERF-6: Pokes are one `LISTEN` per server process shared by every subscriber, plus a
   heartbeat tick per `heartbeatInterval` per stream; a poke fans out to every stream in the
   process only (§10). A commit costs one `pg_notify` per position allocated (INV-POS-4), i.e.
@@ -1850,7 +1855,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-MUT-14 | covered | `rpc.test` "an old client omitting createdAt must retain server time and still obey clientPolicy" |
 | INV-MUT-15 | covered | `Simulation.test` "eight transient answers release only the exhausted effect and push the next entry", "a forever-transient mutation cannot prevent simulation convergence or corrupt the replica" |
 | INV-MUT-16 | covered | `Simulation.test` "seven transient answers followed by applied do not discard the mutation", "a leader restart resets transient answers without discarding intent" |
-| INV-MUT-17 | covered | `Simulation.test` "network failures between transient answers do not exhaust the mutation early", "a failed exhaustion transaction preserves the optimistic replica and prior answer count", "a failed processed-prefix transaction cannot count its transient stop" |
+| INV-MUT-17 | covered | `Simulation.test` "network failures between transient answers do not exhaust the mutation early", "a failed exhaustion transaction preserves the optimistic replica and prior answer count", "a failed processed-prefix transaction cannot count its transient stop", "epoch refusals and stale short responses cannot exhaust pending intent or reset real transient answers" |
 | INV-POS-1 | covered | `ordering.test` "a reader pulling after a later writer commits never skips an earlier writer still in flight", "without the trigger's advisory lock that reader skips the earlier writer (the ordering check can fail)", "a reader advancing its cursor during many random out-of-order commits never misses a change (stress)" |
 | INV-POS-2 | covered | `capture.test` "TRUNCATE on a synced table fails instead of silently bypassing the log", "writes from outside any mutator (scripts, cascades) are captured like any other" |
 | INV-POS-3 | partial | `scopes.test` "a scope move deletes the row for old-scope readers and delivers it to new-scope readers" (payload-free log rows untested) |
