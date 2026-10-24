@@ -252,6 +252,87 @@ describe("reconciliation simulation", () => {
   )
 
   it.effect(
+    "late push and pull responses from a restored epoch cannot release pending intent or install old rows",
+    () =>
+      Effect.gen(function* () {
+        for (const delayed of ["push", "pull"]) {
+          const server = RefServer.make({ pageSize: 100, epochs: true })
+          server.register(clientId, principal("p"))
+          yield* server.writeDirect([
+            { table: ScopeGrants.ScopeGrants, id: grantId, row: Option.some(grant) },
+            { table: Counters, id: "x", row: Option.some(counter) }
+          ])
+          const restoreBackup = server.checkpoint()
+          const disk = MemorySyncStorage.makeDisk()
+          const arrived = yield* Deferred.make<void>()
+          const release = yield* Deferred.make<void>()
+          let hold = false
+          const engine = yield* Engine.make({
+            ...engineOptions,
+            storage: MemorySyncStorage.make(disk),
+            transport: {
+              push: (request) =>
+                Effect.gen(function* () {
+                  const response = yield* server.push(request, Option.none())
+                  if (hold && delayed === "push") {
+                    hold = false
+                    yield* Deferred.succeed(arrived, undefined)
+                    yield* Deferred.await(release)
+                  }
+                  return response
+                }),
+              pull: (request) =>
+                Effect.gen(function* () {
+                  const response = yield* server.pull(request)
+                  if (hold && delayed === "pull") {
+                    hold = false
+                    yield* Deferred.succeed(arrived, undefined)
+                    yield* Deferred.await(release)
+                  }
+                  return response
+                })
+            }
+          })
+          yield* engine.pull
+          yield* engine.mutate(id("pending"), "increment", { id: "x", by: 3 })
+          if (delayed === "pull") yield* engine.push
+          hold = true
+          const suspended = yield* Effect.forkChild(delayed === "push" ? Effect.asVoid(engine.push) : engine.pull)
+          yield* Deferred.await(arrived)
+          restoreBackup()
+          if (delayed === "push") yield* engine.pull
+          else {
+            yield* engine.mutate(id("second"), "increment", { id: "x", by: 5 })
+            yield* engine.push
+          }
+          yield* Deferred.succeed(release, undefined)
+          yield* Fiber.join(suspended)
+          assert.strictEqual(disk.meta.epoch, server.epoch())
+          assert.isTrue(disk.outbox.some((entry) => entry.envelope.mutationId === "pending"))
+          yield* engine.push
+          yield* engine.pull
+          assert.strictEqual(valueOf(disk, "x"), delayed === "push" ? 3 : 8)
+          assert.deepStrictEqual(disk.outbox, [])
+          assert.deepStrictEqual(disk.notices, [])
+        }
+      })
+  )
+
+  it.effect(
+    "restoring an earlier log and ledger cannot strand pending intent or mix replicas across epochs",
+    () =>
+      Effect.gen(function* () {
+        let restores = 0
+        for (const seed of seeds) {
+          const stats = yield* Simulation.run({ seed, steps: 400, restores: true })
+          restores += stats.restores
+        }
+        assert.isAbove(restores, 0)
+      }),
+    60_000
+  )
+
+  it.effect(
     "random schedules keep every client = replay(pending, server@cursor) and lose/duplicate no intent",
     () =>
       Effect.gen(function* () {

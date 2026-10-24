@@ -67,8 +67,11 @@ export interface DirectWrite {
 
 const rowKey = (table: string, id: string) => `${table}\u0000${id}`
 
-export const make = (options: { readonly pageSize: number }) => {
+export const make = (options: { readonly pageSize: number; readonly epochs?: boolean }) => {
   const store = MemoryStore.make()
+  let generation = 0
+  const epoch = () => `simulation-${generation}`
+  const histories = new Map<string, Map<Position, MemoryStore.Tables>>()
   let head: Position = 0n
   let logFloor: Position = 0n
   let log: Array<LogEntry> = []
@@ -83,6 +86,13 @@ export const make = (options: { readonly pageSize: number }) => {
   const executions = new Map<string, number>()
   /** `access_scopes`: every scope ever created or granted in; kept when its grants go (SPEC §4). */
   const accessScopes = new Set<string>()
+
+  const fence = (presented: string | null | undefined) =>
+    Effect.suspend(() =>
+      options.epochs === true && presented !== epoch()
+        ? Effect.fail(new Protocol.ResnapshotRequired({ reason: "unknownCursor", epoch: epoch() }))
+        : Effect.void
+    )
 
   const ledgerOf = (clientId: string) => {
     const existing = ledger.get(clientId)
@@ -165,9 +175,13 @@ export const make = (options: { readonly pageSize: number }) => {
     )
 
   /** Processes in order; `stopAt` injects a transient failure before that index. */
-  const push = (request: Protocol.PushRequest, stopAt: Option.Option<number>): Effect.Effect<Protocol.PushResponse> =>
+  const push = (
+    request: Protocol.PushRequest,
+    stopAt: Option.Option<number>
+  ): Effect.Effect<Protocol.PushResponse, Protocol.ResnapshotRequired> =>
     inMemory(
       Effect.gen(function* () {
+        yield* fence(request.epoch)
         const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis)
         const results: Array<Protocol.PushResult> = []
         for (const [index, item] of request.mutations.entries()) {
@@ -204,6 +218,10 @@ export const make = (options: { readonly pageSize: number }) => {
   const pull = (request: Protocol.PullRequest): Effect.Effect<Protocol.PullResponse, Protocol.ResnapshotRequired> =>
     inMemory(
       Effect.gen(function* () {
+        yield* fence(request.epoch)
+        if (request.cursor !== null && request.cursor > head) {
+          return yield* new Protocol.ResnapshotRequired({ reason: "unknownCursor", epoch: epoch() })
+        }
         const clientId = request.clientId
         const principal = principals.get(clientId)
         let state: Continuation
@@ -302,6 +320,7 @@ export const make = (options: { readonly pageSize: number }) => {
         clientScopes.set(clientId, records)
         const done: Protocol.PullResponse = {
           _tag: "PullDone",
+          ...(options.epochs === true ? { epoch: epoch() } : {}),
           changes,
           acks,
           nextCursor: asPosition(head),
@@ -314,6 +333,43 @@ export const make = (options: { readonly pageSize: number }) => {
   return {
     store,
     history,
+    epoch,
+    historyAt: (timeline: string | null | undefined, cursor: Position) =>
+      (timeline === epoch() || options.epochs !== true ? history : histories.get(timeline ?? ""))?.get(cursor),
+    /** A backup of authoritative state. Restoring rewinds log/ledger and rotates the timeline. */
+    checkpoint: () => {
+      const savedHead = head
+      const savedLogFloor = logFloor
+      const savedRows = MemoryStore.cloneTables(store.tables())
+      const savedLog = [...log]
+      const savedLedger = new Map([...ledger].map(([id, entries]) => [id, new Map(entries)]))
+      const savedScopes = new Map([...clientScopes].map(([id, entries]) => [id, new Map(entries)]))
+      const savedFloors = new Map(ledgerFloor)
+      const savedHistory = new Map(history)
+      const savedExecutions = new Map(executions)
+      const savedAccess = new Set(accessScopes)
+      return () => {
+        histories.set(epoch(), new Map(history))
+        generation++
+        head = savedHead
+        logFloor = savedLogFloor
+        store.replace(MemoryStore.cloneTables(savedRows))
+        log = [...savedLog]
+        ledger.clear()
+        for (const [id, entries] of savedLedger) ledger.set(id, new Map(entries))
+        clientScopes.clear()
+        for (const [id, entries] of savedScopes) clientScopes.set(id, new Map(entries))
+        ledgerFloor.clear()
+        for (const [id, floor] of savedFloors) ledgerFloor.set(id, floor)
+        history.clear()
+        for (const [position, rows] of savedHistory) history.set(position, rows)
+        executions.clear()
+        for (const [id, count] of savedExecutions) executions.set(id, count)
+        accessScopes.clear()
+        for (const id of savedAccess) accessScopes.add(id)
+        continuations.clear()
+      }
+    },
     executions,
     head: () => head,
     /** The entry while it still holds its outcome; none once expired (or never processed). */

@@ -1,9 +1,12 @@
 import { expect, it } from "@effect/vitest"
-import { Cause, Clock, Deferred, Effect, Fiber, Queue, Stream } from "effect"
+import { Cause, Clock, Deferred, Effect, Fiber, Option, Queue, Stream } from "effect"
 import { RpcClientError } from "effect/rpc"
 import { TestClock } from "effect/testing"
 import { Errors, Ids, Protocol } from "echo-sync"
-import type * as Engine from "./Engine.ts"
+import * as Engine from "./Engine.ts"
+import * as MemorySyncStorage from "./testing/MemorySyncStorage.ts"
+import * as RefServer from "../../core/testing/RefServer.ts"
+import * as SimApp from "../../core/testing/SimApp.ts"
 import * as SyncFailure from "./SyncFailure.ts"
 import * as SyncLoop from "./SyncLoop.ts"
 import { recorder } from "../../../test/telemetry-recorder.ts"
@@ -46,6 +49,64 @@ const heartbeat = element("heartbeat")
 
 /** A pending count that is 0 and never changes. */
 const noPending = Stream.concat(Stream.make(0), Stream.never)
+
+it.effect("a discovered or resumed epoch resnapshot delivers pending intent without an external wake", () =>
+  Effect.gen(function* () {
+    for (const resumed of [false, true]) {
+      const server = RefServer.make({ pageSize: 100, epochs: true })
+      const clientId = Ids.ClientId.make("restored")
+      server.register(clientId, SimApp.principal("p"))
+      const disk = MemorySyncStorage.makeDisk()
+      let failSnapshot = false
+      const options = {
+        clientId,
+        actor: SimApp.principal("p"),
+        storage: MemorySyncStorage.make(disk),
+        registry: SimApp.clientRegistry,
+        mutations: SimApp.mutations,
+        transport: {
+          push: (request: Protocol.PushRequest) => server.push(request, Option.none()),
+          pull: (request: Protocol.PullRequest) =>
+            Effect.gen(function* () {
+              if (failSnapshot && request.epoch === server.epoch()) return yield* pullOffline()
+              return yield* server.pull(request)
+            })
+        }
+      }
+      const engine = yield* Engine.make(options)
+      yield* engine.pull
+      yield* engine.mutate(Ids.MutationId.make("setup"), "createScope", { scope: "s", counter: "x" })
+      yield* engine.push
+      yield* engine.pull
+      const restore = server.checkpoint()
+      yield* engine.mutate(Ids.MutationId.make("pending"), "increment", { id: "x", by: 3 })
+      yield* engine.push
+      restore()
+      if (resumed) {
+        failSnapshot = true
+        yield* Effect.flip(engine.pull)
+        expect(disk.meta.resnapshot).toBe(true)
+        failSnapshot = false
+      }
+      const reopened = yield* Engine.make(options)
+      const loop = yield* SyncLoop.make({
+        engine: reopened,
+        pendingMutations: Stream.concat(Stream.make(1), Stream.never)
+      })
+      const running = yield* Effect.forkChild(loop.run)
+      yield* settle
+      expect((yield* loop.status).lastSyncedAt).toBeNull()
+      expect(disk.outbox).toHaveLength(1)
+      yield* TestClock.adjust("1 second")
+      yield* settle
+      expect(disk.outbox).toEqual([])
+      expect(disk.replica.tables().get("counters")?.get("x")?.["value"]).toBe(3)
+      expect(server.store.tables().get("counters")?.get("x")?.["value"]).toBe(3)
+      expect((yield* loop.status).lastSyncedAt).not.toBeNull()
+      yield* Fiber.interrupt(running)
+    }
+  })
+)
 
 it.effect(
   "status and changes wait for the first real pending count; a failed first count emits nothing until a retry counts",

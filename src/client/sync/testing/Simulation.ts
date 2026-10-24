@@ -73,6 +73,7 @@ export class InvariantViolated extends Schema.TaggedError<InvariantViolated>()("
 export interface Options {
   readonly seed: number
   readonly steps: number
+  readonly restores?: boolean
   readonly pageSize?: number
   /** Deliberately wrong client that applies `PullPage`s as they arrive (proof the check bites). */
   readonly pullMode?: "staged" | "incremental"
@@ -88,6 +89,7 @@ export interface Options {
 }
 
 export interface Stats {
+  readonly restores: number
   readonly mutations: number
   readonly resnapshots: number
   readonly reloadsMidSet: number
@@ -203,12 +205,13 @@ const ROLES: ReadonlyArray<Role> = ["reader", "writer", "owner"]
 export const run = (options: Options) =>
   Effect.gen(function* () {
     const rng = prng(options.seed)
-    const server = RefServer.make({ pageSize: options.pageSize ?? 3 })
+    const server = RefServer.make({ pageSize: options.pageSize ?? 3, epochs: options.restores === true })
     const trace: Array<string> = []
     let step = 0
     let faults = true
     let persistent: { readonly clientId: Ids.ClientId; readonly mutationId: Ids.MutationId } | undefined
     const stats = {
+      restores: 0,
       mutations: 0,
       resnapshots: 0,
       reloadsMidSet: 0,
@@ -329,6 +332,8 @@ export const run = (options: Options) =>
       })
     )
     type Client = (typeof clients)[number]
+    let backup = server.checkpoint()
+    const lostReleased = new Set<string>()
 
     /** The deliberately wrong client: applies each `PullPage` as it arrives. */
     const incrementalPull = (client: Client) =>
@@ -378,7 +383,7 @@ export const run = (options: Options) =>
     const expectedReplica = (client: Client) =>
       Effect.gen(function* () {
         const cursor = client.disk.meta.cursor
-        const snapshot = cursor === null ? new Map() : server.history.get(cursor)
+        const snapshot = cursor === null ? new Map() : server.historyAt(client.disk.meta.epoch, cursor)
         if (snapshot === undefined) return yield* violated("cursor names a server commit", `${cursor}`)
         const store = MemoryStore.make(yield* view(snapshot, client.principal))
         const hiddenThrough = Option.match(client.rebuiltThrough, { onNone: () => 0, onSome: (r) => r.seq })
@@ -411,7 +416,12 @@ export const run = (options: Options) =>
           // or by the push response itself when no pull can ever ack it (INV-PUSH-6 corollary).
           if (entry.envelope.seq > pushedThrough) continue
           const ledger = server.ledgerEntry(client.clientId, entry.envelope.mutationId)
-          if (cursor !== null && Option.isSome(ledger) && ledger.value.position <= cursor) {
+          if (
+            (options.restores !== true || client.disk.meta.epoch === server.epoch()) &&
+            cursor !== null &&
+            Option.isSome(ledger) &&
+            ledger.value.position <= cursor
+          ) {
             return yield* violated(
               "pending set never holds an acked mutation",
               `${client.clientId}#${entry.envelope.mutationId}`
@@ -720,12 +730,26 @@ export const run = (options: Options) =>
 
     for (step = 1; step <= options.steps; step++) {
       const roll = rng.int(100)
-      if (roll < 85) {
+      if (options.restores === true && roll >= 97) {
+        const pending = new Set(
+          clients.flatMap((c) => c.disk.outbox.map((e) => `${c.clientId}#${e.envelope.mutationId}`))
+        )
+        // Released intent is outside the recovery guarantee; pending intent must still drain.
+        for (const envelope of committed) {
+          const key = `${envelope.clientId}#${envelope.mutationId}`
+          if (!pending.has(key)) lostReleased.add(key)
+        }
+        backup()
+        stats.restores++
+        note(`server: restore to ${server.head()}, rotate ${server.epoch()}`)
+        for (const client of clients) yield* checkClient(client)
+      } else if (roll < 85) {
         const client = Option.getOrThrow(rng.pick(clients))
         yield* clientStep(client)
         yield* checkClient(client)
       } else if (roll < 95) {
         yield* serverWrite
+        if (options.restores === true && rng.chance(0.25)) backup = server.checkpoint()
       } else {
         const horizon = server.head() - BigInt(5 + rng.int(20))
         if (horizon > 0n) {
@@ -780,12 +804,18 @@ export const run = (options: Options) =>
         stats.exhausted++
         continue
       }
-      if (count !== 1)
+      if (count !== 1 && !(count === 0 && lostReleased.has(key)))
         return yield* violated("every committed intent executes exactly once", `${key} executed ${count}×`)
       const notices = client?.disk.notices.filter((n) => n.envelope.seq === envelope.seq).length ?? 0
       const rejected = Option.isSome(ledger) && ledger.value.outcome._tag === "Rejected"
       const unknown = client?.disk.notices.some((n) => n.envelope.seq === envelope.seq && n._tag === "OutcomeUnknown")
-      if (Option.isSome(ledger) && (notices !== (rejected ? 1 : 0) || unknown === true)) {
+      // After restore, a released identity may be re-enqueued and receive a different verdict.
+      // Its old notice belongs to the old seq, not this timeline's later execution.
+      if (
+        Option.isSome(ledger) &&
+        !(lostReleased.has(key) && ledger.value.seq !== envelope.seq) &&
+        (notices !== (rejected ? 1 : 0) || unknown === true)
+      ) {
         return yield* violated(
           "rejections surface as exactly one notice",
           `${key}: ${notices} notices, rejected=${rejected}`
