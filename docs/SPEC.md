@@ -100,7 +100,7 @@ positions at or below the installed cursor triggers the same undo-all/replay-all
 Every upsert of a known table is decoded once at staging (to refuse a malformed page before it is
 persisted) and decoded again, then encoded, at install: two decodes and one encode per upsert
 per install. All of this runs inside one SQLite transaction under the storage's single permit, so
-no query runs and no mutation is accepted while it runs. See §9.4, §16.3 and INV-CLI-3.
+no query runs and no mutation is accepted while it runs. See §9.4, §16 and INV-CLI-3.
 
 ## 1. Scope, non-goals and admissions
 
@@ -119,7 +119,7 @@ The engine does not and, at this pin, will not:
 - run more than one server process for pokes or presence (`LISTEN` fan-out and presence state
   are process-local; a second instance sees neither);
 - serve a client whose principal differs from the one its replica was first registered under
-  (§4.4: the binding is permanent per `clientId`);
+  (INV-MUT-10: the binding is permanent per `clientId`);
 - order pulls across clients, provide a global catalog snapshot format, or offer a conformance
   suite for a non-TypeScript client;
 - forget idle clients (`echo_sync.clients`, `client_scopes`, ledger identities and floors are
@@ -138,7 +138,8 @@ The engine does not and, at this pin, will not:
   that swallows client aborts this takes up to the client's `idleTimeout` plus the server
   heartbeat (about 45 s).
 - The browser substrate depends on Web Locks, OPFS synchronous access handles and
-  (for multi-tab service) `SharedWorker`; without them the client fails closed (§12.7).
+  (for multi-tab service) `SharedWorker`; without them the client fails closed with
+  `Unsupported` (INV-BRW-9).
 - WebKit terminates a `SharedWorker` with the tab that created it; the router is rebuilt from
   its clients (§12.4).
 
