@@ -849,7 +849,12 @@ pending on top and recaptures undo).
 - OQ-CLI-1: A full rebase per install (Q3) has no incremental path. Whether an install should
   skip undo/replay for entries whose rows the set does not touch is a design question; nothing in
   the correctness contract constrains it beyond INV-CLI-1. The measured baseline and exact
-  counter gates are in §16; changing the algorithm must consciously revise those cost gates.
+  counter gates are in §16: 5 pending / 50 changes took 50.07 ms (103 statements), and
+  500 pending / 5,000 changes took 567.45 ms (9,508 statements), under Bun/wa-sqlite memory VFS.
+  Keep this open for the owner: a large install blocks other storage work for roughly half a
+  second in this run, but all pending targets overlap the page set, so selective replay would
+  not skip any of them. Measure disjoint/dependency-heavy workloads and OPFS before deciding;
+  changing the algorithm must consciously revise those cost gates.
 
 ## 10. Sync loop, pokes and presence
 
@@ -1544,6 +1549,36 @@ of 203, P refreshed undo records holding 200, and final pending/cursor state. It
 INV-CLI-1 and INV-CLI-3's full rebase, not merely the aggregate statement count. Pending reads
 currently use **two** SELECTs (undo images then envelopes), each returning P rows.
 
+#### Install measurement receipts (2026-10-24)
+
+Clean source: [`e2d8e807fa73ee9032364b23ff1060777a138fd9`](https://github.com/skyturtleio/echo-sync/commit/e2d8e807fa73ee9032364b23ff1060777a138fd9).
+Command: `bun test/perf-install.ts` (refuses a dirty tree and prints its source SHA).
+Environment: Bun 1.3.10, Linux x86_64 Amp orb, Effect/sqlite-wasm 4.0.5,
+wa-sqlite 0.1.2 / SQLite 3.47.0, in-memory VFS. This is the allowed Bun fallback: isolating
+the browser worker's connection would require additional worker instrumentation, whereas this
+uses the same `Engine.applyPageSet`, `SqliteSyncStorage` and wasm without a production change.
+No browser/network/OPFS latency is claimed.
+
+| pending P | changes C | staged pages (≤500 upserts each) | install wall time | statements | SELECT-returned rows |
+|---|---|---|---|---|---|
+| 5 | 50 | 1 | 50.074384 ms | 103 | 32 |
+| 500 | 5,000 | 10 | 567.447760 ms | 9,508 | 3,011 |
+
+One run per workload, small then large in one process; no statistical confidence or speedup
+claim. Both start with a non-null cursor, no acks, one writer grant and P independent pending
+increments (100 → 103); the page set overlaps every pending target (authoritative 200 → 203
+after replay). Timed region is the one install transaction, from just before BEGIN through
+staged JSON read/decode, full undo/apply/replay and COMMIT. Setup, enqueues, staging and final
+validation are excluded; counter capture, default telemetry, runtime/JIT/GC and scheduler costs
+are included. The runner checks the derived `8 + 9P + C` statement count, pending count, cursor,
+row count and every final counter value outside timing. Returned rows follow `6P + 1 + pages`.
+
+This is a **before baseline only**; no engine code or algorithm was changed, so there is no
+after/speedup measurement. Recommendation for OQ-CLI-1: retain full rebase for now, but treat
+the large-install permit hold as a reason to investigate representative workloads next.
+Do not adopt selective replay on these data: all targets overlap, and an implementation must
+also account for grant/query dependencies, not just mutation write ids.
+
 ### Open Questions
 
 None. OQ-PERF-1 is resolved by the counter gates; OQ-CLI-1 remains the owner's algorithm decision.
@@ -1640,9 +1675,9 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PUSH-4 | covered | `ledger.test` "seq < 1 is a malformed envelope…"; `scenarios.sh` "sync: MalformedEnvelope halts push; pull and pokes reconnects continue; pending export unaffected"; `version-gate.e2e` "a client below the generated floor stops retrying, can mutate offline, and delivers the original intents after update" |
 | INV-PUSH-5 | covered | `startup.test` "body-supplied cookie and origin headers cannot change a push" |
 | INV-PUSH-6 | covered | `Leader.test` "a push whose response is lost keeps the entry pending until the pull installs its ack, and that cycle sets no lastSyncedAt"; `Simulation.test` "constraint rejections neither release before covering acks nor lose fields in retained notices; ClientExpired still releases on receipt" |
-| INV-CLI-1 | covered | `Simulation.test` "random schedules keep every client = replay(pending, server@cursor) and lose/duplicate no intent" |
+| INV-CLI-1 | covered | `Simulation.test` "random schedules keep every client = replay(pending, server@cursor) and lose/duplicate no intent"; `perf-install.test` "install undoes P entries, writes C changes and replays P handlers without hidden statements" |
 | INV-CLI-2 | covered | `Simulation.test` "a client that applies PullPages before PullDone is caught by an invariant (the check bites)"; `SqliteSyncStorage.test` "after a rebuild, installing the null-cursor set replays pending on top of it and recaptures undo" |
-| INV-CLI-3 | covered | `Store.test` "undo images restore the exact prior state after a handler that fails midway"; `scope-create.e2e` "an optimistic createScope of an id the server already has is rejected ScopeForbidden, and the pull undoes the grant and the write that depended on it; a fresh id is applied and stays", "when only the creation is processed and rejected, a dependent mutation stays pending with no optimistic effect…" |
+| INV-CLI-3 | covered | `Store.test` "undo images restore the exact prior state after a handler that fails midway"; `scope-create.e2e` "an optimistic createScope of an id the server already has is rejected ScopeForbidden, and the pull undoes the grant and the write that depended on it; a fresh id is applied and stays", "when only the creation is processed and rejected, a dependent mutation stays pending with no optimistic effect…"; `perf-install.test` "install undoes P entries, writes C changes and replays P handlers without hidden statements" (phase identities/order and refreshed undo) |
 | INV-CLI-4 | covered | `Outbox.test` "an enqueue retried after its original was released returns the original seq and is not pending"; `Leader.test` "mutate retried across LeaderLost after the lost leader committed leaves exactly one outbox row", "an enqueue cancelled while its COMMIT runs still wakes the loop"; Simulation invariant "enqueue is idempotent on mutationId" |
 | INV-CLI-5 | covered | `SqliteSyncStorage.test` "nextSeq starts at 1 and never reuses a seq, even after its released row is pruned"; `Outbox.test` "pruning released rows keeps pending ones and never lets a seq be reused"; `Simulation.test` "an allocator that reuses a released entry's seq is caught by the never-reused check" |
 | INV-CLI-6 | covered | `Simulation.ts` invariant "pending set never holds an acked mutation", checked on every step of `Simulation.test` random schedules (no test shows the check biting) |
@@ -1761,7 +1796,7 @@ INV-PULL-8, INV-CLI-7, INV-PERF-5).
 | OQ-MUT-2 | §5 | `createdAt` not on the wire; `ctx.now` differs between client and server |
 | OQ-PULL-1 | §7 (Q2) | no explicit `cursor ≤ head` fence; recovery after restore relies on the missing `client_scopes` row |
 | OQ-PULL-2 | §7 | unknown-table changes skipped at install advance the cursor past rows never stored; untested |
-| OQ-CLI-1 | §9 (Q3) | every install is a full rebase; no incremental path |
+| OQ-CLI-1 | §9 (Q3), §16 | full rebase: 50.07 ms for 5/50, 567.45 ms for 500/5,000 pending/changes (Bun memory VFS); algorithm decision remains open |
 | OQ-LOOP-1 | §10 | the push halt is in memory per leader; a new leader retries the batch and halts again |
 | OQ-BRW-1 | §12 | `awaitOpfsPoolFree` bound (2 s) then `LeaderFailed` with no retry |
 | OQ-TEL-1 | §14 | closed telemetry vocabularies not asserted against a committed list |

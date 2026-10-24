@@ -5,7 +5,8 @@ import type { Compiler } from "effect/sql/Statement"
 
 /** Test-only, healthy-path client over a real reserved driver connection. Counts executions,
  * not statement construction, including transaction controls. No trigger-internal SQL or
- * physical rows scanned: `rows` counts rows returned by SELECT to the engine. */
+ * physical rows scanned: `rows` counts array rows returned by SELECT to the engine. Raw
+ * driver-result SELECTs are not row-counted (none of the budget fixtures uses them). */
 export const countingClient = Effect.fnUntraced(function* (source: SqlClient.SqlClient, compiler: Compiler) {
   const connection = yield* source.reserve
   const statements: Array<{ sql: string; params: ReadonlyArray<unknown>; rows: number }> = []
@@ -35,8 +36,9 @@ export const countingClient = Effect.fnUntraced(function* (source: SqlClient.Sql
         })
       )
   }
-  // Same compiler and success-path controls as pinned PgClient / SqliteClient. This facade
-  // deliberately serves serial fixtures only, not pool/concurrency or commit-failure tests.
+  // Default driver compilers, same healthy-path control SQL/count as the pinned drivers.
+  // This facade uses unprepared controls, not PgClient's prepared controls/custom raw COMMIT
+  // result check. It serves serial healthy fixtures, not pool/concurrency/commit-failure tests.
   const client = yield* SqlClient.make({
     acquirer: Effect.succeed(counted),
     compiler,
