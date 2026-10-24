@@ -9,8 +9,8 @@ stable ID `INV-<AREA>-<n>`; IDs are never renumbered or reused, a withdrawn inva
 and is marked withdrawn), **Details**, and **Open Questions** (places where the intended contract
 could not be told from the implementation, or where the implementation and an older document
 disagree). §17 collects every invariant with the test that covers it, or marks it untested. §18
-collects every limit and default. `docs/DECISIONS.md` records the dated rulings that produced the
-current contract, each pointing at the section it changed.
+collects every limit and default. Dated rationale notes sit beneath the rules they explain;
+§17 also lists retired rules so they are not reintroduced.
 
 ## 0. Conventions, versioning and the three questions answered first
 
@@ -21,8 +21,9 @@ A MUST that the current implementation violates is recorded as an Open Question,
 
 Names in `code font` are identifiers in the source: tables (`echo_sync.mutations`), schema tags
 (`ResnapshotRequired`), options (`pageLimit`) and functions (`next_position()`). Source paths are
-relative to the repository root. `SPEC §x` citations refer to this document; `DECISIONS n`
-refers to the numbered ruling in `docs/DECISIONS.md`. Appendices C–E are non-normative
+relative to the repository root. `SPEC §x` citations refer to this document. Notes marked
+**Rationale (YYYY-MM-DD):** record the ruling's date, reason and rejected alternative where
+there was one; the rule remains the primary statement. Appendices C–E are non-normative
 implementation and verification notes, not additional contracts.
 
 ### 0.2 Versioning
@@ -41,13 +42,21 @@ implementation and verification notes, not additional contracts.
   form changes meaning (`echo_meta`, `echo_outbox`, `echo_staging`, `echo_notices`, the
   engine's Postgres tables), when a `dataHash`-relevant part of a `SyncTable` changes (§3), or when
   a MUST in this document changes. A breaking change MUST bump `wireVersion` when it concerns the
-  wire, MUST ship a migration when it concerns the Postgres schema, and MUST update this document
-  and `docs/DECISIONS.md` in the same branch. Additive fields marked optional on the wire
+  wire, MUST ship a migration when it concerns the Postgres schema, and MUST update the rule
+  and its dated rationale in this document in the same branch. Additive fields marked optional on the wire
   (`clientVersion`, `principal`) are not breaking.
 - **Error vocabulary is closed.** The tags in §15 and the literal unions they carry
   (`ResnapshotRequired.reason`, `SyncErrorKind`, `LeaderUnavailable.reason`, telemetry names and
-  outcomes) are part of the contract; adding a member is a design change recorded in
-  `docs/DECISIONS.md`.
+  outcomes) are part of the contract; adding a member is a design change recorded in a dated
+  rationale note next to the affected rule.
+
+**Rationale (2026-10-22):** Two-direction compatibility gates were chosen because an old PWA
+can keep running indefinitely after dismissing reload, while a newer client can corrupt its
+replica against an older server; §10 stops refused clients without discarding intent and §9
+backs off on incompatible server rows rather than rebuilding. The app chooses the table-shape
+floor from generated hash history (§13), rather than the engine assuming the latest hash is
+the only compatible one; a refusing policy or non-additive change must wait for deployed
+clients to understand the gate (Appendix D.4).
 
 ### 0.3 The three questions answered first
 
@@ -130,6 +139,25 @@ The engine does not and, at this pin, will not:
 - offer full-text search in the replica (the pinned wa-sqlite build has no FTS5);
 - ship a UI adapter other than FoldKit (`echo-sync/foldkit`), or carry any UI-framework
   knowledge in `src/core`, `src/client` or `src/server`.
+
+**Rationale (2026-10-21):** A packaged global catalog snapshot (NDJSON+gzip was considered)
+was deferred past the v1 vertical slice in favor of row-by-row scope walks (§7).
+
+**Rationale (2026-10-22):** A non-TypeScript protocol conformance suite was deferred
+indefinitely because TypeScript is the only planned client language; revisit only when a
+non-TypeScript client is planned.
+
+**Rationale (2026-10-21):** Local full-text search was deferred because the pinned wa-sqlite
+build lacks FTS5; a custom build versus non-FTS search must be decided before a consumer
+requiring full-text search is ported (requirement confirmed 2026-10-22).
+
+**Rationale (2026-10-22):** Edge/serverless composition remains unscheduled: the wire and
+client are runtime-agnostic, but the process-scoped shared `LISTEN`/`PubSub` and in-memory
+presence assume a long-lived server (§16), not interchangeable per-request instances.
+
+**Rationale (2026-10-22):** FoldKit is a separate library entry point so adapters can reuse
+the tab API's streams and effects without duplicating sync semantics; keeping the framework
+as a devDependency preserves the framework-free engine boundary.
 
 ### Admissions
 
@@ -282,6 +310,10 @@ reach clients through pull like any other row, and a mutation may change them.
 - INV-ACL-3: The required role is `owner` for `scope_grants` and `writer` for every other table.
 - INV-ACL-4: A principal MAY delete its own grant (`principal_id` = actor) without `owner`; the
   actor `*` MUST NOT. After relinquishing, a write in that scope is `ScopeForbidden`.
+
+  **Rationale (2026-10-23):** Self-revocation was allowed so members can leave a scope without
+  being its owner; this exception grants no right to reinsert the grant after leaving.
+
 - INV-ACL-5: Two grants for one `(scope, principal)` MUST be unrepresentable: `scope_grants.id`
   MUST equal `grantId(scope, principal)` = `${codePointLength(scope)}:${scope}:${principal}`
   (Postgres `CHECK`, migration 002; requires a UTF-8 database), and a patch MUST NOT change the
@@ -293,6 +325,10 @@ reach clients through pull like any other row, and a mutation may change them.
 - INV-ACL-7: A query under `readableBy` MUST return the first `n` rows the actor can read in
   index order (readability pushed under the limit as a `scope_grants` semi-join on
   `(access_scope_id, principal_id)`), not the readable rows among the first `n`.
+
+  **Rationale (2026-10-21):** Applying the limit after an in-memory readability filter read
+  unbounded rows; pushing readability and the limit into every row store bounds the query
+  while retaining `Store.planResult` as the shared conformance reference.
 
 ### Details
 
@@ -358,6 +394,13 @@ was recorded at. The ledger is what makes a push idempotent and what a pull acks
   same identity check and the same conflict retry but with the body replaced by the rejection;
   any other integrity violation (SQLSTATE `23xxx` except `23505`: `CHECK`, `NOT NULL`, foreign
   key, exclusion) is `ConstraintViolated{other, constraint: null}` at once, without retries.
+
+  **Rationale (2026-10-22):** Treating every SQL error as transient made permanent constraint
+  failures retry forever and block all later queued mutations; Store classifies them for
+  ledgered rejection and retained notices instead, preserving whole-cause precedence.
+  Unique violations retain bounded retries because they can be races; other integrity
+  violations reject immediately.
+
 - INV-MUT-7: `seq < 1` is `MalformedEnvelope` for the whole push: checked for every envelope
   before any body runs; nothing executed, nothing ledgered, not answered as `ClientExpired`.
 - INV-MUT-8: The seeded random available to a handler is a function of `(clientId, mutationId)`
@@ -368,6 +411,11 @@ was recorded at. The ledger is what makes a push idempotent and what a pull acks
   construction.
 - INV-MUT-10: A client id registered to one principal MUST be refused to another
   (`ClientForbidden` → `Unauthorized`).
+
+  **Rationale (2026-10-22):** Permanent first-registration binding prevents a request
+  authenticated as another principal from driving an existing replica; every sync and
+  presence request checks it, with the replica-principal assertion optional on the wire for
+  compatibility with earlier peers (§7.1).
 
 ### Details
 
@@ -544,6 +592,9 @@ ORDER BY id COLLATE "C" LIMIT remaining + 1` (the extra row is the lookahead tha
 whether the table is exhausted; at most `remaining` are delivered). When a walk completes its scope moves from `walking`
 to `scopes` (held). Only when `walking` is empty is the log read.
 
+**Rationale (2026-10-21):** Newly granted scopes are walked before the log because a principal
+gaining a scope mid-stream needs its current rows, not only changes committed after the grant.
+
 #### 7.4 Cursor ahead of head
 
 See Q2. No explicit `cursor ≤ head` check exists; the `client_scopes` lookup is what refuses a
@@ -642,6 +693,12 @@ prefix's outcomes with positions. Push never installs data; the pull after it ac
   `MalformedEnvelope` executes and records nothing.
 - INV-PUSH-5: Headers used by `principalFor` MUST be the real HTTP request headers, never
   per-message RPC headers a body could forge.
+
+  **Rationale (2026-10-22):** The pinned RPC HTTP protocol concatenates body-supplied message
+  headers after request headers, allowing NDJSON to override authentication headers; only
+  `HttpServerRequest.headers` is trusted, and request policy must not depend on a raw pathname
+  predicate that can miss the RPC route.
+
 - INV-PUSH-6: After a response, `pushedThrough` advances to the highest answered `seq`; a result
   whose position is `≤` the installed cursor, or whose outcome is `Rejected{ClientExpired}`, is
   covered already (no pull will ack it) and is released at once through a rebase with no
@@ -809,10 +866,21 @@ a leader-owned, server-fenced room membership with process-local state on the se
   RPC result), `server-outdated` (`ServerOutdated`), `server` (everything else: a stopped batch,
   a pull defect, `StoreUnavailable`, `ConstraintViolated`, `MalformedChange`,
   `ResnapshotRequired` on an initial request).
+
+  **Rationale (2026-10-22):** HTTP 401/403 refusals before RPC decoding are `unauthorized`
+  rather than network/protocol defects because the pinned HTTP RPC client ignores status and
+  an empty middleware or proxy refusal otherwise looks like a malformed response; retrying
+  preserves queued intent without halting push, and other statuses keep their classification.
+
 - INV-LOOP-5: Classification is over the whole cause: for push, a defect beats a halting failure
   beats the first failure; for pull, a defect is transient `server`. When push and pull both fail
   transiently in one cycle, `lastError` is push's, unless pull's kind is `server-outdated`, which
   overrides.
+
+  **Rationale (2026-10-23):** One typed `SyncFailure` union is classified once so status kind,
+  halt reason and telemetry agree; separate walks of transport `reason` strings in the engine,
+  loop and telemetry were rejected.
+
 - INV-LOOP-6: `SyncStatus` strings carry no secret: every `lastError.message` is drawn from a
   closed set of library constants (one per kind, plus the stopped-batch text for kind `server`);
   the `Halted` message is library text.
@@ -823,9 +891,18 @@ a leader-owned, server-fenced room membership with process-local state on the se
   after `LISTEN` is in place, covers anything missed while disconnected.
 - INV-LOOP-8: `syncHeaders` is evaluated once per outgoing request (push, pull, every stream
   (re)connect); its evaluation is not counted against `idleTimeout`.
+
+  **Rationale (2026-10-21):** Credential refresh belongs to the app and runs through an Effect
+  per request rather than frozen transport-construction headers; `Unauthorized` is retried
+  with backoff, never fatal, so refreshed credentials can recover the connection.
+
 - INV-LOOP-9: `SyncStatus = {push: Active | Halted{message}, lastError: {kind, message} | null,
   pendingMutations, lastSyncedAt, phase: idle | pushing | pulling | backoff, nextRetryAt}`;
   `status` and `changes` wait for the first real pending count (no seed 0 leaks).
+
+  **Rationale (2026-10-22):** `LeaderClient` exports `SyncError`, `SyncErrorKind` and
+  `SyncStatus` as runtime schemas, not only types, so an adapter need not declare its own copy
+  of the union.
 
 ### Details
 
@@ -841,6 +918,10 @@ nothing; a lost `LISTEN` connection ends the stream with `ServerUnavailable`. Th
 Liveness bound: a connection that died silently (a proxy that keeps the response open) is
 noticed after `idleTimeout` (45 s) and reconnected after the backoff; the change it would have
 announced is covered by the new stream's first poke.
+
+**Rationale (2026-10-21):** A silently dead stream behind a proxy left clients waiting
+forever; periodic heartbeats and an idle deadline were chosen to detect it without making
+heartbeat traffic wake the sync loop.
 
 #### 10.2 Presence on the server (`src/server/postgres/presence.ts`)
 
@@ -870,6 +951,10 @@ retry `presenceRetryDelay` 1 s doubling to 30 s.
 
 Departure lag: behind a proxy that does not forward the client's abort, a partner sees the
 departure only after the stream's idle timeout and heartbeat window, about 45 s.
+
+**Rationale (2026-10-23):** Departure lag was accepted rather than adding an explicit leave
+RPC: a direct server abort removed the entry in milliseconds, but a development reverse proxy
+swallowed the abort and left removal to the heartbeat/idle bound.
 
 ### Open Questions
 
@@ -913,6 +998,12 @@ answered by the released-row marker; a duplicate after that gets a fresh `seq`, 
 answers it from the kept identity (`ClientExpired` at its own position) whatever its `seq`; an
 unknown id at or below the floor is answered at `expired_position`.
 
+**Rationale (2026-10-21):** Expiring outcomes bounds their growth without forgetting mutation
+identities: deleting identities was rejected because a tab can retry `LeaderLost` with the
+same id after suspension past the released-marker window, re-enqueue at a fresh seq above the
+floor and double-apply. Ack-based retention, permanent floors and identity checks preserve
+that late-retry safety independently of log GC (§5, §9).
+
 ### Open Questions
 
 None.
@@ -933,6 +1024,11 @@ replica.
   database `echo-sync/<appId>/<profile>.db`, locks `echo:<appId>:<profile>:leader`,
   `…:leader:<leaderId>` (epoch), `…:tab:<tabId>`, `…:router`, reset channel `…:reset`, tombstone
   `echo-sync/<appId>/~reset-<sha256hex(profile)>`.
+
+  **Rationale (2026-10-21):** WebKit's 255-byte OPFS segment limit requires bounding each
+  identity segment, not only the combined path; otherwise accepted 256–488 byte profiles
+  failed late with `LeaderFailed{UnknownError}` instead of `Unsupported`.
+
 - INV-BRW-2: At most one leader per identity holds the database: election is the leader Web
   Lock (`tryHoldLock` then `holdLock`; `Waiting` is reported only when the first try fails,
   `Elected` once the database is open and the leader serves, `Failed` on any startup failure);
@@ -947,9 +1043,19 @@ replica.
   resubscribe on a defect-free all-`LeaderLost` cause and emit nothing in between;
   `subscribeRaw` ends. A cause with a defect beside `LeaderLost` is not a handover and passes
   through.
+
+  **Rationale (2026-10-22):** Cause-preserving recovery was chosen because `Stream.catchIf`
+  re-fails nonmatching errors bare and could drop a defect beside `LeaderLost`; resubscription
+  uses `Stream.catchCauseIf` and RPC error mapping uses `Cause.map` instead.
+
 - INV-BRW-5: The router is rebuildable from its clients: a router announces itself
   (`RouterStarted`) on its first `Hello`, every tab re-links, and a stale leader announcement is
   ignored (INV-BRW-3).
+
+  **Rationale (2026-10-21):** WebKit terminates the creating tab's SharedWorker even with
+  other tabs connected; rebuilding routes from clients prevents the relaunched, empty router
+  from leaving every tab unserved.
+
 - INV-BRW-6: Registered queries run in one read transaction with `PRAGMA query_only`; every
   emission is one snapshot; a query re-emits after a write to a table its latest run read and
   not after one it stopped reading; raw `exec`/`subscribeRaw` are refused without
@@ -961,8 +1067,22 @@ replica.
   (`ReplicaInUse` on timeout); with the lock: a tombstone present → done; `discardPending` false
   and unreleased entries → `PendingWrites{count}`; else write the tombstone, remove the
   directory, remove the tombstone.
+
+  **Rationale (2026-10-22):** Engine-owned coordinated close replaces requiring apps to close
+  tab clients first: otherwise any live leader made reset fail `ReplicaInUse`, with nothing
+  closing other tabs; a finite lock deadline still fails closed when a client ignores the signal.
+
+  **Rationale (2026-10-22):** Coordination is for deletion only; an engine `closeAll` for
+  sign-out that keeps the replica was rejected, so the app owns cross-tab scope closure when
+  retaining readable data.
+
 - INV-BRW-8: A leader that finds the tombstone completes the removal before opening the
   database (durability across a crash mid-reset).
+
+  **Rationale (2026-10-22):** Recursive removal can crash after leaving a partial replica;
+  recording deletion under the leader lock before removal lets the next leader finish it
+  before opening, and the `~` tombstone prefix cannot collide with a valid profile.
+
 - INV-BRW-9: Modes: `shared-worker` (every tab served through the router), `single-tab` (no
   `SharedWorker`; only the tab whose own worker leads is served, others fail
   `SecondaryTabWithoutRouter`), `unsupported` (a capability missing; everything fails
@@ -1127,6 +1247,11 @@ metric registry and loggers the host provides, through a sanitizing boundary
 (`src/internal/Telemetry.ts`) that admits only closed vocabularies. Nothing the host can see
 carries an id, a cursor, a payload, a header or an error message from the engine's internals.
 
+**Rationale (2026-10-22):** Host-owned telemetry through pinned Effect primitives was chosen
+instead of shipping exporters, OTLP or sampling; worker entries expose Effects the host can
+run in its own telemetry context. Raw-cause logs can expose headers, URLs and bodies, so fixed
+routine lines and a sanitizing tracer with `Exit.void` replace unguarded export.
+
 ### Invariant digest
 
 - INV-TEL-1: Spans the host may see are created only by `Telemetry.observe` / `observeStream`,
@@ -1183,6 +1308,10 @@ leader epoch failed`, `echo router: watching leader epoch failed`, `echo router:
 failed`, `echo router: leader announcement failed`, `presence revocation watch restarting`,
 `echo leader completed the removal of a replica condemned by an interrupted reset`.
 
+**Rationale (2026-10-24):** Names, outcomes, counters and log messages use closed compiler-checked
+literal types instead of `string` parameters beside runtime allow-lists: misspelled outcomes
+previously fell back to `server` and missing log lines disappeared silently.
+
 #### 14.2 Boundary
 
 `boundary(work)` replaces the fiber's `Tracer` with one that opens a host span only for a
@@ -1206,7 +1335,7 @@ the outcome of a clean end.
 Every error the engine can produce is a tagged class in a closed union; the tag is part of the
 contract. The table names where each is raised, whether a client retries it, and what the
 client does. "Retry" is from the sync loop's point of view (§10); "design change" means adding a
-member is recorded in `docs/DECISIONS.md` (§0.2).
+member updates the rule and its dated rationale here (§0.2).
 
 ### Invariant digest
 
@@ -1220,6 +1349,10 @@ member is recorded in `docs/DECISIONS.md` (§0.2).
   never carries a header value, cookie, URL or credential. Error messages are for the app's
   diagnostics, not for `SyncStatus` (INV-LOOP-6), which is the only engine string meant for a
   screen.
+
+  **Rationale (2026-10-23):** Typed wrappers retain the original cause and location because
+  a bare `SchemaError` did not identify the stored table or row, while
+  `new Error(String(cause))` discarded the cause of browser storage failures.
 
 ### Details
 
@@ -1395,7 +1528,17 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 - The package compiles under every TypeScript strictness flag its own `tsconfig.json` enables
   (`strict`, `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`, `noImplicitReturns`,
   `noPropertyAccessFromIndexSignature`, `noImplicitOverride`, `noUncheckedSideEffectImports`, …),
-  because consumers typecheck the shipped source under their own options (DECISIONS 28).
+  because consumers typecheck the shipped source under their own options.
+
+  **Rationale (2026-10-23):** These flags are supported because consumers compile the shipped
+  source; requiring consumers to relax `noImplicitReturns` or
+  `noPropertyAccessFromIndexSignature` for a git dependency was rejected.
+
+### Retired rules
+
+- **Retired (2026-10-22):** Apps must close all tab clients before `resetReplica` (2026-10-21); engine-owned coordinated close supersedes this prerequisite (INV-BRW-7, §12).
+
+### Coverage
 
 | ID | status | covering test(s) |
 |---|---|---|
@@ -1795,7 +1938,7 @@ Historical ledger simulations (40 seeds × 400 steps, counting each seed's first
 | identities kept, ClientExpired released on receipt | yes | on | 0 | 0 | 40 |
 
 The kept-identity model also passed 120 seeds. The real Postgres expiry E2E covers the
-time-dependent late retry after 24 h marker pruning and 7 d outcome expiry (DECISIONS 5).
+time-dependent late retry after 24 h marker pruning and 7 d outcome expiry (§11).
 Each mutation retains roughly 50–80 bytes of identity/index entries permanently; only outcome
 payloads are reclaimed. PostgreSQL 15+ is needed by the verifier's
 `pg_index.indnullsnotdistinct`; the engine schema alone needs PG14's replaceable triggers.

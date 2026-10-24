@@ -2,10 +2,10 @@
 
 Read `docs/SPEC.md` first. It is the contract: the normative specification, derived from the
 code, with every invariant under a stable `INV-<AREA>-<n>` ID (§17 maps each to its test) and
-every limit in §18. `docs/DECISIONS.md` is the dated record of the rulings behind it. If the SPEC
+every limit in §18. Dated rationale notes live next to the rules they explain. If the SPEC
 is wrong, say so in your report and fix the SPEC; do not silently diverge in either direction.
 The complete `docs/` set is `SPEC.md` (contract, with explicitly non-normative mechanism and
-verification appendices), `DECISIONS.md` (rulings), and `getting-started.md` (the human how-to).
+verification appendices) and `getting-started.md` (the human how-to).
 
 ## Repo shape
 
@@ -13,7 +13,7 @@ verification appendices), `DECISIONS.md` (rulings), and `getting-started.md` (th
   TypeScript source (`exports` → `src/**/*.ts`). No build step, no npm publish.
 - `src/core` (shared: SyncTable, AccessScope, Mutation, Store interface, RPC contracts),
   `src/server` (Postgres + RPC handlers), `src/client` (browser leader worker, replica, outbox,
-  queries), `src/foldkit` (the FoldKit adapter, entry point `echo-sync/foldkit`, DECISIONS 17).
+  queries), `src/foldkit` (the FoldKit adapter, entry point `echo-sync/foldkit`, SPEC §1).
   The engine is UI-framework agnostic: `src/core`, `src/client` and `src/server` carry no
   framework knowledge, and every UI adapter is a separate entry point that is a thin translation
   of the `src/client` tab-side API (SPEC §9, §12), adds no sync semantics, and imports nothing from
@@ -51,8 +51,10 @@ verification appendices), `DECISIONS.md` (rulings), and `getting-started.md` (th
   changed), then fast-forward push `main`. Never force-push `main`. No pull requests.
 - A change to engine behavior is a design change: in the same branch, update `docs/SPEC.md`
   (the affected section, its invariant digest and the §17/§18 tables; a new invariant takes the
-  next unused ID, a withdrawn one keeps its ID and is marked withdrawn) and append a dated
-  paragraph to `docs/DECISIONS.md` with the problem, the ruling and the SPEC section it changed.
+  next unused ID, a withdrawn one keeps its ID and is marked withdrawn) and its rationale.
+  Write a new ruling next to the rule it changes as `**Rationale (YYYY-MM-DD):**` followed by
+  one or two sentences giving the decision, reason and rejected alternative where there was one.
+  Keep superseded rules as one-line tombstones in §17's Retired rules list.
   Consumers pin a commit SHA, so an app picks up a change only by bumping its pin.
 
 ## Tests

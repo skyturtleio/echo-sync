@@ -2,7 +2,6 @@
 
 > Consumer guide for SPEC §3, §4, §5, §8 and §13 (wiring a server). Non-normative: where this page disagrees with
 > [`docs/SPEC.md`](SPEC.md), the SPEC wins and the disagreement is a SPEC Open Question.
-> `DECISIONS N` refers to [`docs/DECISIONS.md`](DECISIONS.md).
 
 This page covers how a consumer app wires the Echo Sync server: its tables, its mutations, its
 app migrations, startup, and the request principal. The worked example is
