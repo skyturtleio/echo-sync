@@ -1,0 +1,18 @@
+{
+  "spanNames": ["echo.enqueue", "echo.push", "echo.pull", "echo.install", "echo.rebase", "echo.pokes", "echo.leader.election", "echo.leader.handover", "echo.router.handover", "echo.server.startup", "echo.server.push", "echo.server.pull", "echo.server.pokes"],
+  "outcomeValues": ["ok", "credentials", "unauthorized", "unavailable", "network", "server", "outdated", "server-outdated", "malformed", "resnapshot", "interrupted", "defect", "rejected", "forbidden", "halted", "stopped", "saved", "duplicate", "elected", "lost", "idle-timeout", "server-end", "page", "done"],
+  "countKeys": ["echo.batch_size", "echo.processed", "echo.applied", "echo.rejected", "echo.pages", "echo.resnapshot_count", "echo.pending", "echo.replayed", "echo.released", "echo.notices_rejected", "echo.notices_unknown", "echo.pokes", "echo.heartbeats", "echo.changes", "echo.acks"],
+  "attributeKeys": ["echo.outcome", "echo.result", "echo.reason", "echo.resnapshot"],
+  "eventNames": [],
+  "logMessages": ["echo-sync: diagnostics", "echo-sync: unknown table change skipped", "echo-sync: push halted by an integrity error", "echo-sync: push failed; retrying", "echo-sync: pull failed; retrying", "echo-sync: pending count failed; restarting", "echo-sync: pokes stream ended; reconnecting", "echo-sync: presence track failed; retrying", "echo leader candidate cannot serve", "echo: connecting to leader failed", "echo: accepting a router connection failed", "echo: watching this tab's leader epoch failed", "echo: watching leader epoch failed", "echo router: watching leader epoch failed", "echo router: watching tab failed", "echo router: leader announcement failed", "presence revocation watch restarting", "echo leader completed the removal of a replica condemned by an interrupted reset"],
+  "ProtocolErrors": ["ResnapshotRequired", "Unauthorized", "ClientOutdated", "MalformedEnvelope", "ServerUnavailable", "Forbidden"],
+  "ResnapshotRequired": ["gcHorizon", "unknownCursor", "staleContinuation"],
+  "UnauthorizedReason": ["authenticationRefused", "principalMismatch", "clientPrincipalMismatch", "wildcardPrincipal", "httpUnauthorized"],
+  "SyncFailureErrors": ["CredentialsUnavailable", "PushIntegrityError", "PullProtocolError", "MalformedChange", "ServerOutdated", "PushTransportError", "PullTransportError"],
+  "PushIntegrityError": ["invalidPayload", "serverDefect"],
+  "SyncErrorKind": ["credentials", "unauthorized", "unavailable", "network", "server", "outdated", "server-outdated"],
+  "Notice": ["Rejected", "OutcomeUnknown"],
+  "MutationRejection": ["UnknownMutation", "ArgsDecodeFailed", "RowNotFound", "RowAlreadyExists", "ScopeForbidden", "InvalidRow", "DomainError", "ConstraintViolated", "ClientExpired"],
+  "PushReason": ["CredentialsUnavailable", "Unauthorized", "ClientOutdated", "MalformedEnvelope", "PushIntegrityError", "RpcClientError"],
+  "PullReason": ["CredentialsUnavailable", "Unauthorized", "ClientOutdated", "ServerUnavailable", "PullProtocolError", "RpcClientError"]
+}

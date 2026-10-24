@@ -1328,6 +1328,13 @@ routine lines and a sanitizing tracer with `Exit.void` replace unguarded export.
   removed; the cause is logged separately at Debug under the annotation `echo.diagnostics: true`
   (the only place a host can opt into seeing engine causes). A line whose cause is an interrupt
   is logged at Debug whatever its level.
+- INV-TEL-6: The telemetry and error/notice vocabularies in §14–15 equal the committed
+  `docs/vocabularies.json` lists, checked by `test/vocabularies.test.ts` in the default gate.
+  A new member requires an explicit specification change, not only a source edit.
+
+**Rationale (2026-10-24):** A committed, normative JSON vocabulary beside this spec makes
+closed-set drift fail CI without adding runtime exports for private telemetry lists.
+Compiler exhaustiveness alone cannot detect a newly added but unspecified name.
 
 ### Details
 
@@ -1377,9 +1384,7 @@ the outcome of a clean end.
 
 ### Open Questions
 
-- OQ-TEL-1: The closed vocabularies are enforced at the boundary but not asserted against a
-  committed list: adding an outcome or count key is a one-line change in `Telemetry.ts` that no
-  test or registry notices. §0.2 makes it a design change; tooling to check it is future work.
+None.
 
 ## 15. Error catalog
 
@@ -1389,6 +1394,12 @@ Every error the engine can produce is a tagged class in a closed union; the tag 
 contract. The table names where each is raised, whether a client retries it, and what the
 client does. "Retry" is from the sync loop's point of view (§10); "design change" means adding a
 member updates the rule and its dated rationale here (§0.2).
+
+`docs/vocabularies.json` is the normative machine-readable companion for §14.1 and the wire
+error tags/reasons, client sync failure tags/reasons, mutation rejection tags and notice tags
+in this chapter. Notice tags are `Rejected` and `OutcomeUnknown` (§9.5). Span event names are
+the empty set: no event is exported. Attribute keys are the four fixed keys of INV-TEL-2 plus
+the count keys. Changes to these lists must also update the corresponding prose catalog.
 
 ### Invariant digest
 
@@ -1785,6 +1796,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-TEL-3 | covered | `observability.e2e` "throwing host sinks cannot change saved intent, retry deadlines, halt or successful installs", "closing a pulled subscription in the host context retains its own outcome and protects cleanup and the host parent" |
 | INV-TEL-4 | covered | `observability.e2e` "the whole final push cause remains authoritative, including typed cleanup failures", "batch telemetry agrees with the loop's whole-cause decision, not the first failure"; `SyncLoop.test` "a pokes connection the idle timeout ends must record idle-timeout, and one the server ends server-end" |
 | INV-TEL-5 | partial | `observability.e2e` "RPC request context cannot bypass sanitization for typed failures, defects, SQL spans or tracerLogger events" (the Debug downgrade of interrupted causes is untested) |
+| INV-TEL-6 | covered | `vocabularies.test` "telemetry, wire errors and client failure or notice vocabularies cannot drift from SPEC §14–15" |
 | INV-ERR-1 | covered | `Transport.test` "Unauthorized reason schema matches the closed catalog in SPEC §15", "a server Unauthorized surfaces its diagnostic reason without changing the unauthorized verdict", "HTTP auth refusals before RPC decoding report unauthorized, retry without halting, and keep the pending mutation; other statuses stay network"; `rpc.test` "push, pull and pokes asserting another principal than the session's run no statement or policy and change no row, even for a bound client", "an app authentication refusal carries authenticationRefused through the public RPC surface", "a client bound to another principal carries clientPrincipalMismatch through the public RPC surface", "push, pull and pokes authenticated as * are Unauthorized before they bind or ledger" |
 | INV-ERR-2 | partial | `SqliteRowStore.test` "a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError"; OPFS diagnostic coverage is in browser scenarios only |
 | INV-PERF-1 | covered | `ordering.test` "without the trigger's advisory lock that reader skips the earlier writer (the ordering check can fail)" (the lock is held; its throughput consequence is not measured) |
@@ -1859,7 +1871,6 @@ machine-verifiable literal test-title citations.
 | OQ-CLI-1 | §9 (Q3), §16 | full rebase: 49.41 ms for 5/50, 651.39 ms for 500/5,000 pending/changes (Bun memory VFS); algorithm decision remains open |
 | OQ-LOOP-1 | §10 | the push halt is in memory per leader; a new leader retries the batch and halts again |
 | OQ-SCH-1 | §13 | new-server-before-migration tolerance of an added column untested |
-| OQ-TEL-1 | §14 | closed telemetry vocabularies not asserted against a committed list |
 
 ## Appendix C. Browser mechanisms and verification notes (non-normative)
 
