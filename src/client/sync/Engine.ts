@@ -8,7 +8,8 @@
  *
  * Replay-set invariant (INV-CLI-6): a pending mutation leaves the outbox only inside the transaction
  * that installs a complete pull page set (`PullDone`) carrying its ack, or when a push response
- * reports an outcome the installed replica already covers. `PullPage`s are staged durably and
+ * reports an outcome the installed replica already covers, or bounded transient answers exhaust
+ * it (INV-MUT-15). `PullPage`s are staged durably and
  * never applied on their own: a page's payloads are read at that page's snapshot, which can
  * already contain effects whose log entries (and acks) arrive in later pages, so applying early
  * would either expose a torn transaction or replay a pending mutation over a server row that
@@ -133,7 +134,7 @@ const replay = (context: Context, entry: PendingMutation) =>
     const { storage } = context
     const run = yield* runHandler(storage.rows, context.mutations, context.actor, entry.envelope, entry.createdAt)
     // A pending mutation that no longer applies locally has no optimistic effect; it stays
-    // queued because only the server's verdict removes it.
+    // queued until the server's verdict or bounded transient exhaustion removes it.
     if (Option.isSome(run.rejection)) {
       yield* restore(storage.rows, run.undo)
       yield* storage.setUndo(entry.envelope.seq, [])
@@ -262,7 +263,7 @@ export const applyPageSet = (
 export interface PushResult {
   /** Number of mutations the server reported as processed in this cycle. */
   readonly processed: number
-  /** The server stopped at a transient failure (fewer results than mutations sent). */
+  /** Any batch stopped transiently, even if exhaustion let this push continue afterward. */
   readonly stopped: boolean
 }
 
@@ -308,6 +309,8 @@ export const make = (options: {
     const batchSize = Math.min(options.pushBatchSize ?? 50, 100)
     const pushLock = yield* Semaphore.make(1)
     const pullLock = yield* Semaphore.make(1)
+    // Per-leader only, like the loop's integrity halt. Network failures never touch this map.
+    const transientAnswers = new Map<Ids.MutationId, number>()
 
     const mutate = (mutationId: Ids.MutationId, name: string, args: Schema.Json) =>
       Telemetry.observe(
@@ -344,12 +347,15 @@ export const make = (options: {
     const push = pushLock.withPermit(
       Effect.gen(function* () {
         let processed = 0
+        let sawTransient = false
         while (true) {
           const { meta, pending } = yield* storage.transaction(
             Effect.all({ meta: storage.meta, pending: storage.pending })
           )
+          const pendingIds = new Set(pending.map((entry) => entry.envelope.mutationId))
+          for (const id of transientAnswers.keys()) if (!pendingIds.has(id)) transientAnswers.delete(id)
           const batch = pending.filter((entry) => entry.envelope.seq > meta.pushedThrough).slice(0, batchSize)
-          if (!Arr.isReadonlyArrayNonEmpty(batch)) return { processed, stopped: false }
+          if (!Arr.isReadonlyArrayNonEmpty(batch)) return { processed, stopped: sawTransient }
           const stopped = yield* Telemetry.observe(
             Effect.gen(function* () {
               yield* Telemetry.annotate({ "echo.batch_size": batch.length })
@@ -367,8 +373,13 @@ export const make = (options: {
                 }))
               })
               // `results` is the processed prefix of the request, in request (= seq) order.
+              const firstMissing = batch[response.results.length]
+              const attempts =
+                firstMissing === undefined ? 0 : (transientAnswers.get(firstMissing.envelope.mutationId) ?? 0) + 1
+              const exhausted = attempts >= 8
+              if (firstMissing !== undefined) sawTransient = true
               const through = batch[response.results.length - 1]?.envelope.seq
-              if (through !== undefined) {
+              if (through !== undefined || exhausted) {
                 yield* storage.transaction(
                   Effect.gen(function* () {
                     const current = yield* storage.meta
@@ -388,15 +399,36 @@ export const make = (options: {
                         )
                         .map((result) => [result.mutationId, result.outcome])
                     )
-                    if (covered.size > 0) {
+                    if (covered.size > 0 || exhausted) {
                       yield* rebase(context, Effect.void, (envelope) => {
                         const outcome = covered.get(envelope.mutationId)
-                        return outcome === undefined ? Option.none() : Option.some(noticeFor(envelope, outcome))
+                        if (outcome !== undefined) return Option.some(noticeFor(envelope, outcome))
+                        if (exhausted && envelope.mutationId === firstMissing?.envelope.mutationId) {
+                          return Option.some(
+                            Option.some({
+                              _tag: "Rejected",
+                              envelope,
+                              error: new Mutation.TransientExhausted({
+                                attempts,
+                                message: "the server stopped the push batch at a transient failure"
+                              })
+                            })
+                          )
+                        }
+                        return Option.none()
                       })
                     }
-                    yield* storage.setMeta({ ...current, pushedThrough: Math.max(current.pushedThrough, through) })
+                    if (through !== undefined) {
+                      yield* storage.setMeta({ ...current, pushedThrough: Math.max(current.pushedThrough, through) })
+                    }
                   })
                 )
+              }
+              // Publish counts only after bookkeeping commits: a local rollback must not count.
+              for (const result of response.results) transientAnswers.delete(result.mutationId)
+              if (firstMissing !== undefined) {
+                if (exhausted) transientAnswers.delete(firstMissing.envelope.mutationId)
+                else transientAnswers.set(firstMissing.envelope.mutationId, attempts)
               }
               yield* Telemetry.annotate({
                 "echo.processed": response.results.length,
@@ -405,7 +437,7 @@ export const make = (options: {
                 "echo.result": response.results.length < batch.length ? "stopped" : "ok"
               })
               processed += response.results.length
-              return response.results.length < batch.length
+              return firstMissing !== undefined && !exhausted
             }),
             "echo.push",
             (cause) => SyncFailure.classifyPush(cause).outcome
@@ -477,6 +509,9 @@ export const make = (options: {
               "echo.install",
               (cause) => SyncFailure.classifyPull(cause).outcome
             )
+            for (const installed of [...staged, response]) {
+              for (const ack of installed.acks) transientAnswers.delete(ack.mutationId)
+            }
             yield* Telemetry.histogram("echo.pull.pages", staged.length + 1)
             yield* Telemetry.annotate({
               "echo.pages": staged.length + 1,

@@ -2,7 +2,7 @@ import { assert, describe, it } from "@effect/vitest"
 import type { Scheduler } from "effect/Scheduler"
 import { DateTime, Deferred, Effect, Fiber, Option, Schema } from "effect"
 import * as Engine from "../Engine.ts"
-import { Ids, Mutation, Protocol, ScopeGrants } from "../../../core/index.ts"
+import { Errors, Ids, Mutation, Protocol, ScopeGrants } from "../../../core/index.ts"
 import type { SyncTable } from "../../../core/index.ts"
 import * as MemoryStore from "../../../core/testing/MemoryStore.ts"
 import * as MemorySyncStorage from "./MemorySyncStorage.ts"
@@ -65,7 +65,192 @@ const scriptedPulls = (disk: MemorySyncStorage.Disk, responses: Array<Protocol.P
     }
   })
 
+const transientScenario = (scenario: {
+  readonly network?: boolean
+  readonly applied?: boolean
+  readonly restart?: boolean
+  readonly storageFailure?: boolean
+}) =>
+  Effect.gen(function* () {
+    const server = RefServer.make({ pageSize: 3 })
+    server.register(clientId, principal("p"))
+    yield* server.writeDirect([
+      { table: ScopeGrants.ScopeGrants, id: grantId, row: Option.some(grant) },
+      { table: Counters, id: "x", row: Option.some(counter) }
+    ])
+    const disk = MemorySyncStorage.makeDisk()
+    let answers = 0
+    let network = false
+    let storageFailure = false
+    const storage = MemorySyncStorage.make(disk)
+    const options = {
+      ...engineOptions,
+      storage: {
+        ...storage,
+        addNotices: (notices: ReadonlyArray<Engine.Notice>) =>
+          Effect.gen(function* () {
+            yield* storage.addNotices(notices)
+            if (storageFailure) return yield* new Errors.StoreUnavailable({ message: "disk unavailable" })
+          })
+      },
+      transport: {
+        push: (request: Protocol.PushRequest) =>
+          Effect.suspend(() => {
+            if (network) return Effect.fail(Simulation.pushLost("request"))
+            if (request.mutations[0].mutationId === id("blocked")) {
+              answers++
+              if (!scenario.applied || answers < 8) return server.push(request, Option.some(0))
+            }
+            return server.push(request, Option.none())
+          }),
+        pull: server.pull
+      }
+    }
+    let engine = yield* Engine.make(options)
+    yield* engine.pull
+    yield* engine.mutate(id("blocked"), "increment", { id: "x", by: 11 })
+    const next = yield* engine.mutate(id("next"), "increment", { id: "x", by: 3 })
+    for (let attempt = 0; attempt < 7; attempt++) {
+      assert.isTrue((yield* engine.push).stopped)
+      if (scenario.network) {
+        network = true
+        yield* Effect.flip(engine.push)
+        network = false
+      }
+      assert.lengthOf(disk.notices, 0)
+      assert.lengthOf(disk.outbox, 2)
+      assert.equal(valueOf(disk, "x"), 14)
+    }
+    if (scenario.restart) {
+      engine = yield* Engine.make(options)
+      for (let attempt = 0; attempt < 7; attempt++) {
+        yield* engine.push
+        assert.lengthOf(disk.notices, 0)
+        assert.lengthOf(disk.outbox, 2)
+      }
+    }
+    if (scenario.storageFailure) {
+      storageFailure = true
+      yield* Effect.flip(engine.push)
+      storageFailure = false
+      assert.lengthOf(disk.notices, 0)
+      assert.lengthOf(disk.outbox, 2)
+      assert.equal(valueOf(disk, "x"), 14)
+    }
+    const result = yield* engine.push
+    assert.equal(result.stopped, !scenario.applied)
+    assert.equal(result.processed, scenario.applied ? 2 : 1)
+    assert.equal(valueOf(disk, "x"), scenario.applied ? 14 : 3)
+    assert.equal(disk.meta.pushedThrough, next.seq)
+    if (!scenario.applied) {
+      assert.deepEqual(
+        disk.outbox.map((entry) => entry.envelope.mutationId),
+        [id("next")]
+      )
+      assert.lengthOf(disk.notices, 1)
+      const notice = Schema.decodeUnknownSync(Mutation.Notice)(JSON.parse(JSON.stringify(disk.notices[0])))
+      assert.equal(notice.envelope.mutationId, id("blocked"))
+      assert.equal(notice._tag, "Rejected")
+      if (notice._tag === "Rejected")
+        assert.deepEqual(
+          notice.error,
+          new Mutation.TransientExhausted({
+            attempts: 8,
+            message: "the server stopped the push batch at a transient failure"
+          })
+        )
+    }
+    yield* engine.pull
+    assert.lengthOf(disk.outbox, 0)
+    assert.lengthOf(disk.notices, scenario.applied ? 0 : 1)
+    assert.equal(valueOf(disk, "x"), scenario.applied ? 14 : 3)
+    assert.isFalse((yield* engine.push).stopped)
+  })
+
 describe("reconciliation simulation", () => {
+  it.effect("eight transient answers release only the exhausted effect and push the next entry", () =>
+    transientScenario({})
+  )
+  it.effect("seven transient answers followed by applied do not discard the mutation", () =>
+    transientScenario({ applied: true })
+  )
+  it.effect("network failures between transient answers do not exhaust the mutation early", () =>
+    transientScenario({ network: true })
+  )
+  it.effect("a leader restart resets transient answers without discarding intent", () =>
+    transientScenario({ restart: true })
+  )
+  it.effect("a failed exhaustion transaction preserves the optimistic replica and prior answer count", () =>
+    transientScenario({ storageFailure: true })
+  )
+
+  it.effect("a failed processed-prefix transaction cannot count its transient stop", () =>
+    Effect.gen(function* () {
+      const disk = installedDisk()
+      const storage = MemorySyncStorage.make(disk)
+      let fail = true
+      const engine = yield* Engine.make({
+        ...engineOptions,
+        storage: {
+          ...storage,
+          setMeta: (meta) =>
+            Effect.gen(function* () {
+              yield* storage.setMeta(meta)
+              if (fail) return yield* new Errors.StoreUnavailable({ message: "disk unavailable" })
+            })
+        },
+        transport: {
+          push: (request) =>
+            Effect.succeed({
+              results:
+                request.mutations[0].mutationId === id("prefix")
+                  ? [
+                      {
+                        mutationId: id("prefix"),
+                        position: position(1n),
+                        outcome: { _tag: "Applied" }
+                      }
+                    ]
+                  : []
+            }),
+          pull: () => Effect.die("unused")
+        }
+      })
+      yield* engine.mutate(id("prefix"), "increment", { id: "x", by: 2 })
+      yield* engine.mutate(id("blocked"), "increment", { id: "x", by: 11 })
+      yield* Effect.flip(engine.push)
+      fail = false
+      assert.equal(disk.meta.pushedThrough, 0)
+      assert.equal(valueOf(disk, "x"), 13)
+      for (let attempt = 0; attempt < 7; attempt++) {
+        yield* engine.push
+        assert.lengthOf(disk.notices, 0)
+        assert.equal(valueOf(disk, "x"), 11)
+      }
+      yield* engine.push
+      assert.lengthOf(disk.outbox, 0)
+      assert.equal(valueOf(disk, "x"), 0)
+      const notice = disk.notices[0]
+      assert.equal(
+        notice?._tag === "Rejected" && notice.error._tag === "TransientExhausted" ? notice.error.attempts : 0,
+        8
+      )
+    })
+  )
+
+  it.effect(
+    "a forever-transient mutation cannot prevent simulation convergence or corrupt the replica",
+    () =>
+      Effect.gen(function* () {
+        for (let seed = 1; seed <= 10; seed++) {
+          const stats = yield* Simulation.run({ seed, steps: 400, persistentTransient: true })
+          assert.isAbove(stats.exhausted, 0)
+          assert.isAbove(stats.mutations, stats.exhausted)
+        }
+      }),
+    60_000
+  )
+
   it.effect(
     "random schedules keep every client = replay(pending, server@cursor) and lose/duplicate no intent",
     () =>

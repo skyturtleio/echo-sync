@@ -174,6 +174,31 @@ it.effect("lastSyncedAt stays null after a cycle whose pull failed, and is set b
   })
 )
 
+it.effect("a stopped push that processed later entries cannot advance lastSyncedAt or halt push", () =>
+  Effect.gen(function* () {
+    let pushes = 0
+    const engine: Engine.Engine = {
+      mutate: () => Effect.die("unused"),
+      push: Effect.sync(() => ({ processed: 1, stopped: ++pushes === 1 })),
+      pull: Effect.void
+    }
+    yield* TestClock.adjust("5 seconds")
+    const loop = yield* SyncLoop.make({ engine, pendingMutations: noPending })
+    yield* Effect.forkChild(loop.run)
+    yield* settle
+    expect(yield* loop.status).toMatchObject({
+      push: { _tag: "Active" },
+      lastSyncedAt: null,
+      phase: "backoff",
+      nextRetryAt: 6000,
+      lastError: { kind: "server" }
+    })
+    yield* TestClock.adjust("1 second")
+    yield* settle
+    expect(yield* loop.status).toMatchObject({ lastSyncedAt: 6000, phase: "idle", lastError: null })
+  })
+)
+
 it.effect(
   "a defect beside a transient failure halts push (whole-cause classification); a pull defect is transient",
   () =>

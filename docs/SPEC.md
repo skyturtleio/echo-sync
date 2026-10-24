@@ -1778,7 +1778,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-MUT-14 | covered | `rpc.test` "an old client omitting createdAt must retain server time and still obey clientPolicy" |
 | INV-MUT-15 | covered | `Simulation.test` "eight transient answers release only the exhausted effect and push the next entry", "a forever-transient mutation cannot prevent simulation convergence or corrupt the replica" |
 | INV-MUT-16 | covered | `Simulation.test` "seven transient answers followed by applied do not discard the mutation", "a leader restart resets transient answers without discarding intent" |
-| INV-MUT-17 | covered | `Simulation.test` "network failures between transient answers do not exhaust the mutation early" |
+| INV-MUT-17 | covered | `Simulation.test` "network failures between transient answers do not exhaust the mutation early", "a failed exhaustion transaction preserves the optimistic replica and prior answer count", "a failed processed-prefix transaction cannot count its transient stop" |
 | INV-POS-1 | covered | `ordering.test` "a reader pulling after a later writer commits never skips an earlier writer still in flight", "without the trigger's advisory lock that reader skips the earlier writer (the ordering check can fail)", "a reader advancing its cursor during many random out-of-order commits never misses a change (stress)" |
 | INV-POS-2 | covered | `capture.test` "TRUNCATE on a synced table fails instead of silently bypassing the log", "writes from outside any mutator (scripts, cascades) are captured like any other" |
 | INV-POS-3 | partial | `scopes.test` "a scope move deletes the row for old-scope readers and delivers it to new-scope readers" (payload-free log rows untested) |
@@ -1818,7 +1818,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-CLI-12 | covered | `SqliteSyncStorage.test` "an index-only change keeps rows and cursor; a data-shape change rebuilds and resets them together", "a data-shape migration interrupted at any scheduler boundary leaves the old replica or the new one, never a mix" |
 | INV-CLI-13 | covered | `version-gate.e2e` "unknown-table changes must not stall an old client or be lost after its registry update" |
 | INV-LOOP-1 | covered | `SyncLoop.test` "a transient push failure is retried with backoff and clears once a cycle succeeds"; `Leader.test` "requestSync during backoff runs the next cycle at once and leaves a halted push halted" |
-| INV-LOOP-2 | covered | `SyncLoop.test` "lastSyncedAt stays null after a cycle whose pull failed, and is set by the first cycle that installs"; `Leader.test` "a push whose response is lost keeps the entry pending until the pull installs its ack, and that cycle sets no lastSyncedAt" |
+| INV-LOOP-2 | covered | `SyncLoop.test` "lastSyncedAt stays null after a cycle whose pull failed, and is set by the first cycle that installs", "a stopped push that processed later entries cannot advance lastSyncedAt or halt push"; `Leader.test` "a push whose response is lost keeps the entry pending until the pull installs its ack, and that cycle sets no lastSyncedAt" |
 | INV-LOOP-3 | covered | `SyncLoop.test` "an integrity error halts push for good while pull keeps running"; supplementary browser scenarios cover handover and pending export |
 | INV-LOOP-4 | covered | `version-gate.e2e` "a client below the generated floor stops retrying, can mutate offline, and delivers the original intents after update"; `Transport.test` "a syncHeaders that dies is reported as kind credentials", "a refused connection is reported as kind network, and the request's headers never reach the message", "a server Unauthorized surfaces its diagnostic reason without changing the unauthorized verdict", "HTTP auth refusals before RPC decoding report unauthorized, retry without halting, and keep the pending mutation; other statuses stay network", "a server ServerUnavailable is reported as kind unavailable" |
 | INV-LOOP-5 | covered | `SyncLoop.test` "a defect beside a transient failure halts push (whole-cause classification); a pull defect is transient"; `observability.e2e` "the whole final push cause remains authoritative, including typed cleanup failures" |
@@ -1918,7 +1918,8 @@ machine-verifiable literal test-title citations.
 - **Page set**: the `PullPage*, PullDone` sequence between two cursors. **Continuation**: the
   server's unsigned resume token between pages of one set.
 - **Outbox**: the client's durable queue of mutations with undo images. **Pending**: unreleased
-  outbox entries. **Released**: an entry the server's verdict settled; kept as a marker for 24 h.
+  outbox entries. **Released**: an entry settled by the server's verdict or client transient
+  exhaustion; kept as a marker for 24 h.
 - **Rebase**: undo-all, install, settle, replay-all (§9).
 - **Leader**: the one worker per identity that owns the SQLite database. **Router**: the
   `SharedWorker` that connects tabs to the leader. **Epoch**: a leader's instance lock.

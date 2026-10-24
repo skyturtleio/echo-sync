@@ -18,9 +18,9 @@
  *   over a row that already contains the mutation), torn page sets, and stale rows.
  * - the outbox never holds a mutation whose ledger position is ≤ the installed cursor;
  * - no mutation is ever executed twice on the server.
- * After quiescence: every locally committed mutation executed exactly once, outboxes empty,
- * replicas equal the server restricted to readable scopes, and each server rejection
- * surfaced as exactly one notice.
+ * After quiescence: every locally committed mutation executed exactly once or was exhausted
+ * unexecuted with exactly one notice; outboxes empty, replicas equal the server restricted
+ * to readable scopes, and each server rejection surfaced as exactly one notice.
  */
 import { Array as Arr, Clock, Deferred, Effect, Fiber, Option, Order, Schema } from "effect"
 import { TestClock } from "effect/testing"
@@ -83,6 +83,8 @@ export interface Options {
   readonly seqFromPending?: boolean
   /** GC the ledger together with the log ("ledger GC'd while client offline"). */
   readonly ledgerGc?: boolean
+  /** One mutation is always answered transient, including during quiescence. */
+  readonly persistentTransient?: boolean
 }
 
 export interface Stats {
@@ -91,6 +93,7 @@ export interface Stats {
   readonly reloadsMidSet: number
   readonly notices: number
   readonly transientStops: number
+  readonly exhausted: number
   readonly lostResponses: number
   /** Duplicates (pruned-marker retries) released by a push response's position (INV-PUSH-6 corollary). */
   readonly backstopReleases: number
@@ -204,12 +207,14 @@ export const run = (options: Options) =>
     const trace: Array<string> = []
     let step = 0
     let faults = true
+    let persistent: { readonly clientId: Ids.ClientId; readonly mutationId: Ids.MutationId } | undefined
     const stats = {
       mutations: 0,
       resnapshots: 0,
       reloadsMidSet: 0,
       notices: 0,
       transientStops: 0,
+      exhausted: 0,
       lostResponses: 0,
       expired: 0,
       lateRetries: 0,
@@ -258,7 +263,16 @@ export const run = (options: Options) =>
           push: (request) =>
             Effect.gen(function* () {
               if (faults && rng.chance(0.1)) return yield* pushLost("push request")
-              const stopAt = faults && rng.chance(0.15) ? Option.some(rng.int(request.mutations.length)) : Option.none()
+              if (options.persistentTransient === true && persistent === undefined) {
+                persistent = { clientId, mutationId: request.mutations[0].mutationId }
+              }
+              const blockedAt = request.mutations.findIndex(
+                (entry) => persistent?.clientId === clientId && persistent.mutationId === entry.mutationId
+              )
+              const randomStop =
+                faults && rng.chance(0.15) ? rng.int(request.mutations.length) : request.mutations.length
+              const stop = blockedAt < 0 ? randomStop : Math.min(blockedAt, randomStop)
+              const stopAt = stop < request.mutations.length ? Option.some(stop) : Option.none()
               const response = yield* server.push(request, stopAt)
               if (response.results.length < request.mutations.length) stats.transientStops++
               if (faults && rng.chance(0.15)) {
@@ -753,10 +767,21 @@ export const run = (options: Options) =>
     for (const envelope of committed) {
       const key = `${envelope.clientId}#${envelope.mutationId}`
       const count = server.executions.get(key) ?? 0
-      if (count !== 1)
-        return yield* violated("every committed intent executes exactly once", `${key} executed ${count}×`)
       const ledger = server.ledgerEntry(envelope.clientId, envelope.mutationId)
       const client = clients.find((c) => c.clientId === envelope.clientId)
+      const exhausted =
+        client?.disk.notices.filter(
+          (n) => n.envelope.seq === envelope.seq && n._tag === "Rejected" && n.error._tag === "TransientExhausted"
+        ) ?? []
+      if (exhausted.length > 0) {
+        if (exhausted.length !== 1 || count !== 0 || Option.isSome(ledger)) {
+          return yield* violated("exhausted intent is unexecuted and noticed exactly once", key)
+        }
+        stats.exhausted++
+        continue
+      }
+      if (count !== 1)
+        return yield* violated("every committed intent executes exactly once", `${key} executed ${count}×`)
       const notices = client?.disk.notices.filter((n) => n.envelope.seq === envelope.seq).length ?? 0
       const rejected = Option.isSome(ledger) && ledger.value.outcome._tag === "Rejected"
       const unknown = client?.disk.notices.some((n) => n.envelope.seq === envelope.seq && n._tag === "OutcomeUnknown")

@@ -90,14 +90,23 @@ export const MutationEnvelope = Schema.Struct({
 })
 export type MutationEnvelope = typeof MutationEnvelope.Type
 
+/** Client-only rejection after bounded short-prefix transient answers; never ledgered. */
+export class TransientExhausted extends Schema.TaggedError<TransientExhausted>()("TransientExhausted", {
+  attempts: Schema.Number,
+  message: Schema.String
+}) {}
+
 /**
  * A mutation that left the outbox without being applied as intended, retained for inspection
- * (SPEC §9.5): `Rejected`, processed and rejected with a typed error; `OutcomeUnknown`, processed
+ * (SPEC §9.5): `Rejected`, rejected by the server or exhausted locally; `OutcomeUnknown`, processed
  * with an unknown outcome (its ledger row expired before the ack was pulled, SPEC §11), its effect,
  * if any, in the installed replica. Stored by the client and sent over the tab RPC.
  */
 export const Notice = Schema.Union([
-  Schema.TaggedStruct("Rejected", { envelope: MutationEnvelope, error: MutationRejection }),
+  Schema.TaggedStruct("Rejected", {
+    envelope: MutationEnvelope,
+    error: Schema.Union([MutationRejection, TransientExhausted])
+  }),
   Schema.TaggedStruct("OutcomeUnknown", { envelope: MutationEnvelope })
 ])
 export type Notice = typeof Notice.Type
@@ -255,7 +264,7 @@ export type DecodedNotice<Name extends string, A, E> =
   | {
       readonly _tag: "Rejected"
       readonly envelope: TypedEnvelope<A>
-      readonly error: Exclude<MutationRejection, DomainError> | TypedDomainError<Name, E>
+      readonly error: Exclude<MutationRejection, DomainError> | TransientExhausted | TypedDomainError<Name, E>
     }
   | { readonly _tag: "OutcomeUnknown"; readonly envelope: TypedEnvelope<A> }
 
