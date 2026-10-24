@@ -52,58 +52,57 @@ export const router = (self: SharedWorkerScope): Effect.Effect<void> =>
      * can arrive after its successor's (the announcing tab relays it); without this check it would replace
      * the live route and then be cleared, leaving no leader at all.
      */
-    const accept = (
+    const accept = Effect.fn("Router.accept")(function* (
       replica: Platform.ReplicaIdentity,
       announced: { readonly leaderId: string; readonly port: MessagePort }
-    ) =>
-      Effect.gen(function* () {
-        const epoch = Platform.leaderEpochLockName(replica, announced.leaderId)
-        if (!(yield* Platform.isLockHeld(epoch))) {
-          announced.port.close()
-          return
-        }
-        const duplicate = leader?.leaderId === announced.leaderId
-        const install = Effect.sync(() => {
-          leader?.port.close()
-          leader = announced
-          for (const [tabId, port] of tabs) link(tabId, port)
-          if (replacement !== undefined) Deferred.doneUnsafe(replacement, Effect.void)
-          replacement = undefined
-        })
-        yield* duplicate
-          ? install
-          : Telemetry.observe(
-              install.pipe(Effect.andThen(Telemetry.annotate({ "echo.result": "elected" }))),
-              "echo.router.handover",
-              Telemetry.serverFailure
-            )
-        yield* Effect.forkIn(
-          Platform.awaitLockReleased(epoch).pipe(
-            Effect.andThen(
-              Effect.suspend(() =>
-                leader !== announced
-                  ? Effect.void
-                  : Telemetry.observe(
-                      Effect.gen(function* () {
-                        const next = Deferred.makeUnsafe<void>()
-                        replacement = next
-                        announced.port.close()
-                        leader = undefined
-                        yield* Telemetry.count("echo.leader.loss.total", "lost")
-                        yield* Telemetry.count("echo.router.handover.total", "lost")
-                        yield* Deferred.await(next)
-                        yield* Telemetry.annotate({ "echo.result": "elected" })
-                      }),
-                      "echo.leader.handover",
-                      Telemetry.serverFailure
-                    )
-              )
-            ),
-            Effect.catchCause((cause) => Telemetry.log("Error", "echo router: watching leader epoch failed", cause))
-          ),
-          scope
-        )
+    ) {
+      const epoch = Platform.leaderEpochLockName(replica, announced.leaderId)
+      if (!(yield* Platform.isLockHeld(epoch))) {
+        announced.port.close()
+        return
+      }
+      const duplicate = leader?.leaderId === announced.leaderId
+      const install = Effect.sync(() => {
+        leader?.port.close()
+        leader = announced
+        for (const [tabId, port] of tabs) link(tabId, port)
+        if (replacement !== undefined) Deferred.doneUnsafe(replacement, Effect.void)
+        replacement = undefined
       })
+      yield* duplicate
+        ? install
+        : Telemetry.observe(
+            install.pipe(Effect.andThen(Telemetry.annotate({ "echo.result": "elected" }))),
+            "echo.router.handover",
+            Telemetry.serverFailure
+          )
+      yield* Effect.forkIn(
+        Platform.awaitLockReleased(epoch).pipe(
+          Effect.andThen(
+            Effect.suspend(() =>
+              leader !== announced
+                ? Effect.void
+                : Telemetry.observe(
+                    Effect.gen(function* () {
+                      const next = Deferred.makeUnsafe<void>()
+                      replacement = next
+                      announced.port.close()
+                      leader = undefined
+                      yield* Telemetry.count("echo.leader.loss.total", "lost")
+                      yield* Telemetry.count("echo.router.handover.total", "lost")
+                      yield* Deferred.await(next)
+                      yield* Telemetry.annotate({ "echo.result": "elected" })
+                    }),
+                    "echo.leader.handover",
+                    Telemetry.serverFailure
+                  )
+            )
+          ),
+          Effect.catchCause((cause) => Telemetry.log("Error", "echo router: watching leader epoch failed", cause))
+        ),
+        scope
+      )
+    })
 
     const link = (tabId: string, tabPort: MessagePort) => {
       // A tab already connected to this leader keeps that connection: a second link would displace it.

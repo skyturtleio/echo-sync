@@ -124,14 +124,17 @@ const keyOf = (rows: ReadonlyArray<IndexColumnRow>): ReadonlyArray<KeyColumn> =>
 /** Index key collation of a column kind (text columns are declared `COLLATE "C"`). */
 const collationOf = (kind: SyncTable.ColumnKind) => (kind === "text" ? "C" : null)
 
-const checkRelation = (table: SyncTable.AnySyncTable, relation: Relation, drift: (problem: string) => void) =>
-  Effect.gen(function* () {
-    const sql = yield* SqlClient
+const checkRelation = Effect.fn("verify.checkRelation")(function* (
+  table: SyncTable.AnySyncTable,
+  relation: Relation,
+  drift: (problem: string) => void
+) {
+  const sql = yield* SqlClient
 
-    // Both echo_sync triggers must exist, fire for ordinary writes, and have attach's shape.
-    // Every trigger carrying either function is checked: a second, partial capture trigger
-    // would double-log, and a disabled one beside a working one is still drift.
-    const triggers = yield* sql<TriggerRow>`
+  // Both echo_sync triggers must exist, fire for ordinary writes, and have attach's shape.
+  // Every trigger carrying either function is checked: a second, partial capture trigger
+  // would double-log, and a disabled one beside a working one is still drift.
+  const triggers = yield* sql<TriggerRow>`
       SELECT tgname AS name, tgfoid = 'echo_sync.echo_sync_capture_changes'::regproc AS capture,
              tgenabled::text AS enabled, tgtype::int AS type, tgqual IS NOT NULL AS "when",
              cardinality(tgattr::int2[]) > 0 AS "columnList"
@@ -139,45 +142,45 @@ const checkRelation = (table: SyncTable.AnySyncTable, relation: Relation, drift:
       WHERE tgrelid = ${relation.oid}::oid AND NOT tgisinternal
         AND tgfoid IN ('echo_sync.echo_sync_capture_changes'::regproc, 'echo_sync.reject_truncate'::regproc)
       ORDER BY tgname`
-    for (const [capture, label, type, shape] of [
-      [true, "capture", CAPTURE_TYPE, "AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW"],
-      [false, "truncate guard", GUARD_TYPE, "BEFORE TRUNCATE FOR EACH STATEMENT"]
-    ] as const) {
-      const found = triggers.filter((t) => t.capture === capture)
-      if (found.length === 0) drift(`missing the echo_sync ${label} trigger`)
-      if (capture && found.length > 1) drift(`has ${found.length} echo_sync capture triggers, expected one`)
-      for (const t of found) {
-        if (!FIRES.has(t.enabled) || t.type !== type || t.when || t.columnList) {
-          drift(`echo_sync ${label} trigger ${describeTrigger(t)} is not enabled ${shape} without WHEN or column list`)
-        }
+  for (const [capture, label, type, shape] of [
+    [true, "capture", CAPTURE_TYPE, "AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW"],
+    [false, "truncate guard", GUARD_TYPE, "BEFORE TRUNCATE FOR EACH STATEMENT"]
+  ] as const) {
+    const found = triggers.filter((t) => t.capture === capture)
+    if (found.length === 0) drift(`missing the echo_sync ${label} trigger`)
+    if (capture && found.length > 1) drift(`has ${found.length} echo_sync capture triggers, expected one`)
+    for (const t of found) {
+      if (!FIRES.has(t.enabled) || t.type !== type || t.when || t.columnList) {
+        drift(`echo_sync ${label} trigger ${describeTrigger(t)} is not enabled ${shape} without WHEN or column list`)
       }
     }
+  }
 
-    const columns = yield* sql<ColumnRow>`
+  const columns = yield* sql<ColumnRow>`
       SELECT a.attname AS name, format_type(a.atttypid, a.atttypmod) AS type,
              a.attnotnull AS "notNull", co.collname AS collation
       FROM pg_attribute a LEFT JOIN pg_collation co ON co.oid = a.attcollation
       WHERE a.attrelid = ${relation.oid}::oid AND a.attnum > 0 AND NOT a.attisdropped`
-    const live = new Map(columns.map((c) => [c.name, c]))
-    for (const column of table.columns) {
-      const c = live.get(column.name)
-      if (c === undefined) {
-        drift(`declared column ${column.name} is missing (every wire row must carry it, §11)`)
-        continue
-      }
-      if (c.type !== expectedType[column.kind])
-        drift(`column ${column.name} is ${c.type}, declared ${expectedType[column.kind]}`)
-      if (column.kind === "text" && c.collation !== "C") {
-        drift(`column ${column.name} has collation ${c.collation ?? "none"}, declared "C" (§10)`)
-      }
-      if (c.notNull === column.nullable) {
-        drift(
-          `column ${column.name} is ${c.notNull ? "NOT NULL" : "nullable"}, declared ${column.nullable ? "nullable" : "NOT NULL"}`
-        )
-      }
+  const live = new Map(columns.map((c) => [c.name, c]))
+  for (const column of table.columns) {
+    const c = live.get(column.name)
+    if (c === undefined) {
+      drift(`declared column ${column.name} is missing (every wire row must carry it, §11)`)
+      continue
     }
+    if (c.type !== expectedType[column.kind])
+      drift(`column ${column.name} is ${c.type}, declared ${expectedType[column.kind]}`)
+    if (column.kind === "text" && c.collation !== "C") {
+      drift(`column ${column.name} has collation ${c.collation ?? "none"}, declared "C" (§10)`)
+    }
+    if (c.notNull === column.nullable) {
+      drift(
+        `column ${column.name} is ${c.notNull ? "NOT NULL" : "nullable"}, declared ${column.nullable ? "nullable" : "NOT NULL"}`
+      )
+    }
+  }
 
-    const indexColumns = yield* sql<IndexColumnRow>`
+  const indexColumns = yield* sql<IndexColumnRow>`
       SELECT ic.relname AS index, k.ord::int AS ord, k.ord <= i.indnkeyatts AS key, a.attname AS column,
              i.indoption[k.ord - 1]::int AS option, co.collname AS collation,
              i.indisunique AS unique, i.indisprimary AS primary,
@@ -192,78 +195,76 @@ const checkRelation = (table: SyncTable.AnySyncTable, relation: Relation, drift:
       LEFT JOIN pg_collation co ON co.oid = i.indcollation[k.ord - 1]
       WHERE i.indrelid = ${relation.oid}::oid
       ORDER BY ic.relname, k.ord`
-    const byIndex = new Map<string, Array<IndexColumnRow>>()
-    for (const row of indexColumns) {
-      const list = byIndex.get(row.index) ?? []
-      list.push(row)
-      byIndex.set(row.index, list)
-    }
-    const indexes = [...byIndex.values()]
-    const kindOf = new Map(table.columns.map((c) => [c.name, c.kind]))
+  const byIndex = new Map<string, Array<IndexColumnRow>>()
+  for (const row of indexColumns) {
+    const list = byIndex.get(row.index) ?? []
+    list.push(row)
+    byIndex.set(row.index, list)
+  }
+  const indexes = [...byIndex.values()]
+  const kindOf = new Map(table.columns.map((c) => [c.name, c.kind]))
 
-    const pk = indexes.find((rows) => rows[0]?.primary === true)
-    const pkKey = pk === undefined ? [] : keyOf(pk)
-    const idKey: ReadonlyArray<KeyColumn> = [
-      { column: "id", option: 0, collation: collationOf(kindOf.get("id") ?? "text") }
-    ]
-    if (pk === undefined || pk[0]?.usable !== true || !sameKey(pkKey, idKey)) {
-      drift(
-        `primary key is ${pk === undefined ? "missing" : `(${describeKey(pkKey)})${pk[0]?.usable ? "" : " not valid"}`}, declared (${describeKey(idKey)})`
-      )
-    }
+  const pk = indexes.find((rows) => rows[0]?.primary === true)
+  const pkKey = pk === undefined ? [] : keyOf(pk)
+  const idKey: ReadonlyArray<KeyColumn> = [
+    { column: "id", option: 0, collation: collationOf(kindOf.get("id") ?? "text") }
+  ]
+  if (pk === undefined || pk[0]?.usable !== true || !sameKey(pkKey, idKey)) {
+    drift(
+      `primary key is ${pk === undefined ? "missing" : `(${describeKey(pkKey)})${pk[0]?.usable ? "" : " not valid"}`}, declared (${describeKey(idKey)})`
+    )
+  }
 
-    for (const index of Object.values(table.indexes)) {
-      const name = `${table.name}__${index.name}`
-      const rows = byIndex.get(name)
-      // §10: NULLS FIRST on declared fields, plain ASC (NULLS LAST) on the trailing id.
-      const want: ReadonlyArray<KeyColumn> = index.key.map((c, i) => ({
-        column: c.name,
-        option: i === index.key.length - 1 ? 0 : INDOPTION_NULLS_FIRST,
-        collation: collationOf(c.kind)
-      }))
-      if (rows === undefined) {
-        drift(`declared index ${name} (${describeKey(want)}) is missing`)
-        continue
-      }
+  for (const index of Object.values(table.indexes)) {
+    const name = `${table.name}__${index.name}`
+    const rows = byIndex.get(name)
+    // §10: NULLS FIRST on declared fields, plain ASC (NULLS LAST) on the trailing id.
+    const want: ReadonlyArray<KeyColumn> = index.key.map((c, i) => ({
+      column: c.name,
+      option: i === index.key.length - 1 ? 0 : INDOPTION_NULLS_FIRST,
+      collation: collationOf(c.kind)
+    }))
+    if (rows === undefined) {
+      drift(`declared index ${name} (${describeKey(want)}) is missing`)
+      continue
+    }
+    const first = rows[0]
+    const ok = first !== undefined && first.plain && !first.unique && first.usable && sameKey(keyOf(rows), want)
+    if (!ok) {
+      const flags = [
+        first?.plain ? "" : " non-plain",
+        first?.unique ? " unique" : "",
+        first?.usable ? "" : " not valid/ready/live"
+      ].join("")
+      drift(`index ${name} is (${describeKey(keyOf(rows))})${flags}, declared (${describeKey(want)})`)
+    }
+  }
+
+  for (const set of table.manifest.unique) {
+    // The shape SyncTable's UNIQUE (…) constraint generates: default ASC NULLS LAST, the
+    // column's collation, NULLS DISTINCT.
+    const want: ReadonlyArray<KeyColumn> = set.map((column) => ({
+      column,
+      option: 0,
+      collation: collationOf(kindOf.get(column) ?? "text")
+    }))
+    const backed = indexes.some((rows) => {
       const first = rows[0]
-      const ok = first !== undefined && first.plain && !first.unique && first.usable && sameKey(keyOf(rows), want)
-      if (!ok) {
-        const flags = [
-          first?.plain ? "" : " non-plain",
-          first?.unique ? " unique" : "",
-          first?.usable ? "" : " not valid/ready/live"
-        ].join("")
-        drift(`index ${name} is (${describeKey(keyOf(rows))})${flags}, declared (${describeKey(want)})`)
-      }
+      return (
+        first !== undefined &&
+        first.unique &&
+        !first.primary &&
+        first.plain &&
+        first.usable &&
+        !first.nullsNotDistinct &&
+        sameKey(keyOf(rows), want)
+      )
+    })
+    if (!backed) {
+      drift(`declared unique set (${set.join(", ")}) has no valid unique index with key exactly (${describeKey(want)})`)
     }
-
-    for (const set of table.manifest.unique) {
-      // The shape SyncTable's UNIQUE (…) constraint generates: default ASC NULLS LAST, the
-      // column's collation, NULLS DISTINCT.
-      const want: ReadonlyArray<KeyColumn> = set.map((column) => ({
-        column,
-        option: 0,
-        collation: collationOf(kindOf.get(column) ?? "text")
-      }))
-      const backed = indexes.some((rows) => {
-        const first = rows[0]
-        return (
-          first !== undefined &&
-          first.unique &&
-          !first.primary &&
-          first.plain &&
-          first.usable &&
-          !first.nullsNotDistinct &&
-          sameKey(keyOf(rows), want)
-        )
-      })
-      if (!backed) {
-        drift(
-          `declared unique set (${set.join(", ")}) has no valid unique index with key exactly (${describeKey(want)})`
-        )
-      }
-    }
-  })
+  }
+})
 
 export const verify = (registry: Registry.SyncRegistry) =>
   Effect.gen(function* () {

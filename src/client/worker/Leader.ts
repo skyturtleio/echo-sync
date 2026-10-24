@@ -68,33 +68,34 @@ const send = (endpoint: Endpoint, message: FromLeader) => endpoint.postMessage(m
  * Open the database without migrating it: the OPFS host on one end of a channel, the Effect SQL client on
  * the other. The leader and `Reset` both open through here, so there is one OPFS host path.
  */
-const openConnection = (identity: Platform.ReplicaIdentity) =>
-  Effect.gen(function* () {
-    const poolDirectory = Platform.poolDirectory(identity)
-    yield* Platform.awaitOpfsPoolFree(poolDirectory)
-    // Fails here, before SqliteClient's (uninterruptible) wait for "ready" can start.
-    const serve = yield* OpfsSqlite.open({ poolDirectory, dbName: Platform.dbName(identity) })
-    const channel = new MessageChannel()
-    yield* Effect.forkScoped(serve(channel.port1))
-    // Our own `Reactivity`, so registered queries can re-register their keys per run (the layer hides its own).
-    const reactivity = yield* Reactivity.make
-    const sql: SqlClient.SqlClient = yield* SqliteClient.make({
-      worker: Effect.succeed(channel.port2),
-      installReactivityHooks: true
-    }).pipe(Effect.provideService(Reactivity.Reactivity, reactivity))
-    return { sql, reactivity }
-  })
+const openConnection = Effect.fn("Leader.openConnection")(function* (identity: Platform.ReplicaIdentity) {
+  const poolDirectory = Platform.poolDirectory(identity)
+  yield* Platform.awaitOpfsPoolFree(poolDirectory)
+  // Fails here, before SqliteClient's (uninterruptible) wait for "ready" can start.
+  const serve = yield* OpfsSqlite.open({ poolDirectory, dbName: Platform.dbName(identity) })
+  const channel = new MessageChannel()
+  yield* Effect.forkScoped(serve(channel.port1))
+  // Our own `Reactivity`, so registered queries can re-register their keys per run (the layer hides its own).
+  const reactivity = yield* Reactivity.make
+  const sql: SqlClient.SqlClient = yield* SqliteClient.make({
+    worker: Effect.succeed(channel.port2),
+    installReactivityHooks: true
+  }).pipe(Effect.provideService(Reactivity.Reactivity, reactivity))
+  return { sql, reactivity }
+})
 
 /** The leader's database: `openConnection`, then the engine tables and the replica schema. */
-const openDatabase = (identity: Platform.ReplicaIdentity, registry: Registry.SyncRegistry) =>
-  Effect.gen(function* () {
-    const { sql, reactivity } = yield* openConnection(identity)
-    // Engine tables and the replica schema in one transaction (a manifest change rebuilds the replica).
-    yield* Effect.andThen(SqliteSyncStorage.migrate(registry), Outbox.pruneReleased()).pipe(
-      Effect.provideService(SqlClient.SqlClient, sql)
-    )
-    return { sql, reactivity }
-  })
+const openDatabase = Effect.fn("Leader.openDatabase")(function* (
+  identity: Platform.ReplicaIdentity,
+  registry: Registry.SyncRegistry
+) {
+  const { sql, reactivity } = yield* openConnection(identity)
+  // Engine tables and the replica schema in one transaction (a manifest change rebuilds the replica).
+  yield* Effect.andThen(SqliteSyncStorage.migrate(registry), Outbox.pruneReleased()).pipe(
+    Effect.provideService(SqlClient.SqlClient, sql)
+  )
+  return { sql, reactivity }
+})
 
 /** A replica without `syncUrl`: the engine never calls its transport, because no loop runs. */
 const localOnly: Engine.Transport = {
@@ -367,36 +368,36 @@ const removeCondemned = (parent: FileSystemDirectoryHandle, identity: Platform.R
  * identity's leader lock and before anything opens the pool. `true` if a tombstone was found; the directory
  * and the tombstone are then both gone, so the pool opened next is a fresh, empty replica.
  */
-const completeInterruptedReset = (identity: Platform.ReplicaIdentity) =>
-  Effect.gen(function* () {
-    const parent = yield* opfsDirectory(`echo-sync/${identity.appId}`)
-    if (parent === undefined) return false
-    const tombstone = yield* Platform.tombstoneName(identity)
-    const condemned = yield* Platform.storageCall("looking up the reset tombstone", () =>
-      parent.getFileHandle(tombstone).then(
-        () => true,
-        (cause: unknown) => {
-          if (isNotFound(cause)) return false
-          throw cause
-        }
-      )
+const completeInterruptedReset = Effect.fn("Leader.completeInterruptedReset")(function* (
+  identity: Platform.ReplicaIdentity
+) {
+  const parent = yield* opfsDirectory(`echo-sync/${identity.appId}`)
+  if (parent === undefined) return false
+  const tombstone = yield* Platform.tombstoneName(identity)
+  const condemned = yield* Platform.storageCall("looking up the reset tombstone", () =>
+    parent.getFileHandle(tombstone).then(
+      () => true,
+      (cause: unknown) => {
+        if (isNotFound(cause)) return false
+        throw cause
+      }
     )
-    if (!condemned) return false
-    // As a leader does before opening: the interrupted reset's access handles may outlive its worker briefly.
-    yield* Platform.awaitOpfsPoolFree(Platform.poolDirectory(identity))
-    yield* removeCondemned(parent, identity, tombstone)
-    return true
-  })
+  )
+  if (!condemned) return false
+  // As a leader does before opening: the interrupted reset's access handles may outlive its worker briefly.
+  yield* Platform.awaitOpfsPoolFree(Platform.poolDirectory(identity))
+  yield* removeCondemned(parent, identity, tombstone)
+  return true
+})
 
 /** Unreleased outbox entries; a database without an outbox (never migrated) has none. */
-const countUnreleased = (sql: SqlClient.SqlClient) =>
-  Effect.gen(function* () {
-    const table = yield* sql<{ readonly n: number }>`
+const countUnreleased = Effect.fn("Leader.countUnreleased")(function* (sql: SqlClient.SqlClient) {
+  const table = yield* sql<{ readonly n: number }>`
       SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'echo_outbox'`
-    if ((table[0]?.n ?? 0) === 0) return 0
-    const pending = yield* sql<{ readonly n: number }>`SELECT count(*) AS n FROM echo_outbox WHERE released_at IS NULL`
-    return pending[0]?.n ?? 0
-  })
+  if ((table[0]?.n ?? 0) === 0) return 0
+  const pending = yield* sql<{ readonly n: number }>`SELECT count(*) AS n FROM echo_outbox WHERE released_at IS NULL`
+  return pending[0]?.n ?? 0
+})
 
 /**
  * `resetReplica`'s worker half (DESIGN §9.1, §16.24). Takes the leader lock once the identity's clients have
@@ -409,8 +410,8 @@ const countUnreleased = (sql: SqlClient.SqlClient) =>
  * creates a fresh replica. A tombstone found under the lock means an earlier reset was interrupted after its
  * decision: the removal is completed and the answer is `Done`, with no pending count.
  */
-const reset = (message: Reset): Effect.Effect<ResetOutcome> =>
-  Effect.gen(function* () {
+const reset: (message: Reset) => Effect.Effect<ResetOutcome> = Effect.fn("Leader.reset")(
+  function* (message: Reset) {
     const identity: Platform.ReplicaIdentity = { appId: message.appId, profile: message.profile }
     const invalid = Platform.validateIdentity(identity) ?? Platform.leaderHostCapability()
     if (invalid !== undefined) return { _tag: "ResetFailed", message: invalid } satisfies ResetOutcome
@@ -456,20 +457,24 @@ const reset = (message: Reset): Effect.Effect<ResetOutcome> =>
         return { _tag: "Done" } satisfies ResetOutcome
       })
     )
-  }).pipe(
-    Effect.catchCause((cause) =>
-      Effect.succeed({ _tag: "ResetFailed", message: Cause.pretty(cause) } satisfies ResetOutcome)
-    )
+  },
+  // As for `Failed`: the full cause goes to the diagnostics log, the tab gets the failure that stopped it.
+  Effect.catchCause((cause) =>
+    Effect.as(Telemetry.diagnostic(cause), {
+      _tag: "ResetFailed",
+      message: Platform.describe(Cause.squash(cause))
+    } satisfies ResetOutcome)
   )
+)
 
-const program = (
-  endpoint: WorkerScope,
-  inbox: Queue.Queue<ToLeader>,
-  options: LeaderOptions,
-  init: Init,
-  pending: Set<MessagePort>
-) =>
-  Effect.gen(function* () {
+const program = Effect.fn("Leader.program")(
+  function* (
+    endpoint: WorkerScope,
+    inbox: Queue.Queue<ToLeader>,
+    options: LeaderOptions,
+    init: Init,
+    pending: Set<MessagePort>
+  ) {
     const identity: Platform.ReplicaIdentity = { appId: init.appId, profile: init.profile }
     const invalid = Platform.validateIdentity(identity) ?? Platform.leaderHostCapability()
     if (invalid !== undefined) return yield* new UnsupportedHost({ message: invalid })
@@ -561,10 +566,11 @@ const program = (
           break
       }
     }
-  }).pipe(
-    // Closing the scope releases the leader and epoch locks and the pool's access handles.
-    Effect.scoped,
-    Effect.catchCause((cause) =>
+  },
+  // Closing the scope releases the leader and epoch locks and the pool's access handles.
+  Effect.scoped,
+  (self, endpoint) =>
+    Effect.catchCause(self, (cause) =>
       Telemetry.log("Error", "echo leader candidate cannot serve", cause).pipe(
         Effect.andThen(
           Effect.sync(() => {
@@ -578,7 +584,7 @@ const program = (
         )
       )
     )
-  )
+)
 
 const listen = (
   endpoint: Pick<Endpoint, "addEventListener"> & {

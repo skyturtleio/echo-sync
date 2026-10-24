@@ -28,6 +28,13 @@ report; do not silently diverge.
   `effect/testing`, `effect/Schema` (stable). `effect/schema` (lowercase) is a different,
   unstable barrel.
 - No `any`, no `!`, no `as` outside platform edges (and then with a comment).
+- Functions returning an Effect: `Effect.fn("Module.name")` for coarse steps (once per request, startup,
+  election, reset or connection), for its call-site stack frames in diagnostics; `Effect.fnUntraced` on
+  hot paths (per row, mutation, change or stream element), where it costs about 15× per call. Only
+  internal functions that always run inside `Telemetry.boundary` may use `Effect.fn`: it opens its span
+  in the caller's tracer, so on an exported entry point the span and its failure cause would reach the
+  host's exporter. Spans the host may see are created only by `Telemetry.observe`/`observeStream`, with
+  names from `Telemetry.Name`.
 
 ## Workflow
 
