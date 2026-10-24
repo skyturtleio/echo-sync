@@ -1,0 +1,61 @@
+[
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"cursor\":\"9007199254740993\",\"continuation\":\"9007199254740993\"}",
+    "value": {
+      "clientId": "9007199254740993",
+      "cursor": "9007199254740993",
+      "continuation": {
+        "_tag": "Some",
+        "value": "9007199254740993"
+      }
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"clientVersion\":{\"dataHash\":\"9007199254740993\",\"wireVersion\":1},\"cursor\":\"9007199254740993\",\"continuation\":\"9007199254740993\"}",
+    "value": {
+      "clientId": "9007199254740993",
+      "clientVersion": {
+        "dataHash": "9007199254740993",
+        "wireVersion": 1
+      },
+      "cursor": "9007199254740993",
+      "continuation": {
+        "_tag": "Some",
+        "value": "9007199254740993"
+      }
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"principal\":\"9007199254740993\",\"cursor\":\"9007199254740993\",\"continuation\":\"9007199254740993\"}",
+    "value": {
+      "clientId": "9007199254740993",
+      "principal": "9007199254740993",
+      "cursor": "9007199254740993",
+      "continuation": {
+        "_tag": "Some",
+        "value": "9007199254740993"
+      }
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"cursor\":null,\"continuation\":\"9007199254740993\"}",
+    "value": {
+      "clientId": "9007199254740993",
+      "cursor": null,
+      "continuation": {
+        "_tag": "Some",
+        "value": "9007199254740993"
+      }
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"cursor\":\"9007199254740993\",\"continuation\":null}",
+    "value": {
+      "clientId": "9007199254740993",
+      "cursor": "9007199254740993",
+      "continuation": {
+        "_tag": "None"
+      }
+    }
+  }
+]

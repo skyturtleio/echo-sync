@@ -1,0 +1,852 @@
+[
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{}}],\"acks\":[],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [
+        {
+          "_tag": "upsert",
+          "table": "9007199254740993",
+          "row": {}
+        }
+      ],
+      "acks": [],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{\"example\":null}}],\"acks\":[],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [
+        {
+          "_tag": "upsert",
+          "table": "9007199254740993",
+          "row": {
+            "example": null
+          }
+        }
+      ],
+      "acks": [],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{\"example\":false}}],\"acks\":[],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [
+        {
+          "_tag": "upsert",
+          "table": "9007199254740993",
+          "row": {
+            "example": false
+          }
+        }
+      ],
+      "acks": [],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{\"example\":7}}],\"acks\":[],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [
+        {
+          "_tag": "upsert",
+          "table": "9007199254740993",
+          "row": {
+            "example": 7
+          }
+        }
+      ],
+      "acks": [],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{\"example\":\"text\"}}],\"acks\":[],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [
+        {
+          "_tag": "upsert",
+          "table": "9007199254740993",
+          "row": {
+            "example": "text"
+          }
+        }
+      ],
+      "acks": [],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{\"example\":[1,null]}}],\"acks\":[],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [
+        {
+          "_tag": "upsert",
+          "table": "9007199254740993",
+          "row": {
+            "example": [
+              1,
+              null
+            ]
+          }
+        }
+      ],
+      "acks": [],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{\"example\":{\"title\":\"vector\",\"nested\":[true]}}}],\"acks\":[],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [
+        {
+          "_tag": "upsert",
+          "table": "9007199254740993",
+          "row": {
+            "example": {
+              "title": "vector",
+              "nested": [
+                true
+              ]
+            }
+          }
+        }
+      ],
+      "acks": [],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[{\"_tag\":\"tombstone\",\"table\":\"9007199254740993\",\"id\":\"9007199254740993\"}],\"acks\":[],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [
+        {
+          "_tag": "tombstone",
+          "table": "9007199254740993",
+          "id": "9007199254740993"
+        }
+      ],
+      "acks": [],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[{\"_tag\":\"scopePurged\",\"scopeId\":\"9007199254740993\"}],\"acks\":[],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [
+        {
+          "_tag": "scopePurged",
+          "scopeId": "9007199254740993"
+        }
+      ],
+      "acks": [],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Applied\"}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Applied"
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"UnknownMutation\",\"name\":\"9007199254740993\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "UnknownMutation",
+              "name": "9007199254740993"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ArgsDecodeFailed\",\"name\":\"9007199254740993\",\"message\":\"9007199254740993\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ArgsDecodeFailed",
+              "name": "9007199254740993",
+              "message": "9007199254740993"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"RowNotFound\",\"table\":\"9007199254740993\",\"id\":\"9007199254740993\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "RowNotFound",
+              "table": "9007199254740993",
+              "id": "9007199254740993"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"RowAlreadyExists\",\"table\":\"9007199254740993\",\"id\":\"9007199254740993\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "RowAlreadyExists",
+              "table": "9007199254740993",
+              "id": "9007199254740993"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ScopeForbidden\",\"scopeId\":\"9007199254740993\",\"required\":\"reader\",\"held\":\"reader\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ScopeForbidden",
+              "scopeId": "9007199254740993",
+              "required": "reader",
+              "held": "reader"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ScopeForbidden\",\"scopeId\":\"9007199254740993\",\"required\":\"writer\",\"held\":\"reader\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ScopeForbidden",
+              "scopeId": "9007199254740993",
+              "required": "writer",
+              "held": "reader"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ScopeForbidden\",\"scopeId\":\"9007199254740993\",\"required\":\"owner\",\"held\":\"reader\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ScopeForbidden",
+              "scopeId": "9007199254740993",
+              "required": "owner",
+              "held": "reader"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ScopeForbidden\",\"scopeId\":\"9007199254740993\",\"required\":\"reader\",\"held\":\"writer\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ScopeForbidden",
+              "scopeId": "9007199254740993",
+              "required": "reader",
+              "held": "writer"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ScopeForbidden\",\"scopeId\":\"9007199254740993\",\"required\":\"reader\",\"held\":\"owner\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ScopeForbidden",
+              "scopeId": "9007199254740993",
+              "required": "reader",
+              "held": "owner"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ScopeForbidden\",\"scopeId\":\"9007199254740993\",\"required\":\"reader\",\"held\":null}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ScopeForbidden",
+              "scopeId": "9007199254740993",
+              "required": "reader",
+              "held": null
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"InvalidRow\",\"table\":\"9007199254740993\",\"message\":\"9007199254740993\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "InvalidRow",
+              "table": "9007199254740993",
+              "message": "9007199254740993"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"DomainError\",\"mutation\":\"9007199254740993\",\"error\":null}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "DomainError",
+              "mutation": "9007199254740993",
+              "error": null
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"DomainError\",\"mutation\":\"9007199254740993\",\"error\":false}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "DomainError",
+              "mutation": "9007199254740993",
+              "error": false
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"DomainError\",\"mutation\":\"9007199254740993\",\"error\":7}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "DomainError",
+              "mutation": "9007199254740993",
+              "error": 7
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"DomainError\",\"mutation\":\"9007199254740993\",\"error\":\"text\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "DomainError",
+              "mutation": "9007199254740993",
+              "error": "text"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"DomainError\",\"mutation\":\"9007199254740993\",\"error\":[1,null]}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "DomainError",
+              "mutation": "9007199254740993",
+              "error": [
+                1,
+                null
+              ]
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"DomainError\",\"mutation\":\"9007199254740993\",\"error\":{\"title\":\"vector\",\"nested\":[true]}}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "DomainError",
+              "mutation": "9007199254740993",
+              "error": {
+                "title": "vector",
+                "nested": [
+                  true
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ConstraintViolated\",\"kind\":\"unique\",\"constraint\":\"9007199254740993\",\"message\":\"9007199254740993\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ConstraintViolated",
+              "kind": "unique",
+              "constraint": "9007199254740993",
+              "message": "9007199254740993"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ConstraintViolated\",\"kind\":\"other\",\"constraint\":\"9007199254740993\",\"message\":\"9007199254740993\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ConstraintViolated",
+              "kind": "other",
+              "constraint": "9007199254740993",
+              "message": "9007199254740993"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ConstraintViolated\",\"kind\":\"unique\",\"constraint\":null,\"message\":\"9007199254740993\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ConstraintViolated",
+              "kind": "unique",
+              "constraint": null,
+              "message": "9007199254740993"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClientExpired\",\"mutationId\":\"9007199254740993\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClientExpired",
+              "mutationId": "9007199254740993"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClockSkew\",\"createdAt\":1,\"serverNow\":1}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClockSkew",
+              "createdAt": 1,
+              "serverNow": 1
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClockSkew\",\"createdAt\":\"Infinity\",\"serverNow\":1}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClockSkew",
+              "createdAt": "Infinity",
+              "serverNow": 1
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClockSkew\",\"createdAt\":\"-Infinity\",\"serverNow\":1}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClockSkew",
+              "createdAt": "-Infinity",
+              "serverNow": 1
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClockSkew\",\"createdAt\":\"NaN\",\"serverNow\":1}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClockSkew",
+              "createdAt": "NaN",
+              "serverNow": 1
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClockSkew\",\"createdAt\":1,\"serverNow\":\"Infinity\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClockSkew",
+              "createdAt": 1,
+              "serverNow": "Infinity"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClockSkew\",\"createdAt\":1,\"serverNow\":\"-Infinity\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClockSkew",
+              "createdAt": 1,
+              "serverNow": "-Infinity"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"changes\":[],\"acks\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClockSkew\",\"createdAt\":1,\"serverNow\":\"NaN\"}}}],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "changes": [],
+      "acks": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClockSkew",
+              "createdAt": 1,
+              "serverNow": "NaN"
+            }
+          }
+        }
+      ],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  }
+]

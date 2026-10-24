@@ -12,7 +12,7 @@
   "PushIntegrityError": ["invalidPayload", "serverDefect"],
   "SyncErrorKind": ["credentials", "unauthorized", "unavailable", "network", "server", "outdated", "server-outdated"],
   "Notice": ["Rejected", "OutcomeUnknown"],
-  "MutationRejection": ["UnknownMutation", "ArgsDecodeFailed", "RowNotFound", "RowAlreadyExists", "ScopeForbidden", "InvalidRow", "DomainError", "ConstraintViolated", "ClientExpired"],
+  "MutationRejection": ["UnknownMutation", "ArgsDecodeFailed", "RowNotFound", "RowAlreadyExists", "ScopeForbidden", "InvalidRow", "DomainError", "ConstraintViolated", "ClientExpired", "ClockSkew"],
   "PushReason": ["CredentialsUnavailable", "Unauthorized", "ClientOutdated", "MalformedEnvelope", "PushIntegrityError", "RpcClientError"],
   "PullReason": ["CredentialsUnavailable", "Unauthorized", "ClientOutdated", "ServerUnavailable", "PullProtocolError", "RpcClientError"]
 }

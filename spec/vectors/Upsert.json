@@ -1,0 +1,78 @@
+[
+  {
+    "json": "{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{}}",
+    "value": {
+      "_tag": "upsert",
+      "table": "9007199254740993",
+      "row": {}
+    }
+  },
+  {
+    "json": "{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{\"example\":null}}",
+    "value": {
+      "_tag": "upsert",
+      "table": "9007199254740993",
+      "row": {
+        "example": null
+      }
+    }
+  },
+  {
+    "json": "{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{\"example\":false}}",
+    "value": {
+      "_tag": "upsert",
+      "table": "9007199254740993",
+      "row": {
+        "example": false
+      }
+    }
+  },
+  {
+    "json": "{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{\"example\":7}}",
+    "value": {
+      "_tag": "upsert",
+      "table": "9007199254740993",
+      "row": {
+        "example": 7
+      }
+    }
+  },
+  {
+    "json": "{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{\"example\":\"text\"}}",
+    "value": {
+      "_tag": "upsert",
+      "table": "9007199254740993",
+      "row": {
+        "example": "text"
+      }
+    }
+  },
+  {
+    "json": "{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{\"example\":[1,null]}}",
+    "value": {
+      "_tag": "upsert",
+      "table": "9007199254740993",
+      "row": {
+        "example": [
+          1,
+          null
+        ]
+      }
+    }
+  },
+  {
+    "json": "{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{\"example\":{\"title\":\"vector\",\"nested\":[true]}}}",
+    "value": {
+      "_tag": "upsert",
+      "table": "9007199254740993",
+      "row": {
+        "example": {
+          "title": "vector",
+          "nested": [
+            true
+          ]
+        }
+      }
+    }
+  }
+]

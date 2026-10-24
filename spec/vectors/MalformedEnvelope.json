@@ -1,0 +1,11 @@
+[
+  {
+    "json": "{\"_tag\":\"MalformedEnvelope\",\"clientId\":\"9007199254740993\",\"mutationId\":\"9007199254740993\",\"message\":\"9007199254740993\"}",
+    "value": {
+      "_tag": "MalformedEnvelope",
+      "clientId": "9007199254740993",
+      "mutationId": "9007199254740993",
+      "message": "9007199254740993"
+    }
+  }
+]

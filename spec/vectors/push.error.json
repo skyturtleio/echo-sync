@@ -1,0 +1,65 @@
+[
+  {
+    "json": "{\"_tag\":\"MalformedEnvelope\",\"clientId\":\"9007199254740993\",\"mutationId\":\"9007199254740993\",\"message\":\"9007199254740993\"}",
+    "value": {
+      "_tag": "MalformedEnvelope",
+      "clientId": "9007199254740993",
+      "mutationId": "9007199254740993",
+      "message": "9007199254740993"
+    }
+  },
+  {
+    "json": "{\"_tag\":\"Unauthorized\",\"message\":\"9007199254740993\"}",
+    "value": {
+      "_tag": "Unauthorized",
+      "message": "9007199254740993"
+    }
+  },
+  {
+    "json": "{\"_tag\":\"Unauthorized\",\"reason\":\"authenticationRefused\",\"message\":\"9007199254740993\"}",
+    "value": {
+      "_tag": "Unauthorized",
+      "reason": "authenticationRefused",
+      "message": "9007199254740993"
+    }
+  },
+  {
+    "json": "{\"_tag\":\"Unauthorized\",\"reason\":\"principalMismatch\",\"message\":\"9007199254740993\"}",
+    "value": {
+      "_tag": "Unauthorized",
+      "reason": "principalMismatch",
+      "message": "9007199254740993"
+    }
+  },
+  {
+    "json": "{\"_tag\":\"Unauthorized\",\"reason\":\"clientPrincipalMismatch\",\"message\":\"9007199254740993\"}",
+    "value": {
+      "_tag": "Unauthorized",
+      "reason": "clientPrincipalMismatch",
+      "message": "9007199254740993"
+    }
+  },
+  {
+    "json": "{\"_tag\":\"Unauthorized\",\"reason\":\"wildcardPrincipal\",\"message\":\"9007199254740993\"}",
+    "value": {
+      "_tag": "Unauthorized",
+      "reason": "wildcardPrincipal",
+      "message": "9007199254740993"
+    }
+  },
+  {
+    "json": "{\"_tag\":\"Unauthorized\",\"reason\":\"httpUnauthorized\",\"message\":\"9007199254740993\"}",
+    "value": {
+      "_tag": "Unauthorized",
+      "reason": "httpUnauthorized",
+      "message": "9007199254740993"
+    }
+  },
+  {
+    "json": "{\"_tag\":\"ClientOutdated\",\"message\":\"9007199254740993\"}",
+    "value": {
+      "_tag": "ClientOutdated",
+      "message": "9007199254740993"
+    }
+  }
+]

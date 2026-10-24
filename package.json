@@ -11,7 +11,8 @@
     "./foldkit": "./src/foldkit/index.ts"
   },
   "scripts": {
-    "check": "bun scripts/registry.ts && tsc --noEmit && oxlint --deny-warnings && oxfmt --check && vitest run",
+    "check": "bun scripts/registry.ts && bun run vectors --check && tsc --noEmit && oxlint --deny-warnings && oxfmt --check && vitest run",
+    "vectors": "bun scripts/vectors.ts",
     "test": "vitest run",
     "test:pg": "ECHO_PG_URL=${ECHO_PG_URL:-postgres://postgres:echo@localhost:5432/postgres} vitest run src/server test/",
     "lint": "oxlint --deny-warnings",

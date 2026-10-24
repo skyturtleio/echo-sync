@@ -23,24 +23,35 @@ export function testTitles(source: string, file: string): string[] {
 }
 
 export function checkRegistry(spec: string, titles: ReadonlySet<string>): { errors: string[]; debt: string[] } {
+  spec = spec.replace(/<!--[\s\S]*?(?:-->|$)/g, "")
   const registry = spec.split("## 17. Invariant registry\n")[1]?.split("## 18.")[0] ?? ""
   const appendix = spec.split("## Appendix B. Open Questions index\n")[1]?.split("## Appendix C.")[0] ?? ""
   const errors: string[] = []
   const debt: string[] = []
   const ids = new Set<string>()
-  for (const match of registry.matchAll(/^\| (INV-[A-Z]+-\d+) \| (covered|partial|untested|withdrawn) \| (.*) \|$/gm)) {
+  for (const row of registry
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => /^\|\s*INV-/.test(line))) {
+    const match = /^\| (INV-[A-Z]+-\d+) \| (covered|partial|untested|withdrawn) \| (.*) \|$/.exec(row)
+    if (!match) {
+      errors.push(`Malformed registry row: ${row}`)
+      continue
+    }
     const [, id = "", status, citations = ""] = match
     if (ids.has(id)) errors.push(`Duplicate ${id}`)
     ids.add(id)
     if (status === "partial" || status === "untested") debt.push(id)
-    const names = [...citations.matchAll(/"([^"\n]+)"/g)].map((m) => m[1] ?? "")
+    if ((citations.match(/"/g)?.length ?? 0) % 2 !== 0) errors.push(`${id}: unterminated test citation`)
+    const names = [...citations.matchAll(/"([^"\n]*)"/g)].map((m) => m[1] ?? "")
     if (names.length === 0 && status === "covered") errors.push(`${id}: no named test`)
     for (const name of names) if (!titles.has(name)) errors.push(`${id}: missing test ${JSON.stringify(name)}`)
   }
   for (const id of new Set(spec.match(/\bINV-[A-Z]+-\d+\b/g))) {
     if (!ids.has(id)) errors.push(`${id}: missing from §17`)
   }
-  const indexed = [...appendix.matchAll(/^\| (OQ-[A-Z]+-\d+) \|/gm)].map((m) => m[1] ?? "")
+  const indexed = [...appendix.matchAll(/^[ \t]*\| (OQ-[A-Z]+-\d+) \|/gm)].map((m) => m[1] ?? "")
+  if (new Set(indexed).size !== indexed.length) errors.push("Duplicate open question in Appendix B")
   const text = spec.replace(appendix, "")
   const mentioned = new Set(text.match(/\bOQ-[A-Z]+-\d+\b/g))
   for (const id of indexed) if (!mentioned.has(id)) errors.push(`${id}: indexed but absent from text`)

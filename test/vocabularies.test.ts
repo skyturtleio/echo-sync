@@ -37,8 +37,14 @@ const errors = (text: string): string[] => {
   const tags: string[] = []
   new Visitor({
     ClassDeclaration(node) {
-      if (node.superClass && /TaggedError/.test(text.slice(node.superClass.start, node.superClass.end)) && node.id)
-        tags.push(node.id.name)
+      if (
+        node.superClass?.type === "CallExpression" &&
+        /TaggedError/.test(text.slice(node.superClass.start, node.superClass.end))
+      ) {
+        const tag = node.superClass.arguments[0]
+        if (tag?.type !== "Literal" || typeof tag.value !== "string") throw new Error("Nonliteral error tag")
+        tags.push(tag.value)
+      }
     }
   }).visit(parseSync("v.ts", text).program)
   return tags
@@ -46,7 +52,7 @@ const errors = (text: string): string[] => {
 const references = (text: string): string[] =>
   [...text.matchAll(/(?:^|\|)\s*(?:Protocol\.)?(\w+)(?:\.\w+)?/g)].map((m) => m[1] ?? "")
 const same = (actual: readonly string[], expected: readonly string[]) =>
-  expect([...new Set(actual)].sort()).toEqual([...expected].sort())
+  expect([...new Set(actual)].toSorted()).toEqual([...expected].toSorted())
 
 it("telemetry, wire errors and client failure or notice vocabularies cannot drift from SPEC §14–15", () => {
   const telemetry = source("internal/Telemetry")

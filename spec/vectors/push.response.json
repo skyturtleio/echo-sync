@@ -1,0 +1,569 @@
+[
+  {
+    "json": "{\"results\":[]}",
+    "value": {
+      "results": []
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Applied\"}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Applied"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"UnknownMutation\",\"name\":\"9007199254740993\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "UnknownMutation",
+              "name": "9007199254740993"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ArgsDecodeFailed\",\"name\":\"9007199254740993\",\"message\":\"9007199254740993\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ArgsDecodeFailed",
+              "name": "9007199254740993",
+              "message": "9007199254740993"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"RowNotFound\",\"table\":\"9007199254740993\",\"id\":\"9007199254740993\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "RowNotFound",
+              "table": "9007199254740993",
+              "id": "9007199254740993"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"RowAlreadyExists\",\"table\":\"9007199254740993\",\"id\":\"9007199254740993\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "RowAlreadyExists",
+              "table": "9007199254740993",
+              "id": "9007199254740993"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ScopeForbidden\",\"scopeId\":\"9007199254740993\",\"required\":\"reader\",\"held\":\"reader\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ScopeForbidden",
+              "scopeId": "9007199254740993",
+              "required": "reader",
+              "held": "reader"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ScopeForbidden\",\"scopeId\":\"9007199254740993\",\"required\":\"writer\",\"held\":\"reader\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ScopeForbidden",
+              "scopeId": "9007199254740993",
+              "required": "writer",
+              "held": "reader"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ScopeForbidden\",\"scopeId\":\"9007199254740993\",\"required\":\"owner\",\"held\":\"reader\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ScopeForbidden",
+              "scopeId": "9007199254740993",
+              "required": "owner",
+              "held": "reader"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ScopeForbidden\",\"scopeId\":\"9007199254740993\",\"required\":\"reader\",\"held\":\"writer\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ScopeForbidden",
+              "scopeId": "9007199254740993",
+              "required": "reader",
+              "held": "writer"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ScopeForbidden\",\"scopeId\":\"9007199254740993\",\"required\":\"reader\",\"held\":\"owner\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ScopeForbidden",
+              "scopeId": "9007199254740993",
+              "required": "reader",
+              "held": "owner"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ScopeForbidden\",\"scopeId\":\"9007199254740993\",\"required\":\"reader\",\"held\":null}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ScopeForbidden",
+              "scopeId": "9007199254740993",
+              "required": "reader",
+              "held": null
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"InvalidRow\",\"table\":\"9007199254740993\",\"message\":\"9007199254740993\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "InvalidRow",
+              "table": "9007199254740993",
+              "message": "9007199254740993"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"DomainError\",\"mutation\":\"9007199254740993\",\"error\":null}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "DomainError",
+              "mutation": "9007199254740993",
+              "error": null
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"DomainError\",\"mutation\":\"9007199254740993\",\"error\":false}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "DomainError",
+              "mutation": "9007199254740993",
+              "error": false
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"DomainError\",\"mutation\":\"9007199254740993\",\"error\":7}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "DomainError",
+              "mutation": "9007199254740993",
+              "error": 7
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"DomainError\",\"mutation\":\"9007199254740993\",\"error\":\"text\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "DomainError",
+              "mutation": "9007199254740993",
+              "error": "text"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"DomainError\",\"mutation\":\"9007199254740993\",\"error\":[1,null]}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "DomainError",
+              "mutation": "9007199254740993",
+              "error": [
+                1,
+                null
+              ]
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"DomainError\",\"mutation\":\"9007199254740993\",\"error\":{\"title\":\"vector\",\"nested\":[true]}}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "DomainError",
+              "mutation": "9007199254740993",
+              "error": {
+                "title": "vector",
+                "nested": [
+                  true
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ConstraintViolated\",\"kind\":\"unique\",\"constraint\":\"9007199254740993\",\"message\":\"9007199254740993\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ConstraintViolated",
+              "kind": "unique",
+              "constraint": "9007199254740993",
+              "message": "9007199254740993"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ConstraintViolated\",\"kind\":\"other\",\"constraint\":\"9007199254740993\",\"message\":\"9007199254740993\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ConstraintViolated",
+              "kind": "other",
+              "constraint": "9007199254740993",
+              "message": "9007199254740993"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ConstraintViolated\",\"kind\":\"unique\",\"constraint\":null,\"message\":\"9007199254740993\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ConstraintViolated",
+              "kind": "unique",
+              "constraint": null,
+              "message": "9007199254740993"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClientExpired\",\"mutationId\":\"9007199254740993\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClientExpired",
+              "mutationId": "9007199254740993"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClockSkew\",\"createdAt\":1,\"serverNow\":1}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClockSkew",
+              "createdAt": 1,
+              "serverNow": 1
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClockSkew\",\"createdAt\":\"Infinity\",\"serverNow\":1}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClockSkew",
+              "createdAt": "Infinity",
+              "serverNow": 1
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClockSkew\",\"createdAt\":\"-Infinity\",\"serverNow\":1}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClockSkew",
+              "createdAt": "-Infinity",
+              "serverNow": 1
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClockSkew\",\"createdAt\":\"NaN\",\"serverNow\":1}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClockSkew",
+              "createdAt": "NaN",
+              "serverNow": 1
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClockSkew\",\"createdAt\":1,\"serverNow\":\"Infinity\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClockSkew",
+              "createdAt": 1,
+              "serverNow": "Infinity"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClockSkew\",\"createdAt\":1,\"serverNow\":\"-Infinity\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClockSkew",
+              "createdAt": 1,
+              "serverNow": "-Infinity"
+            }
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"results\":[{\"mutationId\":\"9007199254740993\",\"position\":\"9007199254740993\",\"outcome\":{\"_tag\":\"Rejected\",\"error\":{\"_tag\":\"ClockSkew\",\"createdAt\":1,\"serverNow\":\"NaN\"}}}]}",
+    "value": {
+      "results": [
+        {
+          "mutationId": "9007199254740993",
+          "position": "9007199254740993",
+          "outcome": {
+            "_tag": "Rejected",
+            "error": {
+              "_tag": "ClockSkew",
+              "createdAt": 1,
+              "serverNow": "NaN"
+            }
+          }
+        }
+      ]
+    }
+  }
+]

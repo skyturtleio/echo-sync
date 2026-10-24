@@ -1,0 +1,9 @@
+[
+  {
+    "json": "{\"_tag\":\"ServerUnavailable\",\"message\":\"9007199254740993\"}",
+    "value": {
+      "_tag": "ServerUnavailable",
+      "message": "9007199254740993"
+    }
+  }
+]

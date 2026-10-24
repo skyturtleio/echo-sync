@@ -1,0 +1,291 @@
+[
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":null}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": null
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"clientVersion\":{\"dataHash\":\"9007199254740993\",\"wireVersion\":1},\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":null}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "clientVersion": {
+        "dataHash": "9007199254740993",
+        "wireVersion": 1
+      },
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": null
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"principal\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":null}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "principal": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": null
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"createdAt\":1,\"name\":\"9007199254740993\",\"args\":null}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "createdAt": 1,
+          "name": "9007199254740993",
+          "args": null
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":false}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": false
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":7}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": 7
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":\"text\"}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": "text"
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":[1,null]}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": [
+            1,
+            null
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":{\"title\":\"vector\",\"nested\":[true]}}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": {
+            "title": "vector",
+            "nested": [
+              true
+            ]
+          }
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":null},{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":null}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": null
+        },
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": null
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":null},{\"mutationId\":\"9007199254740993\",\"seq\":1,\"createdAt\":1,\"name\":\"9007199254740993\",\"args\":null}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": null
+        },
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "createdAt": 1,
+          "name": "9007199254740993",
+          "args": null
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":null},{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":false}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": null
+        },
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": false
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":null},{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":7}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": null
+        },
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": 7
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":null},{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":\"text\"}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": null
+        },
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": "text"
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":null},{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":[1,null]}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": null
+        },
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": [
+            1,
+            null
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"clientId\":\"9007199254740993\",\"mutations\":[{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":null},{\"mutationId\":\"9007199254740993\",\"seq\":1,\"name\":\"9007199254740993\",\"args\":{\"title\":\"vector\",\"nested\":[true]}}]}",
+    "value": {
+      "clientId": "9007199254740993",
+      "mutations": [
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": null
+        },
+        {
+          "mutationId": "9007199254740993",
+          "seq": 1,
+          "name": "9007199254740993",
+          "args": {
+            "title": "vector",
+            "nested": [
+              true
+            ]
+          }
+        }
+      ]
+    }
+  }
+]

@@ -35,6 +35,20 @@ implementation and verification notes, not additional contracts.
 trusted to a reader. Abbreviated titles and describe-group labels are not test citations;
 coverage without a verifiable literal title remains explicit debt instead of a false pass.
 
+- INV-SPEC-2: `spec/vectors/*.json` are normative wire encodings. Each vector contains the
+  exact compact JSON bytes (`json`) and the decoded value projected through the type's JSON
+  codec (`value`, e.g. bigint as decimal text and Option as a tagged value). Conformance
+  decodes the committed bytes, checks that value and re-encodes byte-identically.
+  `bun run vectors` regenerates them from Protocol's RPC schemas; `bun run vectors --check`
+  (part of `bun run check`) fails on missing, changed or obsolete files without overwriting
+  them. Commit regenerated vectors with any conscious wire-format change. Generation covers
+  every union variant and optional key present/absent, including nested changes, outcomes and
+  rejections, but does not enumerate the Cartesian product of independent fields.
+
+**Rationale (2026-10-24):** Schema-generated, committed wire examples make encodings reviewable
+and usable by other implementations; round trips alone would accept both sides drifting
+together. Unsupported schema shapes or invalid branch samples fail rather than losing coverage.
+
 ### 0.2 Versioning
 
 - **Wire version.** `Protocol.wireVersion` is `1`. Every `push` and `pull` request carries
@@ -1649,10 +1663,10 @@ OQ-CLI-1 remains the owner's algorithm decision.
 
 ## 17. Invariant registry
 
-Every invariant with the test that covers it. "Covered" names a test whose failure would be
-caused by a violation of the invariant (a test name from `*.test.ts`, a Conformance check, a
-Simulation invariant, or a `check` in `examples/browser-spike/scenarios.sh`). "Partial" means a
-test covers one clause and the rest is untested. "Untested" means no test would fail if the
+Every invariant with the test that covers it. "Covered" names exact double-quoted literal
+test titles from `*.test.ts`, checked by `scripts/registry.ts` (INV-SPEC-1). "Partial" means
+some clauses lack such a citation, including coverage only by dynamically generated Conformance
+checks or `examples/browser-spike/scenarios.sh`. "Untested" means no test would fail if the
 invariant were broken. IDs are never reused.
 
 Rules for the harnesses that produce "covered" (verified against `src/core/testing/Conformance.ts`,
@@ -1737,7 +1751,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PULL-11 | covered | `gc.test` "re-pulling from the previous cursor after a lost PullDone yields the same converged state", "ledger rows written before migration 003 come through it unstamped and are never expired until a pull acks them" |
 | INV-PULL-12 | covered | `gc.test` "expiring the newest ledger row never moves the head back: a cursor at its position does not regress and a page set resumed at it continues" |
 | INV-PULL-13 | covered | `gc.test` "a client whose cursor GC passed must resnapshot and then converges; a client at head is unaffected"; `Simulation.test` "ResnapshotRequired after a suspended pull keeps seqs, pushedThrough and cursor written meanwhile" |
-| INV-PULL-14 | partial | RPC pageLimit construction check has no literal test-title citation |
+| INV-PULL-14 | covered | `rpc.test` "a server with an invalid pageLimit dies at construction instead of producing an endless PullPage" |
 | INV-PUSH-1 | partial | `Transport.test` "push failures are fatal exactly when SPEC §10 says so, classified by real tags over a real RPC server" (includes the cap); the 50 default and the `min(…, 100)` clamp have no test |
 | INV-PUSH-2 | covered | `ledger.test` "a batch stops at a transient failure without recording it, and its resubmission continues in order"; `Transport.test` "a push batch the server stopped is reported as kind server" |
 | INV-PUSH-3 | covered | `rpc.test` "a connection lost mid-batch is a short results list, never a defect the client would halt on", "an infrastructure defect in principalFor is a transient stop (empty results), not a push failure" |
@@ -1784,7 +1798,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-BRW-10 | covered | `worker-lifetime.test` "leader teardown closes fresh transfers discarded before Init, still queued, or delivered to a saved late callback", "router teardown and rejection close fresh connect and announcement peers, including saved late callbacks"; `LeaderClient.test` "closing a client cannot abandon a transferred port queued for acceptance or waiting for its epoch check" |
 | INV-BRW-11 | partial | Browser scenarios cover OPFS handles held for 4 s and past the 10 s bound; no literal test-title citation |
 | INV-SCH-1 | partial | `Migrate.test` "a NOT NULL column without a default is added nullable with the SPEC §13 TODO, never SET NOT NULL"; destructive and safe DDL groups need individual citations |
-| INV-SCH-2 | partial | `Migrate.test` "an intent naming something the diff does not contain is refused, not ignored"; dependent-DDL group needs individual citations |
+| INV-SCH-2 | covered | `Migrate.test` "an intent naming something the diff does not contain is refused, not ignored", "a combined table and column rename is one table TODO and one column TODO, no DDL, no intent error", "an index on a renamed column is a TODO; unrelated changes in the same table stay DDL" |
 | INV-SCH-3 | covered | `Migrate.test` "migrations are numbered after the highest existing one", "scope_grants is the engine's table and is never planned; no change plans nothing"; `version-gate.e2e` "a client below the generated floor stops retrying, can mutate offline, and delivers the original intents after update" (history) |
 | INV-SCH-4 | covered | `startup.test` "a server whose database drifted from the registry never serves; restored, it serves", "a registry table the app migrations never created fails startup as a Drift naming it, not a bare SqlError" |
 | INV-SCH-5 | covered | `capture.test` "attaching a second table with an already-synced name in another schema is refused", "attach with a schema name differing only in case from an attached one is refused, not installed twice", "concurrent attaches of one table name from two schemas cannot both succeed"; `startup.test` "a table captured in two schemas fails startup with one Drift naming both, with every other mismatch", "a search_path that resolves the table name to an uncaptured relation fails startup with a Drift" |
@@ -1807,6 +1821,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PERF-6 | partial | `rpc.test` "more open pokes streams than pool connections do not block push or pull, and the server holds one LISTEN" (fan-out and notify counts unmeasured) |
 | INV-PERF-7 | covered | `perf-postgres.test` both budget tests; `perf-install.test` "install undoes P entries, writes C changes and replays P handlers without hidden statements" (SELECT-returned rows, not physical scans) |
 | INV-SPEC-1 | covered | `registry.test` "a nonexistent cited test, duplicate invariant or unindexed question cannot pass the registry gate" |
+| INV-SPEC-2 | covered | `vectors.test` "wire messages cannot change their committed decoded values, JSON bytes or variant coverage" |
 
 The registry gate prints the current partial/untested list on every run; these statuses do not
 claim that browser-only or dynamically generated checks are absent, only that they are not
@@ -1870,7 +1885,6 @@ machine-verifiable literal test-title citations.
 | OQ-PULL-2 | §7 | unknown-table changes skipped at install advance the cursor past rows never stored; untested |
 | OQ-CLI-1 | §9 (Q3), §16 | full rebase: 49.41 ms for 5/50, 651.39 ms for 500/5,000 pending/changes (Bun memory VFS); algorithm decision remains open |
 | OQ-LOOP-1 | §10 | the push halt is in memory per leader; a new leader retries the batch and halts again |
-| OQ-SCH-1 | §13 | new-server-before-migration tolerance of an added column untested |
 
 ## Appendix C. Browser mechanisms and verification notes (non-normative)
 

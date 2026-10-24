@@ -1,0 +1,108 @@
+[
+  {
+    "json": "{\"_tag\":\"snapshot\",\"room\":\"9007199254740993\",\"entries\":[]}",
+    "value": {
+      "_tag": "snapshot",
+      "room": "9007199254740993",
+      "entries": []
+    }
+  },
+  {
+    "json": "{\"_tag\":\"snapshot\",\"room\":\"9007199254740993\",\"entries\":[{\"principalId\":\"9007199254740993\",\"clientId\":\"9007199254740993\",\"tabId\":\"9007199254740993\",\"state\":null}]}",
+    "value": {
+      "_tag": "snapshot",
+      "room": "9007199254740993",
+      "entries": [
+        {
+          "principalId": "9007199254740993",
+          "clientId": "9007199254740993",
+          "tabId": "9007199254740993",
+          "state": null
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"_tag\":\"snapshot\",\"room\":\"9007199254740993\",\"entries\":[{\"principalId\":\"9007199254740993\",\"clientId\":\"9007199254740993\",\"tabId\":\"9007199254740993\",\"state\":false}]}",
+    "value": {
+      "_tag": "snapshot",
+      "room": "9007199254740993",
+      "entries": [
+        {
+          "principalId": "9007199254740993",
+          "clientId": "9007199254740993",
+          "tabId": "9007199254740993",
+          "state": false
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"_tag\":\"snapshot\",\"room\":\"9007199254740993\",\"entries\":[{\"principalId\":\"9007199254740993\",\"clientId\":\"9007199254740993\",\"tabId\":\"9007199254740993\",\"state\":7}]}",
+    "value": {
+      "_tag": "snapshot",
+      "room": "9007199254740993",
+      "entries": [
+        {
+          "principalId": "9007199254740993",
+          "clientId": "9007199254740993",
+          "tabId": "9007199254740993",
+          "state": 7
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"_tag\":\"snapshot\",\"room\":\"9007199254740993\",\"entries\":[{\"principalId\":\"9007199254740993\",\"clientId\":\"9007199254740993\",\"tabId\":\"9007199254740993\",\"state\":\"text\"}]}",
+    "value": {
+      "_tag": "snapshot",
+      "room": "9007199254740993",
+      "entries": [
+        {
+          "principalId": "9007199254740993",
+          "clientId": "9007199254740993",
+          "tabId": "9007199254740993",
+          "state": "text"
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"_tag\":\"snapshot\",\"room\":\"9007199254740993\",\"entries\":[{\"principalId\":\"9007199254740993\",\"clientId\":\"9007199254740993\",\"tabId\":\"9007199254740993\",\"state\":[1,null]}]}",
+    "value": {
+      "_tag": "snapshot",
+      "room": "9007199254740993",
+      "entries": [
+        {
+          "principalId": "9007199254740993",
+          "clientId": "9007199254740993",
+          "tabId": "9007199254740993",
+          "state": [
+            1,
+            null
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "json": "{\"_tag\":\"snapshot\",\"room\":\"9007199254740993\",\"entries\":[{\"principalId\":\"9007199254740993\",\"clientId\":\"9007199254740993\",\"tabId\":\"9007199254740993\",\"state\":{\"title\":\"vector\",\"nested\":[true]}}]}",
+    "value": {
+      "_tag": "snapshot",
+      "room": "9007199254740993",
+      "entries": [
+        {
+          "principalId": "9007199254740993",
+          "clientId": "9007199254740993",
+          "tabId": "9007199254740993",
+          "state": {
+            "title": "vector",
+            "nested": [
+              true
+            ]
+          }
+        }
+      ]
+    }
+  }
+]
