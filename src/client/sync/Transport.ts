@@ -98,14 +98,21 @@ export interface SyncTransport extends Engine.Transport {
   /** `principal`: the replica's, asserted to the server like the engine's push and pull (SPEC §5). */
   readonly pokes: (
     clientId: Ids.ClientId,
-    principal: AccessScope.PrincipalId
+    principal: AccessScope.PrincipalId,
+    epoch?: Effect.Effect<{ readonly epoch?: string | null }>
   ) => Effect.Effect<Stream.Stream<typeof Protocol.PokesElement.Type, PullTransportError>, PullTransportError>
   /** `Protocol.PresenceRpcs` on the same mount (the server merges both groups, SPEC §10). */
-  readonly presence: (clientId: Ids.ClientId, principal: AccessScope.PrincipalId) => Presence.Upstream<PresenceError>
+  readonly presence: (
+    clientId: Ids.ClientId,
+    principal: AccessScope.PrincipalId,
+    epoch?: Effect.Effect<{ readonly epoch?: string | null }>
+  ) => Presence.Upstream<PresenceError>
 }
 
 export type PresenceError =
   | RpcClientError.RpcClientError
+  | Protocol.ResnapshotRequired
+  | Protocol.ClientOutdated
   | Protocol.Unauthorized
   | Protocol.ServerUnavailable
   | Protocol.Forbidden
@@ -131,7 +138,9 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
         return yield* client.push(payload)
       }).pipe(
         defectsAs((message) => new PushIntegrityError({ reason: "serverDefect", message })),
-        Effect.mapError((error) => new PushTransportError({ reason: lift(error) }))
+        Effect.mapError((error) =>
+          error._tag === "ResnapshotRequired" ? error : new PushTransportError({ reason: lift(error) })
+        )
       ),
 
     // The request is built by the engine from core types; the response is decoded by the RPC client.
@@ -144,11 +153,15 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
       ),
 
     // Any end of this stream (failure, defect, completion) is handled by reconnecting (followPokes).
-    pokes: (clientId, principal) => {
+    pokes: (clientId, principal, epoch = Effect.succeed({})) => {
       const open = (prepared: Headers.Input | undefined) => {
-        const stream = client
-          .pokes({ clientId, principal })
-          .pipe(Stream.mapError((error) => new PullTransportError({ reason: lift(error) })))
+        const stream = Stream.unwrap(
+          Effect.map(epoch, (fence) => client.pokes({ clientId, principal, ...fence }))
+        ).pipe(
+          // A restored server may be otherwise quiet. Wake pull to negotiate its timeline.
+          Stream.catchTag("ResnapshotRequired", () => Stream.succeed(Protocol.Poke.make({}))),
+          Stream.mapError((error) => new PullTransportError({ reason: lift(error) }))
+        )
         return prepared === undefined ? stream : stream.pipe(Stream.provideService(PreparedHeaders, prepared))
       }
       return headers === undefined
@@ -159,17 +172,20 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
           )
     },
 
-    presence: (clientId, principal) => ({
+    presence: (clientId, principal, epoch = Effect.succeed({})) => ({
       // Prepare-then-stream like `pokes`, so the leader's `idleTimeout` starts at send.
       room: (payload) =>
-        headers === undefined
-          ? Effect.succeed(presenceClient.room({ clientId, principal, ...payload }))
-          : Effect.map(acquire(headers), (prepared) =>
-              presenceClient
-                .room({ clientId, principal, ...payload })
-                .pipe(Stream.provideService(PreparedHeaders, prepared))
-            ),
-      track: (payload) => presenceClient.track({ clientId, principal, ...payload })
+        Effect.flatMap(epoch, (fence) =>
+          headers === undefined
+            ? Effect.succeed(presenceClient.room({ clientId, principal, ...payload, ...fence }))
+            : Effect.map(acquire(headers), (prepared) =>
+                presenceClient
+                  .room({ clientId, principal, ...payload, ...fence })
+                  .pipe(Stream.provideService(PreparedHeaders, prepared))
+              )
+        ),
+      track: (payload) =>
+        Effect.flatMap(epoch, (fence) => presenceClient.track({ clientId, principal, ...payload, ...fence }))
     })
   }
 })

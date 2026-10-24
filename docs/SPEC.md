@@ -67,7 +67,8 @@ together. Unsupported schema shapes or invalid branch samples fail rather than l
   a MUST in this document changes. A breaking change MUST bump `wireVersion` when it concerns the
   wire, MUST ship a migration when it concerns the Postgres schema, and MUST update the rule
   and its dated rationale in this document in the same branch. Additive fields marked optional on the wire
-  (`clientVersion`, `principal`, mutation `createdAt`) are not breaking.
+  (`clientVersion`, `principal`, mutation `createdAt`, `epoch`) are not breaking. Epoch refusal is activated only for
+  epoch-aware peers or by the operator's restore fence (§7.4, §11).
 - **Error vocabulary is closed.** The tags in §15 and the literal unions they carry
   (`ResnapshotRequired.reason`, `SyncErrorKind`, `LeaderUnavailable.reason`, telemetry names and
   outcomes) are part of the contract; adding a member is a design change recorded in a dated
@@ -102,22 +103,13 @@ INV-PULL-6; tested by `gc.test.ts` "a continuation replayed by another client, p
 cursor, or garbled, is refused" and "a well-formed forged continuation cannot record a held set no
 snapshot produced".
 
-**Q2 — What does pull do when a client's cursor is ahead of head?** There is no explicit check
-that `cursor ≤ head` for a bare cursor (one is enforced for a resumed continuation's `position`).
-The case is reached only after the database is restored to an earlier backup (head is monotone
-within one database timeline: `GREATEST(gc_horizon, max(log.position), max(mutations.position),
-max(clients.expired_position))`). In that case the client's cursor names a `PullDone` the restored
-database never completed, so its `echo_sync.client_scopes` row is absent and the server answers
-`ResnapshotRequired{unknownCursor}`; the client clears its staging, sets `resnapshot`, and pulls
-from a null cursor, which replaces the replica. If the row did exist with `cursor > head` (no
-known path produces this), `PullDone.nextCursor` would be `head`, moving the cursor backwards and
-re-delivering acks in `(cursor, head]`, which is the empty range, so no ack would be
-re-delivered; the client would then re-install from a position below rows it has already
-installed. There is no restore or epoch fence: the recovery point of a deployed app is its
-database backup, and the engine's recovery mechanism after a restore is the resnapshot the
-missing `client_scopes` row forces. Pending outbox entries survive a resnapshot and are replayed
-and pushed again; the server treats them as new mutations unless their ledger row survived the
-restore. See §7.4 and Open Question OQ-PULL-1.
+**Q2 — What does pull do when a client's cursor is ahead of head?** It answers
+`ResnapshotRequired{unknownCursor, epoch}` before serving any page, even if a held-scope record
+survived. Every epoch-aware request is also compared with `engine_state.epoch` before ledger,
+cursor, registration or presence work. An operator restoring a backup MUST rotate this opaque
+epoch before reopening traffic (§11). The client discards the old replica and sync metadata,
+preserves its identity and pending outbox, then snapshots and re-pushes under the new epoch.
+Already released mutations lost with the backup cannot be recovered from the outbox. See §7.4.
 
 **Q3 — What is the rebase cost model with respect to outbox size and page-set size?** Every
 install and every push that covers an entry is a *full* rebase (`Engine.ts` `rebase`): undo the
@@ -157,7 +149,6 @@ The engine does not and, at this pin, will not:
   suite for a non-TypeScript client;
 - forget idle clients (`echo_sync.clients`, `client_scopes`, ledger identities and floors are
   kept forever: a forgotten floor turns a lost-ack resubmission into a double apply);
-- fence a database restore (Q2);
 - run more than one synced-write transaction at a time on the server (§6);
 - offer full-text search in the replica (the pinned wa-sqlite build has no FTS5);
 - ship a UI adapter other than FoldKit (`echo-sync/foldkit`), or carry any UI-framework
@@ -631,21 +622,30 @@ rest. Payloads are always the current row.
   **Rationale (2026-10-24):** A zero limit emits an unchanged `PullPage` forever. Failing at
   construction follows `Store.checkLimit`: a caller configuration defect is clearer than a
   hidden clamp or a runtime protocol loop.
+- INV-PULL-15: Every `push`, `pull`, `pokes`, `room` and `track` MUST compare a presented
+  `epoch` with `engine_state.epoch` before ledger, cursor, client-registration or presence work.
+  Mismatch (including `null`) MUST return `ResnapshotRequired{unknownCursor, epoch: current}`
+  without that work. A pull cursor above head MUST return the same resnapshot, never a page,
+  regardless of any held-scope record.
+- INV-PULL-16: An absent epoch MAY be served only while `engine_state.require_epoch = false`
+  (the migration's rollout default); once true, every sync entry point MUST refuse absence
+  `ClientOutdated` before any write. `null` is an epoch-aware bootstrap, never a legacy exemption.
 
 ### Details
 
 #### 7.1 Request and policy
 
-`PullRequest{clientId, clientVersion?, principal?, cursor, continuation?}`. At server
+`PullRequest{clientId, clientVersion?, principal?, epoch?, cursor, continuation?}`. At server
 construction, configured `pageLimit` is checked by INV-PULL-14. At the request boundary the
 server refuses authenticated `*` (INV-ACL-8), then runs `assertPrincipal` (INV-PULL-1), the app's
-`clientPolicy` (`ClientOutdated`), `registerClient`, then decodes the continuation (failure →
+`clientPolicy` (`ClientOutdated`), the epoch fence, `registerClient`, then decodes the continuation (failure →
 `staleContinuation`; identity mismatch → `staleContinuation`).
 
 #### 7.2 The snapshot
 
 One `REPEATABLE READ READ ONLY` transaction per page. First statement: `gc_horizon`, `head`
-(§6), `expired_through` of this client. Checks, in order: resumed `position ∈ [cursor, head]`
+(§6), `expired_through` of this client. Checks, in order: `cursor > head` → history resnapshot;
+resumed `position ∈ [cursor, head]`
 and ≥ 0 (else stale); `base = resumed.position ?? cursor`, `base < gc_horizon` → `gcHorizon`;
 cursor non-null → `client_scopes` row at `(clientId, cursor)` must exist (else `unknownCursor`),
 its `scope_ids` is the held set; a resumed continuation then overrides held (`scopes`) and
@@ -664,10 +664,41 @@ to `scopes` (held). Only when `walking` is empty is the log read.
 **Rationale (2026-10-21):** Newly granted scopes are walked before the log because a principal
 gaining a scope mid-stream needs its current rows, not only changes committed after the grant.
 
-#### 7.4 Cursor ahead of head
+#### 7.4 Engine epoch and cursor fence
 
-See Q2. No explicit `cursor ≤ head` check exists; the `client_scopes` lookup is what refuses a
-cursor from a different database timeline.
+Migration `004_engine_epoch` adds an opaque UUID string `epoch` and `require_epoch` to the
+singleton `echo_sync.engine_state`. New clients MUST send their persisted epoch on every sync
+request, or `null` until negotiated. Every pull response carries the current epoch (optional
+on the wire for older servers). A history resnapshot carries it as an additive field on the
+existing `unknownCursor` reason; the reason vocabulary and wire version remain unchanged.
+Epoch mismatch is checked before any engine write; `cursor > head` is independently checked
+inside the page's snapshot before any page or cursor bookkeeping. Requests with matching
+epochs follow normal scope, ledger and continuation checks. Low-level administrative ledger
+primitives are not sync request entry points; custom transports MUST use `executeBatch`/`pull`.
+
+Clients MUST atomically clear the replica, cursor, held-scope staging and push watermark on a
+history resnapshot, preserve `clientId`, every pending envelope (including its seq), released
+markers and notices, and replay pending against the empty base. They MUST persist the new
+epoch with this reset, finish a fresh snapshot before pushing, then re-push pending entries
+whose ledger identity did not survive. A late response from an older epoch MUST NOT install
+or release intent. A refused pokes connection wakes pull so an otherwise quiet restored
+server can recover; presence retries using the epoch now persisted by sync.
+
+**Rationale (2026-10-24):** A restored backup can retain a held-scope row and can catch up past
+an old cursor before that client reconnects, so a head check alone is insufficient. An opaque
+operator-rotated timeline fences every request; clearing `pushedThrough` as well as the cursor
+prevents a previously pushed but still pending mutation from being stranded.
+
+An omitted field remains a legacy request during server-first rollout. The restore statement
+sets `require_epoch = true` permanently, closing that exemption. `ClientOutdated` uses the
+existing §13 stop mechanism for gate-aware old clients; pre-gate clients cannot decode that
+refusal but still cannot write. Operators MAY enable this requirement before a restore once
+clients are deployed. A new client against an old server has no epoch protection; deploy the
+server first. The epoch capability gate is independent of the app's table-shape `clientPolicy`.
+
+**Rationale (2026-10-24):** Accepting absence forever would silently leave legacy clients
+unfenced after restore; refusing it immediately would break the required server-first rollout.
+The persisted restore gate permits that rollout and refuses unprotected clients after recovery.
 
 #### 7.5 The continuation
 
@@ -722,16 +753,10 @@ readable grants; catalog (`resolveTables`); one `SELECT` per table per walk page
 upsert entries, for payloads; one ack `SELECT`; `COMMIT`; after the transaction, three writes when
 `cursor` is non-null (`DELETE client_scopes`, `UPDATE clients`, `UPDATE mutations`) and one
 `INSERT client_scopes` on `PullDone`. Plus, per request, the principal lookup, `clientPolicy` and
-`registerClient`.
+`registerClient` and one epoch read.
 
 ### Open Questions
 
-- OQ-PULL-1 (Q2): there is no explicit `cursor ≤ head` fence; recovery after a database restore
-  relies on the restored `client_scopes` table lacking the row. A row that survived a restore
-  with `cursor > head` would regress the cursor silently. Whether an explicit
-  `ResnapshotRequired{unknownCursor}` for `cursor > head` should be added is open; the
-  `gc.test.ts` test "a cursor the server never completed a page set at is refused rather than
-  trusted" covers the missing-row path only.
 - OQ-PULL-2: Unknown-table changes are skipped by the client at debug level (§9.3). A client on
   an old registry therefore installs `nextCursor` past rows it never stored; it relies on the
   `dataHash` rebuild when the app updates. The retired design text said this is intended; the
@@ -758,8 +783,9 @@ omitting it receive legacy server-time behavior, subject to the same `clientPoli
   connection, pool exhausted) MUST reach the client as a short or empty `results` list, never as
   a defect the client would halt on; any other defect, from `principalFor` or a handler, is a
   server defect and halts the client's push (INV-LOOP-3).
-- INV-PUSH-4: Request-level refusals are `Unauthorized`, `MalformedEnvelope`, `ClientOutdated`;
-  `MalformedEnvelope` executes and records nothing.
+- INV-PUSH-4: Request-level refusals are `Unauthorized`, `MalformedEnvelope`, `ClientOutdated`
+  and the epoch-carrying `ResnapshotRequired` (INV-PULL-14, INV-CLI-13); `MalformedEnvelope`
+  and the epoch refusal execute and record nothing.
 - INV-PUSH-5: Headers used by `principalFor` MUST be the real HTTP request headers, never
   per-message RPC headers a body could forge.
 
@@ -821,7 +847,8 @@ replay set goes through one function, `rebase`.
   (a push result at such a position, or with outcome `Rejected{ClientExpired}` whatever its
   position, is released at once, INV-PUSH-6).
 - INV-CLI-7: `pushedThrough` advances only on push responses, never at install: an entry below
-  a released one may need to be re-sent so a push response's position releases it.
+  a released one may need to be re-sent so a push response's position releases it. A history
+  resnapshot resets it to zero (INV-CLI-13); ordinary GC resnapshots preserve it.
 - INV-CLI-8: Released rows are kept as markers (`released_at`) for `defaultReleasedRetentionMillis`
   = 24 h, so an `enqueue` retried after its original was released adds no intent; the leader
   prunes them at open.
@@ -833,7 +860,7 @@ replay set goes through one function, `rebase`.
 - INV-CLI-10: `ResnapshotRequired` on a request that was not the initial one (non-null cursor
   or a continuation) clears staging, sets `meta.resnapshot`, and continues the loop from a null
   cursor; the replica and its cursor keep serving reads until the snapshot installs. On an
-  initial request it is a pull failure.
+  initial request it is a pull failure, except for a history fence carrying `epoch` (INV-CLI-13).
 - INV-CLI-11: A stored row that no longer decodes, or stored engine data that does not decode,
   is `CorruptStorage` (a defect naming the table and row id), never a bare schema error.
 - INV-CLI-12: A registry whose `dataHash` or table DDL differs from the stored one rebuilds the
@@ -845,13 +872,24 @@ replay set goes through one function, `rebase`.
   without preventing the rest of the page set from installing or its cursor from advancing. A
   later `dataHash` rebuild for a registry that gains that table MUST reset the cursor so the
   replacement snapshot delivers its rows.
+- INV-CLI-14: A history resnapshot carrying `epoch`, on push or pull including initial sync,
+  MUST reset the replica, cursor, staging and `pushedThrough` atomically, preserving identity,
+  all pending intent, released markers and notices. Pending is replayed on the empty base and
+  then on the new snapshot; push waits until that snapshot installs. Stale-epoch responses
+  MUST NOT release pending intent or install pages (§7.4). A completed snapshot with eligible
+  unsent pending entries MUST schedule another cycle without requiring an external wake, even
+  after reload or a failed snapshot attempt; it MUST NOT advance `lastSyncedAt` yet.
+
+  **Rationale (2026-10-24):** Pull can invalidate a push watermark after that cycle's push
+  already found nothing to send. Reporting eligible work from the install and retrying a
+  deferred push prevents quiet servers from leaving restored pending intent stranded.
 
 ### Details
 
 #### 9.1 Storage
 
 SQLite tables, all `STRICT` except the outbox: `echo_meta(key, value)` with keys `sync_meta`
-(one JSON value `{cursor, pushedThrough, resnapshot}`), `client_id`, `engine_schema_version`,
+(one JSON value `{cursor, pushedThrough, resnapshot, epoch?}`), `client_id`, `engine_schema_version`,
 `replica_tables`, `replica_data_hash`, `replica_table_ddl`, `replica_index_hash`;
 `echo_outbox(seq AUTOINCREMENT PK, client_id, mutation_id UNIQUE, name, args, created_at,
 released_at, undo TEXT NOT NULL DEFAULT '[]')` (`undo` is engine schema step 2; a stored
@@ -863,7 +901,8 @@ handler never runs.
 
 #### 9.2 Meta
 
-`{cursor: Cursor, pushedThrough: number, resnapshot: boolean}`. The pull request's cursor is
+`{cursor: Cursor, pushedThrough: number, resnapshot: boolean, epoch?: string | null}`. Missing
+epoch in pre-upgrade storage means unnegotiated, like `null`. The pull request's cursor is
 `null` when `resnapshot` is set, else `cursor`; its continuation is the last staged page's.
 
 #### 9.3 Install
@@ -1080,6 +1119,11 @@ outcomes of old acked ledger rows and raises each client's floors. Identities ar
   if a row with an outcome survives at `seq ≤` the new floor the job dies and rolls back.
 - INV-GC-5: Floors are permanent: no job deletes a client's floor or identities.
 - INV-GC-6: Expiring the newest ledger row MUST NOT move head back (INV-PULL-12).
+- INV-GC-7: Restoring authoritative storage MUST happen with all instances stopped or traffic
+  fenced and in-flight work drained. Before any restored instance accepts traffic, the operator
+  MUST rotate `engine_state.epoch` and enable `require_epoch`. Pending mutations whose ledger
+  rows were lost MUST be eligible to re-push; already released mutations lost with the backup
+  are outside the recovery guarantee.
 
 ### Details
 
@@ -1094,6 +1138,28 @@ identities: deleting identities was rejected because a tab can retry `LeaderLost
 same id after suspension past the released-marker window, re-enqueue at a fresh seq above the
 floor and double-apply. Ack-based retention, permanent floors and identity checks preserve
 that late-retry safety independently of log GC (§5, §9).
+
+#### 11.1 Restoring a database backup
+
+Stop every server instance and prevent traffic, restore the whole database (app rows and the
+`echo_sync` schema together), and run engine migrations if the backup predates migration 004.
+Before reopening traffic, execute this one statement on the restored database:
+
+```sql
+UPDATE echo_sync.engine_state
+SET epoch = gen_random_uuid()::text, require_epoch = true;
+```
+
+Verify `UPDATE 1`. Do not reuse an earlier epoch, turn `require_epoch` back off, or rotate while
+requests are in flight. This applies equally to Coolify database backups and other Postgres
+restore mechanisms; startup deliberately does not rotate automatically. Stop and restart all
+instances so old presence and streaming sessions cannot survive the restore. Consumers must
+pin the epoch-aware client to regain sync after the legacy path is closed (§7.4).
+
+**Rationale (2026-10-24):** The database backup is the recovery point. Rotation distinguishes
+reused positions without a destructive client reset; a restart alone is not a new history and
+must not force every client to resnapshot. An acked and released mutation is no longer pending
+intent and cannot be reconstructed if the restored backup predates it.
 
 ### Open Questions
 
@@ -1292,7 +1358,7 @@ mismatch it refuses to serve. The client rebuilds its replica from a `dataHash` 
 #### 13.1 Startup order
 
 `Startup.prepare`: `migrate` (engine migrations `001_engine`, `002_grant_id_check`,
-`003_ledger_acked_at` in `echo_sync.migrations`) → `migrateApp` (the app's record of
+`003_ledger_acked_at`, `004_engine_epoch` in `echo_sync.migrations`) → `migrateApp` (the app's record of
 `NNN_name` → Effect, in `echo_sync.app_migrations`) → for every registry table except
 `scope_grants` that exists (`to_regclass(quote_ident(name))`, i.e. resolved through
 `search_path`): `attach`, with `TableNameConflict` left for `verify` → `verify`. A table the app
@@ -1481,9 +1547,9 @@ the count keys. Changes to these lists must also update the corresponding prose 
 
 | tag | fields | raised by | client action |
 |---|---|---|---|
-| `ResnapshotRequired` | `reason: gcHorizon \| unknownCursor \| staleContinuation` | `pull` | non-initial request: clear staging, `resnapshot`, pull from null (INV-CLI-10); initial: transient pull failure |
+| `ResnapshotRequired` | `reason: gcHorizon \| unknownCursor \| staleContinuation, epoch?: string` | all sync RPCs (history fence); `pull` (retention/continuation) | with epoch: reset history and resnapshot (INV-CLI-14); without: INV-CLI-10; pokes wakes pull, presence retries |
 | `Unauthorized` | `reason?: …, message` | `push`, `pull`, `pokes`, `room`, `track`; also HTTP 401/403 | transient, kind `unauthorized`; presence rejoins; the safe closed `reason` is surfaced in `SyncStatus.lastError.message`, but never changes retry behavior |
-| `ClientOutdated` | `message` | app `clientPolicy` on `push`/`pull` | terminal for this leader, kind `outdated` |
+| `ClientOutdated` | `message` | app `clientPolicy` on `push`/`pull`; missing required epoch on all sync RPCs | push/pull terminal for this leader, kind `outdated`; streams retry |
 | `MalformedEnvelope` | `clientId, mutationId, message` | `push` (`seq < 1`) | push halts |
 | `ServerUnavailable` | `message` | `pull` (database failure, lost connection), `pokes` (lost `LISTEN`), `room` (grant lookup failed), declared on `track` | transient, kind `unavailable` |
 | `Forbidden` | `room` | `room`, `track` (no grant in the room's scope) | presence subscription ends |
@@ -1798,6 +1864,8 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PULL-12 | covered | `gc.test` "expiring the newest ledger row never moves the head back: a cursor at its position does not regress and a page set resumed at it continues" |
 | INV-PULL-13 | covered | `gc.test` "a client whose cursor GC passed must resnapshot and then converges; a client at head is unaffected"; `Simulation.test` "ResnapshotRequired after a suspended pull keeps seqs, pushedThrough and cursor written meanwhile" |
 | INV-PULL-14 | covered | `rpc.test` "a server with an invalid pageLimit dies at construction instead of producing an endless PullPage" |
+| INV-PULL-15 | covered | `rpc.test` "a stale epoch reaches no ledger, cursor, client registration or presence write on any sync entry point", "a cursor above head is resnapshotted even when its held-scope record survived" |
+| INV-PULL-16 | covered | `rpc.test` "an omitted epoch works during rollout but is refused ClientOutdated after restore fencing" |
 | INV-PUSH-1 | partial | `Transport.test` "push failures are fatal exactly when SPEC §10 says so, classified by real tags over a real RPC server" (includes the cap); the 50 default and the `min(…, 100)` clamp have no test |
 | INV-PUSH-2 | covered | `ledger.test` "a batch stops at a transient failure without recording it, and its resubmission continues in order"; `Transport.test` "a push batch the server stopped is reported as kind server" |
 | INV-PUSH-3 | covered | `rpc.test` "a connection lost mid-batch is a short results list, never a defect the client would halt on", "an infrastructure defect in principalFor is a transient stop (empty results), not a push failure" |
@@ -1817,6 +1885,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-CLI-11 | covered | `SqliteRowStore.test` "a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError" |
 | INV-CLI-12 | covered | `SqliteSyncStorage.test` "an index-only change keeps rows and cursor; a data-shape change rebuilds and resets them together", "a data-shape migration interrupted at any scheduler boundary leaves the old replica or the new one, never a mix" |
 | INV-CLI-13 | covered | `version-gate.e2e` "unknown-table changes must not stall an old client or be lost after its registry update" |
+| INV-CLI-14 | covered | `expiry.e2e` "an epoch rotation resnapshots without losing pushed or unpushed pending mutations; released intent stays lost with the backup"; `Simulation.test` "restoring an earlier log and ledger cannot strand pending intent or mix replicas across epochs", "late push and pull responses from a restored epoch cannot release pending intent or install old rows"; `SyncLoop.test` "a discovered or resumed epoch resnapshot delivers pending intent without an external wake"; `Transport.test` "an epoch-refused pokes connection wakes pull even when the restored server has no new writes" |
 | INV-LOOP-1 | covered | `SyncLoop.test` "a transient push failure is retried with backoff and clears once a cycle succeeds"; `Leader.test` "requestSync during backoff runs the next cycle at once and leaves a halted push halted" |
 | INV-LOOP-2 | covered | `SyncLoop.test` "lastSyncedAt stays null after a cycle whose pull failed, and is set by the first cycle that installs", "a stopped push that processed later entries cannot advance lastSyncedAt or halt push"; `Leader.test` "a push whose response is lost keeps the entry pending until the pull installs its ack, and that cycle sets no lastSyncedAt" |
 | INV-LOOP-3 | covered | `SyncLoop.test` "an integrity error halts push for good while pull keeps running"; supplementary browser scenarios cover handover and pending export |
@@ -1832,6 +1901,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-GC-4 | covered | `gc.test` "the floor after a job is the highest seq of an expired prefix, PullDone.expiredThrough reports it, and the recorded position is the highest expired row's", "expired rows that would not be a seq prefix fail the job loudly and roll back: no row deleted, no floor raised" |
 | INV-GC-5 | covered | `gc.test` "log GC never deletes ledger rows or held-scope records (would cause double apply after resnapshot)", "a job run with no eligible rows changes nothing: young acks, unacked rows and earlier floors stay as they are" |
 | INV-GC-6 | covered | `gc.test` "expiring the newest ledger row never moves the head back: a cursor at its position does not regress and a page set resumed at it continues" |
+| INV-GC-7 | covered | `expiry.e2e` "an epoch rotation resnapshots without losing pushed or unpushed pending mutations; released intent stays lost with the backup"; `Simulation.test` "restoring an earlier log and ledger cannot strand pending intent or mix replicas across epochs" (operator traffic fencing is a precondition, not an automated guarantee) |
 | INV-BRW-1 | covered | `platform.test` "identities with all-dot segments are rejected", "an appId or profile over 255 UTF-8 bytes is refused even when the whole path fits; 255 bytes is accepted", "the longest identity whose journal path fits the pool's 512-byte path header is accepted; one more character is not"; supplementary browser path round-trip scenario |
 | INV-BRW-2 | partial | Browser single-owner, handover and OPFS-startup scenarios; no literal test-title citation |
 | INV-BRW-3 | partial | `platform.test` "a name held only in shared mode does not count as held (a dead leader's watchers)"; stale-announcement coverage is in browser scenarios only |
@@ -1879,6 +1949,7 @@ machine-verifiable literal test-title citations.
 |---|---|---|---|
 | `wireVersion` | 1 | `Protocol.ts` | no |
 | mutation future-clock skew bound | 30,000 ms (strictly greater rejects) | `Protocol.maxMutationFutureSkewMillis`, `rpc.ts` | no |
+| `engine_state.require_epoch` | false on migration; true after restore | migration 004, §11.1 | operator, never disable after restore |
 | push batch size | `min(pushBatchSize ?? 50, 100)` | `Engine.ts` | `pushBatchSize` |
 | `PushRequest.mutations` | 1 … 100 | `Protocol.ts` | no |
 | `pageLimit` (upserts + tombstones per page) | 500; configured value must be a positive safe integer (INV-PULL-14) | `rpc.ts` | `pageLimit` |
@@ -1928,7 +1999,6 @@ machine-verifiable literal test-title citations.
 
 | ID | section | question |
 |---|---|---|
-| OQ-PULL-1 | §7 (Q2) | no explicit `cursor ≤ head` fence; recovery after restore relies on the missing `client_scopes` row |
 | OQ-PULL-2 | §7 | unknown-table changes skipped at install advance the cursor past rows never stored; untested |
 | OQ-CLI-1 | §9 (Q3), §16 | full rebase: 49.41 ms for 5/50, 651.39 ms for 500/5,000 pending/changes (Bun memory VFS); algorithm decision remains open |
 | OQ-LOOP-1 | §10 | the push halt is in memory per leader; a new leader retries the batch and halts again |

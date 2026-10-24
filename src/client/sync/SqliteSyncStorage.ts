@@ -35,7 +35,12 @@ const StoredUndo = Schema.fromJsonString(
 export const Notice = Mutation.Notice
 const StoredNotice = Schema.fromJsonString(Notice)
 const StoredMeta = Schema.fromJsonString(
-  Schema.Struct({ cursor: Ids.Cursor, pushedThrough: Schema.Int, resnapshot: Schema.Boolean })
+  Schema.Struct({
+    cursor: Ids.Cursor,
+    pushedThrough: Schema.Int,
+    resnapshot: Schema.Boolean,
+    epoch: Schema.optionalKey(Schema.NullOr(Schema.String))
+  })
 )
 
 // Our own rows failing to decode means corruption or a version skew: the `CorruptStorage` defect, never retryable.

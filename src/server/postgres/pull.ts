@@ -2,6 +2,7 @@ import { Array as Arr, Effect, Option, type Order, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation, Protocol, type Registry, Store, type SyncTable } from "echo-sync"
 import { assertPrincipal, registerClient } from "./ledger.ts"
+import { checkEpoch } from "./epoch.ts"
 import { decodeRow, q, selectList } from "./rowStore.ts"
 import { type Resolved, resolveTables } from "./schema.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
@@ -45,6 +46,7 @@ export type ClientPolicy = (version: Protocol.ClientVersion | undefined) => Effe
 export interface PullRequest {
   readonly principalId: string
   readonly clientId: string
+  readonly epoch?: string | null | undefined
   readonly clientVersion?: Protocol.ClientVersion | undefined
   /** The wire's replica principal (SPEC §5): checked against `principalId`, never used as it. */
   readonly principal?: string | undefined
@@ -101,6 +103,7 @@ export const pull = Effect.fnUntraced(function* (
 ) {
   yield* assertPrincipal(request.principalId, request.principal)
   if (clientPolicy !== undefined) yield* clientPolicy(request.clientVersion)
+  const epoch = yield* checkEpoch(request.epoch)
   const sql = yield* SqlClient
   yield* registerClient(request.principalId, request.clientId)
   const stale = new Protocol.ResnapshotRequired({ reason: "staleContinuation" })
@@ -132,6 +135,9 @@ export const pull = Effect.fnUntraced(function* (
         FROM echo_sync.engine_state`
       const state = stateRows[0]
       if (state === undefined) return yield* Effect.die("echo_sync.engine_state is empty; run migrate")
+      if (request.cursor !== null && request.cursor > state.head) {
+        return yield* new Protocol.ResnapshotRequired({ reason: "unknownCursor", epoch })
+      }
       // Resumed progress must lie in [originating cursor, head of this snapshot]. A position the
       // server never reached would let PullDone record a nextCursor no snapshot produced.
       if (
@@ -250,6 +256,7 @@ export const pull = Effect.fnUntraced(function* (
       const result: Protocol.PullResponse = logDone
         ? {
             _tag: "PullDone",
+            epoch,
             changes,
             acks,
             nextCursor: Ids.Position.make(nextPosition),
@@ -259,6 +266,7 @@ export const pull = Effect.fnUntraced(function* (
           }
         : {
             _tag: "PullPage",
+            epoch,
             changes,
             acks,
             continuation: Protocol.PullContinuation.make(

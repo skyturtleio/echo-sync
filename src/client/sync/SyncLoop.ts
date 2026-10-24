@@ -195,6 +195,11 @@ export const make = (options: {
         if (Option.isNone(transient) || kind === "server-outdated") {
           transient = Option.some(errorOf(kind, unauthorizedReason))
         }
+      } else if (pulled.value?.retryPush && (yield* SubscriptionRef.get(status)).push._tag === "Active") {
+        // A restore can make an already-pushed entry eligible again during pull. No server
+        // write or future poke is guaranteed, so the loop must schedule its delivery itself.
+        transient = Option.some(stoppedBatch)
+        pushedCleanly = false
       }
       // `engine.pull` succeeds only once a `PullDone` set is installed.
       const syncedAt = pushedCleanly && Exit.isSuccess(pulled) ? yield* Clock.currentTimeMillis : undefined

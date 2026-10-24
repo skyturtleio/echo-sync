@@ -33,6 +33,8 @@ export interface PendingMutation {
 }
 
 export interface SyncMeta {
+  /** Absent in pre-epoch storage; null means no timeline has been negotiated. */
+  readonly epoch?: string | null
   /** Position through which the installed replica is authoritative. */
   readonly cursor: Ids.Cursor
   /** Highest `seq` the server has reported as processed (0 = none); never resent. */
@@ -94,7 +96,9 @@ export interface SyncStorage {
 
 /** The network port. Every failure is classified once, by the transport (see `SyncFailure`). */
 export interface Transport {
-  readonly push: (request: Protocol.PushRequest) => Effect.Effect<Protocol.PushResponse, PushTransportError>
+  readonly push: (
+    request: Protocol.PushRequest
+  ) => Effect.Effect<Protocol.PushResponse, PushTransportError | Protocol.ResnapshotRequired>
   readonly pull: (
     request: Protocol.PullRequest
   ) => Effect.Effect<Protocol.PullResponse, PullTransportError | Protocol.ResnapshotRequired>
@@ -252,7 +256,12 @@ export const applyPageSet = (
     // a pending entry below a released one was processed, but if its outcome is at a position
     // ≤ the old cursor no pull will ever ack it (a duplicate enqueued after its original was
     // released). It must be resent so the push response's position releases it.
-    yield* storage.setMeta({ ...meta, cursor: done.nextCursor, resnapshot: false })
+    yield* storage.setMeta({
+      ...meta,
+      ...(done.epoch === undefined ? {} : { epoch: done.epoch }),
+      cursor: done.nextCursor,
+      resnapshot: false
+    })
     yield* storage.clearStaged
   })
 
@@ -280,8 +289,8 @@ export interface Engine {
   ) => Effect.Effect<Mutation.MutationEnvelope, StoreUnavailable | LocallyRejected>
   /** Sends unprocessed outbox entries in seq order until none remain or the server stops. */
   readonly push: Effect.Effect<PushResult, SyncFailure.PushFailure>
-  /** Pulls until `PullDone`, staging intermediate pages, then installs the set atomically. */
-  readonly pull: Effect.Effect<void, SyncFailure.PullFailure>
+  /** Installs a complete set. `retryPush` asks the loop to deliver intent made eligible by this install. */
+  readonly pull: Effect.Effect<void | { readonly retryPush: boolean }, SyncFailure.PullFailure>
 }
 
 export const make = (options: {
@@ -311,6 +320,19 @@ export const make = (options: {
     const pullLock = yield* Semaphore.make(1)
     // Per-leader only, like the loop's integrity halt. Network failures never touch this map.
     const transientAnswers = new Map<Ids.MutationId, number>()
+
+    // A history fence invalidates positions, including successful-push bookkeeping, but never intent.
+    // Ignore an old in-flight failure after another request already changed our timeline.
+    const resetEpoch = (epoch: string, expected: string | null | undefined) =>
+      storage.transaction(
+        Effect.gen(function* () {
+          const current = yield* storage.meta
+          if ((current.epoch ?? null) !== (expected ?? null)) return
+          yield* rebase(context, storage.rows.clearAll, () => Option.none())
+          yield* storage.clearStaged
+          yield* storage.setMeta({ ...current, epoch, cursor: null, pushedThrough: 0, resnapshot: true })
+        })
+      )
 
     const mutate = (mutationId: Ids.MutationId, name: string, args: Schema.Json) =>
       Telemetry.observe(
@@ -356,22 +378,34 @@ export const make = (options: {
           for (const id of transientAnswers.keys()) if (!pendingIds.has(id)) transientAnswers.delete(id)
           const batch = pending.filter((entry) => entry.envelope.seq > meta.pushedThrough).slice(0, batchSize)
           if (!Arr.isReadonlyArrayNonEmpty(batch)) return { processed, stopped: sawTransient }
+          // Defer until snapshot install, but keep the cycle retrying without an external wake.
+          if (meta.resnapshot) return { processed, stopped: true }
           const stopped = yield* Telemetry.observe(
             Effect.gen(function* () {
               yield* Telemetry.annotate({ "echo.batch_size": batch.length })
               yield* Telemetry.histogram("echo.push.batch_size", batch.length)
-              const response = yield* transport.push({
-                clientId,
-                clientVersion,
-                principal: options.actor,
-                mutations: Arr.map(batch, ({ envelope, createdAt }) => ({
-                  mutationId: envelope.mutationId,
-                  seq: envelope.seq,
-                  createdAt,
-                  name: envelope.name,
-                  args: envelope.args
-                }))
-              })
+              const response = yield* transport
+                .push({
+                  clientId,
+                  epoch: meta.epoch ?? null,
+                  clientVersion,
+                  principal: options.actor,
+                  mutations: Arr.map(batch, ({ envelope, createdAt }) => ({
+                    mutationId: envelope.mutationId,
+                    seq: envelope.seq,
+                    createdAt,
+                    name: envelope.name,
+                    args: envelope.args
+                  }))
+                })
+                .pipe(
+                  Effect.catchTag("ResnapshotRequired", (error) =>
+                    Effect.gen(function* () {
+                      if (error.epoch !== undefined) yield* resetEpoch(error.epoch, meta.epoch)
+                      return { results: [] }
+                    })
+                  )
+                )
               // `results` is the processed prefix of the request, in request (= seq) order.
               const firstMissing = batch[response.results.length]
               const attempts =
@@ -383,6 +417,7 @@ export const make = (options: {
                 yield* storage.transaction(
                   Effect.gen(function* () {
                     const current = yield* storage.meta
+                    if ((current.epoch ?? null) !== (meta.epoch ?? null) || current.resnapshot) return
                     // INV-PUSH-6 corollary: an outcome at a position ≤ the installed cursor is already in
                     // the replica, and no later pull will ack it (acks cover (cursor, nextCursor]).
                     // This is how a duplicate enqueued after its original was released terminates.
@@ -458,6 +493,7 @@ export const make = (options: {
             const continuation = Option.fromNullishOr(staged.at(-1)?.continuation)
             const request: Protocol.PullRequest = {
               clientId,
+              epoch: meta.epoch ?? null,
               clientVersion,
               principal: options.actor,
               cursor: pullFrom(meta),
@@ -467,6 +503,11 @@ export const make = (options: {
               Effect.map(Option.some<Protocol.PullResponse>),
               Effect.catchTag("ResnapshotRequired", (error) =>
                 Effect.gen(function* () {
+                  if (error.epoch !== undefined) {
+                    yield* resetEpoch(error.epoch, meta.epoch)
+                    resnapshots++
+                    return Option.none<Protocol.PullResponse>()
+                  }
                   if (request.cursor === null && Option.isNone(continuation)) return yield* error
                   // Never apply a partial set: drop it and start a snapshot from null. The
                   // replica (and its cursor) keeps serving reads until that snapshot is installed.
@@ -496,19 +537,29 @@ export const make = (options: {
                 const table = options.registry.get(change.table)
                 if (Option.isSome(table)) yield* decodeRow(table.value, change.row)
               }
-              yield* storage.transaction(storage.stage(response))
+              yield* storage.transaction(
+                Effect.gen(function* () {
+                  const current = yield* storage.meta
+                  if ((current.epoch ?? null) === (meta.epoch ?? null)) yield* storage.stage(response)
+                })
+              )
               continue
             }
-            yield* Telemetry.observe(
+            const retryPush = yield* Telemetry.observe(
               storage.transaction(
                 Effect.gen(function* () {
                   const set = yield* storage.staged
+                  const current = yield* storage.meta
+                  if ((current.epoch ?? null) !== (meta.epoch ?? null)) return undefined
                   yield* applyPageSet(context, set, response)
+                  const installed = yield* storage.meta
+                  return (yield* storage.pending).some((entry) => entry.envelope.seq > installed.pushedThrough)
                 })
               ),
               "echo.install",
               (cause) => SyncFailure.classifyPull(cause).outcome
             )
+            if (retryPush === undefined) continue
             for (const installed of [...staged, response]) {
               for (const ack of installed.acks) transientAnswers.delete(ack.mutationId)
             }
@@ -517,7 +568,7 @@ export const make = (options: {
               "echo.pages": staged.length + 1,
               "echo.result": resnapshots > 0 ? "resnapshot" : "ok"
             })
-            return
+            return { retryPush }
           }
         }),
         "echo.pull",

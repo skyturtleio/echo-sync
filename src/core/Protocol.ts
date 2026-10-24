@@ -35,6 +35,8 @@ export const maxMutationFutureSkewMillis = 30_000
 
 export const PushRequest = Schema.Struct({
   clientId: ClientId,
+  /** null bootstraps an epoch-aware client; absent identifies a legacy client. */
+  epoch: Schema.optionalKey(Schema.NullOr(Schema.String)),
   /** Absent only for pre-gate clients; never infer compatibility from absence. */
   clientVersion: Schema.optionalKey(ClientVersion),
   /**
@@ -82,6 +84,7 @@ export type Ack = typeof Ack.Type
 
 export const PullRequest = Schema.Struct({
   clientId: ClientId,
+  epoch: Schema.optionalKey(Schema.NullOr(Schema.String)),
   clientVersion: Schema.optionalKey(ClientVersion),
   /** As on `PushRequest` (SPEC §5). */
   principal: Schema.optionalKey(PrincipalId),
@@ -92,12 +95,14 @@ export type PullRequest = typeof PullRequest.Type
 
 /** More pages follow: stage, do not apply. */
 export const PullPage = Schema.TaggedStruct("PullPage", {
+  epoch: Schema.optionalKey(Schema.String),
   changes: Schema.Array(Change),
   acks: Schema.Array(Ack),
   continuation: PullContinuation
 })
 /** Page set complete: apply the staged set (acks included) atomically, persist `nextCursor`. */
 export const PullDone = Schema.TaggedStruct("PullDone", {
+  epoch: Schema.optionalKey(Schema.String),
   changes: Schema.Array(Change),
   acks: Schema.Array(Ack),
   nextCursor: Position,
@@ -113,6 +118,8 @@ export type PullResponse = typeof PullResponse.Type
 
 /** The client must discard staged pages and resync from a null cursor (INV-CLI-10). */
 export class ResnapshotRequired extends Schema.TaggedError<ResnapshotRequired>()("ResnapshotRequired", {
+  /** Present for a history fence; discard old replica metadata and retry under this epoch. */
+  epoch: Schema.optionalKey(Schema.String),
   reason: Schema.Literals(["gcHorizon", "unknownCursor", "staleContinuation"])
 }) {}
 
@@ -171,7 +178,7 @@ export const SyncRpcs = RpcGroup.make(
   Rpc.make("push", {
     payload: PushRequest,
     success: PushResponse,
-    error: Schema.Union([MalformedEnvelope, Unauthorized, ClientOutdated])
+    error: Schema.Union([MalformedEnvelope, Unauthorized, ClientOutdated, ResnapshotRequired])
   }),
   Rpc.make("pull", {
     payload: PullRequest,
@@ -180,9 +187,13 @@ export const SyncRpcs = RpcGroup.make(
   }),
   Rpc.make("pokes", {
     /** `principal` as on `PushRequest` (SPEC §5). */
-    payload: { clientId: ClientId, principal: Schema.optionalKey(PrincipalId) },
+    payload: {
+      clientId: ClientId,
+      principal: Schema.optionalKey(PrincipalId),
+      epoch: Schema.optionalKey(Schema.NullOr(Schema.String))
+    },
     success: PokesElement,
-    error: Schema.Union([ServerUnavailable, Unauthorized]),
+    error: Schema.Union([ServerUnavailable, Unauthorized, ClientOutdated, ResnapshotRequired]),
     stream: true
   })
 )
@@ -222,6 +233,7 @@ export type RoomElement = typeof RoomElement.Type
 /** The entry's identity and state. `room` is an access scope the principal must be able to read. */
 export const PresencePayload = Schema.Struct({
   clientId: ClientId,
+  epoch: Schema.optionalKey(Schema.NullOr(Schema.String)),
   /** As on `PushRequest` (SPEC §5); not part of the entry. */
   principal: Schema.optionalKey(PrincipalId),
   room: AccessScopeId,
@@ -251,7 +263,7 @@ export const PresenceRpcs = RpcGroup.make(
   Rpc.make("room", {
     payload: PresencePayload,
     success: RoomElement,
-    error: Schema.Union([ServerUnavailable, Unauthorized, Forbidden]),
+    error: Schema.Union([ServerUnavailable, Unauthorized, Forbidden, ClientOutdated, ResnapshotRequired]),
     stream: true
   }),
   /**
@@ -260,6 +272,6 @@ export const PresenceRpcs = RpcGroup.make(
    */
   Rpc.make("track", {
     payload: PresencePayload,
-    error: Schema.Union([ServerUnavailable, Unauthorized])
+    error: Schema.Union([ServerUnavailable, Unauthorized, ClientOutdated, ResnapshotRequired])
   })
 )

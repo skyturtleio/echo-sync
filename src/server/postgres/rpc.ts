@@ -27,6 +27,7 @@ import { AccessScope, Ids, Mutation, Protocol, type Registry, Store } from "echo
 import { assertPrincipal, type ClientForbidden, type LedgerOptions, registerClient, runBatch } from "./ledger.ts"
 import * as Presence from "./presence.ts"
 import { type ClientPolicy, pull } from "./pull.ts"
+import { checkEpoch } from "./epoch.ts"
 import * as RowStore from "./rowStore.ts"
 import { resolveTables } from "./schema.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
@@ -374,12 +375,13 @@ export const executeBatch = (
   request: Protocol.PushRequest
 ): Effect.Effect<
   Protocol.PushResponse,
-  Protocol.Unauthorized | Protocol.MalformedEnvelope | Protocol.ClientOutdated,
+  Protocol.Unauthorized | Protocol.MalformedEnvelope | Protocol.ClientOutdated | Protocol.ResnapshotRequired,
   SqlClient
 > =>
   Effect.gen(function* () {
     yield* assertPrincipal(actor, request.principal)
     if (options.clientPolicy !== undefined) yield* options.clientPolicy(request.clientVersion)
+    yield* checkEpoch(request.epoch)
     const sql = yield* SqlClient
     const tables = yield* resolveTables(options.registry)
     const rowStore = yield* RowStore.make(new Map(tables.map((t) => [t.table.name, t.schema])))
@@ -477,6 +479,7 @@ export const handlers = (options: SyncServerOptions) =>
                   {
                     principalId,
                     clientId: request.clientId,
+                    epoch: request.epoch,
                     clientVersion: request.clientVersion,
                     principal: request.principal,
                     cursor: request.cursor,
@@ -497,11 +500,12 @@ export const handlers = (options: SyncServerOptions) =>
                 Effect.provideService(SqlClient, sql),
                 (work) => Telemetry.observe(work, "echo.server.pull", protocolOutcome)
               ),
-            pokes: ({ clientId, principal }) =>
+            pokes: ({ clientId, principal, epoch }) =>
               Stream.unwrap(
                 Effect.gen(function* () {
                   const principalId = yield* authenticate(options.principalFor)
                   yield* assertPrincipal(principalId, principal)
+                  yield* checkEpoch(epoch)
                   yield* registerClient(principalId, clientId)
                   return pokes
                 }).pipe(Effect.provideService(SqlClient, sql))
@@ -582,6 +586,7 @@ export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor"
             Effect.gen(function* () {
               const principalId = yield* authenticate(options.principalFor)
               yield* assertPrincipal(principalId, payload.principal)
+              yield* checkEpoch(payload.epoch).pipe(serverFailures)
               if (!(yield* holdsRoom(principalId, payload.room))) {
                 return yield* new Protocol.Forbidden({ room: payload.room })
               }
@@ -592,6 +597,7 @@ export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor"
           Effect.gen(function* () {
             const principalId = yield* authenticate(options.principalFor)
             yield* assertPrincipal(principalId, payload.principal)
+            yield* checkEpoch(payload.epoch).pipe(serverFailures)
             yield* presence.track({ principalId, ...payload })
           })
       })

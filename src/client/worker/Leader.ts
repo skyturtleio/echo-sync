@@ -521,6 +521,9 @@ const program = Effect.fn("Leader.program")(
       // The RPC protocol lives in this scope: it closes with the leader.
       const protocol = yield* Layer.build(Transport.layerProtocolHttp(syncUrl, options.syncHeaders?.(actor)))
       const transport = yield* Transport.make.pipe(Effect.provide(protocol))
+      const epoch = storage
+        .transaction(Effect.map(storage.meta, (meta) => ({ epoch: meta.epoch ?? null })))
+        .pipe(Effect.orDie)
       engine = yield* Engine.make({ clientId, actor, storage, registry, mutations, transport })
       const sync = yield* SyncLoop.make({
         engine,
@@ -529,7 +532,7 @@ const program = Effect.fn("Leader.program")(
       yield* Effect.forkScoped(sync.run)
       yield* Effect.forkScoped(
         SyncLoop.followPokes({
-          connect: transport.pokes(clientId, actor),
+          connect: transport.pokes(clientId, actor, epoch),
           wake: sync.wake,
           idleTimeout: options.idleTimeout
         })
@@ -537,7 +540,7 @@ const program = Effect.fn("Leader.program")(
       yield* sync.wake
       loop = sync
       presence = Presence.make({
-        upstream: transport.presence(clientId, actor),
+        upstream: transport.presence(clientId, actor, epoch),
         isFatal: Transport.isFatalPresence,
         idleTimeout: options.idleTimeout
       })

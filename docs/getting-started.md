@@ -182,3 +182,24 @@ code. Never bypass the check.
 | `the unqualified name resolves through search_path to …` | `search_path` selects a different relation than the captured one | fix the server role's `search_path`; `Startup` attaches unqualified names |
 
 Extra undeclared columns and extra indexes are allowed.
+
+## 7. Restore a Postgres backup without leaving clients on the old history
+
+Stop all server instances and drain requests before restoring the whole database, including
+`echo_sync`. If the backup predates engine migration 004, run the current engine migrations
+while traffic remains blocked. Then run this one statement on the restored database:
+
+```sql
+UPDATE echo_sync.engine_state
+SET epoch = gen_random_uuid()::text, require_epoch = true;
+```
+
+Check that it reports `UPDATE 1`, then restart the instances and reopen traffic. Use this step
+after a Coolify database-backup restore too. Do not rotate during live traffic or disable
+`require_epoch` afterwards. Normal server restarts do not require rotation.
+
+Deploy the epoch-aware server before its clients. Legacy clients can sync during rollout;
+after the restore fence, clients without the epoch field receive `ClientOutdated` and must
+update. Epoch-aware clients replace their replica and resend pending mutations without
+changing `clientId`. Mutations already acknowledged and released before the restore are lost
+if they are absent from the backup; this mechanism cannot recover them. See SPEC §7.4 and §11.1.

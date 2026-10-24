@@ -113,6 +113,60 @@ const restore = (into: SqlClient, copy: Effect.Success<ReturnType<typeof backup>
 
 describe.skipIf(!pgAvailable)("expiry floor (SPEC §11) against the real server", () => {
   it.live(
+    "an epoch rotation resnapshots without losing pushed or unpushed pending mutations; released intent stays lost with the backup",
+    () =>
+      Effect.gen(function* () {
+        const pg = yield* SqlClient
+        yield* grant("p", "s1")
+        yield* pg`UPDATE echo_sync.scope_grants SET role = 'writer' WHERE principal_id = 'p'`
+        yield* pg`INSERT INTO items (id, access_scope_id, body) VALUES ('i1', 's1', '')`
+        const { fetch } = yield* serve
+        const { sqlite, storage, engine } = yield* device
+        yield* Effect.gen(function* () {
+          yield* engine.pull
+          const saved = yield* storage.transaction(storage.meta)
+          yield* engine.mutate(mid("released"), "items.append", { id: "i1", suffix: "r" })
+          yield* engine.push
+          yield* engine.pull
+          assert.deepStrictEqual(yield* storage.transaction(storage.pending), [])
+          yield* engine.mutate(mid("pushed"), "items.append", { id: "i1", suffix: "p" })
+          yield* engine.push
+          yield* engine.mutate(mid("unsent"), "items.append", { id: "i1", suffix: "u" })
+          const pending = (yield* storage.transaction(storage.pending)).map((p) => p.envelope)
+          assert.strictEqual((yield* storage.transaction(storage.meta)).pushedThrough, 2)
+
+          // Restore the authoritative row, log and ledger to the saved point. Leave held-scope
+          // records behind deliberately: their presence must never bypass the epoch fence.
+          yield* pg.withTransaction(
+            Effect.gen(function* () {
+              yield* pg`UPDATE items SET body = '' WHERE id = 'i1'`
+              yield* pg`DELETE FROM echo_sync.log WHERE position > ${saved.cursor}`
+              yield* pg`DELETE FROM echo_sync.mutations WHERE position > ${saved.cursor}`
+              yield* pg`SELECT setval('echo_sync.position_seq', ${saved.cursor})`
+              yield* pg`UPDATE echo_sync.engine_state SET epoch = gen_random_uuid()::text, require_epoch = true`
+            })
+          )
+          yield* engine.pull
+          const fresh = yield* storage.transaction(storage.meta)
+          assert.notStrictEqual(fresh.epoch, saved.epoch)
+          assert.strictEqual(fresh.pushedThrough, 0)
+          assert.deepStrictEqual(
+            (yield* storage.transaction(storage.pending)).map((p) => p.envelope),
+            pending
+          )
+          assert.deepStrictEqual(yield* sqlite<{ body: string }>`SELECT body FROM items`, [{ body: "pu" }])
+          assert.strictEqual((yield* engine.push).processed, 2)
+          yield* engine.pull
+          assert.deepStrictEqual(yield* storage.transaction(storage.pending), [])
+          assert.deepStrictEqual(yield* pg<{ body: string }>`SELECT body FROM items`, [{ body: "pu" }])
+          assert.deepStrictEqual(yield* sqlite<{ body: string }>`SELECT body FROM items`, [{ body: "pu" }])
+          assert.deepStrictEqual(yield* SqliteSyncStorage.notices(sqlite), [])
+        }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+      }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
+    60_000
+  )
+
+  it.live(
     "a pending, never-acked mutation at or below the server's raised floor becomes OutcomeUnknown on the next pull (released, not re-pushed, no ledger row); one above the floor stays pending and pushes",
     () =>
       Effect.gen(function* () {

@@ -118,7 +118,7 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (INV-ACL-5)", () => {
       const after = yield* sql<{ name: string }>`SELECT name FROM echo_sync.migrations ORDER BY migration_id`
       assert.deepStrictEqual(
         after.map((r) => r.name),
-        ["engine", "grant_id_check", "ledger_acked_at"]
+        ["engine", "grant_id_check", "ledger_acked_at", "engine_epoch"]
       )
     }).pipe(Effect.provide(EmptyDatabase))
   )

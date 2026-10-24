@@ -10,6 +10,9 @@ import * as SyncLoop from "./SyncLoop.ts"
 import * as Transport from "./Transport.ts"
 
 interface Handlers {
+  readonly pokes?: (request: {
+    readonly epoch?: string | null
+  }) => Stream.Stream<typeof Protocol.PokesElement.Type, Protocol.ResnapshotRequired>
   readonly push?: (
     request: Protocol.PushRequest
   ) => Effect.Effect<Protocol.PushResponse, Protocol.MalformedEnvelope | Protocol.Unauthorized>
@@ -60,7 +63,7 @@ const serve = (handlers: Handlers) =>
       Protocol.SyncRpcs.toLayer({
         push: handlers.push ?? (() => Effect.die("push not expected")),
         pull: handlers.pull ?? (() => Effect.die("pull not expected")),
-        pokes: () => Stream.never
+        pokes: handlers.pokes ?? (() => Stream.never)
       }),
       RpcSerialization.layerNdjson
     ])
@@ -109,6 +112,31 @@ const skewedPull = (() => {
   )
 })()
 const position = Schema.decodeUnknownSync(Ids.Position)("7")
+
+it.effect("an epoch-refused pokes connection wakes pull even when the restored server has no new writes", () =>
+  Effect.gen(function* () {
+    const seen: Array<string | null | undefined> = []
+    const { exit } = yield* harness(
+      serve({
+        pokes: (request) => {
+          seen.push(request.epoch)
+          return Stream.fail(new Protocol.ResnapshotRequired({ reason: "unknownCursor", epoch: "B" }))
+        }
+      }),
+      (transport) =>
+        Effect.gen(function* () {
+          const stream = yield* transport.pokes(
+            Ids.ClientId.make("c"),
+            AccessScope.PrincipalId.make("p"),
+            Effect.succeed({ epoch: "A" })
+          )
+          expect(yield* Stream.runCollect(stream)).toEqual([{ _tag: "poke" }])
+        })
+    )
+    expect(Exit.isSuccess(exit)).toBe(true)
+    expect(seen).toEqual(["A"])
+  }).pipe(Effect.scoped)
+)
 
 /** The failure an exit ended with, or the string "defect"/"success" (a defect would kill the loop's fiber). */
 const failureOf = <A, E>(exit: Exit.Exit<A, E>) =>

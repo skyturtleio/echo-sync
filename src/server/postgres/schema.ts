@@ -5,6 +5,7 @@ import type { Registry, SyncTable } from "echo-sync"
 import engine from "./migrations/001_engine.ts"
 import grantIdCheck from "./migrations/002_grant_id_check.ts"
 import ledgerAckedAt from "./migrations/003_ledger_acked_at.ts"
+import engineEpoch from "./migrations/004_engine_epoch.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
 /** Migrator history table (SPEC §13.1). */
@@ -31,7 +32,8 @@ export const migrate = Effect.gen(function* () {
     loader: PgMigrator.fromRecord({
       "001_engine": engine,
       "002_grant_id_check": grantIdCheck,
-      "003_ledger_acked_at": ledgerAckedAt
+      "003_ledger_acked_at": ledgerAckedAt,
+      "004_engine_epoch": engineEpoch
     }),
     table: migrationsTable
   })

@@ -75,7 +75,7 @@ const connectTo = (
       (input: RequestInfo | URL, init?: RequestInit) => web.handler(new Request(input, init)),
       { preconnect: globalThis.fetch.preconnect }
     )
-    return yield* RpcClient.make(Protocol.SyncRpcs).pipe(
+    return yield* RpcClient.make(Protocol.SyncRpcs.merge(Protocol.PresenceRpcs)).pipe(
       Effect.provide(
         RpcClient.layerProtocolHttp({ url: "http://echo.test/sync" }).pipe(
           Layer.provide([
@@ -244,6 +244,105 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
         )
       }
     })
+  )
+
+  it.live(
+    "a stale epoch reaches no ledger, cursor, client registration or presence write on any sync entry point",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient
+        yield* writer
+        const client = yield* connect
+        const before = yield* client.pull({
+          clientId: Ids.ClientId.make("d"),
+          cursor: null,
+          continuation: Option.none()
+        })
+        assert.isDefined(before.epoch)
+        yield* sql`UPDATE echo_sync.engine_state SET epoch = 'rotated', require_epoch = true`
+        const identity = { clientId: Ids.ClientId.make("new-client"), epoch: before.epoch ?? "missing" }
+        const room = {
+          ...identity,
+          room: AccessScope.AccessScopeId.make("s1"),
+          tabId: Protocol.TabId.make("t"),
+          state: {},
+          revision: 1
+        }
+        const requests = [
+          Effect.asVoid(client.push({ ...push([["m1", "must not write"]]), ...identity })),
+          Effect.asVoid(client.pull({ ...identity, cursor: null, continuation: Option.none() })),
+          Stream.runDrain(client.pokes(identity)),
+          Stream.runDrain(client.room(room)),
+          client.track(room)
+        ]
+        for (const request of requests) {
+          const error = yield* Effect.flip<void, Effect.Error<typeof request>, never>(request)
+          assert.strictEqual(error._tag, "ResnapshotRequired")
+          if (error._tag === "ResnapshotRequired") assert.strictEqual(error.epoch, "rotated")
+        }
+        assert.deepStrictEqual(yield* sql`SELECT * FROM echo_sync.clients WHERE client_id = 'new-client'`, [])
+        assert.deepStrictEqual(yield* sql`SELECT * FROM echo_sync.client_scopes WHERE client_id = 'new-client'`, [])
+        assert.deepStrictEqual(yield* sql`SELECT * FROM echo_sync.mutations`, [])
+        assert.deepStrictEqual(yield* sql`SELECT * FROM items`, [])
+        const snapshot = yield* Stream.runHead(
+          client.room({ ...room, epoch: "rotated", tabId: Protocol.TabId.make("observer") })
+        )
+        assert.isTrue(
+          Option.isSome(snapshot) && snapshot.value._tag === "snapshot" && snapshot.value.entries.length === 1
+        )
+      }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
+  it.live("a cursor above head is resnapshotted even when its held-scope record survived", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      const client = yield* connect
+      const identity = { clientId: Ids.ClientId.make("d") }
+      const initial = yield* client.pull({ ...identity, cursor: null, continuation: Option.none() })
+      yield* sql`INSERT INTO echo_sync.client_scopes (client_id, position, scope_ids) VALUES ('d', 100, '{}'::text[])`
+      const error = yield* Effect.flip(
+        client.pull({
+          ...identity,
+          epoch: initial.epoch ?? null,
+          cursor: Ids.Position.make(100n),
+          continuation: Option.none()
+        })
+      )
+      assert.strictEqual(error._tag, "ResnapshotRequired")
+      if (error._tag === "ResnapshotRequired") assert.strictEqual(error.epoch, initial.epoch)
+      assert.deepStrictEqual(yield* sql`SELECT cursor FROM echo_sync.clients WHERE client_id = 'd'`, [{ cursor: null }])
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
+  it.live("an omitted epoch works during rollout but is refused ClientOutdated after restore fencing", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      yield* writer
+      const client = yield* connect
+      assert.strictEqual((yield* client.push(push([["m1", "legacy"]]))).results.length, 1)
+      yield* sql`UPDATE echo_sync.engine_state SET epoch = gen_random_uuid()::text, require_epoch = true`
+      const identity = { clientId: Ids.ClientId.make("legacy-after") }
+      const room = {
+        ...identity,
+        room: AccessScope.AccessScopeId.make("s1"),
+        tabId: Protocol.TabId.make("t"),
+        state: {},
+        revision: 1
+      }
+      for (const request of [
+        Effect.asVoid(client.push({ ...push([["m2", "refused"]]), ...identity })),
+        Effect.asVoid(client.pull({ ...identity, cursor: null, continuation: Option.none() })),
+        Stream.runDrain(client.pokes(identity)),
+        Stream.runDrain(client.room(room)),
+        client.track(room)
+      ])
+        assert.strictEqual(
+          (yield* Effect.flip<void, Effect.Error<typeof request>, never>(request))._tag,
+          "ClientOutdated"
+        )
+      assert.deepStrictEqual(yield* sql`SELECT * FROM echo_sync.clients WHERE client_id = 'legacy-after'`, [])
+      assert.deepStrictEqual(yield* sql<{ body: string }>`SELECT body FROM items`, [{ body: "legacy" }])
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
   it.live("a pushed mutation's result position and outcome reach the client and come back as its ack", () =>
@@ -758,6 +857,7 @@ describe.skipIf(!pgAvailable)("pokes liveness (SPEC §10.1)", () => {
         // The leader's loop: followPokes over the real RPC stream, `wake` is what runs a pull.
         const stream = client.pokes({ clientId: Ids.ClientId.make("d") }).pipe(
           Stream.tap((element) => Effect.sync(() => void seen.push({ tag: element._tag, at: Date.now() }))),
+          Stream.catchTag("ResnapshotRequired", (error) => Stream.die(error)),
           Stream.mapError((reason) => new PullTransportError({ reason }))
         )
         yield* Effect.forkChild(
