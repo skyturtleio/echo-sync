@@ -17,6 +17,7 @@ import {
   TestDatabase
 } from "./postgres/test-support.ts"
 import * as Startup from "./startup.ts"
+import { recorder } from "../../test/telemetry-recorder.ts"
 
 const options: Startup.StartupOptions = {
   registry,
@@ -53,6 +54,19 @@ const pullOnce = Effect.gen(function* () {
 }).pipe(Effect.scoped)
 
 describe.skipIf(!pgAvailable)("server startup (§11)", () => {
+  it.live(
+    "startup's internal steps (verify, its per-table checks) must never hand the host a span other than echo.server.startup",
+    () =>
+      Effect.gen(function* () {
+        const host = recorder()
+        yield* Startup.prepare({ registry }).pipe(Effect.provideContext(host.context))
+        assert.deepStrictEqual(
+          host.spans.map((span) => span.name),
+          ["echo.server.startup"]
+        )
+      }).pipe(Effect.provide(TestDatabase))
+  )
+
   it.live("body-supplied cookie and origin headers cannot change a push's HTTP principal or origin policy", () =>
     Effect.gen(function* () {
       const db = yield* Effect.context<SqlClient | PgClient.PgClient>()

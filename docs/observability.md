@@ -198,6 +198,7 @@ annotated diagnostic cause. Status/halt text returned to callers is unchanged.
 | Router leader epoch watcher; tab watcher; announcement acceptance | Error |
 | LeaderClient connected epoch watcher; connection setup; router acceptance; own epoch watcher | Error |
 | Server presence revocation watcher restart | Warn |
+| Leader completed an interrupted reset's removal | Warn; fixed text, no path or identity |
 
 Interruption-related routine entries are Debug, not Error/Warn. The only direct `Effect.log*`
 calls remaining in `src` are the shared routine and diagnostics implementations.
