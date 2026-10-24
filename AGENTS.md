@@ -83,10 +83,10 @@ server and restarts it in S4 (the server-restart check). In an Amp orb, use supe
 not detached shell jobs:
 
 ```sh
-amp orb service start echo-server --command 'bun examples/server/main.ts'
-amp orb service start echo-spike --command 'bun run spike' --portal
+amp orb service start echo-server --port 5200 --command 'bun examples/server/main.ts'
+amp orb service start echo-spike --port 5199 --command 'bun run spike' --portal
 examples/browser-spike/scenarios.sh
-ECHO_SERVER_START="amp orb service start echo-server --command 'bun examples/server/main.ts'" \
+ECHO_SERVER_START="amp orb service start echo-server --port 5200 --command 'bun examples/server/main.ts'" \
 ECHO_SERVER_STOP="amp orb service stop echo-server" examples/browser-spike/slice.sh
 bash examples/browser-spike/observability.sh
 amp orb service stop echo-server
