@@ -1,13 +1,17 @@
 # Getting started: the server side
 
+> Consumer guide for SPEC §3, §4, §5, §8 and §13 (wiring a server). Non-normative: where this page disagrees with
+> [`docs/SPEC.md`](SPEC.md), the SPEC wins and the disagreement is a SPEC Open Question.
+> `DECISIONS N` refers to [`docs/DECISIONS.md`](DECISIONS.md).
+
 This page covers how a consumer app wires the Echo Sync server: its tables, its mutations, its
 app migrations, startup, and the request principal. The worked example is
 [examples/server/main.ts](../examples/server/main.ts). It serves the harness app
 (examples/browser-spike/app.ts) and is what scenarios.sh and slice.sh run against
-(docs/vertical-slice.md). DESIGN.md is the contract, and docs/server-substrate.md describes how
+(docs/vertical-slice.md). `docs/SPEC.md` is the contract, and docs/server-substrate.md describes how
 the server is built.
 
-The server needs **PostgreSQL 15+** (DESIGN §11) and runs on Bun. Import core from `echo-sync`
+The server needs **PostgreSQL 15+** (SPEC §13) and runs on Bun. Import core from `echo-sync`
 and the server from `echo-sync/server`.
 
 ```
@@ -34,12 +38,12 @@ export const Todos = SyncTable.make("todos", {
 export const registry = Registry.make([Todos]) // adds the engine's scope_grants table
 ```
 
-DESIGN §5 lists the field types that map to columns. A table's Postgres DDL is
+SPEC §3 lists the field types that map to columns. A table's Postgres DDL is
 `table.postgres.createTable` / `createIndexes`, and you never write it by hand (see §3).
 
 ## 2. Mutations
 
-A mutation is a named handler over `ctx.store` (DESIGN §6). It runs optimistically on the client and
+A mutation is a named handler over `ctx.store` (SPEC §5). It runs optimistically on the client and
 authoritatively on the server. Build a registry of them with `Mutation.makeRegistry`. The server's copy
 can add checks the client cannot evaluate. In the example, `todos.add` on the server rejects some
 titles with a declared domain error, which the client receives as a ledger outcome.
@@ -48,7 +52,7 @@ titles with a declared domain error, which the client receives as a ledger outco
 row needs `owner`. Owners grant and revoke through ordinary mutations on `ScopeGrants.ScopeGrants`,
 with `id: ScopeGrants.grantId(scope, principal)`.
 
-A handler creates a scope with `ctx.store.createScope(scopeId)` (DESIGN §4). The scope id must be
+A handler creates a scope with `ctx.store.createScope(scopeId)` (SPEC §4). The scope id must be
 fresh, and the actor becomes its first `owner`. A second creator gets
 `ScopeForbidden { required: "owner" }`: "already exists" reads as "not yours". So does anyone
 creating a scope whose grants were all revoked, because the server keeps every scope id it has
@@ -60,7 +64,7 @@ for the scenarios, not the app path.
 
 Your tables are created by your own migrations. They are numbered `NNN_name` modules, each with a
 default export `Effect` over `SqlClient`, and `Startup` runs them in their own history table,
-`echo_sync.app_migrations` (DESIGN §11). Generate them from the registry with core's planner. It
+`echo_sync.app_migrations` (SPEC §13). Generate them from the registry with core's planner. It
 compares the registry against the committed snapshot `migrations/manifest.json` and emits only
 safe DDL. Renames, drops and backfills become commented TODOs.
 
@@ -144,7 +148,7 @@ a retention horizon; without ledger expiry the ledger grows with every mutation
 
 ## 5. Headers and the principal
 
-`principalFor(headers)` is app-owned (DESIGN §4). It authenticates the request and returns the
+`principalFor(headers)` is app-owned (SPEC §4). It authenticates the request and returns the
 `PrincipalId`, or fails with `Protocol.Unauthorized`. The server never takes the principal from the
 payload, and every pull and push is filtered by that principal's grants (or `*`). On the client,
 `LeaderOptions.syncHeaders(principal)` returns an `Effect` of headers that the transport runs for every
@@ -158,7 +162,7 @@ real app verifies a session cookie or bearer token here.
 ## 6. Drift: what it means and how to fix it
 
 `Migrate.verify` compares the live catalog with the registry. If they differ, startup fails with
-one `Drift` that lists **every** mismatch, and the server does not serve (DESIGN §11). For the
+one `Drift` that lists **every** mismatch, and the server does not serve (SPEC §13). For the
 example with `todos.title` dropped:
 
 ```

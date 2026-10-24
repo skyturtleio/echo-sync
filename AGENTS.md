@@ -1,7 +1,11 @@
 # Echo Sync — agent guidance
 
-Read `docs/DESIGN.md` first. It is the contract. If the design is wrong, say so in your
-report; do not silently diverge.
+Read `docs/SPEC.md` first. It is the contract: the normative specification, derived from the
+code, with every invariant under a stable `INV-<AREA>-<n>` ID (§17 maps each to its test) and
+every limit in §18. `docs/DECISIONS.md` is the dated record of the rulings behind it. If the SPEC
+is wrong, say so in your report and fix the SPEC; do not silently diverge in either direction.
+`docs/DESIGN.md` is retired and only maps the old `DESIGN §x` citations still found in source
+comments to SPEC sections; the other files in `docs/` are non-normative implementation notes.
 
 ## Repo shape
 
@@ -9,10 +13,10 @@ report; do not silently diverge.
   TypeScript source (`exports` → `src/**/*.ts`). No build step, no npm publish.
 - `src/core` (shared: SyncTable, AccessScope, Mutation, Store interface, RPC contracts),
   `src/server` (Postgres + RPC handlers), `src/client` (browser leader worker, replica, outbox,
-  queries), `src/foldkit` (the FoldKit adapter, entry point `echo-sync/foldkit`, DESIGN §16.17).
+  queries), `src/foldkit` (the FoldKit adapter, entry point `echo-sync/foldkit`, DECISIONS 17).
   The engine is UI-framework agnostic: `src/core`, `src/client` and `src/server` carry no
   framework knowledge, and every UI adapter is a separate entry point that is a thin translation
-  of the `src/client` tab-side API (DESIGN §9.1), adds no sync semantics, and imports nothing from
+  of the `src/client` tab-side API (SPEC §9, §12), adds no sync semantics, and imports nothing from
   the framework (lint-enforced; FoldKit is a devDependency for `examples/foldkit` only). FoldKit
   is the owner's standard UI stack, so its adapter ships here as the standard way FoldKit apps
   consume the engine. Browser code must never import `src/server`.
@@ -41,17 +45,20 @@ report; do not silently diverge.
 
 - Work on a `ws/<name>` branch. Commit in logical steps.
 - Before merging, get an independent review of the diff (a reviewing subagent or a second model),
-  address its findings, and say in your report which DESIGN §14 invariants you tested.
+  address its findings, and say in your report which SPEC invariants (`INV-` IDs) you tested.
 - To land: `git fetch`, rebase linearly onto `origin/main`, run `bun run check` and
   `bun run test:pg` (plus `examples/browser-spike/scenarios.sh` and `slice.sh` when `src/client`
   changed), then fast-forward push `main`. Never force-push `main`. No pull requests.
-- A change to engine behavior is a design change: record it in `docs/DESIGN.md` (a §16 item with
-  the problem and the ruling) in the same branch. Consumers pin a commit SHA, so an app picks up
-  a change only by bumping its pin.
+- A change to engine behavior is a design change: in the same branch, update `docs/SPEC.md`
+  (the affected section, its invariant digest and the §17/§18 tables; a new invariant takes the
+  next unused ID, a withdrawn one keeps its ID and is marked withdrawn) and append a dated
+  paragraph to `docs/DECISIONS.md` with the problem, the ruling and the SPEC section it changed.
+  Consumers pin a commit SHA, so an app picks up a change only by bumping its pin.
 
 ## Tests
 
-Test invariants (see `docs/DESIGN.md` §14). Each test's name states the failure it catches.
+Test invariants (`docs/SPEC.md` §17 lists them with their covering tests). Each test's name
+states the failure it catches; when a test covers an invariant, cite its `INV-` ID in §17.
 Do not add per-function unit tests, snapshot tests of SQL strings, or tests whose expected
 values were derived from the implementation.
 

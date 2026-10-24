@@ -1,11 +1,15 @@
 # Server substrate (Postgres)
 
-`src/server/postgres` implements DESIGN.md §4, §6, §7, §8 on plain Postgres, against core's types
+> Implementation notes for SPEC §4–§8, §10, §11 and §13 (the Postgres server). Non-normative: where this page disagrees with
+> [`docs/SPEC.md`](SPEC.md), the SPEC wins and the disagreement is a SPEC Open Question.
+> `DECISIONS N` refers to [`docs/DECISIONS.md`](DECISIONS.md).
+
+`src/server/postgres` implements SPEC §4, §5, §6, §7 on plain Postgres, against core's types
 (`import { … } from "echo-sync"`). Synced tables are `SyncTable`s: the app creates each relation
 from `table.postgres.createTable` and calls `attach(table)`. A mutation body is an
 `Effect<void, MutationRejection | StoreUnavailable | SqlError, R>`; the RPC adapter builds it from
 `Mutation.run` over `Store.make(RowStore)`. The ledger envelope is
-`{ principalId, clientId, mutationId: string, seq: bigint }` (DESIGN §6): `mutationId` is the
+`{ principalId, clientId, mutationId: string, seq: bigint }` (SPEC §5): `mutationId` is the
 unordered idempotency key, `seq` the client's outbox sequence.
 
 | module | what it owns |
@@ -23,7 +27,7 @@ principal, Drift), see [getting-started.md](getting-started.md).
 ## Wire rows: declared columns through the table's codec
 
 Every row that leaves the server, from a walk or from the log, is `SELECT <declared columns>`
-decoded through `table.postgres.row` (DESIGN §11). Its decoded side is the wire row: snake_case
+decoded through `table.postgres.row` (SPEC §13). Its decoded side is the wire row: snake_case
 column keys, timestamps as epoch ms, int8 as a number, jsonb as is, every declared key present.
 A column the app added to the relation but not to the SyncTable never leaves the database, and
 there is one definition of the encoding (core's). Writes go the other way: each wire value is
@@ -58,8 +62,8 @@ overridden by NDJSON message headers. It runs on every push and pull, and once w
 (`pokes`, presence `room`; `track` is a plain call and runs it too). A credential that expires
 while a stream is open is therefore not detected until that stream reconnects; the client's
 `idleTimeout` and the server's heartbeat bound how long a dead connection stays open, not how long
-an expired token is honoured on a live one. The client evaluates `syncHeaders` per request (DESIGN
-§9.1 Credentials), so a reconnect carries the renewed credential. `ClientForbidden` becomes `Unauthorized`.
+an expired token is honoured on a live one. The client evaluates `syncHeaders` per request (SPEC
+§10), so a reconnect carries the renewed credential. `ClientForbidden` becomes `Unauthorized`.
 
 For example, `examples/server` rejects `Sec-Fetch-Site: cross-site` and `same-site` inside
 `principalFor` before reading the credential; sibling origins are not same-origin. An app can
@@ -168,7 +172,7 @@ mutation-registry floor signal is a possible future item, not implemented here.
   programmer defect (must stay a defect).
 - pokes: `LISTEN echo_sync`. `next_position()` runs `pg_notify('echo_sync', '')`, which Postgres
   delivers at commit and coalesces per transaction. The stream carries no data.
-  **One `LISTEN` per server process** (DESIGN §6): `PgClient.listen` pins a pool connection for
+  **One `LISTEN` per server process** (SPEC §10): `PgClient.listen` pins a pool connection for
   its scope, so a `LISTEN` per stream would exhaust the pool at `maxConnections` open streams and
   block every push and pull. `layerNotifications` owns the single `LISTEN` (`sharedPokes` in
   rpc.ts, provided as the `Notifications` service to both the sync and the presence handlers)
@@ -179,7 +183,7 @@ mutation-registry floor signal is a possible future item, not implemented here.
   (exponential from 50 ms, capped at 5 s, reset once a `LISTEN` is confirmed, not configurable).
   Each attempt runs in its own scope, so an attempt that fails after reserving its connection
   releases it before the backoff. Clients reconnect on any end.
-  **Liveness** (DESIGN §6): the element is `poke | heartbeat`, the first one a poke. While a
+  **Liveness** (SPEC §10): the element is `poke | heartbeat`, the first one a poke. While a
   `LISTEN` is confirmed, its session ticks every `heartbeatInterval` (`SyncServerOptions`, default
   15 s) into a second sliding `PubSub`, and every subscribed stream emits a `heartbeat` per tick, so
   an idle stream is never silent longer than one interval. It is a separate `PubSub` because a tick
@@ -187,7 +191,7 @@ mutation-registry floor signal is a possible future item, not implemented here.
   are a fixed cadence, not "after an interval without a poke": a busy stream also gets them, which
   costs one small frame per interval. The client wakes only on `poke` and ends a stream that
   delivers nothing for `idleTimeout` (`LeaderOptions`, default 45 s).
-- presence (DESIGN §12, `presence.ts` plus `presenceHandlers` in rpc.ts): process-local, no
+- presence (SPEC §10, `presence.ts` plus `presenceHandlers` in rpc.ts): process-local, no
   tables. A `Ref` of rooms, each a map of entries plus a sliding `PubSub<void>` of capacity 1;
   a room exists while it has an entry. `room` checks `roleFor` (any role, the principal's or
   `*`, as for reads) before joining, so an unauthorized caller fails `Forbidden { room }` and
@@ -195,21 +199,21 @@ mutation-registry floor signal is a possible future item, not implemented here.
   stream ends for any reason; on HTTP that includes the client aborting its request. A stream
   subscribes before announcing its join, and each tick is turned into a fresh `RoomSnapshot`
   (entries ordered by principal, client, tab), so snapshots coalesce under load and never miss
-  the latest state. As DESIGN §12 states: the payload carries `clientId` (the entry key needs it);
+  the latest state. As SPEC §10 states: the payload carries `clientId` (the entry key needs it);
   the key also includes the principal, so naming another principal's client id cannot replace
   or end its entry; a rejoin with the same key replaces the entry and ends the older stream
   (a per-member `Deferred` the stream interrupts on, completed after the new member is
   installed), so every open stream holds an entry and keeps its room's `PubSub` current; the
   older stream's release does not remove the newer member (the same `Deferred` is its identity).
   `track`'s state update and its announcement are one uninterruptible step.
-  Room streams carry the §6 heartbeat (DESIGN §16 item 13): the element is `snapshot |
+  Room streams carry the §6 heartbeat (DECISIONS 13): the element is `snapshot |
   heartbeat`, the first one the join snapshot, and every stream emits a `heartbeat` every
   `heartbeatInterval` (the same `SyncServerOptions` field as pokes, default 15 s) from its own
   timer merged beside its change subscription, started only after the join snapshot has been
   emitted (so that snapshot is always the first element). A heartbeat therefore never slides out a pending
   change tick, is never a snapshot, and reads or changes no room state. `track` needs no grant lookup: it only
   changes an entry the same principal holds.
-  **Revocation** (DESIGN §16 item 13): a watcher in `presenceHandlers` consumes its own
+  **Revocation** (DECISIONS 13): a watcher in `presenceHandlers` consumes its own
   `Notifications` subscription. On every poke (one per committed writing transaction, so every
   grant change, plus one when the subscription starts) it asks one query which `(room, principal)`
   pairs with an open stream still hold the scope (a `scope_grants` row for the principal or for
@@ -248,7 +252,7 @@ mutation-registry floor signal is a possible future item, not implemented here.
   `table_name` is the unqualified name, so `attach` refuses a second synced table with the same
   name in another schema (`TableNameConflict`).
 - `attach` is atomic and serialized. It owns its transaction at READ COMMITTED (calling it
-  inside a caller's transaction is a defect, DESIGN §4) and runs the name check and both trigger
+  inside a caller's transaction is a defect, SPEC §4) and runs the name check and both trigger
   DDLs in it, behind a second advisory lock ("echosync" + 1, so it doesn't stall writers).
   READ COMMITTED matters: each statement after the lock gets a fresh snapshot, whereas an
   ambient REPEATABLE READ snapshot taken earlier would miss a concurrent attach that already
@@ -275,7 +279,7 @@ mutation-registry floor signal is a possible future item, not implemented here.
 
 ### Scope creation
 
-`ctx.store.createScope(scopeId)` (core Store, DESIGN §4) calls `StoreOptions.claimScope`. The
+`ctx.store.createScope(scopeId)` (core Store, SPEC §4) calls `StoreOptions.claimScope`. The
 server's claim is `claimScope` in rpc.ts:
 `INSERT INTO echo_sync.access_scopes … ON CONFLICT DO NOTHING RETURNING id`, run in the
 mutation's transaction and savepoint. The `access_scopes` row therefore commits or rolls back
@@ -291,7 +295,7 @@ and three body attempts, which shows the retry path was taken.
 
 
 Migration 002 adds `scope_grants_id_derived`: `id = char_length(access_scope_id) || ':' ||
-access_scope_id || ':' || principal_id` (DESIGN §4, 5242acf). core's `grantId` prefixes the
+access_scope_id || ':' || principal_id` (SPEC §4, 5242acf). core's `grantId` prefixes the
 code-point count (`[...scopeId].length`), which equals `char_length` in a UTF8 database, so core
 and the CHECK derive the same id for every scope id. Under SQL_ASCII `char_length` counts bytes,
 so 002 first refuses any server encoding other than UTF8. The constraint is validated, so a
@@ -335,7 +339,7 @@ whole push. Without this guard, `seq ≤ 0` would fall under the default floor 0
 `ClientExpired` although it was never processed. Core's `Seq` already refuses it on the wire.
 
 Failures are classified over the whole `Cause`, never by its first reason, with precedence
-defect > transient > rejection (DESIGN §6):
+defect > transient > rejection (SPEC §5):
 - any defect or interruption anywhere ⇒ die with the full cause (typed failures turned into
   defects): never retried, never ledgered, never reported transient;
 - otherwise any SQL failure other than the body constraints below, or `StoreUnavailable` anywhere ⇒ transient. The transaction could not have committed, so
@@ -446,7 +450,7 @@ On the wire the continuation is core's opaque branded string. On the server it i
 ```
 
 A plain JSON string survives structured clone and SQLite text storage unchanged. The client
-resends it verbatim with the same cursor. It is untrusted input (DESIGN §8): every value is
+resends it verbatim with the same cursor. It is untrusted input (SPEC §7): every value is
 checked against the request and the page's snapshot, not just decoded. These fail with
 `ResnapshotRequired { reason: "staleContinuation" }`:
 
@@ -520,7 +524,7 @@ transaction. It never touches the ledger, `clients`, or `client_scopes` (tested)
 resnapshot acks only the ledger rows that survive; ledger rows have their own policy below.
 A cursor or continuation below the horizon gets `ResnapshotRequired { reason: "gcHorizon" }`.
 
-### Ledger expiry (DESIGN §16 item 5)
+### Ledger expiry (DECISIONS 5)
 
 Expiry reclaims outcome payloads, not rows. A ledger row's identity `(client_id, mutation_id,
 seq, position)` is kept forever; only its `outcome` (and `acked_at`) is cleared.
@@ -548,12 +552,12 @@ seq, position)` is kept forever; only its `outcome` (and `acked_at`) is cleared.
   an id it has no row for at `seq ≤ expired_through`. A tab's `enqueue` retried after its reply was lost can arrive after any delay
   (`LeaderLost` is retried indefinitely, and a tab can be suspended for days), after its
   released-row marker was pruned, so the outbox gives it a fresh `seq` above the floor; only the
-  kept identity recognises it. No retention value would bound that delay (DESIGN §16 item 5).
+  kept identity recognises it. No retention value would bound that delay (DECISIONS 5).
 - **Pull.** Acks carry only rows that still have an outcome: an expired row is never acked again.
   A device that lost an ack to expiry (its storage went back in time: a restored backup, a copied
   profile) is told by `expiredThrough ≥` that seq and releases the mutation as `OutcomeUnknown`.
 - **Client release.** A `Rejected{ClientExpired}` push result is released on receipt whatever its
-  position, with an `OutcomeUnknown` notice (DESIGN §8, second release corollary; `Engine.ts`):
+  position, with an `OutcomeUnknown` notice (SPEC §9, INV-CLI-6; `Engine.ts`):
   an expired identity is never acked, and after a replica rebuild (null cursor) the first
   corollary (`position ≤ cursor`) could never release it.
 - **Reconcile simulation** (40 seeds × 400 steps, naive ledger GC = `gcLedger` by position with
@@ -576,7 +580,7 @@ seq, position)` is kept forever; only its `outcome` (and `acked_at`) is cleared.
   a cursor or a resumed page set back (tested).
 - **Cost.** Every mutation leaves its identity row (about 50–80 bytes with its index entries)
   forever; the outcome `jsonb` is what is reclaimed. Floors and identities are never deleted;
-  forgetting idle clients is out of scope (DESIGN §16 item 5).
+  forgetting idle clients is out of scope (DECISIONS 5).
 - **Tested** (gc.test.ts, test/expiry.e2e.test.ts): resubmission at the same or a fresh `seq`
   after expiry answers `ClientExpired` at the original position with one execution; young acked
   and unacked rows keep their outcomes; floor, `expired_position` and `expiredThrough`; the
@@ -593,7 +597,7 @@ docker run -d --name echo-pg -p 5432:5432 -e POSTGRES_PASSWORD=echo postgres:17
 bun run test:pg          # ECHO_PG_URL defaults to postgres://postgres:echo@localhost:5432/postgres
 ```
 
-The server requires PostgreSQL 15+ (DESIGN §11: the startup verifier reads
+The server requires PostgreSQL 15+ (SPEC §13: the startup verifier reads
 `pg_index.indnullsnotdistinct`). The engine schema alone needs only PG14 (`CREATE OR REPLACE
 TRIGGER`).
 

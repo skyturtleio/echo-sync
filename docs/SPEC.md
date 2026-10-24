@@ -1320,6 +1320,25 @@ Simulation invariant, or a `check` in `examples/browser-spike/scenarios.sh`). "P
 test covers one clause and the rest is untested. "Untested" means no test would fail if the
 invariant were broken. IDs are never reused.
 
+Rules for the harnesses that produce "covered" (verified against `src/core/testing/Conformance.ts`,
+`src/client/sync/testing/MemorySyncStorage.test.ts` and `.oxlintrc.json`):
+
+- A conformance check derives its expected values from the fixtures it writes, never from the
+  subject's own reads. `MemorySyncStorage.test` runs `Conformance.syncStorage` against "a subject
+  whose every write is a no-op" and expects every check to fail; that stub stays so the rule stays
+  true.
+- `SyncStorage.nextSeq` allocates: two calls in one transaction, before any append, return
+  distinct seqs, and a rolled-back allocation is given back (Conformance "nextSeq allocates: …").
+- `src/core/testing` holds only harnesses that need nothing from the client or the server at
+  runtime (`Conformance`, `MemoryStore`, `SimApp`, `RefServer`); a lint rule forbids runtime
+  imports of `src/client` or `src/server` from `src/core` (type-only imports allowed).
+  Harnesses that drive the client engine (`Simulation`, `MemorySyncStorage`) live in
+  `src/client/sync/testing`.
+- The package compiles under every TypeScript strictness flag its own `tsconfig.json` enables
+  (`strict`, `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`, `noImplicitReturns`,
+  `noPropertyAccessFromIndexSignature`, `noImplicitOverride`, `noUncheckedSideEffectImports`, …),
+  because consumers typecheck the shipped source under their own options (DECISIONS 28).
+
 | ID | status | covering test(s) |
 |---|---|---|
 | INV-ID-1 | covered | `Mutation.test` "the wire rejects seq < 1 and keeps Position exact beyond 2^53"; `SqliteSyncStorage.test` "staged pages and meta round-trip with bigint positions" |

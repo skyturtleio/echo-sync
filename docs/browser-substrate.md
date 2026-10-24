@@ -1,6 +1,10 @@
 # Browser substrate (`src/client/worker`, `src/client/Outbox.ts`)
 
-Implements DESIGN §9's single-owner topology and the durable outbox primitive. Verified in headless
+> Implementation notes for SPEC §12 (browser substrate) and §9.1 (outbox storage). Non-normative: where this page disagrees with
+> [`docs/SPEC.md`](SPEC.md), the SPEC wins and the disagreement is a SPEC Open Question.
+> `DECISIONS N` refers to [`docs/DECISIONS.md`](DECISIONS.md).
+
+Implements SPEC §12's single-owner topology and the durable outbox primitive. Verified in headless
 Chromium with the scripted scenarios at the end of this document.
 
 ## Topology
@@ -59,7 +63,7 @@ tab B ──spawns──▶ leader-candidate worker B (queued on the leader lock
 - Workers are spawned by the **tab**, never by the SharedWorker: no nested workers are needed (Safari
   shipped workers-in-SharedWorker late), and a candidate's lifetime is its tab's.
 
-### Why not `OpfsWorker.run` (deviation from DESIGN §9 wording)
+### Why not `OpfsWorker.run` (deviation from SPEC §12 wording)
 
 `@effect/sql-sqlite-wasm`'s `OpfsWorker.run` registers AccessHandlePoolVFS under the fixed name `"opfs"`.
 That VFS uses its name as its OPFS directory and opens an **exclusive** sync access handle on every file
@@ -81,7 +85,7 @@ port protocol. `SqliteClient` waits for the host's "ready" uninterruptibly; with
 that failed to open never sent it, so a failed leader hung forever holding its locks (review P1,
 reproduced with `?app=.`).
 
-## Liveness: a candidate that cannot serve (DESIGN §9)
+## Liveness: a candidate that cannot serve (SPEC §12)
 
 - Any startup failure (identity rejected, capability missing, pool or database cannot open, migration
   fails) closes the candidate's scope, which releases the leader and epoch locks, reports `Failed` to its
@@ -110,17 +114,17 @@ route. On the tab side every connection is an object; its handshake and epoch wa
 is still the active connection, and a displaced connection completes its `lost` signal (typed
 `LeaderLost` to every in-flight call) before its RPC scope is closed.
 
-## Handover semantics (DESIGN §16 item 1)
+## Handover semantics (DECISIONS 1)
 
 | What | Behavior | Why |
 |---|---|---|
 | Request in flight when the leader dies | Fails with `LeaderUnavailable{reason:"LeaderLost"}` | The tab cannot know whether it committed. |
-| `mutate` after `LeaderLost` | Retried automatically with the id fixed before the first attempt, so exactly one outbox row | `LeaderClient.mutate` (DESIGN §9.1); tested in `Leader.test.ts` with the loss after the commit. |
+| `mutate` after `LeaderLost` | Retried automatically with the id fixed before the first attempt, so exactly one outbox row | `LeaderClient.mutate` (SPEC §9 and §12); tested in `Leader.test.ts` with the loss after the commit. |
 | `enqueue` retry after `LeaderLost` | Safe: idempotent on `mutationId`, pending or released (returns the existing `seq`, allocates none) | Verified across a real handover and at the commit-before-lost-response crash point, with two tabs retrying the same id at once. |
 | `exec` retry | Only if the statement is idempotent | Raw SQL, harness/diagnostics only. |
 | Request issued while no leader is connected | Waits for the next leader | Leadership gaps are short (lock queue). |
-| Open `subscribe` (registered query), `notices` or `syncStatus` stream | **Resumes** on the next leader; nothing is emitted in between, so the consumer keeps the last emission until the fresh first one | DESIGN §9.1; see below. |
-| `requestSync` after `LeaderLost` | Retried like `mutate`; a wake is idempotent (coalesced into the sliding wake queue) | DESIGN §9.1. |
+| Open `subscribe` (registered query), `notices` or `syncStatus` stream | **Resumes** on the next leader; nothing is emitted in between, so the consumer keeps the last emission until the fresh first one | SPEC §9 and §12; see below. |
+| `requestSync` after `LeaderLost` | Retried like `mutate`; a wake is idempotent (coalesced into the sliding wake queue) | SPEC §9 and §12. |
 | Open `subscribeRaw` stream | **Terminates** with `LeaderUnavailable{LeaderLost}`; the caller re-subscribes | See below. |
 | Replica / outbox | Persist (same OPFS file; the new leader reopens it) | Verified. |
 
@@ -131,7 +135,7 @@ the last value (never skip a change). `subscribe`, `notices` and `syncStatus` do
 (their results are whole values, so a repeat is harmless); the raw `subscribeRaw` stream still ends with
 `LeaderLost` and leaves it to the caller (the harness scenarios assert that end).
 
-### Closing the tab client's scope (DESIGN §9.1)
+### Closing the tab client's scope (SPEC §9 and §12)
 
 `LeaderClient.make`'s only finalizer for the leader is `worker.terminate()` on this tab's own leader
 candidate (the harness closes the scope on `pagehide`). `terminate()` stops the worker's event loop at
@@ -159,12 +163,12 @@ dedicated worker does not outlive its document), so no separate scope-close scen
 that ends itself after a commit is covered too: "crash after commit" and "worker-only crash" in
 `scenarios.sh`.
 
-### Resetting a replica (`resetReplica`, DESIGN §9.1, §16.24)
+### Resetting a replica (`resetReplica`, SPEC §9 and §12, §16.24)
 
 `ResetReplica.resetReplica({ appId, profile, spawnLeader }, { discardPending?, closeTimeout? })` deletes one
 identity's replica, for example on sign-out. It is a static function (exported from `echo-sync/client`), so it
 also runs when no tab client for that identity is alive. It closes the identity's tab clients itself
-(DESIGN §16.24); the app prepares nothing.
+(DECISIONS 24); the app prepares nothing.
 
 - Once the reset worker is spawned, it broadcasts `ResetSignal { appId, profile }` on the BroadcastChannel
   `echo:<appId>:<profile>:reset` (a `spawnLeader` that throws closes nothing). Every `LeaderClient` of the
@@ -191,11 +195,11 @@ also runs when no tab client for that identity is alive. It closes the identity'
 - Without `discardPending`, under the lock it opens the database and counts unreleased `echo_outbox` rows.
   A count above 0 fails `PendingWrites { count }`. A database that does not open or an outbox that cannot be
   read fails closed with `ResetFailed`. Either way nothing is deleted.
-- With `discardPending` it never opens the database (DESIGN §9.1, 5fcccb7): it only waits, as a new leader
+- With `discardPending` it never opens the database (SPEC §9 and §12, 5fcccb7): it only waits, as a new leader
   does, for a predecessor's access handles to be released. So a corrupt or partially removed replica can
   still be reset.
 - Then it closes whatever it opened (database and pool, releasing the access handles), writes the identity's
-  tombstone `echo-sync/<appId>/~reset-<sha256(profile)>` (DESIGN §16.26), removes the directory
+  tombstone `echo-sync/<appId>/~reset-<sha256(profile)>` (DECISIONS 26), removes the directory
   `echo-sync/<appId>/<profile>` recursively, removes the tombstone, and releases the lock last. The tombstone
   is written only here, under the lock and after the pending decision, and removed only after the directory;
   its `~` prefix is outside `validateIdentity`'s charset, so it is never a profile's directory. A candidate of a client built after the signal that
@@ -208,7 +212,7 @@ also runs when no tab client for that identity is alive. It closes the identity'
 - Any other failure (unsupported browser, invalid identity, an OPFS error, a `spawnLeader` or
   `postMessage` that throws) is `ResetFailed { message }`; interruption stays interruption.
   Interrupting the reset terminates its worker, and the browser then releases the lock and handles.
-- Durable across a crash (DESIGN §16.26): a reset worker that ends before the tombstone is written leaves the
+- Durable across a crash (DECISIONS 26): a reset worker that ends before the tombstone is written leaves the
   replica intact (same `clientId`, outbox and rows). After the tombstone is written, interruption can leave
   the directory intact, partially removed or gone, with the tombstone still present: the tombstone is removed
   only after the directory removal succeeded. If both removals completed before the interruption, neither
@@ -231,7 +235,7 @@ with the directory listing unchanged and no queued leader request left; one pend
 next leader for `a` has an empty outbox and a new `clientId`; `b` keeps its rows and `clientId`; a replica
 whose database header is overwritten is refused with `ResetFailed` and left intact without
 `discardPending`, and removed with it; throwing `spawnLeader` and `postMessage` are `ResetFailed`). The
-"reset …" checks of DESIGN §16.26 terminate the reset worker at a harness crash point
+"reset …" checks of DECISIONS 26 terminate the reset worker at a harness crash point
 (`echo.resetReplica(…, 'beforeTombstone' | 'midRemoval')`): a reset that ends before its tombstone
 (`ReplicaInUse`, `PendingWrites`, or terminated before the write) leaves the replica intact with no tombstone;
 another profile's tombstone and partial directory change nothing for this identity; after a crash past the
@@ -240,7 +244,7 @@ none of the condemned pool files remain (the new leader's fresh pool directory i
 `resetReplica` without `discardPending`, on a condemned replica that still holds a pending write, answers `Done`
 with neither directory nor tombstone left. On the prior main all four fail.
 
-### Presence (`presence` / `track`, DESIGN §9.1, §12, §16 item 13)
+### Presence (`presence` / `track`, SPEC §9 and §12, §12, §16 item 13)
 
 `presence(room, state)` on the tab client is a `Stream<RoomSnapshot>`. `track(room, state)` replaces this
 tab's state in a room it has joined; for a room it has not joined it does nothing.
@@ -261,8 +265,8 @@ up to 30 s). They tune only the tab-to-leader sender, not the leader's `idleTime
   stream, and so does any failure or clean end. The leader then rejoins after a backoff, and the tab
   stream does not end. Each join is prepare-then-stream like `followPokes`: credentials (`syncHeaders`)
   are resolved first, and the idle clock starts when the request is sent. Only `Forbidden { room }` (no grant in the room's scope) ends it; `Unauthorized` is a
-  credential failure and is rejoined like any other (DESIGN §9.1 Credentials).
-- **Track and delivery (DESIGN §9.1, 07a8f48).** `track` completes once this tab has recorded the desired
+  credential failure and is rejoined like any other (SPEC §9 and §12 Credentials).
+- **Track and delivery (SPEC §9 and §12, 07a8f48).** `track` completes once this tab has recorded the desired
   state, in one synchronous step before any message to the leader. Interrupting the caller afterwards does
   not retract it, and a `track` for a closed stream is dropped. Delivery is two hops of the same shape, tab
   to leader and leader to server, each a supervised sender owned by the open stream:
@@ -274,7 +278,7 @@ up to 30 s). They tune only the tab-to-leader sender, not the leader's `idleTime
   - a sender never ends or restarts its stream, and never waits for the stream to fail: a heartbeating room
     stream cannot strand a state. Snapshots never wait for a send, and the join's end (idle timeout,
     reconnect, handover, close) interrupts one in flight.
-- **Revision fencing (DESIGN §12, §9.1, 001eaaf).** Timeouts and fetch aborts do not stop a request the
+- **Revision fencing (SPEC §10, §12, 001eaaf).** Timeouts and fetch aborts do not stop a request the
   server has already received, so latest-wins is enforced by the receiver (amended in 6c7027f). The tab
   client keeps one revision counter per room for its whole life, outside any stream, so closing and
   reopening a room never resets it. Every event the server may see out of order takes the next value: an
@@ -292,7 +296,7 @@ up to 30 s). They tune only the tab-to-leader sender, not the leader's `idleTime
   behind, and two simultaneous opens of one room in a tab produce exactly one upstream open; the other
   fails `PresenceAlreadyOpen`.
 - **Handover.** Like `subscribe`, the stream re-joins on the next leader and emits nothing in between. A
-  same-key rejoin ends the older server stream (DESIGN §12), which is expected. Other tabs see this tab's
+  same-key rejoin ends the older server stream (SPEC §10), which is expected. Other tabs see this tab's
   entry disappear for at most the reconnect gap.
 
 Evidence:
@@ -356,7 +360,7 @@ Caveats, all from documentation and untested here:
 - The leader also checks `createSyncAccessHandle` itself; a browser lacking it reports `LeaderFailed`
   with the reason instead of hanging.
 
-## WebKit smoke (DESIGN §16 browser matrix)
+## WebKit smoke (DECISIONS 1)
 
 Run on Playwright's WebKit build on Linux, against the Vite harness and examples/server with real
 Postgres. **This is desktop WebKit on Linux (the GTK port, headless), not Safari, and not iPhone Safari.**
@@ -490,7 +494,7 @@ Not covered by any desktop run:
 ## SQLite build capabilities (`@effect/wa-sqlite` 0.1.2, SQLite 3.47.0)
 
 - `CREATE VIRTUAL TABLE fts_probe USING fts5(body)` **fails**: `no such module: fts5`. `pragma_compile_options`
-  has no `ENABLE_FTS5`, and no shipped `.wasm` contains the string `fts5`. (DESIGN §10 / open item 6.)
+  has no `ENABLE_FTS5`, and no shipped `.wasm` contains the string `fts5`. (SPEC §1 non-goals / DECISIONS 6.)
 - `SELECT json_extract('{"a":{"b":42}}', '$.a.b')` **works** (returns `42`).
 
 Reproduce: in the harness page, `await echo.exec("CREATE VIRTUAL TABLE t USING fts5(b)")` and
@@ -505,7 +509,7 @@ startup). `enqueue` returns only after the append's transaction has committed. A
 one leader connection, so `seq` is total and gap-free across tabs; AUTOINCREMENT keeps its high-water
 mark in `sqlite_sequence`, so neither release nor pruning lets a seq be reused.
 
-Release marks rather than deletes (DESIGN §9): an `enqueue` retried after `LeaderLost` can arrive after
+Release marks rather than deletes (SPEC §9): an `enqueue` retried after `LeaderLost` can arrive after
 the original was pushed, acked and released; the row is still there, so the retry returns the original
 `seq` and inserts nothing. Retries arriving after the retention window would be appended as new intents.
 
@@ -531,11 +535,11 @@ tables and replica schema, one transaction) and builds `Engine.make` over the SQ
   or `MalformedEnvelope` in a push halts push for this leader's lifetime, pull keeps running, nothing is
   released) and `SyncLoop.followPokes`, which wakes the loop on every poke and reconnects the pokes stream
   after any end (failure, defect, clean completion) with the same backoff. Reconnecting does not wake
-  the loop; the server's initial poke (sent right after LISTEN, DESIGN §6 aec6cd4) does.
-  A new leader starts a fresh loop, so a halt re-trips on its first push (DESIGN §6).
+  the loop; the server's initial poke (sent right after LISTEN, SPEC §10) does.
+  A new leader starts a fresh loop, so a halt re-trips on its first push (SPEC §10).
 - Without `syncUrl` the replica is local-only: enqueue still applies and persists; `syncStatus` fails
   with `SyncDisabled`.
-- `syncStatus` is `{ push, lastError, pendingMutations, lastSyncedAt, phase, nextRetryAt }` (DESIGN §9.1).
+- `syncStatus` is `{ push, lastError, pendingMutations, lastSyncedAt, phase, nextRetryAt }` (SPEC §9 and §12).
   `lastError` is `null | { kind, message }`: `kind` is `credentials` (`syncHeaders` raised),
   `unauthorized`, `unavailable` (`ServerUnavailable`), `network` (no usable RPC result), `server`
   (the fallback, local `StoreUnavailable` included), `outdated` (server policy refused this client),
@@ -564,7 +568,7 @@ tables and replica schema, one transaction) and builds `Engine.make` over the SQ
   halted) are RPCs on `LeaderRpcs`.
 - `RpcClient.layerProtocolHttp({ url })` posts to `<url>/` (trailing slash): the server route must accept
   it. The harness's fake server normalizes it.
-- Ordering (DESIGN §9): the storage permit serializes transactions and makes a queued one cancellable,
+- Ordering (SPEC §12): the storage permit serializes transactions and makes a queued one cancellable,
   but it is not fair: a releasing fiber may barge ahead of a waiter. Order among one tab's mutations
   comes from the caller: await each `enqueue` before issuing the next. Enqueues issued concurrently,
   from one tab or several, each get a distinct gap-free seq, but in no promised order. A mutate queued

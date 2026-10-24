@@ -1,5 +1,9 @@
 # Host-owned observability
 
+> Implementation notes for SPEC §14 (telemetry). Non-normative: where this page disagrees with
+> [`docs/SPEC.md`](SPEC.md), the SPEC wins and the disagreement is a SPEC Open Question.
+> `DECISIONS N` refers to [`docs/DECISIONS.md`](DECISIONS.md).
+
 Echo Sync uses Effect 4.0.5 only. There is no exporter, SDK, queue, flush, sampling policy,
 or required observability service. Unconfigured tracing does not export anything; the native
 tracer still allocates spans, and metrics use Effect's in-memory registry. Instrumentation

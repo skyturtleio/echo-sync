@@ -1,5 +1,9 @@
 # Vertical slice: the browser leader against the real server
 
+> Verification notes for SPEC §17 (invariant registry): the browser scenarios that cover §9, §10 and §12. Non-normative: where this page disagrees with
+> [`docs/SPEC.md`](SPEC.md), the SPEC wins and the disagreement is a SPEC Open Question.
+> `DECISIONS N` refers to [`docs/DECISIONS.md`](DECISIONS.md).
+
 The harness (examples/browser-spike) runs the real leader worker (`src/client`) against the landed
 Postgres server (`src/server/postgres`) through a small Bun entry, examples/server/main.ts. Nothing in
 `src/server` or `src/core` is specific to the slice.
@@ -42,7 +46,7 @@ It is the worked example for docs/getting-started.md. A database created by an o
 entry (tables but no `echo_sync.app_migrations`) fails migration 001 with "relation already exists".
 Drop it once: `DROP DATABASE echo_slice`.
 
-**`principalFor` is app-owned (DESIGN §4). This entry's implementation is a dev shim:** it trusts the
+**`principalFor` is app-owned (SPEC §4). This entry's implementation is a dev shim:** it trusts the
 `x-echo-principal` request header, which the harness leader sets to its tab's `?principal=`. There is no
 authentication. Only examples/server reads the header; nothing in `src/server` does. A real app
 authenticates the request (session cookie, bearer token) in its own `principalFor`.
@@ -68,7 +72,7 @@ The Vite harness proxies `/sync` and `/admin` to the server (`ECHO_SLICE_SERVER`
 `http://127.0.0.1:5200`). When the server dies mid-response, Vite's proxy keeps the browser's pokes
 response open indefinitely. Scenario 5 caught this before liveness existed: after a restart an idle client
 sent no request for 121 s, and the harness carried a proxy workaround (destroy the browser response when the
-upstream ended incomplete). That workaround is gone: the client's `idleTimeout` (DESIGN §6 Liveness, default
+upstream ended incomplete). That workaround is gone: the client's `idleTimeout` (SPEC §10, default
 45 s; the server heartbeats every 15 s) ends a stream that delivers nothing, so scenario 5 now catches up
 through the idle timeout and the reconnect backoff, as any client behind such a proxy would.
 
@@ -179,7 +183,7 @@ check not listed for a control still passed.
 ### What the slice does not prove
 
 - S4's catch-up time is bounded by the pokes reconnect backoff (1 s doubling to 30 s), not by a resync
-  timer: v1 has none (DESIGN §6). A client behind an intermediary that holds a dead response open, as
+  timer: v1 has none (SPEC §10). A client behind an intermediary that holds a dead response open, as
   Vite's proxy does, is deaf for up to `idleTimeout` (45 s) plus the reconnect backoff.
 - S5 holds the first push open across the leader's closure, but when the gate opens the server may still
   commit that abandoned request, or roll it back and commit the successor's. Both outcomes must give one
