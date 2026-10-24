@@ -1,5 +1,5 @@
 /**
- * The SQLite `ReplicaRowStore` (DESIGN §4, §8, §10) over the leader's single connection.
+ * The SQLite `ReplicaRowStore` (SPEC §4, §9, §3) over the leader's single connection.
  *
  * Contract (core `Store.RowStore`): every method runs inside a transaction the caller owns and never
  * begins or commits one; no authorization; the only typed failure is the transient `StoreUnavailable`.
@@ -119,7 +119,7 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
 
     // Only the registry's replicated tables: echo_outbox, echo_staged and echo_meta are untouched.
     // `WHERE true` defeats SQLite's truncate optimization, which deletes without firing the update hook:
-    // live queries (DESIGN §10) would never see the rows go when nothing is installed in their place.
+    // live queries (INV-BRW-6) would never see the rows go when nothing is installed in their place.
     clearAll: Effect.forEach(
       registry.tables,
       (table) => unavailable(sql.unsafe(`DELETE FROM ${q(table.name)} WHERE true`)),

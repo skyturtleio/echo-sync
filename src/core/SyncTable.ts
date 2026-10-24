@@ -6,7 +6,7 @@ import type { AccessScopeId } from "./AccessScope.ts"
 // ---------------------------------------------------------------------------------------------
 
 /**
- * The finite set of column kinds (DESIGN §5). Every field maps to exactly one; anything that
+ * The finite set of column kinds (SPEC §3). Every field maps to exactly one; anything that
  * cannot be mapped unambiguously is rejected when the table is declared.
  *
  * | kind      | accepted field (classified on its *encoded* side)          | wire            | Postgres                | SQLite                         |
@@ -21,7 +21,7 @@ import type { AccessScopeId } from "./AccessScope.ts"
  * `NullOr(x)` makes the column nullable. Rejected: bare `Schema.Number`, `BigInt`, `Symbol`,
  * `Undefined`/optional keys, `Unknown`/`Any`, `Enum`, other declarations (`Uint8Array`, ...).
  * Timestamps are stored as epoch milliseconds, which is order-preserving in every dialect
- * (DESIGN §10), and must lie within Postgres' `timestamptz` range.
+ * (SPEC §3), and must lie within Postgres' `timestamptz` range.
  */
 export type ColumnKind = "text" | "integer" | "double" | "boolean" | "timestamp" | "json"
 
@@ -49,7 +49,7 @@ export interface Column {
   readonly sqlite: Schema.Codec<Schema.Json, SqliteValue>
 }
 
-/** An index: its declared fields, then `id` as the tiebreak (DESIGN §10). */
+/** An index: its declared fields, then `id` as the tiebreak (INV-TBL-2). */
 export interface Index<Fs extends ReadonlyArray<string> = ReadonlyArray<string>> {
   readonly name: string
   readonly fields: Fs
@@ -79,10 +79,10 @@ export interface TableManifest {
   /**
    * Hash of the storage shape (table name; column names, kinds, nullability). Changes ⇒ replica
    * rebuild. Refinements, brands and nested JSON schemas are validation, not storage, and do not
-   * contribute (DESIGN §5); neither do indexes.
+   * contribute (INV-TBL-3); neither do indexes.
    */
   readonly dataHash: string
-  /** Hash of the index set. Changing it must not force a replica re-download (DESIGN §11). */
+  /** Hash of the index set. Changing it must not force a replica re-download (INV-TBL-3). */
   readonly indexHash: string
 }
 
@@ -374,7 +374,7 @@ const pgCodec = (kind: ColumnKind): Schema.Constraint => {
   }
 }
 
-/** The Postgres column type for a column kind (text is `COLLATE "C"`, DESIGN §10). */
+/** The Postgres column type for a column kind (text is `COLLATE "C"`, INV-TBL-2). */
 export const pgType: Record<ColumnKind, string> = {
   text: 'text COLLATE "C"',
   integer: "bigint",
@@ -424,7 +424,7 @@ export const hash = (text: string): string => {
 }
 
 /**
- * Declares a synced table (DESIGN §5). Throws `SyncTableDeclarationError` for anything that
+ * Declares a synced table (SPEC §3). Throws `SyncTableDeclarationError` for anything that
  * cannot be mapped unambiguously; the type parameters already reject the cases visible to
  * TypeScript (missing `id`/`accessScopeId`, unbranded `id`, optional keys, bigint/symbol leaves,
  * unknown or JSON index fields).

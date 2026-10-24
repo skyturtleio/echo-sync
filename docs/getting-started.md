@@ -167,7 +167,7 @@ example with `todos.title` dropped:
 
 ```
 Drift: schema drift (refusing to serve):
-  todos: declared column title is missing (every wire row must carry it, §11)
+  todos: declared column title is missing (every wire row must carry it, SPEC §13)
 ```
 
 Drift means the database is not what the code that is starting expects. Fix the database or the

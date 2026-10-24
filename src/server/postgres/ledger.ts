@@ -10,7 +10,7 @@ type MutationOutcome = Mutation.MutationOutcome
 const MutationOutcomeJson = Schema.toCodecJson(Mutation.MutationOutcome)
 const isRejection = Schema.is(Mutation.MutationRejection)
 
-/** A push outcome and the ledger position it was recorded at (§6). */
+/** A push outcome and the ledger position it was recorded at (SPEC §5). */
 export interface Processed {
   readonly outcome: MutationOutcome
   readonly position: bigint
@@ -28,7 +28,7 @@ export class MutationTransient extends Schema.TaggedError<MutationTransient>()("
 }) {}
 
 /**
- * `seq < 1` (DESIGN §6) is refused at request level with core's `MalformedEnvelope`: nothing
+ * `seq < 1` (INV-MUT-7) is refused at request level with core's `MalformedEnvelope`: nothing
  * executed or recorded. Without this, `seq ≤ 0` would fall under the default expiry floor 0 and
  * be answered `ClientExpired` although it was never processed. Core's `Seq` already refuses it
  * on the wire; this guard keeps the ledger's own input honest.
@@ -87,7 +87,7 @@ const isConflict = (error: unknown) =>
   (error instanceof Errors.StoreUnavailable && isConflictUnavailable(error)) ||
   (error instanceof Errors.ConstraintViolated && error.kind === "unique")
 
-/** A reason that makes the attempt a defect (DESIGN §6 precedence: defect > transient > rejection). */
+/** A reason that makes the attempt a defect (INV-MUT-3 precedence: defect > transient > rejection). */
 const isDefectReason = (r: Cause.Reason<unknown>) =>
   Cause.isInterruptReason(r) ||
   // The pinned SqlClient raises savepoint/rollback cleanup failures on a dead connection as
@@ -153,7 +153,7 @@ const asRejection = (
 
 /**
  * Classifies the whole failure cause of a mutation attempt, with precedence defect > transient >
- * rejection (DESIGN §6):
+ * rejection (SPEC §5):
  * - any defect or interruption ⇒ die with the full cause (typed failures turned into defects), so
  *   no `catchTag` downstream can mistake it for a retryable transient;
  * - otherwise any remaining SQL failure ⇒ `MutationTransient` (the transaction could not have committed, so
@@ -190,7 +190,7 @@ const classify = (
 }
 
 /**
- * The request's replica principal against the authenticated one (DESIGN §16.21): equal or absent
+ * The request's replica principal against the authenticated one (DECISIONS 21): equal or absent
  * (a client that predates the field) passes; anything else fails before the request binds a
  * client or does any grant, ledger or presence work. An assertion only: the actor is always the
  * authenticated principal, and the message names neither.
@@ -245,7 +245,7 @@ const lockClient = Effect.fnUntraced(function* (principalId: string, clientId: s
 })
 
 /**
- * Executes one mutation at most once with committed effects (DESIGN.md §6), in a transaction it
+ * Executes one mutation at most once with committed effects (INV-MUT-1), in a transaction it
  * owns: calling it inside an ambient `withTransaction` would turn it into a savepoint whose
  * outcome is not committed when returned, so that is a defect.
  *
@@ -277,7 +277,7 @@ export const runMutation = <R>(
         // SERIALIZABLE, first statement of every attempt: handlers read-modify-write through the
         // Store (patch, counters, query-then-insert), and under READ COMMITTED two clients'
         // concurrent mutations would both commit on one stale read (lost update). A conflict is
-        // 40001, which retries the whole attempt (§6).
+        // 40001, which retries the whole attempt (INV-MUT-5).
         yield* sql`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`
         const client = yield* lockClient(envelope.principalId, envelope.clientId)
         const recorded = yield* sql<{ outcome: unknown; position: bigint }>`
@@ -286,7 +286,7 @@ export const runMutation = <R>(
         const row = recorded[0]
         // An expired row (outcome cleared, identity kept): processed before, outcome reclaimed.
         // Answered at its own position whatever seq this attempt carries, so a retry enqueued
-        // under a fresh seq after the client forgot the id is never executed again (DESIGN §16.5).
+        // under a fresh seq after the client forgot the id is never executed again (DECISIONS 5).
         if (row !== undefined && row.outcome === null) {
           const expired: Processed = {
             outcome: {
@@ -310,7 +310,7 @@ export const runMutation = <R>(
           return replay
         }
         // Every seq ≤ the floor was processed and kept its identity, so an unknown id here is a
-        // different id under an already-processed seq: the floor answers it (DESIGN §16.5), never
+        // different id under an already-processed seq: the floor answers it (DECISIONS 5), never
         // the body. A known id was answered above at its own position, whatever its seq.
         if (envelope.seq <= client.expired_through) {
           const expired: Processed = {

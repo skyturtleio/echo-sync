@@ -1,21 +1,21 @@
 /**
- * The engine's `Transport` over core's `SyncRpcs` (DESIGN §6, §8, §12), on the leader.
+ * The engine's `Transport` over core's `SyncRpcs` (SPEC §8, §7, §10), on the leader.
  *
  * This module owns the RPC client and so its error union, and is where every failure is classified
  * once: each push failure becomes a `SyncFailure.PushTransportError` and each pull and pokes failure a
  * `SyncFailure.PullTransportError`, whose `reason` is the innermost recognized evidence (a credential
  * failure or an HTTP 401/403 inside an `RpcClientError` is that reason, never `network`). What a reason means (its status kind, whether a
- * push halts) is decided in `SyncFailure`. A push halts (DESIGN §6, a68a727) on:
+ * push halts) is decided in `SyncFailure`. A push halts (INV-LOOP-3) on:
  * - core's `MalformedEnvelope`: the server refused the batch;
  * - `PushIntegrityError{invalidPayload}`: the outbox batch is not a valid `Protocol.PushRequest` before
  *   it is sent (an honest client cannot produce one, and the server would refuse it at payload decode);
  * - `PushIntegrityError{serverDefect}`: the push call ended in a defect. On the wire this is how the
  *   server reports a push payload it cannot decode (`RpcServer` answers the request with
  *   `Exit.die(<formatted issue>)`; there is no failure tag for it) and how a handler defect arrives
- *   (fatal defects are broadcast as `Defect`). §6 says a defect is never retried and never ledgered, so
+ *   (fatal defects are broadcast as `Defect`). INV-LOOP-3 says a defect is never retried and never ledgered, so
  *   retrying the same batch could only repeat it, and skipping it would open a seq gap.
  *
- * `ClientOutdated` is a separate compatibility stop for both directions until a new leader (§11).
+ * `ClientOutdated` is a separate compatibility stop for both directions until a new leader (SPEC §0.2, §10).
  * Other reasons are transient and retried by the loop. Every pull defect (a handler defect, or a
  * response the RPC client cannot decode, which it raises as a defect) becomes the transient
  * `PullProtocolError`, so a bad page never kills the loop's fiber; core's `ResnapshotRequired` passes
@@ -36,7 +36,7 @@ import {
 } from "./SyncFailure.ts"
 
 /**
- * `error`, or the more specific evidence an `RpcClientError` wraps (DESIGN §9.1): the
+ * `error`, or the more specific evidence an `RpcClientError` wraps (SPEC §10): the
  * `CredentialsUnavailable` that `layerProtocolHttp` puts inside the HTTP `TransportError`, or the HTTP
  * 401/403 that its status filter raises.
  */
@@ -75,7 +75,7 @@ const SyncHeaders = Context.Reference<Effect.Effect<Headers.Input> | undefined>(
 )
 
 /**
- * Headers a stream (re)connect already resolved before its request (DESIGN §6 Liveness): the HTTP
+ * Headers a stream (re)connect already resolved before its request (INV-LOOP-8): the HTTP
  * layer uses them instead of evaluating `syncHeaders` again. Unset for push and pull.
  */
 const PreparedHeaders = Context.Reference<Headers.Input | undefined>("echo-sync/client/Transport/PreparedHeaders", {
@@ -92,15 +92,15 @@ const acquire = (headers: Effect.Effect<Headers.Input>) =>
 /**
  * The engine's transport plus the pokes stream, which the leader follows with `SyncLoop.followPokes`.
  * `pokes` is prepare-then-stream: the Effect resolves this connect's headers (before any `idleTimeout`
- * clock, DESIGN §6 Liveness), and the stream it returns sends the request with exactly those.
+ * clock, INV-LOOP-8), and the stream it returns sends the request with exactly those.
  */
 export interface SyncTransport extends Engine.Transport {
-  /** `principal`: the replica's, asserted to the server like the engine's push and pull (DESIGN §16.21). */
+  /** `principal`: the replica's, asserted to the server like the engine's push and pull (DECISIONS 21). */
   readonly pokes: (
     clientId: Ids.ClientId,
     principal: AccessScope.PrincipalId
   ) => Effect.Effect<Stream.Stream<typeof Protocol.PokesElement.Type, PullTransportError>, PullTransportError>
-  /** `Protocol.PresenceRpcs` on the same mount (the server merges both groups, DESIGN §12). */
+  /** `Protocol.PresenceRpcs` on the same mount (the server merges both groups, SPEC §10). */
   readonly presence: (clientId: Ids.ClientId, principal: AccessScope.PrincipalId) => Presence.Upstream<PresenceError>
 }
 
@@ -113,7 +113,7 @@ export type PresenceError =
 
 /**
  * Only a missing grant (`Forbidden`) ends a presence subscription. Everything else is rejoined, including
- * `Unauthorized`: a credential failure, retried like every other one (DESIGN §9.1 Credentials).
+ * `Unauthorized`: a credential failure, retried like every other one (SPEC §10.3 Credentials).
  */
 export const isFatalPresence = (error: PresenceError): error is Protocol.Forbidden =>
   Predicate.isTagged(error, "Forbidden")
@@ -178,14 +178,14 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
  * RPC over HTTP POST with NDJSON framing, using the platform `fetch`. The server must mount
  * `Protocol.SyncRpcs` with `RpcServer.layerHttp({ protocol: "http" })` and `RpcSerialization.layerNdjson`.
  *
- * `headers` (DESIGN §9.1 Credentials) is evaluated on every outgoing HTTP request: each push, each
+ * `headers` (INV-LOOP-8 Credentials) is evaluated on every outgoing HTTP request: each push, each
  * pull, and each (re)connect of a stream. It is applied to the HTTP client under the RPC protocol, so
  * every RPC on this protocol (including streams added later, such as presence `room`) carries the
  * credential current at the moment it is sent; nothing is cached across requests. A stream's
  * (re)connect resolves them first (`SyncTransport.pokes`, presence `room`) and its request uses that
  * result.
  *
- * Anything `headers` raises is a local acquisition failure (DESIGN §9.1): the request is not sent
+ * Anything `headers` raises is a local acquisition failure (SPEC §10): the request is not sent
  * and the call fails with a transport `RpcClientError` (an HTTP `TransportError` carrying
  * `CredentialsUnavailable`), retried like a network failure and never a server defect.
  */

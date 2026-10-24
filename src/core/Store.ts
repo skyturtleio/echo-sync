@@ -22,7 +22,7 @@ import { grantId, ScopeGrants } from "./ScopeGrants.ts"
 import type { AnySyncTable, Column, EncodedRow, Index } from "./SyncTable.ts"
 
 // ---------------------------------------------------------------------------------------------
-// Ordering: the one definition every RowStore must agree with (DESIGN §10)
+// Ordering: the one definition every RowStore must agree with (INV-TBL-2)
 // ---------------------------------------------------------------------------------------------
 
 /** A wire value in an index key column (index columns are never JSON). */
@@ -85,7 +85,7 @@ export interface Bound {
  * the wire and a `Date` for Postgres.
  *
  * Scope and limit are part of the plan so the store stops after `limit` readable rows instead of
- * scanning past unreadable ones (DESIGN open item 8):
+ * scanning past unreadable ones (DECISIONS 8):
  * - `readableBy` (`Some(principals)`): only rows whose `access_scope_id` has a `scope_grants` row
  *   for one of `principals` (every role satisfies `reader`, so any grant makes a scope readable),
  *   read in the same transaction as the rows; `None` = no scope constraint;
@@ -130,7 +130,7 @@ export const planOrder = (plan: IndexRangePlan): ((a: EncodedRow, b: EncodedRow)
 }
 
 /**
- * A plan limit (`take(n)`) must be a non-negative safe integer (DESIGN §10). Anything else is a
+ * A plan limit (`take(n)`) must be a non-negative safe integer (SPEC §3). Anything else is a
  * programmer error: a defect with this one message in every store, never clamped or unlimited.
  */
 export const checkLimit = (limit: Option.Option<number>): Effect.Effect<void> =>
@@ -295,7 +295,7 @@ export interface TableQuery<T extends AnySyncTable, E> {
 export type ReadError = RowNotFound | ScopeForbidden | InvalidRow | StoreUnavailable
 
 /**
- * The typed, scope-checked store handed to mutators as `ctx.store` (DESIGN §6) and, read-only,
+ * The typed, scope-checked store handed to mutators as `ctx.store` (SPEC §5) and, read-only,
  * to registered queries. Dialect-agnostic: built once by `make` over any `RowStore`.
  */
 export interface EchoStore {
@@ -319,7 +319,7 @@ export interface EchoStore {
   readonly query: <T extends AnySyncTable>(table: T) => TableQuery<T, InvalidRow | StoreUnavailable>
   readonly scan: <T extends AnySyncTable>(table: T) => Effect.Effect<ReadonlyArray<RowOf<T>>, StoreUnavailable>
   /**
-   * Creates the scope `scopeId` with the actor as its first owner (DESIGN §4): claims the id
+   * Creates the scope `scopeId` with the actor as its first owner (SPEC §4): claims the id
    * (`StoreOptions.claimScope`) and, only if the claim succeeds, writes
    * `{ id: grantId(scopeId, actor), role: "owner" }` through the normal write path (undo image,
    * log), skipping the owner check that every other `scope_grants` write needs. The grant is
@@ -337,7 +337,7 @@ export interface EchoStore {
   ) => Effect.Effect<void, ScopeForbidden | InvalidRow | StoreUnavailable | ConstraintViolated>
 }
 
-/** The read half of `EchoStore`: what a registered query's handler gets (DESIGN §10.1). */
+/** The read half of `EchoStore`: what a registered query's handler gets (SPEC §12.3). */
 export type ReadStore = Pick<EchoStore, "get" | "query" | "scan">
 
 /** Pre-image of a row, captured before the first write to it in one store instance. */
@@ -361,7 +361,7 @@ export interface StoreOptions {
    * mutation's transaction); a replica's is optimistic (no `scope_grants` row for the scope).
    */
   readonly claimScope: (scopeId: AccessScopeId) => Effect.Effect<boolean, StoreUnavailable>
-  /** The mutation's `ctx.now` (DESIGN §6): `createScope`'s `grantedAt`, so a rebase replays it exactly. */
+  /** The mutation's `ctx.now` (INV-MUT-8): `createScope`'s `grantedAt`, so a rebase replays it exactly. */
   readonly now: DateTime.Utc
 }
 
@@ -373,7 +373,7 @@ export interface StoreInstance {
    */
   readonly touched: Effect.Effect<ReadonlyArray<UndoImage>>
   /**
-   * Names of every table this instance has read so far (DESIGN §10.1): the tables of `get`, `query`
+   * Names of every table this instance has read so far (INV-BRW-6): the tables of `get`, `query`
    * and `scan`, plus `scope_grants` whenever a role was looked up to authorize or filter a row.
    * A registered query's live subscription is reactive on exactly this set of its latest run.
    */
@@ -381,7 +381,7 @@ export interface StoreInstance {
 }
 
 /**
- * Grant identity is derived (DESIGN §4): a scope_grants row whose id is not
+ * Grant identity is derived (INV-ACL-5): a scope_grants row whose id is not
  * `grantId(accessScopeId, principalId)` is rejected, so two grants for one pair cannot both be
  * written, and a patch that changes the pair (without changing the id) is rejected too.
  */
@@ -424,7 +424,7 @@ const toKeyValue = (table: AnySyncTable, field: string, value: unknown) =>
   })
 
 /**
- * A replica's optimistic scope claim (DESIGN §4): fresh iff `rows` holds no `scope_grants` row for
+ * A replica's optimistic scope claim (SPEC §4): fresh iff `rows` holds no `scope_grants` row for
  * the scope. The server's claim is authoritative; a rejection undoes the optimistic grant.
  */
 export const claimFromGrants =
@@ -432,7 +432,7 @@ export const claimFromGrants =
   (scopeId: AccessScopeId): Effect.Effect<boolean, StoreUnavailable> =>
     Effect.map(rows.scan(ScopeGrants), (grants) => !grants.some((g) => g["access_scope_id"] === scopeId))
 
-/** `actor`'s effective role on a scope, read from the `scope_grants` rows in `rows` (§4). */
+/** `actor`'s effective role on a scope, read from the `scope_grants` rows in `rows` (SPEC §4). */
 export const roleFromGrants =
   (rows: RowStore, actor: PrincipalId) =>
   (scopeId: AccessScopeId): Effect.Effect<Option.Option<Role>, StoreUnavailable> =>
@@ -532,7 +532,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
         const next = { ...current, ...patch, id: current.id }
         const encoded = yield* encode(table, next)
         yield* checkGrantIdentity(table, encoded)
-        // A scope move needs the right on both the old and the new scope (DESIGN §4).
+        // A scope move needs the right on both the old and the new scope (INV-ACL-2).
         if (next.accessScopeId !== current.accessScopeId) yield* authorize(next.accessScopeId, requiredRole(table))
         yield* write(table, id, found, Option.some(encoded))
       }),
@@ -542,7 +542,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
         const found = yield* rows.read(table, id)
         if (Option.isNone(found)) return yield* new RowNotFound({ table: table.name, id })
         const current = yield* decode(table, found.value)
-        // Relinquishing one's own grant needs no role (DESIGN §16.27). `*` is never a real actor;
+        // Relinquishing one's own grant needs no role (DECISIONS 27). `*` is never a real actor;
         // excluding it keeps the `*` row owner-only even for a store built with actor `*`.
         const ownGrant =
           table.name === ScopeGrants.name && options.actor !== Everyone && found.value["principal_id"] === options.actor
@@ -557,7 +557,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
           return yield* new ScopeForbidden({ scopeId, required: "owner", held: Option.getOrNull(held) })
         })
         if (options.actor === Everyone) return yield* forbidden
-        // A replica's claim reads scope_grants; record it like any role lookup (DESIGN §10.1).
+        // A replica's claim reads scope_grants; record it like any role lookup (INV-BRW-6).
         yield* read(ScopeGrants)
         if (!(yield* options.claimScope(scopeId))) return yield* forbidden
         const id = grantId(scopeId, options.actor)
@@ -607,7 +607,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
               readableBy: Option.some([options.actor, Everyone]),
               limit
             }
-            // The semi-join reads `scope_grants`: a grant change can change this result (DESIGN §10.1).
+            // The semi-join reads `scope_grants`: a grant change can change this result (INV-BRW-6).
             if (Option.isSome(plan.readableBy)) yield* read(ScopeGrants)
             return yield* Effect.forEach(yield* rows.range(table, plan), (row) => decode(table, row))
           })

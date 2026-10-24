@@ -28,7 +28,7 @@ export const createSynced = (table: SyncTable.AnySyncTable) =>
   })
 
 /**
- * Postgres tests run only when `ECHO_PG_URL` is set (see docs/server-substrate.md), so
+ * Postgres tests run only when `ECHO_PG_URL` is set (see AGENTS.md "Local environment"), so
  * `bun run check` stays usable without a database. `bun run test:pg` sets it.
  */
 const adminUrl = process.env["ECHO_PG_URL"]
@@ -95,7 +95,7 @@ export const revoke = (principalId: string, scopeId: string) =>
   })
 
 /**
- * A minimal stand-in for a client replica (DESIGN.md §8, §9): stages pages and applies the whole
+ * A minimal stand-in for a client replica (SPEC §7, §9): stages pages and applies the whole
  * set, acks included, only at `PullDone`.
  */
 export class Replica {
@@ -126,7 +126,7 @@ export class Replica {
       this.continuation = Option.some(response.continuation)
       return
     }
-    // A set started from cursor null replaces the replica (§8): nothing older survives.
+    // A set started from cursor null replaces the replica (INV-CLI-2): nothing older survives.
     if (this.cursor === null) this.rows.clear()
     for (const change of this.staged) {
       if (change._tag === "upsert") this.rows.set(`${change.table}/${String(change.row["id"])}`, change.row)

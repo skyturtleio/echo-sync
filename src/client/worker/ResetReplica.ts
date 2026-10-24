@@ -1,8 +1,8 @@
 /**
- * `resetReplica` (DESIGN §9.1, §16 item 11a): delete one identity's replica, for example on sign-out.
+ * `resetReplica` (SPEC §12, DECISIONS 11): delete one identity's replica, for example on sign-out.
  *
  * A static function, not a `LeaderClient` method: it also runs when no client for the identity is alive.
- * It closes the identity's tab clients itself (DESIGN §16.24): once the reset worker is spawned it broadcasts
+ * It closes the identity's tab clients itself (DECISIONS 24): once the reset worker is spawned it broadcasts
  * `ResetSignal` on `Platform.resetChannelName(identity)`, and every `LeaderClient` of the identity in this
  * browser, the caller's own included, enters its terminal reset state and terminates its leader candidate.
  * The worker then waits at most `closeTimeout` (default 5 s) for the leader lock; a leader that does not let
@@ -11,7 +11,7 @@
  * the leader uses; see `reset` in `Leader.ts`.
  *
  * Interrupting the reset terminates that worker, and the browser then releases its lock and access
- * handles. The removal is durable across that (DESIGN §16.26): once the pending decision is made, the worker
+ * handles. The removal is durable across that (DECISIONS 26): once the pending decision is made, the worker
  * writes an engine-owned tombstone before touching the directory and removes it last. Interrupted before the
  * tombstone, the replica is intact; after it, the next leader of the identity (before opening its pool) or the
  * next reset (answering `Done` without a pending count) completes the removal, and a leader then starts on a
@@ -60,7 +60,7 @@ export const resetReplica = (
     const identity: Platform.ReplicaIdentity = { appId: config.appId, profile: config.profile }
     const invalid = Platform.validateIdentity(identity) ?? Platform.tabCapability().unsupported
     if (invalid !== undefined) return yield* new ResetFailed({ message: invalid })
-    // Bounded by contract (DESIGN §16.24): an unhonoured signal must surface as `ReplicaInUse`, never as a reset
+    // Bounded by contract (DECISIONS 24): an unhonoured signal must surface as `ReplicaInUse`, never as a reset
     // that waits forever. Refused before anything is spawned or broadcast.
     // `Duration` reads a numeric NaN as 0 and throws on malformed input: both are refused here, typed.
     const closeTimeout = options.closeTimeout ?? "5 seconds"

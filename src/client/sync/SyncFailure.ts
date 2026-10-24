@@ -1,5 +1,5 @@
 /**
- * Every way a sync cycle can fail, and what each failure means (DESIGN §6, §9.1).
+ * Every way a sync cycle can fail, and what each failure means (SPEC §10).
  *
  * Two closed unions, one per direction, each classified exhaustively in one place: the public status
  * `kind`, whether a push halts (only a push can), and the telemetry outcome. The transport is the only
@@ -16,7 +16,7 @@ import type { Errors, Protocol } from "echo-sync"
 
 /**
  * `syncHeaders` raised (a defect: its error channel is `never`) while the leader was preparing a
- * request (DESIGN §9.1 Credentials). Local and transient, like a network failure: nothing was sent.
+ * request (INV-LOOP-8 Credentials). Local and transient, like a network failure: nothing was sent.
  */
 export class CredentialsUnavailable extends Schema.TaggedError<CredentialsUnavailable>()("CredentialsUnavailable", {
   message: Schema.String
@@ -35,8 +35,8 @@ export class PullProtocolError extends Schema.TaggedError<PullProtocolError>()("
 
 /**
  * A pull change for a table this client knows does not decode with that table's schema. The
- * install transaction fails as a whole (no rows, acks, cursor or staging change). Per DESIGN §8
- * and §6 it is a transient pull failure: the sync loop retries with backoff, never halts.
+ * install transaction fails as a whole (no rows, acks, cursor or staging change). Per INV-CLI-9
+ * and SPEC §10 it is a transient pull failure: the sync loop retries with backoff, never halts.
  */
 export class MalformedChange extends Schema.TaggedError<MalformedChange>()("MalformedChange", {
   table: Schema.String,
@@ -52,8 +52,8 @@ export class ServerOutdated extends Schema.TaggedError<ServerOutdated>()("Server
  * Why a push failed in the transport:
  * - `CredentialsUnavailable`: `syncHeaders` raised; nothing was sent.
  * - `Unauthorized`: the server rejected the credential (its `Unauthorized`, or HTTP 401/403).
- * - `ClientOutdated`: compatibility policy refused this client (DESIGN §11).
- * - `MalformedEnvelope`: the server refused the batch (DESIGN §6). Halts push.
+ * - `ClientOutdated`: compatibility policy refused this client (SPEC §0.2).
+ * - `MalformedEnvelope`: the server refused the batch (INV-LOOP-3). Halts push.
  * - `PushIntegrityError`: the batch is not a valid push request, or the push ended in a defect. Halts push.
  * - `RpcClientError`: no usable RPC result (transport, HTTP, an empty or unreadable response).
  */
@@ -106,7 +106,7 @@ export type PullFailure =
   | ServerOutdated
 
 /**
- * What kind of failure `lastError` reports (DESIGN §9.1), so an app can tell "sign in again"
+ * What kind of failure `lastError` reports (SPEC §10), so an app can tell "sign in again"
  * from "you are offline" without parsing text:
  * - `credentials`: `syncHeaders` raised; nothing was sent.
  * - `unauthorized`: the server rejected the credential (`Unauthorized` or HTTP 401/403).
@@ -129,13 +129,13 @@ export const SyncErrorKind = Schema.Literals([
 ])
 export type SyncErrorKind = typeof SyncErrorKind.Type
 
-/** What one failure means: its status kind and its telemetry outcome (docs/observability.md), which is finer. */
+/** What one failure means: its status kind and its telemetry outcome (SPEC §14), which is finer. */
 interface Meaning {
   readonly kind: SyncErrorKind
   readonly outcome: Outcome
 }
 
-/** A push failure's meaning; `halt` is the library-controlled `Halted` reason when it stops pushing (DESIGN §6). */
+/** A push failure's meaning; `halt` is the library-controlled `Halted` reason when it stops pushing (INV-LOOP-3). */
 interface PushMeaning extends Meaning {
   readonly halt: Option.Option<string>
 }
@@ -191,13 +191,13 @@ const failures = <E>(cause: Cause.Cause<E>): ReadonlyArray<E> =>
  */
 export interface PushVerdict {
   readonly kind: SyncErrorKind
-  /** The `Halted` reason when this push stops pushing (DESIGN §6). */
+  /** The `Halted` reason when this push stops pushing (INV-LOOP-3). */
   readonly halt: Option.Option<string>
   readonly outcome: Outcome
 }
 
 /**
- * Whole-cause verdict on a push (DESIGN §6: defect > integrity > first failure), never just its first
+ * Whole-cause verdict on a push (INV-LOOP-5: defect > integrity > first failure), never just its first
  * failure: a defect anywhere halts, even beside a transient failure, since an RPC request decode failure
  * arrives as an untagged defect. Interruption is the caller's to handle first.
  */

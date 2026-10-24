@@ -6,7 +6,7 @@ import { middleware } from "./fakeSync.ts"
 const sliceProxy: ProxyOptions = {
   target: process.env["ECHO_SLICE_SERVER"] ?? "http://127.0.0.1:5200"
   // No proxy workaround for a server that dies mid-stream: Vite's proxy keeps the browser's pokes response
-  // open, and the client's idleTimeout (DESIGN §6 Liveness) ends it, as it would behind any such proxy.
+  // open, and the client's idleTimeout (INV-LOOP-7) ends it, as it would behind any such proxy.
 }
 export default defineConfig({
   root: fileURLToPath(new URL(".", import.meta.url)),

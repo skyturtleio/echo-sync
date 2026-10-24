@@ -8,7 +8,7 @@ import * as RowStore from "./rowStore.ts"
 import { resolveTables } from "./schema.ts"
 import { Items, pgAvailable, registry, Replica, RowId, TestDatabase } from "./test-support.ts"
 
-// Scope creation on the server (DESIGN §4): the Store-level contract is in Conformance; these are
+// Scope creation on the server (SPEC §4): the Store-level contract is in Conformance; these are
 // the Postgres-only invariants (atomic claim, orphaned scopes, delivery).
 
 const S = AccessScope.AccessScopeId.make("created")
@@ -45,7 +45,7 @@ const accessRows = (scope: string) =>
     return yield* sql<{ n: number }>`SELECT count(*)::int AS n FROM echo_sync.access_scopes WHERE id = ${scope}`
   })
 
-describe.skipIf(!pgAvailable)("scope creation on Postgres (§4)", () => {
+describe.skipIf(!pgAvailable)("scope creation on Postgres (SPEC §4)", () => {
   it.live(
     "two concurrent creators of one scope id get exactly one Applied and one ScopeForbidden{owner}, never two owners",
     () =>

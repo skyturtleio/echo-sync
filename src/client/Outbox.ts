@@ -1,11 +1,11 @@
 /**
- * Durable outbox primitive (DESIGN §9). The outbox is the only client state that is not disposable:
+ * Durable outbox primitive (SPEC §9). The outbox is the only client state that is not disposable:
  * the replica can be rebuilt from the server, unsent intents cannot.
  *
  * Deliberately minimal: append inside the caller's transaction, read pending in order, mark released,
  * prune. The reconciliation loop (`src/client/sync`) builds on these operations.
  *
- * Release marks a row (`released_at`) instead of deleting it (DESIGN §9): an `enqueue` retried after
+ * Release marks a row (`released_at`) instead of deleting it (INV-CLI-4): an `enqueue` retried after
  * `LeaderLost` can arrive after the original was pushed, acked and released. Because the row is still
  * there, the retry returns the original `seq` and inserts nothing; a fresh row would replay the effect
  * locally a second time and get a server position no pull window ever acks. Released rows are pruned
@@ -66,13 +66,13 @@ const toEntries = (rows: ReadonlyArray<unknown>): Effect.Effect<ReadonlyArray<Ou
  * Forward migrations of the engine-owned local tables (`echo_meta`, `echo_outbox`, `echo_staged`,
  * `echo_notices`), in one transaction (joins the caller's). `echo_meta.engine_schema_version` records
  * the last applied step; a database with no version is at 0, which includes one created by main's
- * first outbox DDL (9c89ed5, no `undo` column). Every step is idempotent, so a database whose tables
+ * first outbox DDL (SPEC §13.4, no `undo` column). Every step is idempotent, so a database whose tables
  * already have a step's shape (created by an unversioned development build) passes through it. A
  * version above the newest known step means a newer build wrote this database: a defect, never a
  * silent downgrade. The replica tables are not here: `SqliteSyncStorage.migrate` owns them.
  */
 const steps: ReadonlyArray<Effect.Effect<void, SqlError, SqlClient.SqlClient>> = [
-  // 1: main 9c89ed5.
+  // 1: initial outbox schema (SPEC §9.1).
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient
     yield* sql`CREATE TABLE IF NOT EXISTS echo_outbox (
@@ -113,7 +113,7 @@ export const migrate: Effect.Effect<void, SqlError, SqlClient.SqlClient> = Effec
   )
 })
 
-/** This replica's client id (DESIGN §6 mutation identity), created on first use and persisted. */
+/** This replica's client id (SPEC §2 mutation identity), created on first use and persisted. */
 export const clientId: Effect.Effect<string, SqlError, SqlClient.SqlClient> = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient
   return yield* sql.withTransaction(
@@ -213,7 +213,7 @@ export const pending: Effect.Effect<ReadonlyArray<OutboxEntry>, SqlError, SqlCli
 )
 
 /**
- * Mark entries released once their outcome is installed in the replica (DESIGN §8). Joins the caller's
+ * Mark entries released once their outcome is installed in the replica (SPEC §9.3). Joins the caller's
  * transaction. Re-marking keeps the first release time.
  */
 export const markReleased = (seqs: ReadonlyArray<number>): Effect.Effect<void, SqlError, SqlClient.SqlClient> =>

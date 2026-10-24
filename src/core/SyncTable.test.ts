@@ -167,7 +167,7 @@ describe("SyncTable declaration-time rejection", () => {
     const encodedDefault = Schema.String.pipe(
       Schema.withDecodingDefaultKey(Effect.succeed("d"), { encodingStrategy: "omit" })
     )
-    // @ts-expect-error an encoded-side default lets a stored row omit the key (§11 key presence)
+    // @ts-expect-error an encoded-side default lets a stored row omit the key (INV-TBL-4 key presence)
     expectRejected(() => SyncTable.make("t", { ...base, x: encodedDefault }), /field "x".*encoded-side defaults/)
   })
 
@@ -233,7 +233,7 @@ describe("SyncTable manifest hash", () => {
     expect(b.manifest.dataHash).toBe(a.manifest.dataHash)
   })
 
-  it("ignores refinements, brands and nested JSON schemas: validation is not storage (DESIGN §5)", () => {
+  it("ignores refinements, brands and nested JSON schemas: validation is not storage (SPEC §3)", () => {
     const base = SyncTable.make("notes", fields).manifest.dataHash
     const same = [
       SyncTable.make("notes", { ...fields, title: Schema.NonEmptyString }),

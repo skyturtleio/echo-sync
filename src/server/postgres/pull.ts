@@ -10,7 +10,7 @@ import * as Telemetry from "../../internal/Telemetry.ts"
 const RowKey = Schema.Struct({ table: Schema.String, rowId: Schema.String })
 
 /**
- * Server-side progress of an unfinished page set (DESIGN.md §8). Private to the server: on the
+ * Server-side progress of an unfinished page set (SPEC §7). Private to the server: on the
  * wire it is an opaque string (core's branded `PullContinuation`), the JSON encoding of this
  * struct, which the client resends verbatim.
  *
@@ -46,7 +46,7 @@ export interface PullRequest {
   readonly principalId: string
   readonly clientId: string
   readonly clientVersion?: Protocol.ClientVersion | undefined
-  /** The wire's replica principal (DESIGN §16.21): checked against `principalId`, never used as it. */
+  /** The wire's replica principal (DECISIONS 21): checked against `principalId`, never used as it. */
   readonly principal?: string | undefined
   readonly cursor: bigint | null
   readonly continuation: Option.Option<string>
@@ -82,7 +82,7 @@ const payloadOf = Effect.fnUntraced(function* (table: SyncTable.AnySyncTable, ra
 })
 
 /**
- * Pull one page (DESIGN.md §8) in its own `REPEATABLE READ` snapshot:
+ * Pull one page (SPEC §7) in its own `REPEATABLE READ` snapshot:
  *
  * 1. purge every held scope that is no longer readable;
  * 2. start a row walk for every readable scope not held (initial sync is the same thing from an
@@ -92,7 +92,7 @@ const payloadOf = Effect.fnUntraced(function* (table: SyncTable.AnySyncTable, ra
  *
  * Membership is a diff of states (held vs. readable now), not a replay of grant log entries.
  * At `PullDone` the held set is recorded under `nextCursor`, so the next page set starts from it.
- * See docs/server-substrate.md.
+ * See SPEC §7.
  */
 export const pull = Effect.fnUntraced(function* (
   registry: Registry.SyncRegistry,
@@ -254,7 +254,7 @@ export const pull = Effect.fnUntraced(function* (
             acks,
             nextCursor: Ids.Position.make(nextPosition),
             // Number() is exact only up to Number.MAX_SAFE_INTEGER; that matches SeqFloor being an
-            // Int (DESIGN §16.5). Raised only by `expireLedger`.
+            // Int (DECISIONS 5). Raised only by `expireLedger`.
             expiredThrough: Ids.SeqFloor.make(Number(state.expired_through))
           }
         : {
@@ -285,7 +285,7 @@ export const pull = Effect.fnUntraced(function* (
     yield* sql`
       DELETE FROM echo_sync.client_scopes WHERE client_id = ${request.clientId} AND position < ${request.cursor}`
     yield* sql`UPDATE echo_sync.clients SET cursor = ${request.cursor} WHERE client_id = ${request.clientId}`
-    // Ledger expiry (DESIGN §16 item 5): presenting a cursor the server completed a set at proves
+    // Ledger expiry (DECISIONS 5): presenting a cursor the server completed a set at proves
     // the client installed every ack at or below it, so those rows are acked from now. Only the
     // first stamp counts; a row is never expired before it has one.
     yield* sql`
@@ -302,7 +302,7 @@ export const pull = Effect.fnUntraced(function* (
   return response.result
 }, Telemetry.boundary)
 
-/** Code-point order, matching `COLLATE "C"` (DESIGN.md §10). Table names are ASCII identifiers. */
+/** Code-point order, matching `COLLATE "C"` (INV-TBL-2). Table names are ASCII identifiers. */
 const compare: Order.Order<string> = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
 const payloadKey = (table: string, rowId: string) => `${table}\u0000${rowId}`
 const purged = (scopeId: string): Protocol.Change => ({
@@ -318,7 +318,7 @@ const fetchPayloads = Effect.fnUntraced(function* (tables: ReadonlyArray<Resolve
       ...new Set(entries.filter((e) => e.op === "upsert" && e.table_name === table.name).map((e) => e.row_id))
     ]
     if (ids.length === 0) continue
-    // Declared columns only (DESIGN §11): an undeclared column never leaves the database.
+    // Declared columns only (INV-TBL-4): an undeclared column never leaves the database.
     const rows = yield* sql.unsafe<Record<string, unknown>>(
       `SELECT ${selectList(table, "t")} FROM ${q(schema)}.${q(table.name)} t WHERE t.id::text = ANY($1::text[])`,
       [ids]

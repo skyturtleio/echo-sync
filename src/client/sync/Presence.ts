@@ -1,5 +1,5 @@
 /**
- * The leader's presence (DESIGN §9.1 Presence, §12, §16 item 13). Each tab subscription is one upstream
+ * The leader's presence (SPEC §10.3, DECISIONS 13). Each tab subscription is one upstream
  * `room` stream on the leader, kept up the way `followPokes` keeps the pokes stream up:
  *
  * - A `heartbeat` proves the connection alive and is never forwarded; only snapshots are.
@@ -7,7 +7,7 @@
  *   The subscription then rejoins after a backoff (from `retryDelay`, doubling to `maxRetryDelay`, reset
  *   once a connection delivered a snapshot). The tab stream does not end.
  * - `track` only records the desired state, synchronously, and returns; it never waits on the network
- *   (DESIGN §9.1, 07a8f48). The subscription owns delivery: every join carries the latest state, and a
+ *   (SPEC §10.3). The subscription owns delivery: every join carries the latest state, and a
  *   supervised sender per connection sends any newer state after the join's first snapshot, one send at
  *   a time, latest wins. Each send has the `idleTimeout` deadline; one that fails, dies or times out is
  *   retried with backoff, never by ending the connection, so a healthy room stream never strands a state.
@@ -18,7 +18,7 @@
  * One subscription per `(room, tabId)`: registering it is one synchronous step, and a join at or above the
  * registered revision replaces (and ends) the older one; a lower one is superseded and ends empty without
  * touching it. A release only removes itself, never a successor. A rejoin with the same
- * key ends the older server stream (DESIGN §12); the older one is always ours and already abandoned
+ * key ends the older server stream (SPEC §10.2); the older one is always ours and already abandoned
  * here, so that is expected. Presence never touches the replica or the outbox.
  */
 import { Cause, Deferred, Duration, Effect, Exit, Queue, type Schema, Stream } from "effect"
@@ -27,8 +27,8 @@ import * as Telemetry from "../../internal/Telemetry.ts"
 
 export interface Upstream<E> {
   /**
-   * Prepare-then-stream, like `SyncTransport.pokes`: the Effect resolves this join's credentials (DESIGN
-   * §9.1) and the stream sends the request when run, so `idleTimeout` covers only the stream.
+   * Prepare-then-stream, like `SyncTransport.pokes`: the Effect resolves this join's credentials
+   * (INV-LOOP-8) and the stream sends the request when run, so `idleTimeout` covers only the stream.
    */
   readonly room: (payload: Join) => Effect.Effect<Stream.Stream<Protocol.RoomElement, E>, E>
   readonly track: (payload: Join) => Effect.Effect<void, E>
@@ -38,7 +38,7 @@ export interface Join {
   readonly room: AccessScope.AccessScopeId
   readonly tabId: Protocol.TabId
   readonly state: Schema.Json
-  /** The tab's revision of `state` (DESIGN §9.1, §12 revision fencing); the leader never assigns one. */
+  /** The tab's revision of `state` (SPEC §10.3 revision fencing); the leader never assigns one. */
   readonly revision: number
 }
 
@@ -81,7 +81,7 @@ export const make = <E, F extends E>(options: {
   const subscriptions = new Map<string, Subscription>()
 
   /**
-   * The connection's supervised sender (DESIGN §9.1, 07a8f48): sends every state newer than `sent`, one at
+   * The connection's supervised sender (SPEC §10.3): sends every state newer than `sent`, one at
    * a time, latest wins. Each attempt has the `idleTimeout` deadline; an attempt that fails, dies or runs
    * out of time is retried with backoff, with the latest state. It never ends or restarts the connection:
    * a healthy room stream must not hold a stranded state back. Only the connection's scope ends it.
@@ -119,7 +119,7 @@ export const make = <E, F extends E>(options: {
       Effect.gen(function* () {
         const k = key(room, tabId)
         // Registration is one synchronous step, released on every exit, and only ever removes itself. A join
-        // below the registered subscription's revision is a superseded attempt (DESIGN §12, 6c7027f): it
+        // below the registered subscription's revision is a superseded attempt (SPEC §10.3): it
         // registers nothing, leaves the incumbent alone and ends empty, with no upstream join or sender.
         const sub = yield* Effect.acquireRelease(
           Effect.sync((): Subscription | undefined => {

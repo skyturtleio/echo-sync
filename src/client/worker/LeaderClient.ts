@@ -1,23 +1,23 @@
 /**
- * Tab-side handle to the replica (DESIGN §9). Spawns this tab's leader candidate, finds the current
+ * Tab-side handle to the replica (SPEC §12). Spawns this tab's leader candidate, finds the current
  * leader through the router SharedWorker, and talks to it with Effect RPC.
  *
- * Handover semantics (see docs/browser-substrate.md):
+ * Handover semantics (see SPEC §12):
  * - Leader loss is detected through the leader's epoch Web Lock, never by waiting on a dead port.
  * - In-flight requests fail with `LeaderUnavailable { reason: "LeaderLost" }`. The request may or may
  *   not have been applied before the leader died; `enqueue` is idempotent on `mutationId`, so retry it.
  * - Requests issued while no leader is connected wait for the next one.
  * - `mutate` fixes its `mutationId` before the first attempt and retries `LeaderLost` with it, so a
- *   mutation that committed on the lost leader lands on the §9 idempotency rule: one outbox row.
+ *   mutation that committed on the lost leader lands on INV-CLI-4: one outbox row.
  * - `subscribe` (registered queries) and `notices` re-subscribe to the next leader on `LeaderLost`; the
  *   stream emits nothing in between, so a consumer keeps the last emission until a fresh one arrives.
- * - `syncStatus` also re-subscribes on `LeaderLost` (DESIGN §9.1); `requestSync` retries it like `mutate`.
+ * - `syncStatus` also re-subscribes on `LeaderLost` (INV-BRW-4); `requestSync` retries it like `mutate`.
  * - `presence` re-joins the next leader on `LeaderLost` with this tab's latest tracked state; `track`
- *   updates that state (DESIGN §9.1 Presence). See `tabApi`.
+ *   updates that state (SPEC §10.3 Presence). See `tabApi`.
  * - Raw `subscribeRaw` streams terminate with `LeaderUnavailable { reason: "LeaderLost" }`;
  *   the caller re-subscribes and receives a fresh full result from the new leader.
  *
- * Reset (DESIGN §16.24): `resetReplica`'s signal puts the client into a terminal state. Every request and
+ * Reset (DECISIONS 24): `resetReplica`'s signal puts the client into a terminal state. Every request and
  * stream fails `LeaderUnavailable { reason: "Reset" }`, which is not a handover (never retried or
  * resubscribed); `status` reports `reset: true` and stays open. See `enterReset`.
  */
@@ -39,7 +39,7 @@ import * as Telemetry from "../../internal/Telemetry.ts"
 import { type AccessScope, type Errors, Ids, type Mutation, Protocol, type Query } from "echo-sync"
 import type { LocallyRejected } from "../sync/Engine.ts"
 import type { SyncStatus } from "../sync/SyncLoop.ts"
-// Values, so apps get the runtime schemas (and their types) without RPC introspection (DESIGN §16.19).
+// Values, so apps get the runtime schemas (and their types) without RPC introspection (DECISIONS 19).
 export { SyncError, SyncStatus } from "../sync/SyncLoop.ts"
 export { SyncErrorKind } from "../sync/SyncFailure.ts"
 import {
@@ -73,7 +73,7 @@ import { TabPlatform } from "./TabPlatform.ts"
 export interface LeaderClientConfig extends TabApiOptions {
   readonly appId: string
   readonly profile: string
-  /** The principal this replica acts as (DESIGN §4). One profile belongs to one principal. */
+  /** The principal this replica acts as (SPEC §4). One profile belongs to one principal. */
   readonly principal: string
   /** e.g. `(name) => new Worker(new URL("./leader.worker.ts", import.meta.url), { type: "module", name })` */
   readonly spawnLeader: (name: string) => Worker
@@ -96,7 +96,7 @@ export interface Status {
   readonly isLeaderTab: boolean
   readonly leaderId: string | undefined
   /**
-   * `resetReplica` closed this client (DESIGN §16.24): terminal. Its leader candidate is terminated, every
+   * `resetReplica` closed this client (DECISIONS 24): terminal. Its leader candidate is terminated, every
    * request fails `LeaderUnavailable { reason: "Reset" }`, and no leader is started or joined for it again
    * (`isLeaderTab` false, `leaderId` undefined). Build a new client to use the replica again.
    */
@@ -112,14 +112,14 @@ export class LeaderClient extends Context.Service<
       params?: SqlParams
     ) => Effect.Effect<Rows, SqlFailure | RawExecDisabled | LeaderUnavailable>
     /**
-     * The one write API (DESIGN §9.1): encodes `args`, generates the `mutationId` once, and enqueues,
+     * The one write API (INV-BRW-4): encodes `args`, generates the `mutationId` once, and enqueues,
      * retrying `LeaderLost` only. Resolves after the leader committed the optimistic apply and the outbox
      * entry. `options.mutationId` is for replay and tests; apps never mint ids.
      */
     readonly mutate: MutateFn
     /**
      * The replay/test primitive under `mutate`: one attempt with a caller-chosen `mutationId` (replay of an
-     * exported entry, tests; DESIGN §9.1). Apps use `mutate`; a UI adapter does not export this.
+     * exported entry, tests; SPEC §12.3). Apps use `mutate`; a UI adapter does not export this.
      * Resolves only after the outbox entry is committed in SQLite.
      */
     readonly enqueue: (
@@ -141,26 +141,26 @@ export class LeaderClient extends Context.Service<
      */
     readonly syncStatus: Stream.Stream<SyncStatus, SyncDisabled | LeaderUnavailable>
     /**
-     * Wake the leader's sync loop (coalesced) and complete once the wake is accepted (DESIGN §9.1). Implies
+     * Wake the leader's sync loop (coalesced) and complete once the wake is accepted (SPEC §10). Implies
      * no network success and never clears a halted push; retried across `LeaderLost`.
      */
     readonly requestSync: Effect.Effect<void, SyncDisabled | LeaderUnavailable>
     /**
-     * This tab's presence in `room` (DESIGN §9.1): its entry exists exactly while the stream runs. Emits the
+     * This tab's presence in `room` (SPEC §10.3): its entry exists exactly while the stream runs. Emits the
      * room's snapshots; survives handover (re-joined on the new leader with the latest `track`ed state).
      */
     readonly presence: PresenceFn
     /**
      * Record this tab's desired state in a room it has joined through `presence` (a no-op otherwise).
      * Completes once this tab has recorded it, before any message to the leader; the open stream then
-     * delivers the latest state, eventually, while it stays open (DESIGN §9.1).
+     * delivers the latest state, eventually, while it stays open (SPEC §10.3).
      */
     readonly track: TrackFn
     /** Retained notices, current list then every change; survives handover. */
     readonly notices: Stream.Stream<ReadonlyArray<StoredNotice>, SqlFailure | LeaderUnavailable>
-    /** The only way a notice is removed (DESIGN §9.1). Idempotent, so retried across `LeaderLost`. */
+    /** The only way a notice is removed (SPEC §9.5). Idempotent, so retried across `LeaderLost`. */
     readonly dismissNotices: (ids: ReadonlyArray<number>) => Effect.Effect<void, SqlFailure | LeaderUnavailable>
-    /** Pending outbox entries for export (DESIGN §9); available while push is halted. */
+    /** Pending outbox entries for export (SPEC §9); available while push is halted. */
     readonly exportPending: Effect.Effect<ReadonlyArray<PendingExport>, SqlFailure | LeaderUnavailable>
     /** This tab's view of the topology: the current value, then every change. */
     readonly status: Stream.Stream<Status>
@@ -203,7 +203,7 @@ const isLeaderLost = (e: unknown): e is LeaderUnavailable => e instanceof Leader
 const lostBackoff = Schedule.spaced("50 millis")
 
 /**
- * Only a cause whose failures are all `LeaderLost` and that has no defect is a handover (DESIGN §16.23): a
+ * Only a cause whose failures are all `LeaderLost` and that has no defect is a handover (DECISIONS 23): a
  * defect means the leader died of a bug, which a silent resubscription would hide.
  */
 const isHandover = <E>(cause: Cause.Cause<E>): boolean =>
@@ -242,7 +242,7 @@ export interface LeaderCalls {
   readonly dismissNotices: (ids: ReadonlyArray<number>) => Effect.Effect<void, SqlFailure | LeaderUnavailable>
   readonly syncStatus: Stream.Stream<SyncStatus, SyncDisabled | LeaderUnavailable>
   readonly requestSync: Effect.Effect<void, SyncDisabled | LeaderUnavailable>
-  /** `room`/`track` with this tab's id filled in; `revision` is the tab's (DESIGN §9.1). */
+  /** `room`/`track` with this tab's id filled in; `revision` is the tab's (SPEC §10.3). */
   readonly presence: (
     room: AccessScope.AccessScopeId,
     state: Schema.Json,
@@ -256,11 +256,11 @@ export interface LeaderCalls {
 }
 
 /**
- * The DESIGN §9.1 semantics over `calls`: id generation, `LeaderLost` retry and re-subscription, and the
+ * The SPEC §12.3 semantics over `calls`: id generation, `LeaderLost` retry and re-subscription, and the
  * tab-side encode/decode. Exported so they are tested against a real leader without a browser.
  */
 export interface TabApiOptions {
-  /** Deadline of one presence send to the leader (DESIGN §9.1 sender). Default 45 s, the default `idleTimeout`. */
+  /** Deadline of one presence send to the leader (SPEC §10.3 sender). Default 45 s, the default `idleTimeout`. */
   readonly presenceSendTimeout?: Duration.Input
   /** First retry delay of a failed presence send; doubles up to 30 s. Default 1 s. */
   readonly presenceRetryDelay?: Duration.Input
@@ -275,7 +275,7 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
       const encoded: Schema.Json = yield* Effect.orDie(
         Schema.encodeUnknownEffect(Schema.toCodecJson(mutation.args))(args)
       )
-      // Fixed once, before the first attempt: every retry presents the same idempotency key (DESIGN §9).
+      // Fixed once, before the first attempt: every retry presents the same idempotency key (INV-BRW-4).
       const mutationId = options?.mutationId ?? Ids.MutationId.make(crypto.randomUUID())
       return yield* calls
         .enqueue({ mutationId, name: mutation.name, args: encoded })
@@ -296,7 +296,7 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
     )
   /**
    * The latest desired state per joined room, kept in the tab: a new leader knows nothing of the old one's
-   * (DESIGN §9.1, 07a8f48). `track` completes once this tab has recorded it, before any leader IPC. The open
+   * (SPEC §10.3). `track` completes once this tab has recorded it, before any leader IPC. The open
    * stream owns delivery to the leader: every (re)join carries the latest state, and a supervised sender
    * scoped to that join sends any newer one after the join's first snapshot, one at a time, latest wins,
    * never blocking snapshots.
@@ -309,7 +309,7 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
   }
   const joined = new Map<string, Cell>()
   /**
-   * One revision counter per room for the life of this tab client (DESIGN §9.1, 6c7027f), outside any
+   * One revision counter per room for the life of this tab client (SPEC §10.3), outside any
    * stream's cell: closing and reopening a room never resets it. Every event the server may see out of
    * order takes the next value: an open, an accepted `track`, a handover rejoin.
    */
@@ -415,7 +415,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     const scope = yield* Effect.scope
     /**
      * Everything that keeps this client in the topology: the tab lock, lock watchers, router acceptance and
-     * leader connections. Closed by a reset (DESIGN §16.24), which releases or dequeues every lock this tab
+     * leader connections. Closed by a reset (DECISIONS 24), which releases or dequeues every lock this tab
      * held or waited on; the client itself stays usable until `scope` closes, failing every request.
      */
     const topology = Scope.forkUnsafe(scope)
@@ -530,7 +530,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     // `reconnectRouter`.
     let router: SharedWorker | undefined
     /**
-     * The terminal reset state (DESIGN §16.24), entered synchronously on the signal. Requests waiting for a
+     * The terminal reset state (DECISIONS 24), entered synchronously on the signal. Requests waiting for a
      * leader and those in flight fail `Reset` (not `LeaderLost`, so nothing retries or resubscribes), the
      * candidate is terminated (the browser releases its leader and epoch locks and drops a queued leader
      * request), and closing `topology` releases the tab lock, dequeues every lock watcher and closes the
@@ -571,7 +571,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     )
 
     // Held for the tab's lifetime: the leader and the router drop this tab's port when it is released.
-    // Waited on in a fiber owned by `topology`, so a reset during the wait dequeues the request (DESIGN §16.24).
+    // Waited on in a fiber owned by `topology`, so a reset during the wait dequeues the request (DECISIONS 24).
     const tabLockFiber = fork(platform.holdLock(Platform.tabLockName(identity, tabId)).pipe(Scope.provide(topology)))
     if (tabLockFiber === undefined) return service
     const tabLock = yield* Fiber.await(tabLockFiber)

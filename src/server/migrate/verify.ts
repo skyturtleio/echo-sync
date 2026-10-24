@@ -1,5 +1,5 @@
 /**
- * Startup verifier (DESIGN §11, "Generator and verifier contract"): compares the live Postgres
+ * Startup verifier (SPEC §13, "Generator and verifier contract"): compares the live Postgres
  * catalog with the registry's manifests and fails with one `Drift` listing every mismatch. Run it
  * after `migrate` and the app migrations, before serving; on `Drift` the server must not serve.
  *
@@ -8,9 +8,9 @@
  * included, on every relation the capture trigger maps the name to: attached (capture `AFTER ROW
  * INSERT|UPDATE|DELETE` and truncate guard `BEFORE STATEMENT TRUNCATE`, both enabled, no `WHEN`,
  * no column list); every declared column present with its type,
- * text collation `"C"`, and nullability (§11 key presence); primary key exactly `(id)`; each
+ * text collation `"C"`, and nullability (SPEC §13 key presence); primary key exactly `(id)`; each
  * declared index `table__index` a plain btree on the key columns in order, `ASC NULLS FIRST` on
- * declared fields and `ASC` on the trailing `id`, text keys collated `"C"` (§10); each declared
+ * declared fields and `ASC` on the trailing `id`, text keys collated `"C"` (SPEC §3); each declared
  * unique set backed by a unique index whose key is exactly those columns, `ASC NULLS LAST`,
  * `NULLS DISTINCT`. Indexes count only if valid, ready and live, and only their key columns
  * (`indnkeyatts`) are compared, never `INCLUDE` payload. Extra live columns and indexes
@@ -165,13 +165,13 @@ const checkRelation = Effect.fn("verify.checkRelation")(function* (
   for (const column of table.columns) {
     const c = live.get(column.name)
     if (c === undefined) {
-      drift(`declared column ${column.name} is missing (every wire row must carry it, §11)`)
+      drift(`declared column ${column.name} is missing (every wire row must carry it, SPEC §13)`)
       continue
     }
     if (c.type !== expectedType[column.kind])
       drift(`column ${column.name} is ${c.type}, declared ${expectedType[column.kind]}`)
     if (column.kind === "text" && c.collation !== "C") {
-      drift(`column ${column.name} has collation ${c.collation ?? "none"}, declared "C" (§10)`)
+      drift(`column ${column.name} has collation ${c.collation ?? "none"}, declared "C" (SPEC §3)`)
     }
     if (c.notNull === column.nullable) {
       drift(
@@ -218,7 +218,7 @@ const checkRelation = Effect.fn("verify.checkRelation")(function* (
   for (const index of Object.values(table.indexes)) {
     const name = `${table.name}__${index.name}`
     const rows = byIndex.get(name)
-    // §10: NULLS FIRST on declared fields, plain ASC (NULLS LAST) on the trailing id.
+    // SPEC §3: NULLS FIRST on declared fields, plain ASC (NULLS LAST) on the trailing id.
     const want: ReadonlyArray<KeyColumn> = index.key.map((c, i) => ({
       column: c.name,
       option: i === index.key.length - 1 ? 0 : INDOPTION_NULLS_FIRST,
@@ -289,7 +289,7 @@ export const verify = (registry: Registry.SyncRegistry) =>
         })
       }
       if (attached.length > 0) {
-        // DESIGN §11: the relation the unqualified name resolves to through search_path must be a
+        // SPEC §13: the relation the unqualified name resolves to through search_path must be a
         // captured one, or app SQL writes a relation sync never sees.
         const [resolved] = yield* sql<Relation>`
           SELECT c.oid::int AS oid, n.nspname AS schema FROM pg_class c

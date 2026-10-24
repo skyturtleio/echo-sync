@@ -20,7 +20,7 @@ export interface ReplicaIdentity {
 // No all-dot segments: "." and ".." are path traversal in the OPFS directory walk.
 const segment = /^(?!\.+$)[A-Za-z0-9._-]+$/
 
-/** SQLite path inside the OPFS access-handle pool (DESIGN §9 naming). */
+/** SQLite path inside the OPFS access-handle pool (INV-BRW-1 naming). */
 export const dbName = ({ appId, profile }: ReplicaIdentity): string => `echo-sync/${appId}/${profile}.db`
 
 /**
@@ -44,7 +44,7 @@ export const vfsMaxPathname = maxDbNameLength + "-journal".length
 
 /**
  * The longest OPFS entry name, in UTF-8 bytes, that every engine accepts: WebKit refuses a 256-byte
- * directory or file name (`UnknownError`) where Chromium accepts far longer ones (DESIGN §16 item 1,
+ * directory or file name (`UnknownError`) where Chromium accepts far longer ones (DECISIONS 1,
  * WebKit smoke). `appId` and `profile` are each a directory name in `poolDirectory`.
  */
 export const maxSegmentBytes = 255
@@ -80,7 +80,7 @@ export const validateIdentity = (identity: ReplicaIdentity): string | undefined 
 export const poolDirectory = ({ appId, profile }: ReplicaIdentity): string => `echo-sync/${appId}/${profile}`
 
 /**
- * Name of the identity's reset tombstone (DESIGN §16.26), an engine-owned file in `echo-sync/<appId>` whose
+ * Name of the identity's reset tombstone (DECISIONS 26), an engine-owned file in `echo-sync/<appId>` whose
  * presence means a reset that passed its pending decision condemned `poolDirectory(identity)`. It starts with
  * "~", which `validateIdentity` never accepts, so it is never a profile's directory. The profile is hashed
  * (SHA-256, hex) rather than embedded so the name fits `maxSegmentBytes` for every valid profile.
@@ -98,7 +98,7 @@ export const routerName = ({ appId, profile }: ReplicaIdentity): string => `echo
 export const leaderLockName = ({ appId, profile }: ReplicaIdentity): string => `echo:${appId}:${profile}:leader`
 
 /**
- * The BroadcastChannel `resetReplica` signals on (DESIGN §16.24): every tab client of this identity that
+ * The BroadcastChannel `resetReplica` signals on (DECISIONS 24): every tab client of this identity that
  * receives it enters its terminal reset state and terminates its leader candidate.
  */
 export const resetChannelName = ({ appId, profile }: ReplicaIdentity): string => `echo:${appId}:${profile}:reset`

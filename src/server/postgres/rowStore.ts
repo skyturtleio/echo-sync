@@ -20,7 +20,7 @@ export const q = (name: string) => `"${name.replaceAll('"', '""')}"`
 
 /**
  * Declared columns only, so a column the app added to the relation but not to the SyncTable
- * never leaves the database (DESIGN §11). Names are validated identifiers (core rejects others).
+ * never leaves the database (SPEC §3). Names are validated identifiers (core rejects others).
  */
 export const selectList = (table: SyncTable.AnySyncTable, alias?: string) =>
   table.columns.map((c) => (alias === undefined ? q(c.name) : `${alias}.${q(c.name)}`)).join(", ")
@@ -36,7 +36,7 @@ const bindColumn = (column: SyncTable.Column, value: Schema.Json) => {
 }
 
 /**
- * Postgres `RowStore` (DESIGN §4) over the relations of `schemaOf` (SyncTable name → schema).
+ * Postgres `RowStore` (SPEC §4) over the relations of `schemaOf` (SyncTable name → schema).
  * Runs inside the caller's transaction. Writes preserve constraint failures; reads and all
  * other SQL failures retain the transient `StoreUnavailable` mapping.
  */

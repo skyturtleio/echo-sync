@@ -14,7 +14,7 @@ export const ClientVersion = Schema.Struct({
 export type ClientVersion = typeof ClientVersion.Type
 
 // ---------------------------------------------------------------------------------------------
-// Push (DESIGN §6)
+// Push (SPEC §8)
 // ---------------------------------------------------------------------------------------------
 
 /** One mutation in a push batch; `clientId` is carried once on the request. Pushed in `seq` order. */
@@ -31,7 +31,7 @@ export const PushRequest = Schema.Struct({
   /** Absent only for pre-gate clients; never infer compatibility from absence. */
   clientVersion: Schema.optionalKey(ClientVersion),
   /**
-   * The principal this replica acts as (DESIGN §16.21). A consistency assertion, never a credential:
+   * The principal this replica acts as (DECISIONS 21). A consistency assertion, never a credential:
    * the server refuses the request `Unauthorized` unless it equals the authenticated principal, and
    * never uses it as the actor. Absent only for clients that predate it.
    */
@@ -40,7 +40,7 @@ export const PushRequest = Schema.Struct({
 })
 export type PushRequest = typeof PushRequest.Type
 
-/** Outcome of one processed mutation and the ledger position it was recorded at (DESIGN §6, §8). */
+/** Outcome of one processed mutation and the ledger position it was recorded at (SPEC §5, §7). */
 export const PushResult = Schema.Struct({
   mutationId: MutationId,
   position: Position,
@@ -56,7 +56,7 @@ export const PushResponse = Schema.Struct({ results: Schema.Array(PushResult) })
 export type PushResponse = typeof PushResponse.Type
 
 // ---------------------------------------------------------------------------------------------
-// Pull (DESIGN §8)
+// Pull (SPEC §7)
 // ---------------------------------------------------------------------------------------------
 
 /** Opaque to the client: resend verbatim. The server owns its schema (JSON inside the string). */
@@ -76,7 +76,7 @@ export type Ack = typeof Ack.Type
 export const PullRequest = Schema.Struct({
   clientId: ClientId,
   clientVersion: Schema.optionalKey(ClientVersion),
-  /** As on `PushRequest` (DESIGN §16.21). */
+  /** As on `PushRequest` (DECISIONS 21). */
   principal: Schema.optionalKey(PrincipalId),
   cursor: Cursor,
   continuation: Schema.OptionFromNullOr(PullContinuation)
@@ -94,17 +94,17 @@ export const PullDone = Schema.TaggedStruct("PullDone", {
   changes: Schema.Array(Change),
   acks: Schema.Array(Ack),
   nextCursor: Position,
-  /** The server's ledger-expiry floor for this client (DESIGN §16.5); 0 when nothing expired. */
+  /** The server's ledger-expiry floor for this client (DECISIONS 5); 0 when nothing expired. */
   expiredThrough: SeqFloor
 })
 export const PullResponse = Schema.Union([PullPage, PullDone])
 export type PullResponse = typeof PullResponse.Type
 
 // ---------------------------------------------------------------------------------------------
-// Errors and RPC group (DESIGN §12)
+// Errors and RPC group (SPEC §10)
 // ---------------------------------------------------------------------------------------------
 
-/** The client must discard staged pages and resync from a null cursor (DESIGN §8). */
+/** The client must discard staged pages and resync from a null cursor (INV-CLI-10). */
 export class ResnapshotRequired extends Schema.TaggedError<ResnapshotRequired>()("ResnapshotRequired", {
   reason: Schema.Literals(["gcHorizon", "unknownCursor", "staleContinuation"])
 }) {}
@@ -120,7 +120,7 @@ export class ClientOutdated extends Schema.TaggedError<ClientOutdated>()("Client
 }) {}
 
 /**
- * Request-level push rejection (DESIGN §6): an envelope in the batch is malformed (e.g.
+ * Request-level push rejection (INV-MUT-7): an envelope in the batch is malformed (e.g.
  * `seq < 1`), so the whole push is refused; nothing is executed or ledgered.
  */
 export class MalformedEnvelope extends Schema.TaggedError<MalformedEnvelope>()("MalformedEnvelope", {
@@ -130,17 +130,17 @@ export class MalformedEnvelope extends Schema.TaggedError<MalformedEnvelope>()("
 }) {}
 
 /**
- * Transient server infrastructure failure on `pull` or `pokes` (DESIGN §6): retry with backoff.
+ * Transient server infrastructure failure on `pull` or `pokes` (SPEC §10): retry with backoff.
  * A defect from the server is always a bug; push reports this case as a short result list.
  */
 export class ServerUnavailable extends Schema.TaggedError<ServerUnavailable>()("ServerUnavailable", {
   message: Schema.String
 }) {}
 
-/** A hint that something may have changed; never data (DESIGN §8). Wakes the client's sync loop. */
+/** A hint that something may have changed; never data (INV-LOOP-7). Wakes the client's sync loop. */
 export const Poke = Schema.TaggedStruct("poke", {})
 
-/** Liveness only (DESIGN §6 Liveness): proves the stream is alive and never wakes the sync loop. */
+/** Liveness only (INV-LOOP-7): proves the stream is alive and never wakes the sync loop. */
 export const Heartbeat = Schema.TaggedStruct("heartbeat", {})
 
 /** One `pokes` stream element; the first element of every stream is a `Poke`. */
@@ -158,7 +158,7 @@ export const SyncRpcs = RpcGroup.make(
     error: Schema.Union([ResnapshotRequired, ServerUnavailable, Unauthorized, ClientOutdated])
   }),
   Rpc.make("pokes", {
-    /** `principal` as on `PushRequest` (DESIGN §16.21). */
+    /** `principal` as on `PushRequest` (DECISIONS 21). */
     payload: { clientId: ClientId, principal: Schema.optionalKey(PrincipalId) },
     success: PokesElement,
     error: Schema.Union([ServerUnavailable, Unauthorized]),
@@ -167,7 +167,7 @@ export const SyncRpcs = RpcGroup.make(
 )
 
 // ---------------------------------------------------------------------------------------------
-// Presence (DESIGN §12): in-memory, connection-scoped, never on the durable path
+// Presence (SPEC §10): in-memory, connection-scoped, never on the durable path
 // ---------------------------------------------------------------------------------------------
 
 /** One tab of a client. A presence entry is keyed by `(clientId, tabId)`. */
@@ -192,7 +192,7 @@ export type RoomSnapshot = typeof RoomSnapshot.Type
 /**
  * One `room` stream element: a `RoomSnapshot` (the first element of every stream that installed its
  * entry; a superseded join, with a revision lower than the stored entry's, ends with no element) or a
- * `Heartbeat` (DESIGN §16 item 13, the §6 Liveness shape), which is never a snapshot and
+ * `Heartbeat` (DECISIONS 13, SPEC §10), which is never a snapshot and
  * changes no room state.
  */
 export const RoomElement = Schema.Union([RoomSnapshot, Heartbeat])
@@ -201,13 +201,13 @@ export type RoomElement = typeof RoomElement.Type
 /** The entry's identity and state. `room` is an access scope the principal must be able to read. */
 export const PresencePayload = Schema.Struct({
   clientId: ClientId,
-  /** As on `PushRequest` (DESIGN §16.21); not part of the entry. */
+  /** As on `PushRequest` (DECISIONS 21); not part of the entry. */
   principal: Schema.optionalKey(PrincipalId),
   room: AccessScopeId,
   tabId: TabId,
   state: Schema.Json,
   /**
-   * Tab-assigned, never decreasing per `(room, tab)` for the life of the tab client (DESIGN §9.1, §12
+   * Tab-assigned, never decreasing per `(room, tab)` for the life of the tab client (SPEC §10.3
    * revision fencing): `track` is a no-op unless it is greater than the entry's; a join installs its
    * `(state, revision)` when it is at least the entry's and is a superseded attempt otherwise. A late
    * request therefore never displaces a newer state.
@@ -216,7 +216,7 @@ export const PresencePayload = Schema.Struct({
 })
 
 /**
- * The principal holds no grant in the room's scope (DESIGN §9.1 Presence). Unlike `Unauthorized` (a
+ * The principal holds no grant in the room's scope (SPEC §10.3 Presence). Unlike `Unauthorized` (a
  * credential failure, retried), this is a fact about access, and the only error that ends a presence stream.
  */
 export class Forbidden extends Schema.TaggedError<Forbidden>()("Forbidden", { room: AccessScopeId }) {}

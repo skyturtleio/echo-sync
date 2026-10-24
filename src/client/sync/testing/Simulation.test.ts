@@ -137,7 +137,7 @@ describe("reconciliation simulation", () => {
 
   it.effect(
     // Late enqueue retries of pruned ids run here too: the server keeps every expired identity
-    // (DESIGN §16.5), so a retry under a fresh seq above the floor is still recognised.
+    // (DECISIONS 5), so a retry under a fresh seq above the floor is still recognised.
     "ledger GC'd while a client is behind, with late retries of pruned ids: processed intents are released by the floor or the kept identity, never re-executed",
     () =>
       Effect.gen(function* () {
@@ -239,7 +239,7 @@ describe("reconciliation simulation", () => {
   )
 
   it.effect(
-    "the reference server's scope claim: an applied creation takes the id, a rejected one leaves it fresh, and an orphaned scope is never re-claimable (DESIGN §4)",
+    "the reference server's scope claim: an applied creation takes the id, a rejected one leaves it fresh, and an orphaned scope is never re-claimable (SPEC §4)",
     () =>
       Effect.gen(function* () {
         const server = RefServer.make({ pageSize: 10 })

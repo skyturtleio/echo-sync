@@ -53,7 +53,7 @@ const pullOnce = Effect.gen(function* () {
   )
 }).pipe(Effect.scoped)
 
-describe.skipIf(!pgAvailable)("server startup (§11)", () => {
+describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
   it.live(
     "startup's internal steps (verify, its per-table checks) must never hand the host a span other than echo.server.startup",
     () =>

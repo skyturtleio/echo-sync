@@ -151,7 +151,7 @@ it.live("an interrupted transaction rolls back rows, outbox, seq and meta togeth
   }).pipe(Effect.provide(Db))
 )
 
-// --- migrate (DESIGN §9, §11): the replica schema and the bookkeeping that describes it move together.
+// --- migrate (SPEC §9, SPEC §13): the replica schema and the bookkeeping that describes it move together.
 
 const reindexed = Registry.make([
   SyncTable.make(

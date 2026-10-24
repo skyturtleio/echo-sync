@@ -58,7 +58,7 @@ const mutate = (
     return outcome._tag === "Applied" ? "Applied" : `Rejected:${outcome.error._tag}`
   })
 
-describe.skipIf(!pgAvailable)("scope_grants id derivation (§4)", () => {
+describe.skipIf(!pgAvailable)("scope_grants id derivation (INV-ACL-5)", () => {
   it.live("a grant written around the store with an id that is not grantId(scope, principal) is rejected", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient
@@ -177,7 +177,7 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (§4)", () => {
 
 const write = (store: Store.EchoStore) => store.patch(Items, RowId.make("shared"), { body: "v1" })
 
-describe.skipIf(!pgAvailable)("self-revocation of a grant (§4, §16.27)", () => {
+describe.skipIf(!pgAvailable)("self-revocation of a grant (SPEC §4, DECISIONS 27)", () => {
   it.live(
     "a reader or writer deleting its own grant is Applied: its client is purged of the scope, the owner keeps the rows and sees the tombstone",
     () =>

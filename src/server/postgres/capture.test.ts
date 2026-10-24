@@ -24,7 +24,7 @@ const Children = SyncTable.make("children", {
 const Dup = bareTable("dup")
 const Half = bareTable("half")
 
-describe.skipIf(!pgAvailable)("change capture (§7)", () => {
+describe.skipIf(!pgAvailable)("change capture (SPEC §6)", () => {
   it.live("TRUNCATE on a synced table fails instead of silently bypassing the log", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient

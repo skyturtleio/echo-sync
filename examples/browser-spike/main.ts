@@ -1,6 +1,6 @@
 /**
  * Dev harness page. Exposes `window.echo` so agent-browser (or a human in devtools) can drive
- * scenarios across tabs; see docs/browser-substrate.md "Running the browser scenarios".
+ * scenarios across tabs; see AGENTS.md "Browser scenarios".
  */
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -43,7 +43,7 @@ if (params.has("holdEpochWatch")) {
   })
 }
 if (params.has("ignoreReset")) {
-  // Fault injection: this page never hears the engine's reset signal (DESIGN §16.24), as an old build or a
+  // Fault injection: this page never hears the engine's reset signal (DECISIONS 24), as an old build or a
   // frozen tab would not; its client keeps its leader. Only the engine's `echo:*:reset` channels are muted.
   const add = BroadcastChannel.prototype.addEventListener
   Object.defineProperty(BroadcastChannel.prototype, "addEventListener", {
@@ -355,7 +355,7 @@ const echo = {
       ms: Math.round(performance.now() - started)
     }
   },
-  /** The engine's reset tombstone name for `target` (DESIGN §16.26), an entry of `echo-sync/<appId>`. */
+  /** The engine's reset tombstone name for `target` (DECISIONS 26), an entry of `echo-sync/<appId>`. */
   tombstoneName: (target: { readonly appId: string; readonly profile: string } = { appId, profile }) =>
     Effect.runPromise(Platform.tombstoneName(target)),
   /**

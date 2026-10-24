@@ -117,7 +117,7 @@ it.live("an enqueue cancelled while its COMMIT runs still wakes the loop: the en
 )
 
 // ---------------------------------------------------------------------------------------------
-// Registered queries, raw live queries and raw exec over the leader's RPC handlers (DESIGN §10.1)
+// Registered queries, raw live queries and raw exec over the leader's RPC handlers (INV-BRW-6)
 // ---------------------------------------------------------------------------------------------
 
 const RowId = Schema.String.pipe(Schema.brand("RowId"))
@@ -385,7 +385,7 @@ it.live("revoking a grant re-emits a live query whose handler only used db.query
 )
 
 // ---------------------------------------------------------------------------------------------
-// Tab-side API (DESIGN §9.1) over a real leader, with leader loss injected between tab and leader
+// Tab-side API (SPEC §12.3) over a real leader, with leader loss injected between tab and leader
 // ---------------------------------------------------------------------------------------------
 
 const leaderLost = new LeaderUnavailable({ reason: "LeaderLost", message: "injected" })
@@ -499,7 +499,7 @@ it.live("a dismissed notice is gone from the notices stream, and an undismissed 
 )
 
 // ---------------------------------------------------------------------------------------------
-// syncStatus and requestSync (DESIGN §9.1) over leaders wired as `program` wires them
+// syncStatus and requestSync (SPEC §10) over leaders wired as `program` wires them
 // ---------------------------------------------------------------------------------------------
 
 /** A push integrity failure (the server refused the batch): halts push. */
@@ -874,7 +874,7 @@ it.live(
       // The rejoin was read before s2 (whose track was lost with the leader): it carries the latest state at
       // that point, never the opening s0, and the catch-up after its first snapshot brings the new leader to s2.
       expect(joins).toEqual(["s0", "s1"])
-      // Revisions are the tab's (DESIGN §9.1, 6c7027f): the handover rejoin takes a fresh one (2), above
+      // Revisions are the tab's (SPEC §10.3): the handover rejoin takes a fresh one (2), above
       // anything the old leader was ever given, so a late old-leader track is fenced; s2 then takes 3.
       expect(pairs).toEqual(['join "s0"@0', 'track "s1"@1', 'join "s1"@2', 'track "s2"@3'])
       expect(held[2]).toBe("s2")

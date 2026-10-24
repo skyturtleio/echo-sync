@@ -1,5 +1,5 @@
 /**
- * Leader-candidate worker (DESIGN §9). Every tab spawns one of these as a dedicated `Worker`; Web Locks
+ * Leader-candidate worker (SPEC §12). Every tab spawns one of these as a dedicated `Worker`; Web Locks
  * let exactly one of them, the leader, open the OPFS database. The leader serves `LeaderRpcs` to every
  * tab on a `MessagePort` brokered by the router (or by its own tab when there is no SharedWorker).
  *
@@ -10,9 +10,9 @@
  * runLeaderWorker(self, { registry, mutations, syncUrl: "/sync" })
  * ```
  *
- * The leader owns the reconciliation engine (DESIGN §8, §9): `enqueue` runs `Engine.mutate` (optimistic
+ * The leader owns the reconciliation engine (SPEC §7, §9): `enqueue` runs `Engine.mutate` (optimistic
  * apply + outbox append in one transaction), and with a `syncUrl` it runs the sync loop (push/pull with
- * backoff, the §6 fatal-push halt) and follows the server's pokes stream, reconnecting on any end. A
+ * backoff, the INV-LOOP-3 fatal-push halt) and follows the server's pokes stream, reconnecting on any end. A
  * new leader starts a fresh loop: a push halt is in memory and re-trips on that leader's first push.
  */
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
@@ -115,7 +115,7 @@ export const enqueueAndWake =
 
 /**
  * A stream of `run`'s results that re-runs after every invalidation of the keys its latest run passed to
- * `watch` (DESIGN §10.1). `run` must call `watch` while it still holds the storage permit: writes are
+ * `watch` (INV-BRW-6). `run` must call `watch` while it still holds the storage permit: writes are
  * admitted through the same permit and invalidate as they execute, so none can fall between the read and
  * the registration. A failed run ends the stream.
  */
@@ -148,7 +148,7 @@ export interface HandlerOptions {
   readonly storage: SqliteSyncStorage.SqliteSyncStorage
   readonly engine: Engine.Engine
   readonly loop: SyncLoop.SyncLoop | undefined
-  /** The leader's presence (DESIGN §9.1); `undefined` on a local-only replica, like `loop`. */
+  /** The leader's presence (SPEC §10.3); `undefined` on a local-only replica, like `loop`. */
   readonly presence: Presence.Presence<Protocol.Forbidden> | undefined
   readonly actor: AccessScope.PrincipalId
   readonly queries: Query.QueryRegistry
@@ -172,7 +172,7 @@ export const makeHandlers = ({
   /**
    * Run `self` with the connection in `query_only`, so any write in it fails and its transaction rolls
    * back. Use inside the admitted transaction: the flag is switched off again before COMMIT/ROLLBACK and
-   * before the permit is released, so the next admitted writer never sees it (DESIGN §10.1).
+   * before the permit is released, so the next admitted writer never sees it (INV-BRW-6).
    */
   const readOnly = <A, E, R>(self: Effect.Effect<A, E, R>) =>
     Effect.orDie(sql`PRAGMA query_only = ON`).pipe(
@@ -193,7 +193,7 @@ export const makeHandlers = ({
     subscribe: ({ name, args }) =>
       liveRuns(reactivity, (watch) =>
         // One read transaction per run: the result and the tables it read are one replica version, and
-        // the new dependency set is registered before any later write is admitted (DESIGN §10.1).
+        // the new dependency set is registered before any later write is admitted (INV-BRW-6).
         // Read-only twice over: handlers only get a `ReadStore` projection, and `query_only` stops any write
         // that reaches the connection anyway, so nothing commits outside the outbox.
         storage
@@ -220,14 +220,14 @@ export const makeHandlers = ({
       ),
     subscribeRaw: ({ query }) => {
       // Caller SQL can switch `query_only` off itself, so it is no security boundary: raw reads are a
-      // harness tool behind the same flag as `exec`, refused before the connection is touched (DESIGN §10.1).
+      // harness tool behind the same flag as `exec`, refused before the connection is touched (INV-BRW-6).
       if (!allowRawExec) return Stream.fail(new RawExecDisabled())
       return sql
         .reactive(
           query.tables,
-          // One read transaction per emission, so a batch never mixes replica versions (DESIGN §10).
+          // One read transaction per emission, so a batch never mixes replica versions (INV-BRW-6).
           // `query_only` makes a writing statement fail inside the transaction, which then rolls back;
-          // it is switched off again before COMMIT/ROLLBACK, still inside the permit (DESIGN §10.1).
+          // it is switched off again before COMMIT/ROLLBACK, still inside the permit (INV-BRW-6).
           storage
             .transaction(
               readOnly(
@@ -243,7 +243,7 @@ export const makeHandlers = ({
     leaderInfo: () => Effect.succeed(info),
     syncStatus: () => (loop === undefined ? Stream.fail(new SyncDisabled()) : loop.changes),
     requestSync: () => (loop === undefined ? Effect.fail(new SyncDisabled()) : loop.wake),
-    // Never touches the replica or the outbox (DESIGN §3): no permit, no SQL.
+    // Never touches the replica or the outbox (SPEC §10): no permit, no SQL.
     presence: (payload) => (presence === undefined ? Stream.fail(new SyncDisabled()) : presence.join(payload)),
     track: (payload) => (presence === undefined ? Effect.fail(new SyncDisabled()) : presence.track(payload)),
     notices: () =>
@@ -291,10 +291,10 @@ export interface LeaderOptions {
   readonly registry: Registry.SyncRegistry
   /** The app's mutations; `enqueue` runs them optimistically. */
   readonly mutations: Mutation.MutationRegistry
-  /** The app's registered queries (DESIGN §10.1); `subscribe` runs them by name. Defaults to none. */
+  /** The app's registered queries (SPEC §12.3); `subscribe` runs them by name. Defaults to none. */
   readonly queries?: Query.QueryRegistry
   /**
-   * Serve the raw SQL RPCs, `exec` and `subscribeRaw` (DESIGN §10.1). Dev harnesses and diagnostics only;
+   * Serve the raw SQL RPCs, `exec` and `subscribeRaw` (INV-BRW-6). Dev harnesses and diagnostics only;
    * apps never set it: raw SQL can write outside the outbox (including by switching `query_only` off), so
    * this flag, not `query_only`, is the boundary. Without it both fail with `RawExecDisabled`.
    */
@@ -306,7 +306,7 @@ export interface LeaderOptions {
   readonly syncUrl?: string
   /**
    * Request headers for the sync server, given the principal this replica acts as (its tab's
-   * `principal`): the credentials the server's `principalFor` authenticates (DESIGN §4, §9.1
+   * `principal`): the credentials the server's `principalFor` authenticates (SPEC §4, §10
    * Credentials). The Effect runs for every outgoing request (each push, each pull, each stream
    * (re)connect), so a renewed credential is used by the next request without a leader restart. The
    * app owns refresh: return what should be on the wire now; after a failed renewal return what you
@@ -315,7 +315,7 @@ export interface LeaderOptions {
   readonly syncHeaders?: (principal: AccessScope.PrincipalId) => Effect.Effect<Readonly<Record<string, string>>>
   /**
    * A pokes stream with no element (poke or heartbeat) for this long is ended and reconnected
-   * (DESIGN §6 Liveness). Default 45 s; must exceed the server's `heartbeatInterval` (default 15 s).
+   * (INV-LOOP-7). Default 45 s; must exceed the server's `heartbeatInterval` (default 15 s).
    */
   readonly idleTimeout?: Duration.Input
 }
@@ -354,7 +354,7 @@ const removeIfPresent = (
   )
 
 /**
- * The removal a tombstone stands for (DESIGN §16.26): the profile's directory, then the tombstone. The
+ * The removal a tombstone stands for (DECISIONS 26): the profile's directory, then the tombstone. The
  * tombstone goes last, so a crash in between leaves it in place and the next leader or reset repeats this.
  */
 const removeCondemned = (parent: FileSystemDirectoryHandle, identity: Platform.ReplicaIdentity, tombstone: string) =>
@@ -364,7 +364,7 @@ const removeCondemned = (parent: FileSystemDirectoryHandle, identity: Platform.R
   )
 
 /**
- * Finish a reset that was interrupted after writing its tombstone (DESIGN §16.26). Call only under the
+ * Finish a reset that was interrupted after writing its tombstone (DECISIONS 26). Call only under the
  * identity's leader lock and before anything opens the pool. `true` if a tombstone was found; the directory
  * and the tombstone are then both gone, so the pool opened next is a fresh, empty replica.
  */
@@ -400,12 +400,12 @@ const countUnreleased = Effect.fn("Leader.countUnreleased")(function* (sql: SqlC
 })
 
 /**
- * `resetReplica`'s worker half (DESIGN §9.1, §16.24). Takes the leader lock once the identity's clients have
+ * `resetReplica`'s worker half (SPEC §12, DECISIONS 24). Takes the leader lock once the identity's clients have
  * let go of it, waiting at most the reset's `closeTimeout`; it never gets it from a live leader. Under it,
  * without `discardPending`, it opens the database through the leader's own OPFS host (no migration), counts
  * the outbox and closes the database and the pool; any failure there is `ResetFailed` with nothing removed.
  * With `discardPending` it never opens the database. Then it writes the identity's tombstone, removes
- * `echo-sync/<appId>/<profile>`, removes the tombstone (DESIGN §16.26) and releases the lock last. A candidate
+ * `echo-sync/<appId>/<profile>`, removes the tombstone (DECISIONS 26) and releases the lock last. A candidate
  * of a client built after the signal that queued meanwhile is elected only after the directory is gone, so it
  * creates a fresh replica. A tombstone found under the lock means an earlier reset was interrupted after its
  * decision: the removal is completed and the answer is `Done`, with no pending count.
@@ -419,7 +419,7 @@ const reset: (message: Reset) => Effect.Effect<ResetOutcome> = Effect.fn("Leader
     return yield* Effect.scoped(
       Effect.gen(function* () {
         // The tab broadcast the reset signal before sending `Reset`, so every honouring client is terminating its
-        // candidate (DESIGN §16.24). Wait for the lock at most `closeTimeoutMillis`; a holder that does not let
+        // candidate (DECISIONS 24). Wait for the lock at most `closeTimeoutMillis`; a holder that does not let
         // go in time (an old build, a frozen tab) is `ReplicaInUse` and nothing is touched. A grant after the
         // deadline is released at once (`holdLockWithin`), so this worker never holds the lock it gave up on.
         const lock = Platform.leaderLockName(identity)
@@ -427,12 +427,12 @@ const reset: (message: Reset) => Effect.Effect<ResetOutcome> = Effect.fn("Leader
         // timeout too short for even a free lock's (asynchronous) grant answers `ReplicaInUse`, never a deletion.
         if (!(yield* Platform.holdLockWithin(lock, message.closeTimeoutMillis)))
           return { _tag: "ReplicaInUse" } satisfies ResetOutcome
-        // An earlier reset already passed its pending decision and condemned this replica (DESIGN §16.26):
+        // An earlier reset already passed its pending decision and condemned this replica (DECISIONS 26):
         // finish its removal and count nothing.
         if (yield* completeInterruptedReset(identity)) return { _tag: "Done" } satisfies ResetOutcome
         if ((yield* opfsDirectory(poolDirectory)) === undefined) return { _tag: "Done" } satisfies ResetOutcome
         if (message.discardPending) {
-          // Never opens the database (DESIGN §9.1): a corrupt or partially removed replica can still be reset.
+          // Never opens the database (SPEC Appendix C.1): a corrupt or partially removed replica can still be reset.
           // Only waits, as a new leader does, for a predecessor's access handles to be released.
           yield* Platform.awaitOpfsPoolFree(poolDirectory)
         } else {
@@ -445,7 +445,7 @@ const reset: (message: Reset) => Effect.Effect<ResetOutcome> = Effect.fn("Leader
         }
         const parent = yield* opfsDirectory(`echo-sync/${identity.appId}`)
         if (parent !== undefined) {
-          // The decision is made: record it durably before touching the directory (DESIGN §16.26). From here a
+          // The decision is made: record it durably before touching the directory (DECISIONS 26). From here a
           // crash leaves the tombstone, and the next leader or reset completes the removal; before here it
           // leaves the replica intact.
           const tombstone = yield* Platform.tombstoneName(identity)
@@ -494,7 +494,7 @@ const program = Effect.fn("Leader.program")(
     // The leader lock is held from here until this worker dies.
     const leaderId = crypto.randomUUID()
     yield* Platform.holdLock(Platform.leaderEpochLockName(identity, leaderId))
-    // Before the pool is opened (DESIGN §16.26): a replica condemned by an interrupted reset is never served; its
+    // Before the pool is opened (DECISIONS 26): a replica condemned by an interrupted reset is never served; its
     // removal is completed here and the database below starts fresh, with a new clientId.
     if (yield* completeInterruptedReset(identity)) {
       yield* Telemetry.log("Warn", "echo leader completed the removal of a replica condemned by an interrupted reset")
@@ -576,7 +576,7 @@ const program = Effect.fn("Leader.program")(
           Effect.sync(() => {
             // The full cause is in the diagnostics log above; the tab gets the one failure that stopped it.
             send(endpoint, { _tag: "Failed", message: Platform.describe(Cause.squash(cause)) })
-            // A candidate that cannot serve must not linger (DESIGN §9): ending the worker guarantees that
+            // A candidate that cannot serve must not linger (INV-BRW-2): ending the worker guarantees that
             // anything a failed open acquired outside the scope (e.g. a half-built handle pool) and every
             // Web Lock is released, so the next queued candidate is elected.
             endpoint.close()

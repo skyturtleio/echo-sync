@@ -14,7 +14,7 @@ import * as Transport from "../src/client/sync/Transport.ts"
 import { layerHttp } from "../src/server/postgres/rpc.ts"
 import { grant, Items, pgAvailable, registry, RowId, TestDatabase } from "../src/server/postgres/test-support.ts"
 
-// Scope creation (DESIGN §4) end to end: the real Postgres server (RPC adapter over HTTP + NDJSON),
+// Scope creation (SPEC §4) end to end: the real Postgres server (RPC adapter over HTTP + NDJSON),
 // the real Transport, and the real Engine over SQLite. The client's claim is optimistic (no grant
 // for the scope in its replica); the server's is authoritative. Runs only with ECHO_PG_URL.
 
@@ -87,7 +87,7 @@ const setup = Effect.gen(function* () {
   return { pg: Context.get(db, SqlClient), engine, replica, notices, pending, fetch }
 })
 
-describe.skipIf(!pgAvailable)("scope creation (DESIGN §4) against the real server", () => {
+describe.skipIf(!pgAvailable)("scope creation (SPEC §4) against the real server", () => {
   it.live(
     "an optimistic createScope of an id the server already has is rejected ScopeForbidden, and the pull undoes the grant and the write that depended on it; a fresh id is applied and stays",
     () =>
@@ -137,7 +137,7 @@ describe.skipIf(!pgAvailable)("scope creation (DESIGN §4) against the real serv
   )
 
   it.live(
-    "when only the creation is processed and rejected, a dependent mutation stays pending with no optimistic effect and gets no notice until the server's own verdict (§8)",
+    "when only the creation is processed and rejected, a dependent mutation stays pending with no optimistic effect and gets no notice until the server's own verdict (INV-CLI-3)",
     () =>
       Effect.gen(function* () {
         yield* grant("someone-else", "taken")

@@ -17,7 +17,7 @@
  * boundary) acquires its own subject in its own scope and closes it before the next case.
  *
  * Every expectation is a constant derived from the fixture the check wrote, never an observation
- * of a subject (DESIGN §14): a subject whose writes are no-ops fails every check.
+ * of a subject (SPEC §17): a subject whose writes are no-ops fails every check.
  */
 import { Array as Arr, Cause, DateTime, Deferred, Effect, Exit, Fiber, Option, Schema, Scheduler } from "effect"
 import type { Scope } from "effect"
@@ -34,7 +34,7 @@ import type { Mutation } from "../index.ts"
 export interface RowStoreSubject<S extends Store.RowStore = Store.RowStore> {
   readonly rows: S
   readonly transaction: <A, E, R>(self: Effect.Effect<A, E, R>) => Effect.Effect<A, E | Errors.StoreUnavailable, R>
-  /** The substrate's scope claim (DESIGN §4); default: a replica's (`Store.claimFromGrants`). */
+  /** The substrate's scope claim (SPEC §4); default: a replica's (`Store.claimFromGrants`). */
   readonly claimScope?: Store.StoreOptions["claimScope"] | undefined
 }
 
@@ -42,7 +42,7 @@ export interface SyncStorageSubject {
   readonly storage: Engine.SyncStorage
   /** A new `SyncStorage` over the same durable state (a reload: nothing in memory survives). */
   readonly reopen: Effect.Effect<Engine.SyncStorage, unknown>
-  /** The released-row retention window passes: released markers are pruned (DESIGN §9). */
+  /** The released-row retention window passes: released markers are pruned (SPEC §9). */
   readonly pruneReleased: Effect.Effect<void, unknown>
 }
 
@@ -142,7 +142,7 @@ const grant = (
 }
 const GRANTS = [
   grant(mine, u1, "reader"),
-  // A derived id: the server CHECK (DESIGN §4) rejects any other, so malformed-id rejection is tested
+  // A derived id: the server CHECK (SPEC §4) rejects any other, so malformed-id rejection is tested
   // in src/server/postgres/grants.test.ts, not here.
   grant(open, AccessScope.Everyone, "writer"),
   grant(theirs, AccessScope.PrincipalId.make("u2"), "owner")
@@ -328,7 +328,7 @@ const atomicity = <S, R>(options: TransactionCase<S, R>) =>
 const TEXT = ["", "a", "aa", "a\u{1F600}", "B", "b", "Z", "\u00E9", "\uFFFF", "\u{1F600}", "\u{10FFFF}"]
 
 // Beyond int4 on both sides up to the safe-integer limits: int8 storage must round-trip and order
-// these as numbers (DESIGN §10), not only small values.
+// these as numbers (SPEC §3), not only small values.
 const WIDE_INTS = [
   -Number.MAX_SAFE_INTEGER,
   -(2 ** 31 + 1),
@@ -528,7 +528,7 @@ export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): R
     })
   ),
   check(
-    "take(n) defects identically for NaN, -1, 1.5 and 2^53 (never clamped or unlimited); take(0) is []; collect is unlimited (DESIGN §10)",
+    "take(n) defects identically for NaN, -1, 1.5 and 2^53 (never clamped or unlimited); take(0) is []; collect is unlimited (SPEC §3)",
     use(make, ({ rows, transaction }) =>
       Effect.gen(function* () {
         const fail = violation("take(n) limits")
@@ -677,7 +677,7 @@ export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): R
     })
   ),
   check(
-    "createScope writes exactly the actor's owner grant on a fresh id; an existing id is ScopeForbidden{owner} with nothing written; the actor * is refused before any claim (DESIGN §4)",
+    "createScope writes exactly the actor's owner grant on a fresh id; an existing id is ScopeForbidden{owner} with nothing written; the actor * is refused before any claim (SPEC §4)",
     use(make, (subject) =>
       Effect.gen(function* () {
         const { rows, transaction } = subject

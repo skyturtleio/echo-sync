@@ -35,7 +35,7 @@ export interface SyncServerOptions {
   readonly registry: Registry.SyncRegistry
   readonly mutations: Mutation.MutationRegistry
   /**
-   * Authenticates and applies request policy to the real HTTP request's headers (DESIGN §4).
+   * Authenticates and applies request policy to the real HTTP request's headers (SPEC §4).
    * Body-supplied RPC message headers are never exposed. Runs for every call / stream open.
    */
   readonly principalFor: (headers: Headers) => Effect.Effect<AccessScope.PrincipalId, Protocol.Unauthorized>
@@ -45,14 +45,14 @@ export interface SyncServerOptions {
   readonly pageLimit?: number | undefined
   readonly ledger?: LedgerOptions | undefined
   /**
-   * Cadence of the `heartbeat` element on every open `pokes` stream (DESIGN §6 Liveness), so a
+   * Cadence of the `heartbeat` element on every open `pokes` stream (INV-LOOP-7), so a
    * proxy or the client's `idleTimeout` never sees a live stream as idle. Default 15 s; must stay
    * below the clients' `idleTimeout` (default 45 s).
    */
   readonly heartbeatInterval?: Duration.Input | undefined
 }
 
-/** The telemetry outcome of a sync handler's typed failures (docs/observability.md). */
+/** The telemetry outcome of a sync handler's typed failures (SPEC §14). */
 const protocolOutcome = Telemetry.byFailure(
   (
     error:
@@ -83,8 +83,8 @@ const serverUnavailable = (error: SqlError) =>
 const isNotSql = <E>(error: E | SqlError): error is Exclude<E, SqlError> => !isSqlError(error)
 
 /**
- * Whole-cause classification of a handler failure, precedence defect > transient > typed (DESIGN
- * §6). A `SqlError` may arrive as a failure or, from the pinned client's `orDie` rollback on a
+ * Whole-cause classification of a handler failure, precedence defect > transient > typed
+ * (SPEC §5, §8). A `SqlError` may arrive as a failure or, from the pinned client's `orDie` rollback on a
  * dead connection, as a defect; both are infrastructure. Any other defect keeps the whole cause
  * as defects, so a programmer bug is never reported as retryable. Without either, the typed
  * failures (and any interruption) pass through.
@@ -144,7 +144,7 @@ const mapForbidden = <A, E, R>(
   )
 
 /**
- * The pull/pokes failure mapping (DESIGN §6), for any transport: infrastructure (`SqlError`) ⇒
+ * The pull/pokes failure mapping (SPEC §8, §10), for any transport: infrastructure (`SqlError`) ⇒
  * `ServerUnavailable`; a client id bound to another principal (`ClientForbidden`) ⇒
  * `Unauthorized`; any other defect stays a defect (a server bug); other typed failures pass.
  */
@@ -157,7 +157,7 @@ export const serverFailures = <A, E, R>(
 }
 
 /**
- * The push failure mapping (DESIGN §6), for any transport, applied over authentication and the
+ * The push failure mapping (SPEC §8), for any transport, applied over authentication and the
  * batch together: infrastructure anywhere (a `SqlError` failure or defect, e.g. a session lookup
  * in `principalFor`) is an empty results list, a transient stop; `ClientForbidden` ⇒
  * `Unauthorized`; any other defect stays a defect (the client halts push on it). Idempotent, so
@@ -195,7 +195,7 @@ export const roleFor = (sql: SqlClient, actor: string) => (scopeId: AccessScope.
   })
 
 /**
- * The authoritative scope claim (DESIGN §4): inserts the `access_scopes` row inside the mutation's
+ * The authoritative scope claim (SPEC §4): inserts the `access_scopes` row inside the mutation's
  * transaction and savepoint, so it commits or rolls back with the grant. The mutation runs at
  * SERIALIZABLE (ledger.ts): a concurrent creator blocks on the first one's uncommitted row and,
  * once that commits, fails with 40001; the ledger retries it, and the retry finds the row (no
@@ -230,7 +230,7 @@ interface ListenSession {
 const listenBackoff = (attempt: number) => Duration.millis(Math.min(50 * 2 ** attempt, 5_000))
 
 /**
- * The process's single `LISTEN` on `pokeChannel` (DESIGN §6). `PgClient.listen` reserves a pool
+ * The process's single `LISTEN` on `pokeChannel` (SPEC §10.1). `PgClient.listen` reserves a pool
  * connection for its scope, so one per `pokes` stream would exhaust the pool at `poolSize`
  * connected clients and block every push and pull. Lives in the caller's scope
  * (`layerNotifications`) and returns once the first attempt has settled, so a server normally
@@ -246,7 +246,7 @@ const listenBackoff = (attempt: number) => Duration.millis(Math.min(50 * 2 ** at
  * emits the initial poke only then, so a commit after that poke notifies it and a commit before
  * it is covered by the pull the poke triggers (subscribe-then-poke). Without a confirmed `LISTEN`
  * it fails `ServerUnavailable` and the client reconnects with backoff. After that poke, the stream
- * also carries a `heartbeat` every `heartbeatInterval` from the session's clock (DESIGN §6
+ * also carries a `heartbeat` every `heartbeatInterval` from the session's clock (SPEC §10.1
  * Liveness), so an idle stream is never silent for longer than one interval.
  */
 export const sharedPokes = (
@@ -318,7 +318,7 @@ export const sharedPokes = (
 
 /**
  * The process's single `LISTEN` (`sharedPokes`), shared by the sync handlers (each `pokes` stream)
- * and the presence handlers (revocation, DESIGN §16 item 13). Each run of the stream is one
+ * and the presence handlers (revocation, DECISIONS 13). Each run of the stream is one
  * subscription: an immediate `poke`, then one per committed writing transaction, plus heartbeats.
  */
 export class Notifications extends Context.Service<
@@ -338,13 +338,13 @@ export const layerNotifications = (options: Pick<SyncServerOptions, "heartbeatIn
   )
 
 /**
- * Push for an authenticated `actor`, for any transport (DESIGN §6): resolves the registry's
+ * Push for an authenticated `actor`, for any transport (SPEC §8): resolves the registry's
  * tables, runs each mutation through the ledger (`runBatch`) with a `Store` scoped to the actor,
  * and returns the processed prefix as a `PushResponse`. Never fails with infrastructure: a SQL
  * failure before the first mutation (catalog read) is an empty result list, and `runBatch` turns
  * one inside the batch into a short list, so a defect always means a server bug (the client halts
  * push on any defect). A client id bound to another principal, or a `request.principal` that is not
- * `actor` (DESIGN §16.21, checked first), fails `Unauthorized`.
+ * `actor` (DECISIONS 21, checked first), fails `Unauthorized`.
  */
 export const executeBatch = (
   options: Pick<SyncServerOptions, "registry" | "mutations" | "ledger" | "clientPolicy">,
@@ -407,12 +407,12 @@ const requestHeaders = Effect.gen(function* () {
 })
 
 /**
- * Handlers for `Protocol.SyncRpcs` over Postgres (DESIGN §6, §8).
+ * Handlers for `Protocol.SyncRpcs` over Postgres (SPEC §8, §7).
  *
  * Pull and pokes report infrastructure failures as `ServerUnavailable`.
  * Push never fails with an infrastructure error: every SQL failure (connection, pool, `40001`
  * after the bounded retry) stops the batch as a short results list, so the client only ever sees
- * a defect for a server bug (the client halts push on any defect, §6).
+ * a defect for a server bug (the client halts push on any defect, INV-LOOP-3).
  */
 export const handlers = (options: SyncServerOptions) =>
   Protocol.SyncRpcs.toLayer(
@@ -475,7 +475,7 @@ export const handlers = (options: SyncServerOptions) =>
               return pokes
             }).pipe(Effect.provideService(SqlClient, sql))
           ).pipe(
-            // A lost LISTEN connection ends the stream typed; the client reconnects on any end (§6).
+            // A lost LISTEN connection ends the stream typed; the client reconnects on any end (INV-LOOP-7).
             Stream.catchCause((cause) => Stream.fromEffect(toServerFailure(cause))),
             Stream.catchTag("ClientForbidden", (e) => Stream.fail(forbidden(e))),
             (work) => Telemetry.observeStream(work, "echo.server.pokes", protocolOutcome)
@@ -485,12 +485,12 @@ export const handlers = (options: SyncServerOptions) =>
   )
 
 /**
- * Handlers for `Protocol.PresenceRpcs` (DESIGN §12): process-local presence, authorized like
+ * Handlers for `Protocol.PresenceRpcs` (SPEC §10): process-local presence, authorized like
  * reads. `room` requires a grant of any role in the room's scope (the principal's or `*`), checked
  * on join and again once the entry is installed (`Presence.join`'s `admit`); `track` only changes
  * an entry the same principal holds, so it needs no grant lookup of its own.
  *
- * Revocation (DESIGN §16 item 13): every notification on the shared `LISTEN` (one per committed
+ * Revocation (DECISIONS 13): every notification on the shared `LISTEN` (one per committed
  * writing transaction, grant changes included, plus one when each subscription starts) re-checks
  * every `(room, principal)` with an open stream against `scope_grants` in one query, and
  * `Presence.reevaluate` removes and ends `Forbidden` the ones that no longer hold the scope. A
@@ -567,7 +567,7 @@ export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor"
 
 /**
  * Mounts `Protocol.SyncRpcs` and `Protocol.PresenceRpcs` on `path` of the app's `HttpRouter`,
- * HTTP POST with NDJSON framing, which is what the browser's transport speaks (DESIGN §6, §12).
+ * HTTP POST with NDJSON framing, which is what the browser's transport speaks (SPEC §10).
  * Each group's handlers are provided, not merged, so neither leaks into the app's context.
  */
 export const layerHttp = (options: SyncServerOptions & { readonly path?: HttpRouter.PathInput | undefined }) =>

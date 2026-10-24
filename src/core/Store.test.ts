@@ -96,7 +96,7 @@ const agrees = (dialect: () => Promise<Dialect>) => {
     }
   )
 }
-describe("index ordering is one definition across dialects (DESIGN §10)", () => {
+describe("index ordering is one definition across dialects (SPEC §3)", () => {
   it("the reference orders text by code point, NULL first ascending, id as tiebreak", () => {
     // Derived by hand: labels NULL(i3: rank 1, i7: rank NULL → NULL first), "B", "a"(rank NULL, 1:i4,i8), U+FFFF, 😀.
     expect(reference(plan(Items.indexes.by_label, [], "asc"))).toEqual(["i7", "i3", "i6", "i5", "i4", "i8", "i2", "i1"])

@@ -1,7 +1,7 @@
 /**
  * In-memory reference implementation of the engine's client storage port (`SyncStorage`):
  * replica rows (a `MemoryStore`), sync meta, the outbox with durable `seq` allocation and
- * released-row markers (DESIGN §6, §9 rule 1), staged pull pages, and notices.
+ * released-row markers (INV-CLI-4), staged pull pages, and notices.
  *
  * `Disk` is what survives a reload; the engine and everything in memory may be rebuilt over it.
  * Transactions are serialized: the snapshot of the whole disk, the body and the rollback run
@@ -45,7 +45,7 @@ export const makeDisk = (): Disk => ({
   crashAfterWrites: Option.none()
 })
 
-/** The released-row retention window has passed (DESIGN §9: default 24 h). */
+/** The released-row retention window has passed (INV-CLI-8: default 24 h). */
 export const pruneReleased = (disk: Disk) => {
   disk.released = new Map()
 }

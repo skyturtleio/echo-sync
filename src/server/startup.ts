@@ -14,7 +14,7 @@ export interface StartupOptions extends SyncServerOptions {
 }
 
 /**
- * Startup order (DESIGN §11): engine `migrate` → app migrations → `attach` every app table →
+ * Startup order (SPEC §13): engine `migrate` → app migrations → `attach` every app table →
  * `Migrate.verify` (fails with one `Drift` listing every mismatch). `scope_grants` is attached by
  * the engine migration.
  *
@@ -39,7 +39,7 @@ export const prepare = (options: Pick<StartupOptions, "registry" | "appMigration
       }>`SELECT to_regclass(quote_ident(${table.name})) IS NOT NULL AS exists`
       if (found?.exists !== true) continue
       // A same-name relation already captured in another schema: leave it to verify, which
-      // reports the multi-schema capture in the one Drift with every other mismatch (§11).
+      // reports the multi-schema capture in the one Drift with every other mismatch (INV-SCH-5).
       // Every other attach failure still stops startup.
       yield* attach(table).pipe(Effect.catchTag("TableNameConflict", () => Effect.void))
     }

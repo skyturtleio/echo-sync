@@ -1,5 +1,5 @@
 /**
- * Router SharedWorker (DESIGN §9): one per replica identity. It never touches the database; it only
+ * Router SharedWorker (SPEC §12): one per replica identity. It never touches the database; it only
  * remembers which leader is current and hands every tab a fresh `MessagePort` to it.
  *
  * Usage, in an app-owned SharedWorker entry file:

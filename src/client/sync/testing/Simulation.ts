@@ -1,11 +1,11 @@
 /**
- * Deterministic simulation of N clients against the reference server (DESIGN §14).
+ * Deterministic simulation of N clients against the reference server (SPEC §17).
  *
  * A seeded PRNG drives a schedule of local mutations, pushes (lost requests, transient stops
  * at random positions, lost responses), paginated pulls (failing between pages), server
  * out-of-band writes, grant/revoke/move, client reload (memory lost, disk kept), going
  * offline, log GC (forces resnapshot), optional ledger GC, clock skew, enqueue retries after
- * release (answered by released-row markers, or ended by the §8 position backstop once the
+ * release (answered by released-row markers, or ended by the INV-PUSH-6 position backstop once the
  * markers were pruned), crashes in the middle of a storage transaction followed by a reload,
  * and local mutations/pushes committing while a pull is suspended on the network. Time is the
  * ambient `Clock` (run under `TestClock`), skewed per client. Intents count as committed from
@@ -92,7 +92,7 @@ export interface Stats {
   readonly notices: number
   readonly transientStops: number
   readonly lostResponses: number
-  /** Duplicates (pruned-marker retries) released by a push response's position (§8 corollary). */
+  /** Duplicates (pruned-marker retries) released by a push response's position (INV-PUSH-6 corollary). */
   readonly backstopReleases: number
   /** Enqueue retries after release whose marker was pruned that enqueued a duplicate. */
   readonly lateRetries: number
@@ -149,7 +149,7 @@ const diff = (actual: string, expected: string) => {
 }
 
 /**
- * Rows of `tables` the client should hold: known tables only (DESIGN §8 skips the rest), in
+ * Rows of `tables` the client should hold: known tables only (SPEC §7 skips the rest), in
  * scopes `principal` can read, judged by the grant rows in `tables`.
  */
 const view = (tables: MemoryStore.Tables, principal: AccessScope.PrincipalId) =>
@@ -298,7 +298,7 @@ export const run = (options: Options) =>
           skew: 0,
           /**
            * Set by a schema rebuild to the last seq allocated before it: those entries' optimistic
-           * effects are invisible until the null-cursor set installs (DESIGN §9).
+           * effects are invisible until the null-cursor set installs (INV-CLI-2).
            */
           rebuiltThrough: Option.none<{ readonly seq: number; readonly pending: number }>(),
           engine: yield* Engine.make({
@@ -394,7 +394,7 @@ export const run = (options: Options) =>
         for (const entry of client.disk.outbox) {
           // Once the client has the outcome (seq ≤ pushedThrough), an outcome covered by the
           // installed cursor must already have released the entry: by the pull that acked it,
-          // or by the push response itself when no pull can ever ack it (§8 corollary).
+          // or by the push response itself when no pull can ever ack it (INV-PUSH-6 corollary).
           if (entry.envelope.seq > pushedThrough) continue
           const ledger = server.ledgerEntry(client.clientId, entry.envelope.mutationId)
           if (cursor !== null && Option.isSome(ledger) && ledger.value.position <= cursor) {
@@ -499,7 +499,7 @@ export const run = (options: Options) =>
 
     /**
      * Records an intent the caller was told is saved, independently of the outbox. A seq already
-     * recorded for a different mutationId is a reused seq (DESIGN §6: never reused).
+     * recorded for a different mutationId is a reused seq (INV-CLI-5: never reused).
      */
     const record = (envelope: MutationEnvelope) =>
       Effect.gen(function* () {
@@ -554,7 +554,7 @@ export const run = (options: Options) =>
           const original = late.value
           const marker = client.disk.released.get(original.mutationId)
           if (marker !== undefined) {
-            // §9 rule 1: the marker answers with the seq it records; no handler, no new intent.
+            // INV-CLI-4: the marker answers with the seq it records; no handler, no new intent.
             stats.markerHits++
             note(`${client.clientId}: retry enqueue of released ${original.mutationId} (marker)`)
             const lastSeq = client.disk.lastSeq
@@ -566,7 +566,7 @@ export const run = (options: Options) =>
           }
           // Marker pruned: the duplicate gets a fresh seq. The server still knows the id: its
           // ledger entry answers it, or, once expired, its kept identity answers ClientExpired
-          // (DESIGN §16.5), so it never executes again, with or without ledger expiry.
+          // (DECISIONS 5), so it never executes again, with or without ledger expiry.
           {
             note(`${client.clientId}: retry enqueue of released ${original.mutationId} (pruned)`)
             return yield* ignoreExpected(
@@ -594,7 +594,7 @@ export const run = (options: Options) =>
           return
         }
         const { name, args } = randomMutation(client)
-        // Caller-generated, unordered idempotency key (DESIGN §6).
+        // Caller-generated, unordered idempotency key (SPEC §2).
         const mutationId = Ids.MutationId.make(
           `m${rng.int(2 ** 30).toString(36)}-${client.clientId}-${client.disk.lastSeq}`
         )
@@ -661,7 +661,7 @@ export const run = (options: Options) =>
       })
 
     /**
-     * A new app version with a different `dataHash` (DESIGN §9, browser `migrate`): the replica is
+     * A new app version with a different `dataHash` (INV-CLI-12, browser `migrate`): the replica is
      * emptied, the cursor nulled and pending undo emptied; outbox and push watermark are kept.
      * The next install must restore nothing and replay every unsettled pending entry.
      */

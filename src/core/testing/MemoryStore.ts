@@ -1,6 +1,6 @@
 /**
- * In-memory `ReplicaRowStore`: the reference semantics for row storage (DESIGN §4 store
- * layering, §10 index ordering). Rows are kept in wire form, keyed by table name then id.
+ * In-memory `ReplicaRowStore`: the reference semantics for row storage (SPEC §4 store
+ * layering, SPEC §3 index ordering). Rows are kept in wire form, keyed by table name then id.
  * Ordering and range matching come from core's single definition (`Store.planMatches`,
  * `Store.planOrder`, `Store.compareText`), never from JS string comparison.
  */

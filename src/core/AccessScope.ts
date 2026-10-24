@@ -1,6 +1,6 @@
 import { Schema } from "effect"
 
-/** Opaque, app-generated identity of an access scope (DESIGN §4). */
+/** Opaque, app-generated identity of an access scope (SPEC §4). */
 export const AccessScopeId = Schema.String.check(Schema.isNonEmpty()).pipe(Schema.brand("echo-sync/AccessScopeId"))
 export type AccessScopeId = typeof AccessScopeId.Type
 

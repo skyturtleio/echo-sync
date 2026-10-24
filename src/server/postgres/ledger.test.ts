@@ -104,7 +104,7 @@ const storedBody = (mutation: Mutation.AnyMutation, args: Schema.Json) =>
     )
   })
 
-describe.skipIf(!pgAvailable)("mutation ledger (§6)", () => {
+describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
   it.live("a persistent unique violation is ledgered with a position instead of blocking later mutations", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient
@@ -433,7 +433,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (§6)", () => {
     Effect.gen(function* () {
       const sql = yield* SqlClient
       yield* runMutation(env("m1", 1n), Effect.void)
-      // No v1 job raises the floor (§16.5); raise it by hand.
+      // No v1 job raises the floor (DECISIONS 5); raise it by hand.
       yield* sql`UPDATE echo_sync.clients SET expired_through = 2, expired_position = 41 WHERE client_id = 'c1'`
       const expired = yield* runMutation(env("m2", 2n), appendEffect("x"))
       assert.deepStrictEqual(expired, {

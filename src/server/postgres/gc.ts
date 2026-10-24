@@ -8,7 +8,7 @@ import * as Telemetry from "../../internal/Telemetry.ts"
  *
  * The horizon only moves forward, and every entry at or below it is deleted in the same
  * transaction, so a pull snapshot sees either the old log and old horizon or the new ones.
- * Ledger rows are not touched: their retention is `expireLedger` (DESIGN.md §16 item 5).
+ * Ledger rows are not touched: their retention is `expireLedger` (DECISIONS 5).
  */
 export const collectGarbage = Effect.fnUntraced(function* (retention: Duration.Input) {
   const sql = yield* SqlClient
@@ -39,13 +39,13 @@ export class LedgerRetentionTooShort extends Schema.TaggedError<LedgerRetentionT
 }) {}
 
 /**
- * Twice the client's released-row window (§9, 24 h), with margin for a paused tab's clock. A
- * shorter retention could expire a row a late enqueue retry can still duplicate (DESIGN §16 item 5).
+ * Twice the client's released-row window (SPEC §9, 24 h), with margin for a paused tab's clock. A
+ * shorter retention could expire a row a late enqueue retry can still duplicate (DECISIONS 5).
  */
 export const minimumLedgerRetention = Duration.hours(48)
 
 /**
- * Ledger expiry (DESIGN §16 item 5): one job run. It reclaims outcome payloads, not rows: for each
+ * Ledger expiry (DECISIONS 5): one job run. It reclaims outcome payloads, not rows: for each
  * client, it clears `outcome` (and `acked_at`) on its ledger rows acked (`acked_at`, stamped by
  * pull) at or before `now − retention` by the Effect `Clock`, raises its floor (`expired_through`)
  * to the highest `seq` cleared and records the highest cleared position (`expired_position`); both

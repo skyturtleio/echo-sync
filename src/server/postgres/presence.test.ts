@@ -115,7 +115,7 @@ const until = (snapshots: Queue.Queue<Protocol.RoomSnapshot>, want: ReadonlyArra
     }
   })
 
-describe("presence state (§12)", () => {
+describe("presence state (SPEC §10)", () => {
   it.effect(
     "a presence entry lives exactly while its stream runs: completion, a failing consumer and interruption each remove it",
     () =>
@@ -633,7 +633,7 @@ describe("presence state (§12)", () => {
   )
 })
 
-describe.skipIf(!pgAvailable)("presence over the sync mount (§12)", () => {
+describe.skipIf(!pgAvailable)("presence over the sync mount (SPEC §10)", () => {
   it.live(
     "a presence entry is dropped when its room stream ends: a client that goes away over HTTP is removed for everyone",
     () =>
@@ -679,7 +679,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (§12)", () => {
   )
 
   it.live(
-    "a join or track asserting another replica principal than the session's is Unauthorized and changes no entry (§16.21)",
+    "a join or track asserting another replica principal than the session's is Unauthorized and changes no entry (DECISIONS 21)",
     () =>
       Effect.gen(function* () {
         yield* grant("p", "s1")
@@ -810,7 +810,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (§12)", () => {
         // Tab 2 reconnects before its old stream has ended: the old stream's end must not drop it.
         const tab2again = yield* open(client, payload("c1", "t2", "two, again"))
         yield* until(tab2again.snapshots, ["p/c0/watch=null", 'p/c1/t1="one, moved"', 'p/c1/t2="two, again"'])
-        // The rejoin ended the old stream: an entry has exactly one observing stream (§12).
+        // The rejoin ended the old stream: an entry has exactly one observing stream (SPEC §10).
         assert.isTrue(Exit.isSuccess(yield* Fiber.join(tab2.fiber)))
         yield* Fiber.interrupt(tab1.fiber)
         yield* until(observer.snapshots, ["p/c0/watch=null", 'p/c1/t2="two, again"'])

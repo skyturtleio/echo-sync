@@ -86,9 +86,10 @@ not detached shell jobs:
 amp orb service start echo-server --command 'bun examples/server/main.ts'
 amp orb service start echo-spike --command 'bun run spike' --portal
 examples/browser-spike/scenarios.sh
-amp orb service stop echo-server
-examples/browser-spike/slice.sh
+ECHO_SERVER_START="amp orb service start echo-server --command 'bun examples/server/main.ts'" \
+ECHO_SERVER_STOP="amp orb service stop echo-server" examples/browser-spike/slice.sh
 bash examples/browser-spike/observability.sh
+amp orb service stop echo-server
 ```
 
 On another machine, run `bun examples/server/main.ts` and `bun run spike` in separate terminals.

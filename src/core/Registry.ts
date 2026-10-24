@@ -10,7 +10,7 @@ export interface SyncRegistry {
   /** System tables first, then app tables in declaration order (DDL order). */
   readonly tables: ReadonlyArray<AnySyncTable>
   readonly get: (name: string) => Option.Option<AnySyncTable>
-  /** Combined hashes; a `dataHash` change means "rebuild replica, keep outbox" (DESIGN §9). */
+  /** Combined hashes; a `dataHash` change means "rebuild replica, keep outbox" (INV-CLI-12). */
   readonly dataHash: string
   readonly indexHash: string
 }

@@ -42,7 +42,7 @@ const mutations = Mutation.makeRegistry([addItem])
 
 /**
  * A real RpcClient (HTTP POST, NDJSON) against the mounted router, as the browser transport
- * speaks it (DESIGN §6). The handler shares the test's database clients.
+ * speaks it (SPEC §10). The handler shares the test's database clients.
  */
 const connectWith = (wrap: (sql: SqlClient) => SqlClient) =>
   Effect.gen(function* () {
@@ -123,7 +123,7 @@ const writer = Effect.gen(function* () {
   yield* sql`UPDATE echo_sync.scope_grants SET role = 'writer' WHERE principal_id = 'p'`
 })
 
-describe.skipIf(!pgAvailable)("sync RPC over HTTP (§6, §8)", () => {
+describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
   it.live("a pushed mutation's result position and outcome reach the client and come back as its ack", () =>
     Effect.gen(function* () {
       yield* writer
@@ -310,7 +310,7 @@ const pushFor = (clientId: string, principal?: AccessScope.PrincipalId) => ({
 const refusal = (exit: Exit.Exit<unknown, { readonly _tag: string }>) =>
   Exit.isFailure(exit) ? Option.getOrUndefined(Exit.findErrorOption(exit)) : undefined
 
-describe.skipIf(!pgAvailable)("the replica's principal against the authenticated session (§16.21)", () => {
+describe.skipIf(!pgAvailable)("the replica's principal against the authenticated session (DECISIONS 21)", () => {
   const alice = AccessScope.PrincipalId.make("alice-replica-principal")
   const bob = AccessScope.PrincipalId.make("bob-session-principal")
   /**
@@ -457,7 +457,7 @@ const nextPoke = (received: Queue.Queue<typeof Protocol.PokesElement.Type>) =>
     (poke) => (Option.isSome(poke) ? Effect.void : Effect.fail("no poke within 5 s"))
   )
 
-describe.skipIf(!pgAvailable)("one LISTEN per server process (§6)", () => {
+describe.skipIf(!pgAvailable)("one LISTEN per server process (SPEC §10.1)", () => {
   it.live(
     "more open pokes streams than pool connections do not block push or pull, and the server holds one LISTEN",
     () =>
@@ -547,7 +547,7 @@ describe.skipIf(!pgAvailable)("one LISTEN per server process (§6)", () => {
   )
 })
 
-describe.skipIf(!pgAvailable)("pokes liveness (§6)", () => {
+describe.skipIf(!pgAvailable)("pokes liveness (SPEC §10.1)", () => {
   it.live(
     "an idle pokes stream carries a heartbeat at least every heartbeatInterval, and no heartbeat makes the client pull",
     () =>
@@ -627,7 +627,7 @@ const killListener = Effect.gen(function* () {
     WHERE datname = current_database() AND query ILIKE 'listen%'`
 })
 
-describe.skipIf(!pgAvailable)("re-establishing the shared LISTEN (§6)", () => {
+describe.skipIf(!pgAvailable)("re-establishing the shared LISTEN (SPEC §10.1)", () => {
   it.live(
     "LISTEN attempts that fail after reserving a connection release it: recovery succeeds after more failures than the pool has connections",
     () =>

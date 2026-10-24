@@ -5,7 +5,8 @@ affects; the SPEC states the resulting behavior and is the only normative text. 
 records *why* and *when*, not *what*. Dates are the day the ruling first appeared in the design
 record (git history of the former `docs/DESIGN.md` §16); the original text carried no date for
 most of them. Thread names and reviewed heads are dropped. Numbering is the original §16
-numbering so that `DESIGN §16.N` citations in source comments still resolve.
+numbering; current citations use `DECISIONS N`, and historical `DESIGN §16.N` citations in
+commit messages map to the same entry.
 
 A new ruling is appended here, in the same branch as the SPEC change it motivates, as
 `N. <title> (YYYY-MM-DD, RESOLVED | DEFERRED | UNSCHEDULED)`.

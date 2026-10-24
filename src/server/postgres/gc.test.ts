@@ -31,7 +31,7 @@ const gcAt = (offset: number) =>
   )
 const twoHours = 2 * 60 * 60 * 1000
 
-describe.skipIf(!pgAvailable)("log GC (§7)", () => {
+describe.skipIf(!pgAvailable)("log GC (SPEC §11)", () => {
   it.live("entries younger than the retention window survive GC", () =>
     Effect.gen(function* () {
       yield* grant("p", "s1")
@@ -177,7 +177,7 @@ const ledgerClient = Effect.gen(function* () {
   return { replica, counter, submit, state, seqs, identities, ageAcks }
 })
 
-describe.skipIf(!pgAvailable)("ledger expiry (DESIGN §16 item 5)", () => {
+describe.skipIf(!pgAvailable)("ledger expiry (DECISIONS 5)", () => {
   it.live(
     "an acked row older than the retention expires, and its resubmission answers Rejected{ClientExpired} at the recorded position instead of executing again",
     () =>
@@ -468,7 +468,7 @@ const expectStale = (cursor: bigint | null, position: string) =>
     assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "staleContinuation")
   })
 
-describe.skipIf(!pgAvailable)("pull continuation (§8)", () => {
+describe.skipIf(!pgAvailable)("pull continuation (SPEC §7)", () => {
   it.live("a continuation replayed by another client, principal, or cursor, or garbled, is refused", () =>
     Effect.gen(function* () {
       yield* grant("p", "s1")

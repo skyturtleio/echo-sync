@@ -2,7 +2,7 @@
  * The application the simulation runs, declared with core's real APIs: a `counters` SyncTable,
  * intent-shaped mutations (increment/transfer are wrong if replayed over a server result that
  * already contains them), and a `notes` table that only the server's registry has (a table
- * added by a newer deploy, DESIGN §8). Grants are core's `scope_grants` system table.
+ * added by a newer deploy, SPEC §7). Grants are core's `scope_grants` system table.
  */
 import { DateTime, Effect, Schema } from "effect"
 import { AccessScope, Mutation, Registry, ScopeGrants, SyncTable } from "../index.ts"
@@ -65,7 +65,7 @@ const remove = Mutation.make("remove", {
 })
 
 /**
- * Creates a scope (DESIGN §4), then optionally creates a counter in it. A counter id that exists
+ * Creates a scope (SPEC §4), then optionally creates a counter in it. A counter id that exists
  * makes the mutation fail after the claim, so a test can reach a rejected creation.
  */
 const createScope = Mutation.make("createScope", {
@@ -85,7 +85,7 @@ export const ANYONE = AccessScope.Everyone
 export const scope = (id: string) => AccessScope.AccessScopeId.make(id)
 export const principal = (id: string) => AccessScope.PrincipalId.make(id)
 
-/** A `scope_grants` row in wire form, with core's derived id (DESIGN §4). */
+/** A `scope_grants` row in wire form, with core's derived id (SPEC §4). */
 export const grantRow = (scopeId: string, who: string, role: AccessScope.Role): SyncTable.EncodedRow =>
   Schema.encodeSync(ScopeGrants.ScopeGrants.wire)({
     id: ScopeGrants.grantId(scope(scopeId), principal(who)),

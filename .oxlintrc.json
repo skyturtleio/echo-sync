@@ -28,7 +28,7 @@
         "patterns": [
           {
             "group": ["foldkit", "foldkit/**"],
-            "message": "Only examples may import FoldKit; the adapter, core, client and server never do (DESIGN §16.17)."
+            "message": "Only examples may import FoldKit; the adapter, core, client and server never do (DECISIONS 17)."
           }
         ]
       }
@@ -67,7 +67,7 @@
               },
               {
                 "group": ["foldkit", "foldkit/**"],
-                "message": "Only examples may import FoldKit; the adapter, core, client and server never do (DESIGN §16.17)."
+                "message": "Only examples may import FoldKit; the adapter, core, client and server never do (DECISIONS 17)."
               }
             ]
           }
@@ -94,11 +94,11 @@
               {
                 "group": ["**/client", "**/client/**", "echo-sync/client"],
                 "allowTypeImports": true,
-                "message": "Core must not import src/client at runtime (DESIGN §14); `import type` only. Engine-driving harnesses live in src/client/sync/testing."
+                "message": "Core must not import src/client at runtime (SPEC §17); `import type` only. Engine-driving harnesses live in src/client/sync/testing."
               },
               {
                 "group": ["foldkit", "foldkit/**"],
-                "message": "Only examples may import FoldKit; the adapter, core, client and server never do (DESIGN §16.17)."
+                "message": "Only examples may import FoldKit; the adapter, core, client and server never do (DECISIONS 17)."
               }
             ]
           }

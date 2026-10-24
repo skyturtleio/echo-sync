@@ -2,7 +2,7 @@ import { Effect } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 
 /**
- * Ledger expiry (DESIGN §16 item 5): `acked_at` is when the client proved it installed the row's
+ * Ledger expiry (DECISIONS 5): `acked_at` is when the client proved it installed the row's
  * ack, stamped by the first pull that presents a cursor at or past the row's position. `NULL` (every
  * row before this migration, and every row not yet acked) is never expired. Additive: existing rows
  * keep `NULL` until their client's next pull stamps them.

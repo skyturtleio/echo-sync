@@ -99,7 +99,7 @@ const second = Migrate.generate({
   name: "more"
 })
 
-describe.skipIf(adminUrl === "")("generated migrations and the startup verifier (DESIGN §11, real Postgres)", () => {
+describe.skipIf(adminUrl === "")("generated migrations and the startup verifier (SPEC §13, real Postgres)", () => {
   it.layer(EmptyDatabase)((db) => {
     db.effect(
       "generated modules applied to an empty database pass the verifier, and the NOT NULL default is gone",

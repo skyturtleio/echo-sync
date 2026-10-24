@@ -1,10 +1,10 @@
 /**
- * The leader's sync loop (DESIGN §8, §9): runs `Engine.push` then `Engine.pull` whenever woken (local
+ * The leader's sync loop (SPEC §10): runs `Engine.push` then `Engine.pull` whenever woken (local
  * enqueue, poke) and retries transient failures with backoff; `followPokes` keeps the pokes stream up.
  *
- * Fatal push (DESIGN §6, a68a727): a push failure that `SyncFailure.classifyPush` says halts (an integrity
+ * Fatal push (INV-LOOP-3): a push failure that `SyncFailure.classifyPush` says halts (an integrity
  * failure: `MalformedEnvelope`, an invalid batch, or a push defect) halts pushing for the lifetime of this
- * loop: no automatic retry, no outbox entry is released (that would leave a seq gap, §16.5). Pull keeps
+ * loop: no automatic retry, no outbox entry is released (that would leave a seq gap, DECISIONS 5). Pull keeps
  * running. The halt is surfaced through `status`, and the pending outbox stays exportable.
  */
 import {
@@ -39,13 +39,13 @@ export const SyncPhase = Schema.Literals(["idle", "pushing", "pulling", "backoff
 export type SyncPhase = typeof SyncPhase.Type
 
 /**
- * A failure: its kind and a library-controlled description of it (DESIGN §9.1). Never raw
+ * A failure: its kind and a library-controlled description of it (INV-LOOP-6). Never raw
  * error text, so never header values, bodies, URLs or tokens; the leader logs the full cause.
  */
 export const SyncError = Schema.Struct({ kind: SyncErrorKind, message: Schema.String })
 export type SyncError = typeof SyncError.Type
 
-/** The leader's sync state (DESIGN §9.1). No `connected` flag: a finished cycle proves nothing about now. */
+/** The leader's sync state (INV-LOOP-9). No `connected` flag: a finished cycle proves nothing about now. */
 export const SyncStatus = Schema.Struct({
   push: PushState,
   /** Last failure, cleared by a clean cycle; `outdated` persists for this leader's lifetime. */
@@ -73,7 +73,7 @@ export interface SyncLoop {
 }
 
 /**
- * The public text for each kind (DESIGN §9.1, 418d688): library-controlled constants. No raw error
+ * The public text for each kind (INV-LOOP-6): library-controlled constants. No raw error
  * message, name, unrecognized tag, string cause, URL or `Cause.pretty` ever reaches `syncStatus`, since
  * any of them can carry a token, an echoed header or a request body. Detail goes to the leader's log.
  */
@@ -90,7 +90,7 @@ const messages: Record<SyncErrorKind, string> = {
 const stoppedBatch: SyncError = { kind: "server", message: "the server stopped the push batch at a transient failure" }
 
 /**
- * The status consequences of a failure cause (DESIGN §6: defect > integrity > transient), never just
+ * The status consequences of a failure cause (INV-LOOP-5: defect > integrity > transient), never just
  * its first failure. Interruption is re-raised (the loop is stopping). The returned strings are
  * constants; the cause itself is only ever logged.
  */
@@ -108,7 +108,7 @@ export const make = (options: {
    * The current count of unreleased outbox entries, then the count after every outbox write (the leader
    * passes a reactive count over `echo_outbox`). Required. Followed while `run` runs; a failure restarts it after
    * a second. `status` and `changes` wait for its first value: a status with an unknown count would tell
-   * a consumer there are no pending writes (DESIGN §9.1).
+   * a consumer there are no pending writes (INV-LOOP-9).
    */
   readonly pendingMutations: Stream.Stream<number, Errors.StoreUnavailable>
 }): Effect.Effect<SyncLoop> =>
@@ -247,21 +247,21 @@ const pokesOutcome =
     })
 
 /**
- * Follows the server's pokes stream (DESIGN §6, §8, 81a07db): every `poke` wakes the loop, a
- * `heartbeat` only proves liveness (DESIGN §6 Liveness) and never wakes it, and the stream is
+ * Follows the server's pokes stream (INV-LOOP-7): every `poke` wakes the loop, a
+ * `heartbeat` only proves liveness (INV-LOOP-7) and never wakes it, and the stream is
  * reconnected after ANY end (failure, defect, clean completion, or `idleTimeout` with no element at
  * all) following a backoff that starts at `retryDelay`, doubles up to `maxRetryDelay`, and resets once
  * a connection delivered a poke. The idle timeout is what notices a connection that died silently (a
  * proxy that keeps the response open); it must exceed the server's `heartbeatInterval`.
  * Reconnecting does not wake the loop itself: a wake before the server's LISTEN is confirmed could pull
  * before a change that the new stream then never announces. The server emits one poke on every stream
- * right after LISTEN (DESIGN §6, aec6cd4), and that first element is what covers anything missed while
- * disconnected. Pokes are only hints (§8), so nothing here is fatal. Runs until interrupted.
+ * right after LISTEN (INV-LOOP-7), and that first element is what covers anything missed while
+ * disconnected. Pokes are only hints (INV-LOOP-7), so nothing here is fatal. Runs until interrupted.
  */
 export const followPokes = (options: {
   /**
-   * One (re)connect: the Effect prepares it (resolves credentials, DESIGN §9.1) and the stream it
-   * returns sends the request when run. `idleTimeout` covers only the stream (DESIGN §6 Liveness).
+   * One (re)connect: the Effect prepares it (resolves credentials, INV-LOOP-8) and the stream it
+   * returns sends the request when run. `idleTimeout` covers only the stream (INV-LOOP-8).
    */
   readonly connect: Effect.Effect<
     Stream.Stream<{ readonly _tag: "poke" | "heartbeat" }, PullTransportError>,

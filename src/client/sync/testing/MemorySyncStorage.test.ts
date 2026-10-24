@@ -84,7 +84,7 @@ describe("a SyncStorage whose reopen closes earlier handles conforms (the suite 
   register(Conformance.syncStorage(closeOnReopen))
 })
 
-describe("the suite's expectations come from fixtures, not from the subject (DESIGN §14)", () => {
+describe("the suite's expectations come from fixtures, not from the subject (SPEC §17)", () => {
   const noopRows: Store.ReplicaRowStore = {
     read: () => Effect.succeedNone,
     write: () => Effect.void,

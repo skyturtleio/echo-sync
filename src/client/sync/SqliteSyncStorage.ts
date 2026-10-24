@@ -1,5 +1,5 @@
 /**
- * The engine's `SyncStorage` port on the leader's SQLite connection (DESIGN §8, §9).
+ * The engine's `SyncStorage` port on the leader's SQLite connection (SPEC §7, §9).
  *
  * Everything the engine persists (replica rows, outbox, sync meta, staged pull pages, notices) lives in
  * one database and commits or rolls back in one SQLite transaction. `transaction` is
@@ -31,7 +31,7 @@ const StoredUndo = Schema.fromJsonString(
     })
   )
 )
-/** A stored notice (DESIGN §9): core's `Mutation.Notice`, so it can also cross the tab RPC. */
+/** A stored notice (SPEC §9): core's `Mutation.Notice`, so it can also cross the tab RPC. */
 export const Notice = Mutation.Notice
 const StoredNotice = Schema.fromJsonString(Notice)
 const StoredMeta = Schema.fromJsonString(
@@ -64,7 +64,7 @@ const encodeTables = encode(StoredTables)
 const q = (name: string) => `"${name.replaceAll('"', '""')}"`
 
 /**
- * Brings the leader's database in line with `registry` (DESIGN §9, §11) in ONE SQLite transaction:
+ * Brings the leader's database in line with `registry` (SPEC §9.6, §13.4) in ONE SQLite transaction:
  * the outbox, the engine's tables, the replica tables, and the bookkeeping that describes them.
  *
  * The registry's manifest hashes live in `echo_meta` under `replica_tables`, `replica_data_hash`,
@@ -164,7 +164,7 @@ export interface SqliteSyncStorage extends Engine.SyncStorage {
   /**
    * The number of unreleased outbox entries, then the number after every write to `echo_outbox` (an
    * append or a release, through the connection's reactivity hook). Each count is read under the permit,
-   * so it sees committed state only: a recount, never bookkeeping that can drift (DESIGN §9.1).
+   * so it sees committed state only: a recount, never bookkeeping that can drift (INV-LOOP-9).
    */
   readonly pendingCount: Stream.Stream<number, Errors.StoreUnavailable>
 }
@@ -214,7 +214,7 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
     // BEGIN/COMMIT failures map like any statement's; the body's own errors pass through unchanged.
     // `withTransaction` waits for the connection lease uninterruptibly; waiting for `permit` first makes
     // a transaction queued behind a long one (e.g. a pull install) cancellable while it waits. Admission
-    // is serialized, not fair (DESIGN §9, aa267ac): a fiber that just released may take the permit again
+    // is serialized, not fair (SPEC Appendix C.1): a fiber that just released may take the permit again
     // ahead of a waiter. Order between mutations comes from the caller sequencing them, never from here.
     // The leader runs its own SQL through `admit` or `transaction`, so nothing it serves bypasses the permit.
     transaction: (self) =>
@@ -283,7 +283,7 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
   }
 }
 
-/** Delete the notices with these ids; the only way a notice is ever removed (DESIGN §9.1). */
+/** Delete the notices with these ids; the only way a notice is ever removed (SPEC §9.5). */
 export const dismissNotices = (
   sql: SqlClient.SqlClient,
   ids: ReadonlyArray<number>
@@ -292,7 +292,7 @@ export const dismissNotices = (
     ? Effect.void
     : Effect.asVoid(SqliteRowStore.unavailable(sql`DELETE FROM echo_notices WHERE ${sql.in("id", ids)}`))
 
-/** Every retained notice, oldest first, with its id (DESIGN §9: retained for inspection). */
+/** Every retained notice, oldest first, with its id (SPEC §9.5: retained for inspection). */
 export const notices = (
   sql: SqlClient.SqlClient
 ): Effect.Effect<

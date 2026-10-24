@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Vertical-slice scenarios: the real browser leader against the real server (examples/server/main.ts on
-# Postgres), driven by agent-browser through the Vite harness. See docs/vertical-slice.md.
+# Postgres), driven by agent-browser through the Vite harness. See AGENTS.md "Browser scenarios".
 #
 #   [SLICE_ORDER="base offline conflict deleteedit"] [SLICE_CONTROL=<fault>] examples/browser-spike/slice.sh [base-url]
 #
 # SLICE_ORDER lists the sections to run, in order; SLICE_CONTROL injects one deliberate fault that must
-# make its check fail (both documented in docs/vertical-slice.md).
+# make its check fail (both documented in AGENTS.md "Browser scenarios").
 #
 # Needs the harness running. Unless $ECHO_SERVER_START is set, slice.sh starts examples/server/main.ts
 # itself (output to $ECHO_SERVER_LOG, default /dev/null) and stops it on exit. Scenario 5 stops and restarts
@@ -195,10 +195,10 @@ ab tab close "$C2" >/dev/null
 
 }
 
-# ── Offline convergence (DESIGN §14, docs/vertical-slice.md): two independent clients, each its own profile
+# ── Offline convergence (SPEC §17, AGENTS.md "Browser scenarios"): two independent clients, each its own profile
 # and client id, with the harness network gate (`echo.setOffline`: the leader's requests fail as an
 # unreachable server does and its open streams abort). Every wait is an awaited condition. SLICE_CONTROL
-# names one deliberate fault that must make exactly its check fail (see docs/vertical-slice.md).
+# names one deliberate fault that must make exactly its check fail (see AGENTS.md "Browser scenarios").
 ctl() { [ "${SLICE_CONTROL:-}" = "$1" ]; }
 now() { date +%s%3N; }
 # Re-evaluates a JS body returning { ok, ... } in short evals until ok (one CDP evaluate cannot wait out a

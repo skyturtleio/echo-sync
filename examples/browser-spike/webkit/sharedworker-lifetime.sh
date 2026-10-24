@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Does a SharedWorker survive the close of the tab that created it while another tab is still connected?
-# The router (DESIGN §9) relies on it. Chromium: yes. Playwright WebKit (Linux): no. See
-# docs/browser-substrate.md "WebKit smoke".
+# The router (SPEC §12) relies on it. Chromium: yes. Playwright WebKit (Linux): no. See
+# AGENTS.md "WebKit smoke".
 #
 #   [WEBKIT=1] examples/browser-spike/webkit/sharedworker-lifetime.sh [base-url]
 SESSION_PREFIX=swlife

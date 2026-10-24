@@ -20,7 +20,7 @@ const handStatements = (steps: ReadonlyArray<Migrate.Step>) =>
     s._tag === "Todo" ? s.lines.filter((l) => /^ {2}[A-Z]+ [^<]*;$/.test(l)).map((l) => l.trim()) : []
   )
 
-describe("the generator never emits DDL for a rename, drop, lossy type change or unique-set change (DESIGN §11)", () => {
+describe("the generator never emits DDL for a rename, drop, lossy type change or unique-set change (SPEC §13)", () => {
   const v1 = SyncTable.make(
     "docs",
     { ...base, title: Schema.String, rank: Schema.Int, body: Schema.String, legacy: Schema.String, extra: Schema.Int },
@@ -94,7 +94,7 @@ describe("the generator never emits DDL for a rename, drop, lossy type change or
   })
 })
 
-describe("DDL that depends on a TODO rename or kind change is a TODO too (DESIGN §11)", () => {
+describe("DDL that depends on a TODO rename or kind change is a TODO too (SPEC §13)", () => {
   it("a combined table and column rename is one table TODO and one column TODO, no DDL, no intent error", () => {
     const v1 = SyncTable.make("docs", { ...base, title: Schema.String, body: Schema.String })
     const v2 = SyncTable.make("articles", { ...base, heading: Schema.String, body: Schema.String })
@@ -252,7 +252,7 @@ describe("safe changes become exactly the pinned DDL", () => {
     ])
   })
 
-  it("a NOT NULL column without a default is added nullable with the §11 TODO, never SET NOT NULL", () => {
+  it("a NOT NULL column without a default is added nullable with the SPEC §13 TODO, never SET NOT NULL", () => {
     const v1 = SyncTable.make("notes", base)
     const v2 = SyncTable.make("notes", { ...base, rank: Schema.Int })
     const steps = Migrate.plan(snapshotOf(v1), Registry.make([v2]))
@@ -268,7 +268,7 @@ describe("safe changes become exactly the pinned DDL", () => {
     ])
   })
 
-  it("an index-only change is DROP/CREATE INDEX with §10 ordering and leaves dataHash unchanged (no re-download)", () => {
+  it("an index-only change is DROP/CREATE INDEX with SPEC §3 ordering and leaves dataHash unchanged (no re-download)", () => {
     const fields = { ...base, label: Schema.NullOr(Schema.String), rank: Schema.Int, at: Schema.Date }
     const v1 = SyncTable.make("items", fields, { indexes: { by_label: ["label"], stale: ["rank"] } })
     const v2 = SyncTable.make("items", fields, { indexes: { by_label: ["label", "rank"], by_at: ["at"] } })

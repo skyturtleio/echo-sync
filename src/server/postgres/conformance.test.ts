@@ -51,7 +51,7 @@ const subject = Effect.gen(function* () {
   return made
 })
 
-describe.skipIf(!pgAvailable)("Postgres RowStore conforms to Store.RowStore (DESIGN §14)", () => {
+describe.skipIf(!pgAvailable)("Postgres RowStore conforms to Store.RowStore (SPEC §17)", () => {
   for (const check of Conformance.rowStore(subject)) {
     it.live(
       check.name,

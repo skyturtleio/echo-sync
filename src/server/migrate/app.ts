@@ -3,7 +3,7 @@ import * as PgMigrator from "@effect/sql-pg/PgMigrator"
 import type { SqlClient } from "effect/sql/SqlClient"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
-/** The app migrations' own history table (DESIGN §11); never the engine's `echo_sync.migrations`. */
+/** The app migrations' own history table (SPEC §13); never the engine's `echo_sync.migrations`. */
 export const appMigrationsTable = "echo_sync.app_migrations"
 
 /**

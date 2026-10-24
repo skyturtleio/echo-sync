@@ -136,7 +136,7 @@ it.effect(
       const fiber = yield* Effect.forkChild(Stream.runDrain(presence.join({ room, tabId, state: "s0", revision: 0 })))
       yield* Queue.fail(yield* server.nextConnection, dropped())
       yield* TestClock.adjust("1 second")
-      // A credential failure (DESIGN §9.1 Credentials) is retried like any other, never fatal.
+      // A credential failure (SPEC §10.3 Credentials) is retried like any other, never fatal.
       yield* Queue.fail(yield* server.nextConnection, new Protocol.Unauthorized({ message: "expired" }))
       yield* TestClock.adjust("2 seconds")
       expect(fiber.pollUnsafe()).toBeUndefined()

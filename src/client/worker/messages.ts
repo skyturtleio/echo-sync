@@ -16,9 +16,9 @@ export const ToLeader = Schema.Union([
   /** A port to the router; the router sends `Connect` messages on it. */
   Schema.TaggedStruct("RouterPort", { port: Port }),
   /**
-   * Instead of `Init`: reset this identity's replica (DESIGN §9.1 `resetReplica`) and answer with one
+   * Instead of `Init`: reset this identity's replica (SPEC §12 `resetReplica`) and answer with one
    * `ResetOutcome`. The worker never becomes leader. `closeTimeoutMillis`: how long it waits for the leader
-   * lock while the identity's clients close (DESIGN §16.24); always finite.
+   * lock while the identity's clients close (DECISIONS 24); always finite.
    */
   Schema.TaggedStruct("Reset", {
     appId: Schema.String,
@@ -89,7 +89,7 @@ export const isRouterBroadcast = Schema.is(RouterBroadcast)
 
 /**
  * `resetReplica` → every tab client of the identity, on the BroadcastChannel named
- * `Platform.resetChannelName(identity)` (DESIGN §16.24). A client that receives it for its own identity enters
+ * `Platform.resetChannelName(identity)` (DECISIONS 24). A client that receives it for its own identity enters
  * its terminal reset state. An event, not a tombstone: a client built afterwards never sees it.
  */
 export const ResetSignal = Schema.TaggedStruct("ResetSignal", { appId: Schema.String, profile: Schema.String })

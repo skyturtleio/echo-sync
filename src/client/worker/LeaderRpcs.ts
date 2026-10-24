@@ -1,6 +1,6 @@
 /**
  * Tab ↔ leader contract. Every request a tab makes against the local replica/outbox goes through
- * this `RpcGroup` over a `MessagePort` brokered by the router (see `docs/browser-substrate.md`).
+ * this `RpcGroup` over a `MessagePort` brokered by the router (see SPEC §12).
  * Payloads cross a structured-clone boundary, so every success/error is a Schema.
  */
 import * as Schema from "effect/Schema"
@@ -19,7 +19,7 @@ export class SqlFailure extends Schema.TaggedError<SqlFailure>()("SqlFailure", {
  * The leader that was serving this request went away (tab closed / worker crashed) or no leader can be
  * reached. The request may or may not have been applied: `enqueue` is idempotent on `mutationId`, so it
  * is safe to retry; `exec` is only safe to retry if the statement is.
- * `Reset`: `resetReplica` closed this tab client (DESIGN §16.24); terminal, never retried. Build a new client.
+ * `Reset`: `resetReplica` closed this tab client (DECISIONS 24); terminal, never retried. Build a new client.
  */
 export class LeaderUnavailable extends Schema.TaggedError<LeaderUnavailable>()("LeaderUnavailable", {
   reason: Schema.Literals(["LeaderLost", "LeaderFailed", "Unsupported", "SecondaryTabWithoutRouter", "Reset"]),
@@ -33,7 +33,7 @@ export const Rows = Schema.Array(Schema.Record(Schema.String, Schema.Unknown))
 export type Rows = typeof Rows.Type
 
 /**
- * `exec` on a leader started without `allowRawExec` (DESIGN §10.1): raw writes bypass the outbox and
+ * `exec` on a leader started without `allowRawExec` (INV-BRW-6): raw writes bypass the outbox and
  * break the replica invariant, so only the dev harness enables it.
  */
 export class RawExecDisabled extends Schema.TaggedError<RawExecDisabled>()("RawExecDisabled", {}) {}
@@ -41,17 +41,17 @@ export class RawExecDisabled extends Schema.TaggedError<RawExecDisabled>()("RawE
 /** This leader was started without a `syncUrl`: a local-only replica, nothing syncs. */
 export class SyncDisabled extends Schema.TaggedError<SyncDisabled>()("SyncDisabled", {}) {}
 
-/** This tab already has an open `presence` stream for the room (one entry per tab per room, DESIGN §12). */
+/** This tab already has an open `presence` stream for the room (one entry per tab per room, SPEC §10.3). */
 export class PresenceAlreadyOpen extends Schema.TaggedError<PresenceAlreadyOpen>()("PresenceAlreadyOpen", {
   room: Schema.String
 }) {}
 
-/** A tab's presence in one room (DESIGN §9.1): the tab id is the server's entry key with the clientId. */
+/** A tab's presence in one room (SPEC §10.3): the tab id is the server's entry key with the clientId. */
 export const PresencePayload = Schema.Struct({
   room: AccessScope.AccessScopeId,
   tabId: Protocol.TabId,
   state: Schema.Json,
-  /** The tab's revision of `state` (DESIGN §9.1); the leader keeps the highest and the server fences on it. */
+  /** The tab's revision of `state` (SPEC §10.3); the leader keeps the highest and the server fences on it. */
   revision: Protocol.PresencePayload.fields.revision
 })
 
@@ -81,7 +81,7 @@ export type Statement = typeof Statement.Type
  * A raw live query, for the dev harness only (served only with `allowRawExec`, like `exec`): a fixed list
  * of read statements plus the tables they depend on (table-level dependencies). The leader runs it with
  * `PRAGMA query_only` on, which catches accidental writes but is no security boundary: caller SQL can
- * switch it off. Registered queries (`subscribe`) are the read path for apps (DESIGN §10.1).
+ * switch it off. Registered queries (`subscribe`) are the read path for apps (SPEC §12.3).
  */
 export const LiveQuery = Schema.Struct({
   statements: Schema.Array(Statement),
@@ -93,7 +93,7 @@ export type LiveQuery = typeof LiveQuery.Type
 export const QueryResult = Schema.Struct({ results: Schema.Array(Rows) })
 export type QueryResult = typeof QueryResult.Type
 
-/** One pending outbox entry, as exported for recovery (DESIGN §9). */
+/** One pending outbox entry, as exported for recovery (SPEC §9). */
 export const PendingExport = Schema.Struct({ envelope: Mutation.MutationEnvelope, createdAt: Schema.Int })
 export type PendingExport = typeof PendingExport.Type
 
@@ -119,7 +119,7 @@ export class LeaderRpcs extends RpcGroup.make(
   }),
   /**
    * Run a mutation optimistically and durably append it to the outbox, in one SQLite transaction
-   * (DESIGN §9). Resolves only after that transaction committed. A known `mutationId` (pending or
+   * (SPEC §9). Resolves only after that transaction committed. A known `mutationId` (pending or
    * released) returns its original seq and runs nothing. `LocallyRejected`: the handler rejected it
    * against the local replica; nothing was saved.
    */
@@ -129,7 +129,7 @@ export class LeaderRpcs extends RpcGroup.make(
     error: Schema.Union([SqlFailure, LocallyRejected])
   }),
   /**
-   * A registered query (DESIGN §10.1), by name with its encoded args. Emits the encoded result of a run,
+   * A registered query (INV-BRW-6), by name with its encoded args. Emits the encoded result of a run,
    * then of a fresh run after every write to a table the latest run read. Each run, and the dependency
    * set derived from it, comes from one read transaction.
    */
@@ -148,7 +148,7 @@ export class LeaderRpcs extends RpcGroup.make(
   }),
   /**
    * Raw live query: emits the current result, then a fresh result after every write to `tables`.
-   * `RawExecDisabled` unless the leader allows raw SQL (DESIGN §10.1).
+   * `RawExecDisabled` unless the leader allows raw SQL (INV-BRW-6).
    */
   Rpc.make("subscribeRaw", {
     payload: { query: LiveQuery },
@@ -163,7 +163,7 @@ export class LeaderRpcs extends RpcGroup.make(
   /** Wake the sync loop (coalesced); completes once the wake is queued, never clears a halted push. */
   Rpc.make("requestSync", { error: SyncDisabled }),
   /**
-   * Join `room` as this tab and observe it (DESIGN §9.1 Presence): room snapshots only (heartbeats stay on
+   * Join `room` as this tab and observe it (SPEC §10.3 Presence): room snapshots only (heartbeats stay on
    * the leader). The leader keeps the upstream stream up (idle timeout, rejoin with the latest tracked
    * state); the entry lives exactly while this stream is open. `Forbidden`: no grant in the room's scope.
    */
@@ -180,8 +180,8 @@ export class LeaderRpcs extends RpcGroup.make(
    * list after every change to `echo_notices`. The engine never removes one; only `dismissNotices` does.
    */
   Rpc.make("notices", { success: Schema.Array(StoredNotice), error: SqlFailure, stream: true }),
-  /** Delete the notices with these ids (DESIGN §9.1). Unknown ids are ignored, so a retry is harmless. */
+  /** Delete the notices with these ids (SPEC §9.5). Unknown ids are ignored, so a retry is harmless. */
   Rpc.make("dismissNotices", { payload: { ids: Schema.Array(Schema.Int) }, error: SqlFailure }),
-  /** Every pending outbox entry in seq order. Always available, also while push is halted (DESIGN §6). */
+  /** Every pending outbox entry in seq order. Always available, also while push is halted (INV-LOOP-3). */
   Rpc.make("exportPending", { success: Schema.Array(PendingExport), error: SqlFailure })
 ) {}

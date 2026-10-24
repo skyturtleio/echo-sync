@@ -1,7 +1,7 @@
 import { Deferred, type Duration, Effect, PubSub, Ref, type Scope, Semaphore, Stream } from "effect"
 import { type AccessScope, Protocol } from "echo-sync"
 
-/** An entry, the room it is in, and the revision of its state (DESIGN §12 revision fencing). */
+/** An entry, the room it is in, and the revision of its state (SPEC §10 revision fencing). */
 export interface Joined extends Protocol.PresenceEntry {
   readonly room: AccessScope.AccessScopeId
   readonly revision: number
@@ -27,7 +27,7 @@ interface Room {
 }
 
 /**
- * The entry key. DESIGN §12 keys entries by `(clientId, tabId)`; the principal is part of the key
+ * The entry key. SPEC §10 keys entries by `(clientId, tabId)`; the principal is part of the key
  * too, so a caller naming another principal's client id can neither replace nor end that entry.
  */
 const keyOf = (principalId: string, clientId: string, tabId: string) => JSON.stringify([principalId, clientId, tabId])
@@ -66,10 +66,10 @@ const byKey = (a: Protocol.PresenceEntry, b: Protocol.PresenceEntry) =>
               : 0
 
 /**
- * Process-local presence state (DESIGN §12): a `Ref` of rooms plus a `PubSub` per room. A room
+ * Process-local presence state (SPEC §10): a `Ref` of rooms plus a `PubSub` per room. A room
  * exists while it has an entry. Authorization is the caller's (the RPC handlers).
  *
- * Every `join` stream also carries a `heartbeat` every `heartbeatInterval` (DESIGN §16 item 13).
+ * Every `join` stream also carries a `heartbeat` every `heartbeatInterval` (DECISIONS 13).
  * Heartbeats come from the stream's own timer, merged beside the room's change subscription, so
  * a heartbeat can never slide out a pending change tick, and they read and change no room state.
  */
@@ -94,7 +94,7 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
      * stream could leave as the room's last member, the room would be recreated on a new `PubSub`,
      * and the replaced stream would observe the abandoned one forever.
      *
-     * A join whose revision is lower than the stored entry's is a superseded attempt (DESIGN §12
+     * A join whose revision is lower than the stored entry's is a superseded attempt (SPEC §10
      * revision fencing): nothing is installed, the entry and its stream are untouched, and the result
      * is `undefined`.
      */
@@ -210,7 +210,7 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
         ),
 
       /**
-       * Revocation (DESIGN §16 item 13): asks `holds` which `(room, principal)` pairs with an open
+       * Revocation (DECISIONS 13): asks `holds` which `(room, principal)` pairs with an open
        * stream still hold the room's scope, then, for each pair that does not, removes every entry
        * of that principal in that room in one step, ends each of those streams `Forbidden`, and
        * announces the removal once. The installation gate is held throughout, so no entry is

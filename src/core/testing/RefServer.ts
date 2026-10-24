@@ -1,16 +1,16 @@
 /**
- * Reference sync server for the simulation (DESIGN §4, §6–§8), no Postgres.
+ * Reference sync server for the simulation (SPEC §4–§7), no Postgres.
  *
  * - One store of current rows; a log of change identities (position, table, id, scope) and a
- *   per-client ledger, sharing one commit-ordered position counter (§7).
- * - Readability is computed from `scope_grants` rows (grants are a system SyncTable, §4).
+ *   per-client ledger, sharing one commit-ordered position counter (SPEC §6).
+ * - Readability is computed from `scope_grants` rows (grants are a system SyncTable, SPEC §4).
  * - Pull pages are served at their own snapshot: payloads are the row state at the moment the
- *   page is served, not when the entry was logged (§8). Membership is a state diff against the
+ *   page is served, not when the entry was logged (SPEC §7). Membership is a state diff against the
  *   per-client held-scope record (`client_scopes`); a null cursor holds nothing, so it walks
  *   every readable scope and then continues with the log.
  * - Log and ledger are independently GC-able; ledger GC clears an entry's outcome but keeps its
  *   identity, and keeps a per-client floor, so resubmissions (under any seq) are answered
- *   `ClientExpired` instead of re-executed (§16.5).
+ *   `ClientExpired` instead of re-executed (DECISIONS 5).
  * - Mutations run through the same `Mutation.runHandler` (core `Store.make` + `Mutation.run`)
  *   the client runs optimistically, against the server's rows and grants.
  *
@@ -43,7 +43,7 @@ interface LogEntry {
 interface LedgerEntry {
   readonly position: Position
   readonly seq: number
-  /** `null` once expired: the identity stays, the outcome is reclaimed (§16.5). */
+  /** `null` once expired: the identity stays, the outcome is reclaimed (DECISIONS 5). */
   readonly outcome: MutationOutcome | null
 }
 
@@ -76,12 +76,12 @@ export const make = (options: { readonly pageSize: number }) => {
   const principals = new Map<string, AccessScope.PrincipalId>()
   /** `client_scopes`: scopes held by a client as of each completed pull, by `nextCursor`. */
   const clientScopes = new Map<string, Map<Position, ReadonlySet<string>>>()
-  /** Highest `seq` per client whose ledger row was GC'd (DESIGN §16.5 floor). */
+  /** Highest `seq` per client whose ledger row was GC'd (DECISIONS 5 floor). */
   const ledgerFloor = new Map<string, { readonly seq: number; readonly position: Position }>()
   const continuations = new Map<string, Continuation>()
   const history = new Map<Position, MemoryStore.Tables>([[0n, new Map()]])
   const executions = new Map<string, number>()
-  /** `access_scopes`: every scope ever created or granted in; kept when its grants go (§4). */
+  /** `access_scopes`: every scope ever created or granted in; kept when its grants go (SPEC §4). */
   const accessScopes = new Set<string>()
 
   const ledgerOf = (clientId: string) => {
@@ -135,7 +135,7 @@ export const make = (options: { readonly pageSize: number }) => {
     store.transaction(
       Effect.gen(function* () {
         const principal = principals.get(envelope.clientId) ?? AccessScope.PrincipalId.make("nobody")
-        // The authoritative claim (DESIGN §4): fresh iff no access_scopes row; it is added only
+        // The authoritative claim (SPEC §4): fresh iff no access_scopes row; it is added only
         // if the mutation applies, like the Postgres insert that rolls back with the savepoint.
         const claimed = new Set<string>()
         const claimScope = (scopeId: AccessScope.AccessScopeId) =>
@@ -197,7 +197,7 @@ export const make = (options: { readonly pageSize: number }) => {
 
   /**
    * One page, read at the current state (= this page's snapshot). Membership is a state diff
-   * (DESIGN §8): held-but-unreadable ⇒ `ScopePurged`; readable-but-not-held ⇒ row walk;
+   * (SPEC §7): held-but-unreadable ⇒ `ScopePurged`; readable-but-not-held ⇒ row walk;
    * walks run before any log read; log entries in held scopes become upserts if the row's
    * current scope is readable, else tombstones.
    */
@@ -334,7 +334,7 @@ export const make = (options: { readonly pageSize: number }) => {
       log = log.filter((entry) => entry.position > through)
       if (through > logFloor) logFloor = through
     },
-    /** Expires ledger entries with position ≤ `through`: outcome cleared, identity kept (§16.5). */
+    /** Expires ledger entries with position ≤ `through`: outcome cleared, identity kept (DECISIONS 5). */
     gcLedger: (through: Position) => {
       for (const [clientId, entries] of ledger) {
         for (const [id, entry] of entries) {

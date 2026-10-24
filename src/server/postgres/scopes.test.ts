@@ -35,7 +35,7 @@ const readableScopes = (principalId: string) =>
     return new Set(rows.map((r) => r.scope_id))
   })
 
-describe.skipIf(!pgAvailable)("scope delivery (§4, §8)", () => {
+describe.skipIf(!pgAvailable)("scope delivery (SPEC §4, §7)", () => {
   it.live("a scope move deletes the row for old-scope readers and delivers it to new-scope readers", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient
@@ -178,7 +178,7 @@ describe.skipIf(!pgAvailable)("scope delivery (§4, §8)", () => {
   )
 
   it.live(
-    "pulled rows are the wire form: epoch-ms timestamps, and no column the SyncTable does not declare (§11)",
+    "pulled rows are the wire form: epoch-ms timestamps, and no column the SyncTable does not declare (INV-TBL-4)",
     () =>
       Effect.gen(function* () {
         const sql = yield* SqlClient

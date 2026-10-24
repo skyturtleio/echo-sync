@@ -7,7 +7,7 @@ import grantIdCheck from "./migrations/002_grant_id_check.ts"
 import ledgerAckedAt from "./migrations/003_ledger_acked_at.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
-/** Migrator history table (DESIGN.md §4). */
+/** Migrator history table (SPEC §13.1). */
 export const migrationsTable = "echo_sync.migrations"
 
 /**
@@ -56,10 +56,10 @@ export class TableNameConflict extends Schema.TaggedError<TableNameConflict>()("
  * READ COMMITTED gives the check a fresh snapshot after the lock, so two concurrent attaches of
  * one name from different schemas cannot both pass. Inside a caller's transaction (e.g. a
  * REPEATABLE READ snapshot taken before a concurrent attach committed) the check could miss that
- * attach, so calling it there is a defect (DESIGN §4).
+ * attach, so calling it there is a defect (INV-SCH-7).
  *
  * Every writer participates: mutators, imports, scripts, and cascades all go through the row
- * trigger, which takes the engine lock before allocating a log position (§7).
+ * trigger, which takes the engine lock before allocating a log position (INV-POS-1).
  */
 export const attach = (table: SyncTable.AnySyncTable, options?: { readonly schema?: string | undefined }) =>
   Effect.gen(function* () {
@@ -127,7 +127,7 @@ export interface Resolved {
 /**
  * Registry tables that are attached, sorted by name (the walk order). A registry table without
  * capture is not synced: walking it would deliver rows whose later changes are never logged.
- * A captured relation outside the registry is unknown to clients and skipped (DESIGN §8).
+ * A captured relation outside the registry is unknown to clients and skipped (SPEC §7).
  */
 export const resolveTables = (registry: Registry.SyncRegistry) =>
   Effect.map(syncedTables, (captured) => {

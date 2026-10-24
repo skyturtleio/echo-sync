@@ -3,7 +3,7 @@ import { SqlClient } from "effect/sql/SqlClient"
 import { ScopeGrants } from "echo-sync"
 
 /**
- * Engine schema v1 (DESIGN.md §4, §6, §7).
+ * Engine schema v1 (SPEC §4, §5, §6).
  *
  * Migration modules are immutable once released: change the engine with a new `NNN_name.ts`.
  * The `echo_sync` schema itself is created by `migrate` before the migrator runs, because the
@@ -30,12 +30,12 @@ export default Effect.gen(function* () {
       created_at timestamptz NOT NULL DEFAULT now()
     )`
 
-  // A system synced table (DESIGN.md §4): each grant is a row in the scope it grants, so it
+  // A system synced table (SPEC §4): each grant is a row in the scope it grants, so it
   // replicates to that scope's readers and its changes are ordered with data changes in the log.
   // The table is core's SyncTable DDL (one definition, including UNIQUE (access_scope_id,
   // principal_id)), created inside `echo_sync`. Caveat: a fresh database runs this migration with
   // the core version it is deployed with, so a change to ScopeGrants' storage shape needs its own
-  // migration for existing databases, like any SyncTable change (DESIGN §11).
+  // migration for existing databases, like any SyncTable change (SPEC §13).
   const [{ search_path } = { search_path: "public" }] = yield* sql<{ search_path: string }>`SHOW search_path`
   yield* sql`SELECT set_config('search_path', 'echo_sync', true)`
   yield* sql.unsafe(ScopeGrants.ScopeGrants.postgres.createTable)
@@ -54,7 +54,7 @@ export default Effect.gen(function* () {
       client_id text PRIMARY KEY,
       principal_id text NOT NULL,
       cursor bigint,
-      -- §16.5 expiry floor: seq ≤ expired_through is answered Rejected{clientExpired} at
+      -- DECISIONS 5 expiry floor: seq ≤ expired_through is answered Rejected{clientExpired} at
       -- expired_position (the highest expired ledger row). No v1 job raises them.
       expired_through bigint NOT NULL DEFAULT 0,
       expired_position bigint NOT NULL DEFAULT 0,
@@ -62,7 +62,7 @@ export default Effect.gen(function* () {
       created_at timestamptz NOT NULL DEFAULT now()
     )`
 
-  // The set of scopes whose contents a client holds as of a completed pull position (§8). The wire
+  // The set of scopes whose contents a client holds as of a completed pull position (SPEC §7). The wire
   // cursor is a bare position, so this is how the next pull knows what to purge and what to walk.
   // Rows below the cursor a client presents are pruned on that pull; at most a couple per client.
   yield* sql`
@@ -97,12 +97,12 @@ export default Effect.gen(function* () {
     )`
   yield* sql`CREATE INDEX log_scope_position ON echo_sync.log (access_scope_id, position)`
 
-  // §7: every position allocation takes the engine's transaction-scoped advisory lock first.
+  // INV-POS-1: every position allocation takes the engine's transaction-scoped advisory lock first.
   // The lock is held until commit, so the next allocation can only happen after this
   // transaction is visible: positions are handed out in commit order.
   // Key = bytes of "echosync" as a signed int8.
   // The NOTIFY is delivered at commit (and deduplicated within a transaction): it is the poke
-  // stream's hint that something may have changed (DESIGN §8). It carries no data.
+  // stream's hint that something may have changed (INV-POS-4). It carries no data.
   yield* sql`
     CREATE FUNCTION echo_sync.next_position() RETURNS bigint
     LANGUAGE plpgsql VOLATILE AS $$

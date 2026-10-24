@@ -3,7 +3,7 @@ import type { PureSchema } from "./Mutation.ts"
 import type { EchoStore, ReadError, ReadStore } from "./Store.ts"
 
 /**
- * Registered read queries (DESIGN §10, §10.1), the read-side twin of `Mutation.make`. A query is a
+ * Registered read queries (SPEC §12.3), the read-side twin of `Mutation.make`. A query is a
  * deterministic function of its args and the rows it reads through `ReadStore`; the leader runs it in
  * one read transaction and re-runs it when a table the latest run read changes.
  */
@@ -84,7 +84,7 @@ export const makeRegistry = (queries: ReadonlyArray<AnyQuery>): QueryRegistry =>
 
 /**
  * Run one registered query by name over `db`. The handler is given a fresh object with only the read
- * methods, so no cast inside a handler reaches `insert`/`patch`/`delete` (DESIGN §10.1).
+ * methods, so no cast inside a handler reaches `insert`/`patch`/`delete` (INV-BRW-6).
  */
 export const run = (
   registry: QueryRegistry,

@@ -13,7 +13,7 @@ import { ClientId, MutationId, Seq } from "./Ids.ts"
 import * as Store from "./Store.ts"
 import type { EchoStore } from "./Store.ts"
 
-/** Inputs of one handler run (DESIGN §6). `now` and `random` are fixed by the caller. */
+/** Inputs of one handler run (SPEC §5). `now` and `random` are fixed by the caller. */
 export interface MutationContext {
   readonly actor: PrincipalId
   readonly now: DateTime.Utc
@@ -48,7 +48,7 @@ export class DomainError extends Schema.TaggedError<DomainError>()("DomainError"
 }) {}
 
 /**
- * Terminal (DESIGN §16.5): the server answered a `seq ≤` its expiry floor for this client. The
+ * Terminal (DECISIONS 5): the server answered a `seq ≤` its expiry floor for this client. The
  * mutation was processed at some point; its outcome is unknown, its effect (if any) is installed.
  */
 export class ClientExpired extends Schema.TaggedError<ClientExpired>()("ClientExpired", {
@@ -85,8 +85,8 @@ export type MutationEnvelope = typeof MutationEnvelope.Type
 
 /**
  * A mutation that left the outbox without being applied as intended, retained for inspection
- * (DESIGN §9): `Rejected`, processed and rejected with a typed error; `OutcomeUnknown`, processed
- * with an unknown outcome (its ledger row expired before the ack was pulled, §16.5), its effect,
+ * (SPEC §9.5): `Rejected`, processed and rejected with a typed error; `OutcomeUnknown`, processed
+ * with an unknown outcome (its ledger row expired before the ack was pulled, DECISIONS 5), its effect,
  * if any, in the installed replica. Stored by the client and sent over the tab RPC.
  */
 export const Notice = Schema.Union([
@@ -148,7 +148,7 @@ export const make = <const Name extends string, A extends PureSchema, E extends 
   )
   const encodeError = Schema.encodeUnknownEffect(Schema.toCodecJson(errorSchema))
   /**
-   * Whole-cause classification (DESIGN §6). A defect or interruption anywhere dies with the
+   * Whole-cause classification (INV-MUT-3). A defect or interruption anywhere dies with the
    * full cause (failures turned into defects), never a Rejected outcome. A StoreUnavailable
    * anywhere is transient. Only a cause made purely of permanent failures is a rejection.
    */
@@ -160,7 +160,7 @@ export const make = <const Name extends string, A extends PureSchema, E extends 
     }
     const transient = failures.find((e) => e instanceof StoreUnavailable)
     if (transient !== undefined) return Effect.fail(transient)
-    // Every domain failure must be declared and encodable, not only the one reported (DESIGN §6):
+    // Every domain failure must be declared and encodable, not only the one reported (INV-MUT-3):
     // an undeclared or unencodable domain error anywhere is a bug in the mutation, so the
     // mutation dies with the full cause. Otherwise the first failure in cause order is reported.
     return Effect.gen(function* () {
@@ -221,7 +221,7 @@ export const run = (
 }
 
 // ---------------------------------------------------------------------------------------------
-// Typed notice decoding (DESIGN §9.1)
+// Typed notice decoding (SPEC §9.5)
 // ---------------------------------------------------------------------------------------------
 
 /** `decodeNotice` was given a notice of another mutation, or one its schemas cannot decode. */

@@ -1,5 +1,5 @@
 /**
- * FoldKit adapter (DESIGN §16.17): a thin translation of the `echo-sync/client` tab-side API (DESIGN §9.1)
+ * FoldKit adapter (DECISIONS 17): a thin translation of the `echo-sync/client` tab-side API (SPEC §12.3)
  * into the two shapes FoldKit runs, with no sync semantics of its own.
  *
  * - Streams (`subscribe`, `syncStatus`, `notices`, `status`) are `Stream<message, never, R>`, for a
@@ -16,12 +16,12 @@
  * Command. A typed error becomes `onFailure({ _tag: "Error", error })`; a defect (also one alongside a typed
  * error) becomes
  * `onFailure({ _tag: "Defect" })`, carrying nothing of the cause and logging nothing (a cause can hold header
- * values, URLs or SQLite text; DESIGN §9.1, §16.20). An interruption-only cause stays an interruption, so
+ * values, URLs or SQLite text; SPEC §10, DECISIONS 20). An interruption-only cause stays an interruption, so
  * FoldKit tearing a Subscription or Command down never yields a message.
  *
  * Termination: `onFailure` is the terminal element of an adapter stream. The tab client already absorbs
  * `LeaderLost` (re-subscription, `mutate`/`requestSync`/`dismissNotices` retry); any error it lets through
- * ends its stream (DESIGN §9.1), and the adapter never retries or re-subscribes on its own. Re-opening is the
+ * ends its stream (SPEC §10.3), and the adapter never retries or re-subscribes on its own. Re-opening is the
  * app's decision, e.g. by changing the Subscription's dependencies.
  *
  * Limits: the handlers (`onValue`, `onFailure`, `onSuccess`) must not throw; they are message constructors and
@@ -112,7 +112,7 @@ const run = <A, E, R, V, F>(
 
 type Stream_<K extends "syncStatus" | "notices" | "status"> = TabClient[K]
 
-/** A registered query's live result (DESIGN §9.1 `subscribe`); keeps its last value across handover. */
+/** A registered query's live result (INV-BRW-4 `subscribe`); keeps its last value across handover. */
 export const subscribe = <CE, R, A extends Mutation.PureSchema, S extends Mutation.PureSchema, V, F>(
   client: ClientSource<CE, R>,
   query: Query.Query<string, A, S>,
@@ -161,7 +161,7 @@ export const requestSync = <CE, R, V, F>(
     h
   )
 
-/** The only way a notice is removed (DESIGN §9.1). */
+/** The only way a notice is removed (SPEC §9.5). */
 export const dismissNotices = <CE, R, V, F>(
   client: ClientSource<CE, R>,
   ids: ReadonlyArray<number>,

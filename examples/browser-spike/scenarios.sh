@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Browser invariant scenarios (DESIGN §14) for the leader/router/outbox substrate, driven by agent-browser
+# Browser invariant scenarios (SPEC §17) for the leader/router/outbox substrate, driven by agent-browser
 # against the Vite harness. Each scenario uses a fresh appId, so it starts from an empty replica.
 #
 #   bun run spike &                              # the Vite harness
@@ -152,7 +152,7 @@ worker_crash() { # $1 = label, $2 = extra page flags
   connected=$(ev <<<"return (await echo.until(() => echo.statusLog.some((s) => s.leaderId === '$(jq -r .leaderId <<<"$f")'), 15000)) === true")
   ev <<<"echo.releaseEpochWatch(); await new Promise((r) => setTimeout(r, 300)); return true" >/dev/null
   log=$(ev <<<"return echo.statusLog")
-  # syncStatus (DESIGN §9.1): the stream never ends, and it emits again once the tab follows F's leader.
+  # syncStatus (INV-BRW-4): the stream never ends, and it emits again once the tab follows F's leader.
   sync=$(ev <<<"const f = echo.statusLog.findIndex((s) => s.leaderId === '$(jq -r '.leaderId // empty' <<<"$f")')
 await echo.until(() => echo.syncStatusLog.some((e) => e.afterStatus > f), 15000)
 return { firstOnNew: f, entries: echo.syncStatusLog.map((e) => ({ after: e.afterStatus, pending: e.value.pendingMutations, phase: e.value.phase, synced: e.value.lastSyncedAt !== null })), ended: echo.syncWatch.ended ?? null }")
@@ -268,7 +268,7 @@ for t in "$A" "$B" "$C"; do ab tab close "$t" >/dev/null; done
 # ── reactive query re-emits after a cross-tab write ─────────────────────────────────────────────────
 # (The pair_a/pair_b agreement is a sanity check only: "no write interleaves between the statements of one
 # emission" holds by construction (withTransaction leases the single connection), and removing the
-# transaction does not make this check fail. See docs/browser-substrate.md.)
+# transaction does not make this check fail. See SPEC Appendix C.3.)
 APP="reactive-$RUN"
 A=$(open_tab "$BASE/?app=$APP")
 ev <<<'await echo.exec("CREATE TABLE pair_a (id INTEGER PRIMARY KEY)")
@@ -333,7 +333,7 @@ const s = await stats(); const exp = await echo.exportPending()
 return { pass: halted === true && s.pushes === 2 && exp.ok && exp.value.map((x) => x.envelope.mutationId).join() === 'halt-me', s, exp }")"
 ab tab close "$B" >/dev/null
 
-# ── database path length (DESIGN §9): the OPFS pool, not wa-sqlite's default mxPathname, is the bound ──
+# ── database path length (INV-BRW-1): the OPFS pool, not wa-sqlite's default mxPathname, is the bound ──
 # A UUID-length profile (the HeyBabe trial's identity shape) opens and keeps a write across a reload.
 UUID_PROFILE=$(cat /proc/sys/kernel/random/uuid)
 T=$(open_tab "$BASE/?app=heybabe-trial&profile=$UUID_PROFILE")
@@ -348,7 +348,7 @@ ab tab close "$T" >/dev/null
 # The bound, from the pinned AccessHandlePoolVFS: a stored path ("/" + SQLite's file name) must stay under
 # its 512-byte header, and the longest file name is "<db>-journal". So the longest db name is
 # 512 - 1 - 1 - 8 = 502 characters, i.e. appId + profile = 502 - len("echo-sync//.db") = 488. Each of them is
-# also an OPFS directory name, at most 255 UTF-8 bytes (WebKit's limit, DESIGN §16 item 1): 233 + 255.
+# also an OPFS directory name, at most 255 UTF-8 bytes (WebKit's limit, DECISIONS 1): 233 + 255.
 pad() { printf '%s' "$1"; printf "${2}%.0s" $(seq 1 $(($3 - ${#1}))); }
 APP=$(pad "bound-$RUN" a 233)
 PROFILE=$(pad "" p 255)
@@ -381,11 +381,11 @@ check "the longest database path the pool holds (appId 233 + profile 255) opens 
           and $g.mode == "unsupported" and $g.reason == "Unsupported" and ($g.message | contains("profile is 256 bytes")) and ($g.appDirExists | not)),
     longest: $l, over: $o, segment: $g }')"
 
-# ── resetReplica (DESIGN §9.1): guarded by the leader lock and the outbox, deletes only its identity ──
+# ── resetReplica (INV-BRW-7): guarded by the leader lock and the outbox, deletes only its identity ──
 # Profile "a" syncs with the fake server, whose push always halts, so its entry stays pending. Profile "b"
 # is a sibling identity of the same app. The resets run from a tab of an unrelated app (no client for "a").
 # A's page never hears the reset signal (`ignoreReset`, as an old build or a frozen tab), so its leader lives
-# on through the first reset (DESIGN §16.24).
+# on through the first reset (DECISIONS 24).
 APP="reset-$RUN"
 A=$(open_tab "$BASE/?app=$APP&profile=a&syncUrl=$BASE/fake-sync/rpc&ignoreReset")
 a0=$(ev <<<'await echo.ready(); const e = await echo.enqueue({ mutationId: "pending-a", name: "t", args: {} }); const i = await echo.info(); return { ok: e.ok, clientId: i.ok ? i.value.clientId : null }')
@@ -454,7 +454,7 @@ return { pass: !s.ok && s.error._tag === 'ResetFailed' && s.error.message.includ
   && !p.ok && p.error._tag === 'ResetFailed' && p.error.message.includes('injected postMessage failure'), s, p }")"
 ab tab close "$R" >/dev/null
 
-# ── reset durability across a crash (DESIGN §16.26): an engine-owned tombstone ──────────────────────
+# ── reset durability across a crash (DECISIONS 26): an engine-owned tombstone ──────────────────────
 # Profiles "a" and "b" of one app each hold a row and a pending write (the fake server's push halts). Resets
 # with discardPending run from a tab of an unrelated app and are interrupted at a crash point inside their
 # worker (`echo.resetReplica(…, fault)`, leader.worker.ts), which terminates the worker there: before the
@@ -539,7 +539,7 @@ const app = await echo.opfsList('echo-sync/$APP')
 return { pass: before.includes(tombstone) && r.ok && !r.interrupted && app !== null && !app.includes('b') && !app.includes(tombstone) && app.includes('a'), r, before, app }")"
 ab tab close "$R" >/dev/null
 
-# ── coordinated reset (DESIGN §16.24): resetReplica closes the identity's clients itself ─────────────
+# ── coordinated reset (DECISIONS 24): resetReplica closes the identity's clients itself ─────────────
 # Two tabs hold clients of one identity (the leader in one of them) and a third holds a sibling profile. One
 # of the two calls resetReplica with no app-side preparation. On main this fails ReplicaInUse (nothing closes
 # the leader), or, in single-tab mode, the queued candidate is elected and re-creates the replica.
@@ -639,7 +639,7 @@ for t in "$P" "$Q"; do ab tab close "$t" >/dev/null; done
 # The client's scope closed while the reset's own close of the client's topology is in progress (`closeOnReset`
 # forks it in the task that delivers the signal): once that scope close completes, every lock the page held or
 # queued is gone. Smoke coverage only: the race needs the topology close to suspend after it detached from the
-# client's scope, which the harness cannot force, so this check also passes on e4b93b5. The deterministic
+# client's scope, which the harness cannot force, so this check also passes without the fix (DECISIONS 24). The deterministic
 # regression is the LeaderClient.test.ts invariant with a gated tab-lock release.
 APP="coord-close-$RUN"
 P=$(open_tab "$BASE/?app=$APP&closeOnReset")
@@ -656,7 +656,7 @@ check "coordinated reset: a client scope closed as the reset arrives has release
   "$(jq -nc --argjson c "$cl" '{ pass: (($c.before.held | length) > 0 and $c.after.held == [] and $c.after.pending == []), c: $c }')"
 for t in "$P" "$Q"; do ab tab close "$t" >/dev/null; done
 
-# ── presence (DESIGN §9.1, §12): entry exactly while the tab stream is open; survives handover ────────
+# ── presence (SPEC §10.3, §12): entry exactly while the tab stream is open; survives handover ────────
 # Needs the real server (PresenceRpcs is mounted with SyncRpcs on /sync). L is the leader tab; F and W follow.
 if [ "$SYNC_MODE" = real ]; then
   APP="presence-$RUN"

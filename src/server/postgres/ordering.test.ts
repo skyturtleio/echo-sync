@@ -4,7 +4,7 @@ import { SqlClient } from "effect/sql/SqlClient"
 import { grant, pgAvailable, Replica, TestDatabase } from "./test-support.ts"
 
 /**
- * DESIGN.md §7: a client that has pulled through cursor c has seen every change with
+ * INV-POS-1: a client that has pulled through cursor c has seen every change with
  * position ≤ c. Writers allocate a position, then hold their transaction open for a random time,
  * so allocation order and commit order disagree unless the engine lock serializes them.
  */
@@ -104,7 +104,7 @@ const withoutEngineLock = Effect.gen(function* () {
     LANGUAGE sql VOLATILE AS $$ SELECT nextval('echo_sync.position_seq') $$`
 })
 
-describe.skipIf(!pgAvailable)("log ordering (§7)", () => {
+describe.skipIf(!pgAvailable)("log ordering (SPEC §6)", () => {
   it.live(
     "a reader pulling after a later writer commits never skips an earlier writer still in flight",
     () =>

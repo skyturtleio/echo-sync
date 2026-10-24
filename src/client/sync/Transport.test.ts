@@ -117,7 +117,7 @@ const failureOf = <A, E>(exit: Exit.Exit<A, E>) =>
 /** Whether this failure halts a push, by the verdict `SyncLoop` acts on. */
 const isFatal = (failure: SyncFailure.PushFailure) => Option.isSome(SyncFailure.classifyPush(Cause.fail(failure)).halt)
 
-it.effect("push failures are fatal exactly when §6 says so, classified by their real tags over a real RPC server", () =>
+it.effect("push failures are fatal exactly when SPEC §10 says so, classified by real tags over a real RPC server", () =>
   Effect.gen(function* () {
     const cases = [
       {
@@ -161,7 +161,14 @@ it.effect("push failures are fatal exactly when §6 says so, classified by their
         fatal: true,
         served: 0
       },
-      { name: "network down", server: "unreachable" as const, size: 1, tag: "RpcClientError", fatal: false, served: 0 },
+      {
+        name: "network down",
+        server: "unreachable" as const,
+        size: 1,
+        tag: "RpcClientError",
+        fatal: false,
+        served: 0
+      },
       {
         name: "Unauthorized",
         server: serve({ push: () => Effect.fail(new Protocol.Unauthorized({ message: "expired" })) }),
@@ -309,7 +316,7 @@ it.effect("a transport built with headers sends them on push, pull and the pokes
 )
 
 /**
- * The request payloads of the `Protocol` before DESIGN §16.21 added `principal`, frozen here (not
+ * The request payloads of the `Protocol` before DECISIONS 21 added `principal`, frozen here (not
  * derived from the current schemas): what a deployed pre-change server decodes.
  */
 const PreviousRpcs = RpcGroup.make(
@@ -353,7 +360,7 @@ const PreviousRpcs = RpcGroup.make(
   })
 )
 
-it.effect("a pre-§16.21 server serves push, pull, pokes, room and track that assert the replica principal", () =>
+it.effect("a pre-DECISIONS-21 server serves push, pull, pokes, room and track that assert the replica principal", () =>
   Effect.gen(function* () {
     const alice = AccessScope.PrincipalId.make("alice")
     const room = AccessScope.AccessScopeId.make("r")
@@ -852,7 +859,7 @@ it.live("a push batch the server stopped is reported as kind server", () =>
   }).pipe(Effect.scoped)
 )
 
-/** Present in each failure's own text, URL or body below; no emitted status may contain it (DESIGN §9.1). */
+/** Present in each failure's own text, URL or body below; no emitted status may contain it (INV-LOOP-6). */
 const sentinel = "SENTINEL-7d3a91"
 
 /** Every status the real loop emitted until `done`, serialized; the assertions search all of it. */

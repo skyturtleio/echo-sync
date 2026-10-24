@@ -61,7 +61,7 @@ const makeStore = () => {
   }).store
 }
 
-describe("mutation args evolve without breaking queued intents (DESIGN §6)", () => {
+describe("mutation args evolve without breaking queued intents (SPEC §5)", () => {
   it("a v1 envelope still in an outbox decodes through the wire envelope and runs as v2", async () => {
     // Exactly what a v1 client persisted and later pushes, as JSON text.
     const queued = JSON.parse(
@@ -128,7 +128,7 @@ const failing = (body: Effect.Effect<void, { readonly _tag: "Nope" } | StoreUnav
 const compound = (other: Cause.Reason<{ readonly _tag: "Nope" } | StoreUnavailable>) =>
   Effect.failCause(Cause.fromReasons([Cause.makeFailReason({ _tag: "Nope" as const }), other]))
 
-describe("mutation outcome classification over the whole cause (DESIGN §6)", () => {
+describe("mutation outcome classification over the whole cause (SPEC §5)", () => {
   it("a domain failure combined with a defect dies with the defect, never a Rejected outcome", async () => {
     const exit = await Effect.runPromise(
       Effect.exit(
@@ -166,7 +166,7 @@ const strict = (reasons: ReadonlyArray<Cause.Reason<string | RowNotFound>>) =>
   ])
 const outcome = (reasons: ReadonlyArray<Cause.Reason<string | RowNotFound>>) =>
   Effect.runPromise(Effect.exit(Mutation.run(strict(reasons), { name: "strict", args: {} }, ctx())))
-describe("every domain failure in a cause must encode before any is reported (DESIGN §6)", () => {
+describe("every domain failure in a cause must encode before any is reported (SPEC §5)", () => {
   const valid = Cause.makeFailReason("valid")
   const unencodable = Cause.makeFailReason("") // type-valid string, rejected by NonEmptyString
 
@@ -219,7 +219,7 @@ const mismatchOf = async (effect: Effect.Effect<unknown, Mutation.NoticeMismatch
   return await Effect.runPromise(Effect.flip(effect))
 }
 
-describe("decodeNotice types a stored notice by its mutation (DESIGN §9.1)", () => {
+describe("decodeNotice types a stored notice by its mutation (SPEC §9.5)", () => {
   const TooLate = Schema.TaggedStruct("TooLate", { deadline: Schema.Date })
   const Locked = Schema.TaggedStruct("Locked", { by: Schema.String })
   const deadline = new Date(1_700_000_000_000)

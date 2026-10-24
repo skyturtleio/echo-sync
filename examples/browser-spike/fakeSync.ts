@@ -1,6 +1,6 @@
 /**
  * Harness-only fake sync server (Vite dev middleware): a real `RpcServer` for core's `SyncRpcs` over HTTP
- * with NDJSON, as DESIGN §12 mounts it. Its push refuses every batch with `MalformedEnvelope`, pull answers
+ * with NDJSON, as SPEC §10 mounts it. Its push refuses every batch with `MalformedEnvelope`, pull answers
  * an empty `PullDone`, and pokes sends one poke and then ends cleanly. Per-client counters are served at
  * `/fake-sync/stats?clientId=…`, so a scenario can watch the leader's sync loop from outside.
  */

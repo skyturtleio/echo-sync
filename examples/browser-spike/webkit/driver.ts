@@ -1,5 +1,5 @@
 /**
- * WebKit driver for the browser scenarios (WEBKIT=1, see docs/browser-substrate.md "WebKit smoke").
+ * WebKit driver for the browser scenarios (WEBKIT=1, see AGENTS.md "WebKit smoke").
  *
  * agent-browser drives Chromium over CDP only. This script answers the same `ab` subcommands that
  * lib.sh, scenarios.sh and slice.sh use, against Playwright's WebKit build:

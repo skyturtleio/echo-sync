@@ -37,7 +37,7 @@ const names = new Set<string>(spanNames)
 /** Spans that also record a `<name>.duration` timer. */
 const timed: ReadonlySet<Name> = new Set<Name>(["echo.install", "echo.rebase"])
 
-/** The closed vocabulary of `echo.outcome`, `echo.result` and `echo.reason` (docs/observability.md). */
+/** The closed vocabulary of `echo.outcome`, `echo.result` and `echo.reason` (SPEC §14.1). */
 const outcomeValues = [
   "ok",
   "credentials",

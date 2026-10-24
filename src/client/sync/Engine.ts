@@ -1,12 +1,12 @@
 /**
- * Client reconciliation engine (DESIGN §6, §8, §9).
+ * Client reconciliation engine (SPEC §5, §7, §9).
  *
  * Pure Effect code over two ports: a transactional `SyncStorage` (replica rows, outbox, sync
  * metadata, staged pull pages, notices) and a `Transport` for push/pull. Handlers run through
  * core's typed store (`Store.make`) and mutation registry (`Mutation.run`), the same code the
  * server runs authoritatively.
  *
- * Replay-set invariant (§8): a pending mutation leaves the outbox only inside the transaction
+ * Replay-set invariant (INV-CLI-6): a pending mutation leaves the outbox only inside the transaction
  * that installs a complete pull page set (`PullDone`) carrying its ack, or when a push response
  * reports an outcome the installed replica already covers. `PullPage`s are staged durably and
  * never applied on their own: a page's payloads are read at that page's snapshot, which can
@@ -48,7 +48,7 @@ export const initialMeta: SyncMeta = { cursor: null, pushedThrough: 0, resnapsho
 /** The cursor the in-progress page set started from. */
 const pullFrom = (meta: SyncMeta): Ids.Cursor => (meta.resnapshot ? null : meta.cursor)
 
-/** A mutation that left the outbox without being applied as intended, retained for inspection (§9). */
+/** A mutation that left the outbox without being applied as intended, retained for inspection (SPEC §9.5). */
 export type Notice = Mutation.Notice
 
 type StoreUnavailable = Errors.StoreUnavailable
@@ -66,14 +66,14 @@ export interface SyncStorage {
   /** Unreleased outbox entries in ascending `seq`. */
   readonly pending: Effect.Effect<ReadonlyArray<PendingMutation>, StoreUnavailable>
   /**
-   * The outbox entry for a caller-generated `mutationId`, pending or released (DESIGN §9 rule 1:
+   * The outbox entry for a caller-generated `mutationId`, pending or released (INV-CLI-4:
    * release marks the row; released rows are retained for a window, then pruned).
    */
   readonly lookup: (
     mutationId: Ids.MutationId
   ) => Effect.Effect<Option.Option<Mutation.MutationEnvelope>, StoreUnavailable>
   /**
-   * Allocates the next outbox `seq` from durable state (DESIGN §6): starts at 1, monotone,
+   * Allocates the next outbox `seq` from durable state (INV-CLI-5): starts at 1, monotone,
    * never reused by a committed entry; rolled back with the transaction, so also gap-free.
    */
   readonly nextSeq: Effect.Effect<Ids.Seq, StoreUnavailable>
@@ -109,7 +109,7 @@ export class LocallyRejected extends Schema.TaggedError<LocallyRejected>()("Loca
 // Running a handler (shared with the reference server)
 // ---------------------------------------------------------------------------------------------
 
-// The handler runner, role lookup and restore live in core (DESIGN §14: the reference server
+// The handler runner, role lookup and restore live in core (SPEC §17: the reference server
 // and the core harnesses use them without importing client code); re-exported here.
 export const roleFromGrants = Store.roleFromGrants
 export const claimFromGrants = Store.claimFromGrants
@@ -203,7 +203,7 @@ const applyChange = (storage: SyncStorage, registry: Registry.SyncRegistry, chan
     if (change._tag === "scopePurged") return yield* storage.rows.purgeScope(change.scopeId)
     const table = registry.get(change.table)
     if (Option.isNone(table)) {
-      // DESIGN §8: during a deploy that adds a synced table, clients on the old registry receive
+      // SPEC §7: during a deploy that adds a synced table, clients on the old registry receive
       // its rows; they arrive with the next app version, whose manifest change rebuilds the
       // replica from null. Failing here would stop sync for every stale client.
       return yield* Telemetry.log("Debug", "echo-sync: unknown table change skipped")
@@ -247,7 +247,7 @@ export const applyPageSet = (
       if (envelope.seq <= done.expiredThrough) return Option.some(Option.some({ _tag: "OutcomeUnknown", envelope }))
       return Option.none()
     })
-    // `pushedThrough` is deliberately not raised here (§8: it advances only on push responses):
+    // `pushedThrough` is deliberately not raised here (SPEC §9: it advances only on push responses):
     // a pending entry below a released one was processed, but if its outcome is at a position
     // ≤ the old cursor no pull will ever ack it (a duplicate enqueued after its original was
     // released). It must be resent so the push response's position releases it.
@@ -270,7 +270,7 @@ export interface Engine {
   /**
    * Appends to the outbox and applies optimistically in one transaction ("saved" on success).
    * `mutationId` is the caller's idempotency key: enqueuing an id the outbox knows (pending or
-   * released, §9) returns the original envelope without running the handler again.
+   * released, INV-CLI-4) returns the original envelope without running the handler again.
    */
   readonly mutate: (
     mutationId: Ids.MutationId,
@@ -287,7 +287,7 @@ export const make = (options: {
   readonly clientId: Ids.ClientId
   /**
    * The principal this client acts as; optimistic role checks read its replica grants. Every push and
-   * pull asserts it to the server (DESIGN §16.21).
+   * pull asserts it to the server (DECISIONS 21).
    */
   readonly actor: AccessScope.PrincipalId
   readonly storage: SyncStorage
@@ -371,7 +371,7 @@ export const make = (options: {
                 yield* storage.transaction(
                   Effect.gen(function* () {
                     const current = yield* storage.meta
-                    // §8 corollary: an outcome at a position ≤ the installed cursor is already in
+                    // INV-PUSH-6 corollary: an outcome at a position ≤ the installed cursor is already in
                     // the replica, and no later pull will ack it (acks cover (cursor, nextCursor]).
                     // This is how a duplicate enqueued after its original was released terminates.
                     // Second corollary: `Rejected{ClientExpired}` answers an expired identity, which

@@ -19,7 +19,7 @@ export interface Dialect {
   readonly create: (table: AnySyncTable) => Promise<void>
   readonly insert: (table: AnySyncTable, row: EncodedRow) => Promise<void>
   readonly readAll: (table: AnySyncTable) => Promise<ReadonlyArray<EncodedRow>>
-  /** Executes `plan` as SQL following the DESIGN §10 rules (NULLS FIRST asc / LAST desc). */
+  /** Executes `plan` as SQL following the SPEC §3 rules (NULLS FIRST asc / LAST desc). */
   readonly range: (table: AnySyncTable, plan: IndexRangePlan) => Promise<ReadonlyArray<string>>
   readonly close: () => Promise<void>
 }

@@ -29,7 +29,7 @@ export class InvalidRow extends Schema.TaggedError<InvalidRow>()("InvalidRow", {
   message: Schema.String
 }) {}
 
-/** An authoritative database write violated an app constraint (DESIGN §16.15). */
+/** An authoritative database write violated an app constraint (DECISIONS 15). */
 export class ConstraintViolated extends Schema.TaggedError<ConstraintViolated>()("ConstraintViolated", {
   kind: Schema.Literals(["unique", "other"]),
   constraint: Schema.NullOr(Schema.String),
