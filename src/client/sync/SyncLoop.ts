@@ -25,7 +25,7 @@ import {
 import type { Errors, Protocol } from "echo-sync"
 import type * as Engine from "./Engine.ts"
 import * as SyncFailure from "./SyncFailure.ts"
-import { type PullTransportError, SyncErrorKind } from "./SyncFailure.ts"
+import { type PullReason, SyncErrorKind } from "./SyncFailure.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
 export const PushState = Schema.Union([
@@ -256,7 +256,7 @@ export const make = (options: {
  */
 const pokesOutcome =
   (timedOut: () => boolean) =>
-  (cause: Cause.Cause<PullTransportError | Cause.Done>): Telemetry.Outcome =>
+  (cause: Cause.Cause<PullReason | Cause.Done>): Telemetry.Outcome =>
     Result.match(Pull.filterNoDone(cause), {
       onSuccess: (failure) => SyncFailure.classifyPull(failure).outcome,
       onFailure: () => (timedOut() ? "idle-timeout" : "server-end")
@@ -279,10 +279,7 @@ export const followPokes = (options: {
    * One (re)connect: the Effect prepares it (resolves credentials, INV-LOOP-8) and the stream it
    * returns sends the request when run. `idleTimeout` covers only the stream (INV-LOOP-8).
    */
-  readonly connect: Effect.Effect<
-    Stream.Stream<{ readonly _tag: "poke" | "heartbeat" }, PullTransportError>,
-    PullTransportError
-  >
+  readonly connect: Effect.Effect<Stream.Stream<{ readonly _tag: "poke" | "heartbeat" }, PullReason>, PullReason>
   readonly wake: Effect.Effect<void>
   readonly retryDelay?: Duration.Input
   readonly maxRetryDelay?: Duration.Input

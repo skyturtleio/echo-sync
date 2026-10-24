@@ -14,7 +14,6 @@ import { TestClock } from "effect/testing"
 import * as Engine from "../src/client/sync/Engine.ts"
 import * as SqliteSyncStorage from "../src/client/sync/SqliteSyncStorage.ts"
 import * as SyncLoop from "../src/client/sync/SyncLoop.ts"
-import * as SyncFailure from "../src/client/sync/SyncFailure.ts"
 import * as Transport from "../src/client/sync/Transport.ts"
 import { executeBatch, handlers, layerHttp, Notifications } from "../src/server/postgres/rpc.ts"
 import { collectGarbage, expireLedger } from "../src/server/postgres/gc.ts"
@@ -38,7 +37,6 @@ const done: Protocol.PullResponse = {
   nextCursor: cursor,
   expiredThrough: Ids.SeqFloor.make(0)
 }
-const pushError = (reason: SyncFailure.PushReason) => new SyncFailure.PushTransportError({ reason })
 const malformedEnvelope = () =>
   new Protocol.MalformedEnvelope({
     clientId: Ids.ClientId.make("device"),
@@ -127,10 +125,8 @@ it.live(
 
 it.effect("batch telemetry agrees with the loop's whole-cause decision, not the first failure", () =>
   Effect.gen(function* () {
-    const unauthorized = Cause.fail(
-      pushError(new Protocol.Unauthorized({ reason: "authenticationRefused", message: secret }))
-    )
-    const malformed = Cause.fail(pushError(malformedEnvelope()))
+    const unauthorized = Cause.fail(new Protocol.Unauthorized({ reason: "authenticationRefused", message: secret }))
+    const malformed = Cause.fail(malformedEnvelope())
     for (const { cause, expected } of [
       { cause: Cause.combine(unauthorized, malformed), expected: "halted" },
       { cause: Cause.combine(malformed, unauthorized), expected: "halted" },
@@ -182,8 +178,7 @@ it.effect("the whole final push cause remains authoritative, including typed cle
         let pulls = 0
         const failure = new Error(`cleanup-${secret}`)
         const { engine, storage } = yield* device({
-          push: () =>
-            Effect.fail(pushError(new Protocol.Unauthorized({ reason: "authenticationRefused", message: secret }))),
+          push: () => Effect.fail(new Protocol.Unauthorized({ reason: "authenticationRefused", message: secret })),
           pull: () =>
             Effect.sync(() => {
               pulls++
@@ -194,7 +189,7 @@ it.effect("the whole final push cause remains authoritative, including typed cle
         const push = engine.push.pipe(
           Effect.onExit(() =>
             mode === "typed"
-              ? Effect.fail(pushError(malformedEnvelope()))
+              ? Effect.fail(malformedEnvelope())
               : mode === "interrupt"
                 ? Effect.interrupt
                 : Effect.die(failure)
@@ -250,11 +245,9 @@ it.effect("throwing host sinks cannot change saved intent, retry deadlines, halt
             Effect.suspend(() => {
               pushes++
               return Effect.fail(
-                pushError(
-                  pushes === 1
-                    ? new Protocol.Unauthorized({ reason: "authenticationRefused", message: secret })
-                    : malformedEnvelope()
-                )
+                pushes === 1
+                  ? new Protocol.Unauthorized({ reason: "authenticationRefused", message: secret })
+                  : malformedEnvelope()
               )
             }),
           pull: () => Effect.succeed(done)
@@ -303,8 +296,7 @@ it.live("SQLite sync never exports a typed failure, defect, result or dependency
   return Effect.gen(function* () {
     let failing = false
     const { engine, storage } = yield* device({
-      push: () =>
-        Effect.fail(pushError(new Protocol.Unauthorized({ reason: "authenticationRefused", message: secret }))),
+      push: () => Effect.fail(new Protocol.Unauthorized({ reason: "authenticationRefused", message: secret })),
       pull: () => (failing ? Effect.die(new Error(secret)) : Effect.succeed(done))
     })
     yield* engine.mutate(Ids.MutationId.make("intent"), "accept", { secret })

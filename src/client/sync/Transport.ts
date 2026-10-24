@@ -1,10 +1,9 @@
 /**
  * The engine's `Transport` over core's `SyncRpcs` (SPEC §8, §7, §10), on the leader.
  *
- * This module owns the RPC client and so its error union, and is where every failure is classified
- * once: each push failure becomes a `SyncFailure.PushTransportError` and each pull and pokes failure a
- * `SyncFailure.PullTransportError`, whose `reason` is the innermost recognized evidence (a credential
- * failure or an HTTP 401/403 inside an `RpcClientError` is that reason, never `network`). What a reason means (its status kind, whether a
+ * This module owns the RPC client and lifts credential failures and HTTP 401/403 out of an
+ * `RpcClientError`. Other failures retain their original tag without transport wrappers.
+ * What an error means (its status kind, whether a
  * push halts) is decided in `SyncFailure`. A push halts (INV-LOOP-3) on:
  * - core's `MalformedEnvelope`: the server refused the batch;
  * - `PushIntegrityError{invalidPayload}`: the outbox batch is not a valid `Protocol.PushRequest` before
@@ -27,13 +26,7 @@ import { RpcClient, RpcClientError, RpcSerialization } from "effect/rpc"
 import { type AccessScope, type Ids, Protocol } from "echo-sync"
 import type * as Presence from "./Presence.ts"
 import type * as Engine from "./Engine.ts"
-import {
-  CredentialsUnavailable,
-  PullProtocolError,
-  PushIntegrityError,
-  PullTransportError,
-  PushTransportError
-} from "./SyncFailure.ts"
+import { CredentialsUnavailable, PullProtocolError, PushIntegrityError, type PullReason } from "./SyncFailure.ts"
 
 /**
  * `error`, or the more specific evidence an `RpcClientError` wraps (SPEC §10): the
@@ -100,7 +93,7 @@ export interface SyncTransport extends Engine.Transport {
     clientId: Ids.ClientId,
     principal: AccessScope.PrincipalId,
     epoch?: Effect.Effect<{ readonly epoch?: string | null }>
-  ) => Effect.Effect<Stream.Stream<typeof Protocol.PokesElement.Type, PullTransportError>, PullTransportError>
+  ) => Effect.Effect<Stream.Stream<typeof Protocol.PokesElement.Type, PullReason>, PullReason>
   /** `Protocol.PresenceRpcs` on the same mount (the server merges both groups, SPEC §10). */
   readonly presence: (
     clientId: Ids.ClientId,
@@ -138,18 +131,14 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
         return yield* client.push(payload)
       }).pipe(
         defectsAs((message) => new PushIntegrityError({ reason: "serverDefect", message })),
-        Effect.mapError((error) =>
-          error._tag === "ResnapshotRequired" ? error : new PushTransportError({ reason: lift(error) })
-        )
+        Effect.mapError(lift)
       ),
 
     // The request is built by the engine from core types; the response is decoded by the RPC client.
     pull: (request) =>
       client.pull(request).pipe(
         defectsAs((message) => new PullProtocolError({ message })),
-        Effect.mapError((error) =>
-          error._tag === "ResnapshotRequired" ? error : new PullTransportError({ reason: lift(error) })
-        )
+        Effect.mapError(lift)
       ),
 
     // Any end of this stream (failure, defect, completion) is handled by reconnecting (followPokes).
@@ -160,16 +149,11 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
         ).pipe(
           // A restored server may be otherwise quiet. Wake pull to negotiate its timeline.
           Stream.catchTag("ResnapshotRequired", () => Stream.succeed(Protocol.Poke.make({}))),
-          Stream.mapError((error) => new PullTransportError({ reason: lift(error) }))
+          Stream.mapError(lift)
         )
         return prepared === undefined ? stream : stream.pipe(Stream.provideService(PreparedHeaders, prepared))
       }
-      return headers === undefined
-        ? Effect.succeed(open(undefined))
-        : acquire(headers).pipe(
-            Effect.mapError((reason) => new PullTransportError({ reason })),
-            Effect.map(open)
-          )
+      return headers === undefined ? Effect.succeed(open(undefined)) : acquire(headers).pipe(Effect.map(open))
     },
 
     presence: (clientId, principal, epoch = Effect.succeed({})) => ({

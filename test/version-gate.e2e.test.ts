@@ -203,9 +203,9 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
         )
         expect(refused._tag).toBe("Failure")
         const refusal = Option.getOrNull(Exit.findErrorOption(refused))
-        expect(refusal?._tag === "PullTransportError" && refusal.reason._tag).toBe("ClientOutdated")
+        expect(refusal?._tag).toBe("ClientOutdated")
         const pushRefusal = yield* Effect.flip(engine.push)
-        expect(pushRefusal._tag === "PushTransportError" && pushRefusal.reason).toBeInstanceOf(Protocol.ClientOutdated)
+        expect(pushRefusal).toBeInstanceOf(Protocol.ClientOutdated)
         expect(history.map((h) => h.migration)).toEqual(["001_old", "002_current"])
         expect(allowed.size).toBe(1)
         const loop = yield* SyncLoop.make({

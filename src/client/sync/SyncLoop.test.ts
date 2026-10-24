@@ -17,18 +17,16 @@ const rpcFailure = () =>
   })
 // The real fatal classification and core's real error, not stand-ins (reviewer question 1).
 const malformed = () =>
-  new SyncFailure.PushTransportError({
-    reason: new Protocol.MalformedEnvelope({
-      clientId: Ids.ClientId.make("c"),
-      mutationId: Ids.MutationId.make("m"),
-      message: "bad envelope"
-    })
+  new Protocol.MalformedEnvelope({
+    clientId: Ids.ClientId.make("c"),
+    mutationId: Ids.MutationId.make("m"),
+    message: "bad envelope"
   })
-const offline = () => new SyncFailure.PushTransportError({ reason: rpcFailure() })
-const pullOffline = () => new SyncFailure.PullTransportError({ reason: rpcFailure() })
+const offline = rpcFailure
+const pullOffline = rpcFailure
 
 /** Fake engine: `pushFails` decides each push attempt's outcome; counts calls. */
-const fakeEngine = (pushFails: (attempt: number) => SyncFailure.PushTransportError | undefined) => {
+const fakeEngine = (pushFails: (attempt: number) => SyncFailure.PushReason | undefined) => {
   const calls = { push: 0, pull: 0 }
   const engine: Engine.Engine = {
     mutate: () => Effect.die("unused"),

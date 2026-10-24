@@ -28,10 +28,7 @@ interface Handlers {
  * A real RpcServer (HTTP, NDJSON) behind a web handler, and the leader's Transport talking to it
  * through `fetch`. `served` counts requests that reached the server.
  */
-const harness = <
-  A extends SyncFailure.PushTransportError | SyncFailure.PullTransportError | Protocol.ResnapshotRequired,
-  B
->(
+const harness = <A extends SyncFailure.PushReason | SyncFailure.PullReason, B>(
   server: Layer.Layer<never, never, HttpRouter.HttpRouter> | "unreachable",
   body: (transport: Effect.Success<typeof Transport.make>) => Effect.Effect<B, A>
 ) =>
@@ -225,8 +222,8 @@ it.effect("push failures are fatal exactly when SPEC §10 says so, classified by
     for (const c of cases) {
       const { exit, served } = yield* harness(c.server, (t) => t.push(batch(c.size)))
       const failure = failureOf(exit)
-      if (!(failure instanceof SyncFailure.PushTransportError)) throw new Error(`${c.name}: ${String(failure)}`)
-      const reason = failure.reason
+      if (typeof failure === "string") throw new Error(`${c.name}: ${failure}`)
+      const reason = failure
       const tag = reason._tag === "PushIntegrityError" ? `${reason._tag}:${reason.reason}` : reason._tag
       expect({ case: c.name, tag, fatal: isFatal(failure), served }).toEqual({
         case: c.name,
@@ -284,16 +281,13 @@ it.effect(
         (t) => t.pull(request)
       )
       const unavailable = failureOf(down.exit)
-      expect(unavailable).toEqual(
-        new SyncFailure.PullTransportError({ reason: new Protocol.ServerUnavailable({ message: "db down" }) })
-      )
+      expect(unavailable).toEqual(new Protocol.ServerUnavailable({ message: "db down" }))
 
       const noId = yield* harness(skewedPull, (t) => t.pull(request))
       const dies = yield* harness(serve({ pull: () => Effect.die(new Error("bug")) }), (t) => t.pull(request))
       for (const exit of [noId.exit, dies.exit]) {
         const failure = failureOf(exit)
-        if (!(failure instanceof SyncFailure.PullTransportError)) throw new Error(String(failure))
-        expect(failure.reason).toBeInstanceOf(SyncFailure.PullProtocolError)
+        expect(failure).toBeInstanceOf(SyncFailure.PullProtocolError)
       }
     }).pipe(Effect.scoped)
 )

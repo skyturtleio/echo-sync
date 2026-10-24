@@ -24,7 +24,6 @@ import * as SqlClient from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation, Protocol, Query, Registry, ScopeGrants, type Store, SyncTable } from "echo-sync"
 import * as Engine from "../sync/Engine.ts"
 import * as SqliteSyncStorage from "../sync/SqliteSyncStorage.ts"
-import { PullTransportError, PushTransportError } from "../sync/SyncFailure.ts"
 import * as SyncLoop from "../sync/SyncLoop.ts"
 import { enqueueAndWake, makeHandlers } from "./Leader.ts"
 import { type LeaderCalls, tabApi } from "./LeaderClient.ts"
@@ -504,18 +503,16 @@ it.live("a dismissed notice is gone from the notices stream, and an undismissed 
 
 /** A push integrity failure (the server refused the batch): halts push. */
 const integrity = () =>
-  new PushTransportError({
-    reason: new Protocol.MalformedEnvelope({
-      clientId: Ids.ClientId.make("c"),
-      mutationId: Ids.MutationId.make("m"),
-      message: "bad envelope"
-    })
+  new Protocol.MalformedEnvelope({
+    clientId: Ids.ClientId.make("c"),
+    mutationId: Ids.MutationId.make("m"),
+    message: "bad envelope"
   })
 /** No usable RPC result: transient. */
 const unreachable = () =>
   new RpcClientError.RpcClientError({ reason: new RpcClientError.RpcClientDefect({ message: "offline", cause: null }) })
-const pushOffline = () => new PushTransportError({ reason: unreachable() })
-const pullOffline = () => new PullTransportError({ reason: unreachable() })
+const pushOffline = unreachable
+const pullOffline = unreachable
 const decodePush = Schema.decodeUnknownSync(Protocol.PushResponse)
 
 /** One replica database, shared by the successive leaders of a test (a handover keeps the file). */

@@ -26,7 +26,7 @@ import { Array as Arr, Clock, Deferred, Effect, Fiber, Option, Order, Schema } f
 import { TestClock } from "effect/testing"
 import { RpcClientError } from "effect/rpc"
 import * as Engine from "../Engine.ts"
-import { type PullFailure, PullTransportError, type PushFailure, PushTransportError } from "../SyncFailure.ts"
+import type { PullFailure, PushFailure } from "../SyncFailure.ts"
 import { Ids, ScopeGrants } from "../../../core/index.ts"
 import type { AccessScope, Mutation, Protocol, SyncTable } from "../../../core/index.ts"
 import * as MemoryStore from "../../../core/testing/MemoryStore.ts"
@@ -54,9 +54,9 @@ const lost = (during: string) =>
     reason: new RpcClientError.RpcClientDefect({ message: `lost ${during}`, cause: null })
   })
 /** A lost push request or response: what the transport reports when no usable RPC result arrived. */
-export const pushLost = (during: string) => new PushTransportError({ reason: lost(during) })
+export const pushLost = lost
 /** A lost pull request or response. */
-export const pullLost = (during: string) => new PullTransportError({ reason: lost(during) })
+export const pullLost = lost
 
 export class InvariantViolated extends Schema.TaggedError<InvariantViolated>()("InvariantViolated", {
   seed: Schema.Number,
@@ -448,7 +448,7 @@ export const run = (options: Options) =>
       self.pipe(
         Effect.asVoid,
         Effect.catch((error) => {
-          if (error instanceof PushTransportError || error instanceof PullTransportError) {
+          if (error instanceof RpcClientError.RpcClientError) {
             return Effect.sync(() => note(`  ↳ ${error._tag}`))
           }
           if (error instanceof Engine.LocallyRejected) return Effect.sync(() => note(`  ↳ ${error._tag}`))

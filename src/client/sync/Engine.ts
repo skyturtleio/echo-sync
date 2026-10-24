@@ -15,12 +15,13 @@
  * would either expose a torn transaction or replay a pending mutation over a server row that
  * already contains it.
  */
-import { Array as Arr, Clock, Effect, Option, Schema, Semaphore } from "effect"
+import { Array as Arr, Clock, Effect, Match, Option, Schema, Semaphore } from "effect"
 import { Mutation, Protocol, Store } from "../../core/index.ts"
 import type { AccessScope, Errors, Ids, Registry, SyncTable } from "../../core/index.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
+import { failureOutcome } from "../../internal/ErrorCatalog.ts"
 import * as SyncFailure from "./SyncFailure.ts"
-import { MalformedChange, type PullTransportError, type PushTransportError, ServerOutdated } from "./SyncFailure.ts"
+import { MalformedChange, type PullReason, type PushReason, ServerOutdated } from "./SyncFailure.ts"
 
 type PullPage = typeof Protocol.PullPage.Type
 type PullDone = typeof Protocol.PullDone.Type
@@ -96,12 +97,8 @@ export interface SyncStorage {
 
 /** The network port. Every failure is classified once, by the transport (see `SyncFailure`). */
 export interface Transport {
-  readonly push: (
-    request: Protocol.PushRequest
-  ) => Effect.Effect<Protocol.PushResponse, PushTransportError | Protocol.ResnapshotRequired>
-  readonly pull: (
-    request: Protocol.PullRequest
-  ) => Effect.Effect<Protocol.PullResponse, PullTransportError | Protocol.ResnapshotRequired>
+  readonly push: (request: Protocol.PushRequest) => Effect.Effect<Protocol.PushResponse, PushReason>
+  readonly pull: (request: Protocol.PullRequest) => Effect.Effect<Protocol.PullResponse, PullReason>
 }
 
 /** The handler rejected the mutation against the local replica; nothing was saved. */
@@ -150,9 +147,22 @@ const replay = (context: Context, entry: PendingMutation) =>
 /** The notice a released mutation leaves behind, if any. */
 const noticeFor = (envelope: Mutation.MutationEnvelope, outcome: Mutation.MutationOutcome): Option.Option<Notice> => {
   if (outcome._tag === "Applied") return Option.none()
-  // ClientExpired answers a resubmission whose ledger row expired: it was processed before.
-  if (outcome.error._tag === "ClientExpired") return Option.some({ _tag: "OutcomeUnknown", envelope })
-  return Option.some({ _tag: "Rejected", envelope, error: outcome.error })
+  const rejected = (error: Mutation.MutationRejection): Notice => ({ _tag: "Rejected", envelope, error })
+  return Option.some(
+    Match.valueTags(outcome.error, {
+      UnknownMutation: rejected,
+      ArgsDecodeFailed: rejected,
+      RowNotFound: rejected,
+      RowAlreadyExists: rejected,
+      ScopeForbidden: rejected,
+      InvalidRow: rejected,
+      DomainError: rejected,
+      ConstraintViolated: rejected,
+      ClockSkew: rejected,
+      // Expired ledger rows were processed before, but no longer have a known outcome.
+      ClientExpired: (): Notice => ({ _tag: "OutcomeUnknown", envelope })
+    })
+  )
 }
 
 /**
@@ -361,9 +371,7 @@ export const make = (options: {
           })
         ),
         "echo.enqueue",
-        Telemetry.byFailure((error: StoreUnavailable | LocallyRejected) =>
-          error._tag === "LocallyRejected" ? "rejected" : "server"
-        )
+        Telemetry.byFailure(failureOutcome)
       )
 
     const push = pushLock.withPermit(

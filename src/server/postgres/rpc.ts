@@ -7,7 +7,6 @@ import {
   Duration,
   Effect,
   Layer,
-  Match,
   Option,
   Predicate,
   PubSub,
@@ -31,6 +30,7 @@ import { checkEpoch } from "./epoch.ts"
 import * as RowStore from "./rowStore.ts"
 import { resolveTables } from "./schema.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
+import { failureOutcome } from "../../internal/ErrorCatalog.ts"
 
 export interface SyncServerOptions {
   readonly registry: Registry.SyncRegistry
@@ -54,23 +54,7 @@ export interface SyncServerOptions {
 }
 
 /** The telemetry outcome of a sync handler's typed failures (SPEC §14). */
-const protocolOutcome = Telemetry.byFailure(
-  (
-    error:
-      | Protocol.Unauthorized
-      | Protocol.MalformedEnvelope
-      | Protocol.ClientOutdated
-      | Protocol.ResnapshotRequired
-      | Protocol.ServerUnavailable
-  ): Telemetry.Outcome =>
-    Match.valueTags(error, {
-      Unauthorized: (): Telemetry.Outcome => "unauthorized",
-      MalformedEnvelope: (): Telemetry.Outcome => "halted",
-      ClientOutdated: (): Telemetry.Outcome => "outdated",
-      ResnapshotRequired: (): Telemetry.Outcome => "resnapshot",
-      ServerUnavailable: (): Telemetry.Outcome => "unavailable"
-    })
-)
+const protocolOutcome = Telemetry.byFailure(failureOutcome)
 
 /** `notify` channel of `echo_sync.next_position()`: one hint per committed writing transaction. */
 export const pokeChannel = "echo_sync"
