@@ -5,14 +5,9 @@
   "attributeKeys": ["echo.outcome", "echo.result", "echo.reason", "echo.resnapshot"],
   "eventNames": [],
   "logMessages": ["echo-sync: diagnostics", "echo-sync: unknown table change skipped", "echo-sync: push halted by an integrity error", "echo-sync: push failed; retrying", "echo-sync: pull failed; retrying", "echo-sync: pending count failed; restarting", "echo-sync: pokes stream ended; reconnecting", "echo-sync: presence track failed; retrying", "echo leader candidate cannot serve", "echo: connecting to leader failed", "echo: accepting a router connection failed", "echo: watching this tab's leader epoch failed", "echo: watching leader epoch failed", "echo router: watching leader epoch failed", "echo router: watching tab failed", "echo router: leader announcement failed", "presence revocation watch restarting", "echo leader completed the removal of a replica condemned by an interrupted reset"],
-  "ProtocolErrors": ["ResnapshotRequired", "Unauthorized", "ClientOutdated", "MalformedEnvelope", "ServerUnavailable", "Forbidden"],
   "ResnapshotRequired": ["gcHorizon", "unknownCursor", "staleContinuation"],
   "UnauthorizedReason": ["authenticationRefused", "principalMismatch", "clientPrincipalMismatch", "wildcardPrincipal", "httpUnauthorized"],
-  "SyncFailureErrors": ["CredentialsUnavailable", "PushIntegrityError", "PullProtocolError", "MalformedChange", "ServerOutdated", "PushTransportError", "PullTransportError"],
   "PushIntegrityError": ["invalidPayload", "serverDefect"],
   "SyncErrorKind": ["credentials", "unauthorized", "unavailable", "network", "server", "outdated", "server-outdated"],
-  "Notice": ["Rejected", "OutcomeUnknown"],
-  "MutationRejection": ["UnknownMutation", "ArgsDecodeFailed", "RowNotFound", "RowAlreadyExists", "ScopeForbidden", "InvalidRow", "DomainError", "ConstraintViolated", "ClientExpired", "ClockSkew"],
-  "PushReason": ["CredentialsUnavailable", "Unauthorized", "ClientOutdated", "MalformedEnvelope", "PushIntegrityError", "RpcClientError"],
-  "PullReason": ["CredentialsUnavailable", "Unauthorized", "ClientOutdated", "ServerUnavailable", "PullProtocolError", "RpcClientError"]
+  "Notice": ["Rejected", "OutcomeUnknown"]
 }

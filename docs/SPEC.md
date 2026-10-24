@@ -1446,8 +1446,9 @@ routine lines and a sanitizing tracer with `Exit.void` replace unguarded export.
   removed; the cause is logged separately at Debug under the annotation `echo.diagnostics: true`
   (the only place a host can opt into seeing engine causes). A line whose cause is an interrupt
   is logged at Debug whatever its level.
-- INV-TEL-6: The telemetry and error/notice vocabularies in §14–15 equal the committed
-  `docs/vocabularies.json` lists, checked by `test/vocabularies.test.ts` in the default gate.
+- INV-TEL-6: The telemetry and reason/notice vocabularies in §14–15 equal the committed
+  `docs/vocabularies.json` lists; error codes equal the §15.1 table directly, checked by
+  `test/vocabularies.test.ts` in the default gate.
   A new member requires an explicit specification change, not only a source edit.
 
 **Rationale (2026-10-24):** A committed, normative JSON vocabulary beside this spec makes
@@ -1536,9 +1537,10 @@ changing retained notices, or changing operator-visible outcomes. Status kinds a
 outcomes remain projections, not additional error identities; successful responses containing
 mutation rejections must not be reclassified as failed operations.
 
-`docs/vocabularies.json` is the normative machine-readable companion for §14.1 and the wire
-error tags/reasons, client sync failure tags/reasons, mutation rejection tags and notice tags
-in this chapter. Notice tags are `Rejected` and `OutcomeUnknown` (§9.5). Span event names are
+`docs/vocabularies.json` is the normative machine-readable companion for §14.1 and the
+reason literals, status kinds and notice tags in this chapter. Error codes are checked against
+§15.1 directly rather than duplicated in JSON. Notice tags are `Rejected` and `OutcomeUnknown`
+(§9.5). Span event names are
 the empty set: no event is exported. Attribute keys are the four fixed keys of INV-TEL-2 plus
 the count keys. Changes to these lists must also update the corresponding prose catalog.
 
@@ -1970,8 +1972,8 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-TEL-6 | covered | `vocabularies.test` "telemetry, wire errors and client failure or notice vocabularies cannot drift from SPEC §14–15" |
 | INV-ERR-1 | covered | `Transport.test` "Unauthorized reason schema matches the closed catalog in SPEC §15", "a server Unauthorized surfaces its diagnostic reason without changing the unauthorized verdict", "HTTP auth refusals before RPC decoding report unauthorized, retry without halting, and keep the pending mutation; other statuses stay network"; `rpc.test` "push, pull and pokes asserting another principal than the session's run no statement or policy and change no row, even for a bound client", "an app authentication refusal carries authenticationRefused through the public RPC surface", "a client bound to another principal carries clientPrincipalMismatch through the public RPC surface", "push, pull and pokes authenticated as * are Unauthorized before they bind or ledger" |
 | INV-ERR-2 | partial | `SqliteRowStore.test` "a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError"; OPFS diagnostic coverage is in browser scenarios only |
-| INV-ERR-3 | untested | — (catalog equality and exhaustive-mapping compile fixture pending implementation) |
-| INV-ERR-4 | untested | — (notice and operation-outcome regression pending implementation) |
+| INV-ERR-3 | covered | `vocabularies.test` "telemetry, wire errors and client failure or notice vocabularies cannot drift from SPEC §14–15", "a wire error without a catalog mapping cannot compile" (also checked by `tsc --noEmit`) |
+| INV-ERR-4 | covered | `observability.e2e` "request failures append no notices and ledgered rejections keep successful batch outcomes", "batch telemetry agrees with the loop's whole-cause decision, not the first failure" |
 | INV-PERF-1 | covered | `ordering.test` "without the trigger's advisory lock that reader skips the earlier writer (the ordering check can fail)" (the lock is held; its throughput consequence is not measured) |
 | INV-PERF-2 | covered | `perf-postgres.test` "a pushed mutation adds only its N reads and M writes to the fixed ledger cost" |
 | INV-PERF-3 | covered | `perf-postgres.test` "empty, log and scope-walk pages retain their derived statement and returned-row budgets" |

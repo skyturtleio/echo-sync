@@ -9,7 +9,7 @@ import { FetchHttpClient, Headers, HttpRouter, HttpServerRequest, HttpServerResp
 import { Rpc } from "effect/rpc"
 import { RequestId } from "effect/rpc/RpcMessage"
 import { SqlClient } from "effect/sql/SqlClient"
-import { AccessScope, Ids, Mutation, Protocol } from "echo-sync"
+import { AccessScope, Errors, Ids, Mutation, Protocol } from "echo-sync"
 import { TestClock } from "effect/testing"
 import * as Engine from "../src/client/sync/Engine.ts"
 import * as SqliteSyncStorage from "../src/client/sync/SqliteSyncStorage.ts"
@@ -56,11 +56,62 @@ const device = Effect.fnUntraced(
       mutations,
       transport
     })
-    return { engine, storage }
+    return { engine, storage, sqlite }
   },
   Effect.provide(Reactivity.layer),
   Effect.provideService(Tracer.Tracer, Tracer.nativeTracer)
 )
+
+it.effect("request failures append no notices and ledgered rejections keep successful batch outcomes", () => {
+  const recording = recorder()
+  const outcomes = (name: string) =>
+    recording.spans.filter((span) => span.name === name).map((span) => new Map(span.attributes).get("echo.outcome"))
+  return Effect.gen(function* () {
+    let refused = true
+    let results: Protocol.PushResponse["results"] = []
+    const { engine, storage, sqlite } = yield* device({
+      push: (request) => {
+        if (refused) return Effect.fail(new Protocol.Unauthorized({ message: secret }))
+        results = request.mutations.map((envelope, index) => ({
+          mutationId: envelope.mutationId,
+          position: cursor,
+          outcome: {
+            _tag: "Rejected",
+            error:
+              index === 0
+                ? new Errors.ConstraintViolated({ kind: "unique", constraint: "unique-title", message: secret })
+                : index === 1
+                  ? new Mutation.ClockSkew({ createdAt: 40001, serverNow: 10000 })
+                  : new Mutation.ClientExpired({ mutationId: envelope.mutationId })
+          }
+        }))
+        return Effect.succeed({ results })
+      },
+      pull: () => Effect.succeed({ ...done, acks: results })
+    })
+    const local = yield* Effect.flip(engine.mutate(Ids.MutationId.make("local"), "missing", {}))
+    expect(local).toBeInstanceOf(Engine.LocallyRejected)
+    for (const id of ["constraint", "clock", "expired"]) yield* engine.mutate(Ids.MutationId.make(id), "accept", {})
+    yield* Effect.exit(engine.push)
+    expect(yield* storage.transaction(SqliteSyncStorage.notices(sqlite))).toEqual([])
+    expect(yield* storage.transaction(storage.pending)).toHaveLength(3)
+    refused = false
+    yield* engine.push
+    const immediate = yield* storage.transaction(SqliteSyncStorage.notices(sqlite))
+    expect(immediate.map(({ notice }) => notice._tag)).toEqual(["OutcomeUnknown"])
+    yield* engine.pull
+    const retained = yield* storage.transaction(SqliteSyncStorage.notices(sqlite))
+    expect(retained.map(({ notice }) => notice._tag)).toEqual(["OutcomeUnknown", "Rejected", "Rejected"])
+    expect(retained.flatMap(({ notice }) => (notice._tag === "Rejected" ? [notice.error] : []))).toEqual([
+      new Errors.ConstraintViolated({ kind: "unique", constraint: "unique-title", message: secret }),
+      new Mutation.ClockSkew({ createdAt: 40001, serverNow: 10000 })
+    ])
+    expect(yield* storage.transaction(storage.pending)).toEqual([])
+    expect(outcomes("echo.enqueue")).toEqual(["rejected", "saved", "saved", "saved"])
+    expect(outcomes("echo.push")).toEqual(["unauthorized", "ok"])
+    expect(outcomes("echo.pull")).toEqual(["ok"])
+  }).pipe(Effect.scoped, Effect.provide(recording.layer))
+})
 
 it.live(
   "sync propagates exported IDs and sampling through suppressed spans and preserves an explicit external parent",
