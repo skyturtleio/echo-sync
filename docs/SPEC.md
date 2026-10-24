@@ -1593,7 +1593,9 @@ inside `DomainError.error`; dependency errors other than the recognized `RpcClie
 are not new engine codes. Testing-only errors and private implementation errors mapped at
 public boundaries (such as `UnsupportedHost`) are outside this catalog. The redundant internal
 `PushTransportError` and `PullTransportError` carriers are removed by this refactor; their
-underlying error tags, status kinds and messages are preserved.
+underlying error tags, status kinds and safe status messages are preserved. Opt-in diagnostic
+causes now contain the underlying error directly, not the removed wrapper's tag, nesting or
+rendered stack. Raw diagnostic representation is not the stable app-facing status contract.
 
 | code (`_tag` unless marked `name`) | fields | raised by | push halt / recovery | retained notice or app failure/status | telemetry outcome at observation point |
 |---|---|---|---|---|---|

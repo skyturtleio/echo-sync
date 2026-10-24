@@ -98,7 +98,18 @@ it("telemetry, wire errors and client failure or notice vocabularies cannot drif
       const node = statement.declaration
       const body = text.slice(node.start, node.end)
       codes.push(...errors(body))
-      if (node.superClass?.type === "Identifier" && node.superClass.name === "Error") codes.push(...literals(body))
+      if (node.superClass?.type === "Identifier" && node.superClass.name === "Error") {
+        for (const field of node.body.body) {
+          if (
+            field.type === "PropertyDefinition" &&
+            field.key.type === "Identifier" &&
+            field.key.name === "name" &&
+            field.value?.type === "Literal" &&
+            typeof field.value.value === "string"
+          )
+            codes.push(field.value.value)
+        }
+      }
     }
   }
   codes.push(
@@ -115,7 +126,7 @@ it("telemetry, wire errors and client failure or notice vocabularies cannot drif
 })
 
 it("a wire error without a catalog mapping cannot compile", () => {
-  // The RPC-derived PushReason expands when the wire schema changes. Its mapping has no fallback.
+  // Closed input check; the catalog's Record constraint separately checks every RPC-derived tag.
   // @ts-expect-error An additional wire tag requires a catalog entry before it can be classified.
   const missingMapping: (error: PushReason | { readonly _tag: "FutureWireError" }) => unknown = failureMeaning
   expect(missingMapping(new Protocol.Unauthorized({ message: "refused" }))).toEqual({
