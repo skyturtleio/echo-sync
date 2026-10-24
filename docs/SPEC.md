@@ -760,13 +760,6 @@ upsert entries, for payloads; one ack `SELECT`; `COMMIT`; after the transaction,
 `INSERT client_scopes` on `PullDone`. Plus, per request, the principal lookup, `clientPolicy` and
 `registerClient` and one epoch read.
 
-### Open Questions
-
-- OQ-PULL-2: Unknown-table changes are skipped by the client at debug level (§9.3). A client on
-  an old registry therefore installs `nextCursor` past rows it never stored; it relies on the
-  `dataHash` rebuild when the app updates. The retired design text said this is intended; the
-  code confirms it; no test covers it.
-
 ## 8. Push
 
 ### Overview
@@ -2046,7 +2039,6 @@ machine-verifiable literal test-title citations.
 
 | ID | section | question |
 |---|---|---|
-| OQ-PULL-2 | §7 | unknown-table changes skipped at install advance the cursor past rows never stored; untested |
 | OQ-CLI-1 | §9 (Q3), §16 | full rebase: 49.41 ms for 5/50, 651.39 ms for 500/5,000 pending/changes (Bun memory VFS); algorithm decision remains open |
 | OQ-LOOP-1 | §10 | the push halt is in memory per leader; a new leader retries the batch and halts again |
 
