@@ -956,6 +956,10 @@ notice by its mutation: a `DomainError` payload round-trips to the declared erro
 of another mutation, or one its schemas cannot read, is `NoticeMismatch`, never a value or a
 defect.
 
+The §15 catalog specifies the notice disposition of each error. Request failures only update
+sync status; they never append mutation notices. Rejection during local replay keeps the
+entry queued without optimistic effects and without a new notice until authoritative settlement.
+
 #### 9.6 Rebuild
 
 INV-CLI-12. After a rebuild the next pull is from a null cursor (the installed set replays
@@ -1433,8 +1437,10 @@ routine lines and a sanitizing tracer with `Exit.void` replace unguarded export.
   the work's result, its saved intent, a retry deadline, a halt or an install (`guard`).
 - INV-TEL-4: The outcome of a span is computed over the whole exit: `ok` on success, else
   `interrupted` if the cause has an interrupt, else `defect` if it has a die, else the
-  classifier's verdict over the typed failures (for push: `halted` beats the first failure; the
-  server's classifier is the constant `server`). A recorded `echo.result` on a successful exit
+  classifier's verdict over the typed failures (for push: `halted` beats the first failure).
+  Typed failures are classified by the error tag in §15, not by each raise site. This does not
+  recursively classify error payloads inside successful mutation outcomes or `LocallyRejected`.
+  A recorded `echo.result` on a successful exit
   (`"saved"`, `"duplicate"`, …) is the outcome.
 - INV-TEL-5: Log lines the host receives are from the closed `LogMessage` set, with their cause
   removed; the cause is logged separately at Debug under the annotation `echo.diagnostics: true`
@@ -1518,9 +1524,17 @@ None.
 ### Overview
 
 Every error the engine can produce is a tagged class in a closed union; the tag is part of the
-contract. The table names where each is raised, whether a client retries it, and what the
-client does. "Retry" is from the sync loop's point of view (§10); "design change" means adding a
-member updates the rule and its dated rationale here (§0.2).
+contract, except the construction errors identified by `Error.name` below. The catalog below
+is the normative list of engine error codes. Removing or renaming a code or a reason literal
+is breaking. Adding a code is additive to the catalog, but sending a new wire variant to an
+older decoder still has to satisfy §0.2. "Retry" is from the sync loop's point of view (§10).
+
+**Rationale (2026-10-24):** Wire errors, client `SyncFailure` wrappers/status kinds, and
+telemetry classifiers described the same failures in three places. One catalog records their
+relationships so a refactor can remove redundant wrappers without renaming wire codes,
+changing retained notices, or changing operator-visible outcomes. Status kinds and telemetry
+outcomes remain projections, not additional error identities; successful responses containing
+mutation rejections must not be reclassified as failed operations.
 
 `docs/vocabularies.json` is the normative machine-readable companion for §14.1 and the wire
 error tags/reasons, client sync failure tags/reasons, mutation rejection tags and notice tags
@@ -1546,18 +1560,91 @@ the count keys. Changes to these lists must also update the corresponding prose 
   a bare `SchemaError` did not identify the stored table or row, while
   `new Error(String(cause))` discarded the cause of browser storage failures.
 
+- INV-ERR-3: The engine-defined observable error codes MUST be exactly the catalog below;
+  additions MUST update the catalog and its code-vocabulary test together. A code cannot be
+  removed or renamed as an implementation-only refactor. Typed RPC failures and mutation
+  rejections MUST be exhaustively mapped: adding a variant without its status/notice mapping
+  MUST fail compilation, not fall through to a default classification.
+- INV-ERR-4: Error mapping MUST preserve the distinction between a request failure, a local
+  enqueue rejection and a ledgered rejection inside a successful response. Request failures
+  do not append retained mutation notices. A ledgered rejection does not by itself change a
+  successful batch's `echo.outcome` to `rejected`. Whole-cause precedence remains §10/§14.
+
 ### Details
 
-#### 15.1 Wire errors (`src/core/Protocol.ts`), encodable, cross the RPC boundary
+#### 15.1 Observable error catalog
 
-| tag | fields | raised by | client action |
-|---|---|---|---|
-| `ResnapshotRequired` | `reason: gcHorizon \| unknownCursor \| staleContinuation, epoch?: string` | all sync RPCs (history fence); `pull` (retention/continuation) | with epoch: reset history and resnapshot (INV-CLI-14); without: INV-CLI-10; pokes wakes pull, presence retries |
-| `Unauthorized` | `reason?: …, message` | `push`, `pull`, `pokes`, `room`, `track`; also HTTP 401/403 | transient, kind `unauthorized`; presence rejoins; the safe closed `reason` is surfaced in `SyncStatus.lastError.message`, but never changes retry behavior |
-| `ClientOutdated` | `message` | app `clientPolicy` on `push`/`pull`; missing required epoch on all sync RPCs | push/pull terminal for this leader, kind `outdated`; streams retry |
-| `MalformedEnvelope` | `clientId, mutationId, message` | `push` (`seq < 1`) | push halts |
-| `ServerUnavailable` | `message` | `pull` (database failure, lost connection), `pokes` (lost `LISTEN`), `room` (grant lookup failed), declared on `track` | transient, kind `unavailable` |
-| `Forbidden` | `room` | `room`, `track` (no grant in the room's scope) | presence subscription ends |
+`notice` below means the durable §9.5 notice, not a failed method call or a `SyncStatus`
+emission. `status(x)` means `lastError.kind = x`, with the safe library message of §10.
+`halt` means the §10 push-loop halt; `stop` is the separate `ClientOutdated` terminal stop.
+`—` means no retained notice or no dedicated error span, respectively. The telemetry column
+describes the existing observation point, not a promise that each error creates a span.
+Interruptions and defects take precedence over typed failures (§14). Rejection payloads are
+successful RPC data: a completed batch is `ok`, a short batch is `stopped`, and server pull
+pages are `page`/`done`, regardless of the rejection tags they contain. A successful client
+full-set pull is `ok`, or `resnapshot` after recovery. Local handler rejections instead
+fail enqueue as `LocallyRejected`, whose outcome is `rejected`.
+
+`core` means either replica or server code. The four construction codes marked `name` are
+ordinary JavaScript errors, not wire `_tag` variants. App-defined domain errors are encoded
+inside `DomainError.error`; dependency errors other than the recognized `RpcClientError`
+are not new engine codes. Testing-only errors and private implementation errors mapped at
+public boundaries (such as `UnsupportedHost`) are outside this catalog. The redundant internal
+`PushTransportError` and `PullTransportError` carriers are removed by this refactor; their
+underlying error tags, status kinds and messages are preserved.
+
+| code (`_tag` unless marked `name`) | fields | raised by | push halt / recovery | retained notice or app failure/status | telemetry outcome at observation point |
+|---|---|---|---|---|---|
+| `ResnapshotRequired` | `reason: gcHorizon \| unknownCursor \| staleContinuation, epoch?: string` | all sync RPCs (history fence); pull (retention/continuation) | no; with epoch: reset history and resnapshot preserving intent (INV-CLI-14); without: INV-CLI-10; pokes wakes pull, presence retries | —; unhandled initial pull failure: status(server); history refusal never exhausts intent | `resnapshot` on failed sync RPC/pull and successful client pull recovery; handled client push refusal `stopped` |
+| `Unauthorized` | `reason?: UnauthorizedReason, message` | server RPC; client HTTP 401/403 | no; retry | —; status(unauthorized), presence rejoins | `unauthorized` on sync RPC/client sync |
+| `ClientOutdated` | `message` | server policy on push/pull; missing required epoch on all sync RPCs | stop push/pull for this leader; streams retry | —; status(outdated) | `outdated` on sync RPC/client sync |
+| `MalformedEnvelope` | `clientId, mutationId, message` | server push | halt | —; Halted | `halted` |
+| `ServerUnavailable` | `message` | server pull/pokes/presence | no; retry | —; status(unavailable), presence rejoins | `unavailable` on sync RPC/client sync |
+| `Forbidden` | `room` | server presence | no; end presence subscription | —; method/stream failure | —; no presence-operation span |
+| `UnknownMutation` | `name` | core registry lookup | no | Rejected when settled; LocallyRejected at enqueue | batch result; local enqueue `rejected` |
+| `ArgsDecodeFailed` | `name, message` | core mutation decode | no | Rejected when settled; LocallyRejected at enqueue | batch result; local enqueue `rejected` |
+| `RowNotFound` | `table, id` | core store | no | Rejected when settled; LocallyRejected at enqueue | batch result; local enqueue `rejected` |
+| `RowAlreadyExists` | `table, id` | core store | no | Rejected when settled; LocallyRejected at enqueue | batch result; local enqueue `rejected` |
+| `ScopeForbidden` | `scopeId, required, held` | core authorization | no | Rejected when settled; LocallyRejected at enqueue | batch result; local enqueue `rejected` |
+| `InvalidRow` | `table, message` | core row validation | no | Rejected when settled; LocallyRejected at enqueue | batch result; local enqueue `rejected` |
+| `DomainError` | `mutation, error: Json` | core declared-error encoding | no | Rejected when settled; LocallyRejected at enqueue | batch result; local enqueue `rejected` |
+| `ConstraintViolated` | `kind: unique \| other, constraint, message` | core storage | no; retry if outside handler rejection | Rejected when settled; LocallyRejected at enqueue; outside handler: status(server) | batch result / local enqueue `rejected` / sync storage failure `server` |
+| `ClientExpired` | `mutationId` | server ledger | no; settle immediately on push receipt | OutcomeUnknown | batch result |
+| `ClockSkew` | `createdAt, serverNow` | server ledger | no; settle on covering ack | Rejected | batch result |
+| `TransientExhausted` | `attempts, message` | client after 8 short-prefix answers | no; release through rebase and continue | Rejected; message `the server stopped the push batch at a transient failure` | exhausting batch `stopped`; not a server outcome |
+| `StoreUnavailable` | `message` | core storage | no; retry | —; status(server) or failed enqueue | `server` on client sync/enqueue; server batch stops |
+| `CorruptStorage` | `table, id, cause` | core stored-data decode | halt if push defect; pull retries | —; defect | `defect` |
+| `UnknownQuery` | `name` | client query lookup | no | —; method/stream failure | — |
+| `QueryArgsDecodeFailed` | `name, message` | client query decode | no | —; method/stream failure | — |
+| `NoticeMismatch` | `mutation, name, message` | client notice decode | no | —; decode failure | — |
+| `DuplicateMutation` (name) | `message` | core registry construction | not running | —; thrown Error | — |
+| `DuplicateQuery` (name) | `message` | core registry construction | not running | —; thrown Error | — |
+| `SyncTableDeclarationError` (name) | `message` | core table declaration | not running | —; thrown Error | — |
+| `MutationTransient` | `clientId, mutationId, message` | server ledger | no; retry remainder | —; status(server) for stopped batch | server batch `stopped`; client batch `stopped` |
+| `ClientForbidden` | `clientId` | server client binding | no; maps to Unauthorized | —; status(unauthorized) through RPC | `unauthorized` after RPC mapping |
+| `LedgerRetentionTooShort` | `retentionMillis, minimumMillis` | server GC | not applicable | —; maintenance call failure | — |
+| `Drift` | `mismatches: [{table, problem}]` | server verification | server does not start | —; startup failure | startup `server` |
+| `TableNameConflict` | `table, existingSchema` | server attach | server verification fails | —; attach failure | —; startup verification can fail as Drift |
+| `MigrationPlanError` (name) | `message` | core migration generator | not running | —; thrown Error | — |
+| `CredentialsUnavailable` | `message` | client credential acquisition | no; retry | —; status(credentials) | `credentials` |
+| `PushIntegrityError` | `reason: invalidPayload \| serverDefect, message` | client transport | halt | —; Halted | `halted` |
+| `PullProtocolError` | `message` | client transport | no; retry | —; status(server) | `server` |
+| `MalformedChange` | `table, message` | client pull decode | no; retry | —; status(server) | `malformed` |
+| `ServerOutdated` | `table` | client pull decode | no; retry, keep staging | —; status(server-outdated) | `server-outdated` |
+| `RpcClientError` | `reason` (Effect RPC transport detail) | client dependency boundary | no; retry after lifting credentials/HTTP auth | —; status(network) | `network` |
+| `LocallyRejected` | `name, error: MutationRejection` | client enqueue | no; nothing saved | —; enqueue failure | `rejected` |
+| `SqlFailure` | `message` | leader SQLite boundary | no direct loop effect | —; method/stream failure | — |
+| `LeaderUnavailable` | `reason: LeaderLost \| LeaderFailed \| Unsupported \| SecondaryTabWithoutRouter \| Reset, message` | tab routing | no direct loop effect; §12 recovery | —; method/stream failure | —; handover result separately `elected`/`lost` |
+| `RawExecDisabled` | — | leader raw SQL gate | no | —; method/stream failure | — |
+| `SyncDisabled` | — | local-only leader | sync loop absent | —; method/stream failure | — |
+| `PresenceAlreadyOpen` | `room` | tab presence | no | —; second subscription fails | — |
+| `ReplicaInUse` | — | reset worker | no direct loop effect | —; reset failure, nothing deleted | — |
+| `PendingWrites` | `count` | reset worker | no direct loop effect | —; reset failure, nothing deleted | — |
+| `ResetFailed` | `message` | reset worker/tab | no direct loop effect | —; reset failure | — |
+| `BrowserStorageError` | `operation, cause` | browser storage boundary | candidate cannot serve if startup fails | —; surfaced via LeaderUnavailable/ResetFailed | —; depends on enclosing boundary |
+| `LockError` | `name, message` | browser Web Locks | candidate/route operation fails | —; substrate failure or mapped LeaderUnavailable | election `server` if election fails typed |
+
+#### 15.2 Diagnostic reasons and projections
 
 `Unauthorized.reason` is the closed diagnostic union:
 
@@ -1575,74 +1662,17 @@ parsing messages. The field is optional on the wire for an old server's response
 always set it. One tag and retry behavior remain for every reason; branching client sync semantics
 by reason was rejected.
 
-#### 15.2 Mutation outcomes (`Mutation.MutationRejection`), ledgered and acked
-
-| tag | fields | meaning |
-|---|---|---|
-| `UnknownMutation` | `name` | no mutation of that name in the server registry |
-| `ArgsDecodeFailed` | `name, message` | args do not decode with the mutation's args schema |
-| `RowNotFound` | `table, id` | `patch`/`delete` of a missing row |
-| `RowAlreadyExists` | `table, id` | `insert` of an existing id |
-| `ScopeForbidden` | `scopeId, required, held` | actor lacks `required` in the row's scope (INV-ACL-2) or the scope id is taken (INV-ACL-6) |
-| `InvalidRow` | `table, message` | a row, patch or index bound does not satisfy the table schema |
-| `DomainError` | `mutation, error: Json` | a declared domain error, encoded with the mutation's `error` schema |
-| `ConstraintViolated` | `kind: unique \| other, constraint, message` | an authoritative database constraint (INV-MUT-6) |
-| `ClientExpired` | `mutationId` | answered at or below the client's expiry floor (§11); the effect, if any, is installed; outcome unknown |
-| `ClockSkew` | `createdAt, serverNow` (epoch ms) | writer timestamp exceeds server time by more than 30 s; no handler writes; retained rejection notice (INV-MUT-12) |
-
-#### 15.3 Core store and registry errors (`src/core/Errors.ts`, `Query.ts`, `Mutation.ts`)
-
-| tag | fields | kind | notes |
-|---|---|---|---|
-| `StoreUnavailable` | `message` | typed, transient | never ledgered; stops the batch (`MutationTransient` on the server) |
-| `CorruptStorage` | `table, id, cause` | defect | stored data no longer decodes with its schema (INV-CLI-11) |
-| `UnknownQuery` | `name` | typed | tab `query` of an unregistered name |
-| `QueryArgsDecodeFailed` | `name, message` | typed | |
-| `NoticeMismatch` | `mutation, name, message` | typed | `decodeNotice` against the wrong mutation |
-| `TransientExhausted` | `attempts, message` | client-only retained rejection | 8 transient answers; message retains the last observable error: `the server stopped the push batch at a transient failure`; never a server outcome |
-| `DuplicateMutation` / `DuplicateQuery` | `name` | construction `Error` | registry refuses two of one name (INV-MUT-9) |
-
-#### 15.4 Server-only (`src/server`)
-
-| tag | fields | where | effect |
-|---|---|---|---|
-| `MutationTransient` | `clientId, mutationId, message` | `runMutation` | batch stops; processed prefix returned |
-| `ClientForbidden` | `clientId` | `lockClient` | surfaced as `Unauthorized` |
-| `LedgerRetentionTooShort` | `retentionMillis, minimumMillis` | `expireLedger` | job fails before any SQL |
-| `Drift` | `mismatches: [{table, problem}]` | `verify` | server does not serve |
-| `TableNameConflict` | `table, existingSchema` | `attach` | left to `verify` by `prepare` |
-| `MigrationPlanError` | `message` | `Migrate.plan` | generation refused |
-
-#### 15.5 Client sync (`src/client/sync`)
-
-| tag | fields | meaning | loop verdict |
-|---|---|---|---|
-| `CredentialsUnavailable` | `message` | `syncHeaders` raised; nothing sent | kind `credentials`, retry |
-| `PushIntegrityError` | `reason: invalidPayload \| serverDefect, message` | batch not a valid request / server defect | push halts |
-| `PullProtocolError` | `message` | pull ended in a defect | kind `server`, retry |
-| `MalformedChange` | `table, message` | known-table change does not decode | kind `server`, outcome `malformed`, retry, staging cleared by the failed install |
-| `ServerOutdated` | `table` | known-table payload lacks a declared column | kind `server-outdated`, retry, staging kept |
-| `PushTransportError` | `reason: PushReason` | transport wrapper | per reason (§10) |
-| `PullTransportError` | `reason: PullReason` | transport wrapper | per reason (§10) |
-| `LocallyRejected` | `name, error: MutationRejection` | `mutate`'s handler rejected against the replica | surfaced to the tab; nothing saved |
-
 `SyncErrorKind` = `credentials | unauthorized | unavailable | network | server | outdated |
 server-outdated`.
 
-#### 15.6 Browser substrate (`src/client/worker`)
+`Rejected` and `OutcomeUnknown` are notice tags, not additional error classes; `Rejected` is
+also the mutation outcome containing an error. `Halted` is a push-state tag. They retain their
+existing fields and meanings in §5/§9/§10. There is no `VersionMismatch` wire tag; compatibility
+refusal is `ClientOutdated`.
 
-| tag | fields | meaning |
-|---|---|---|
-| `SqlFailure` | `message` | a SQLite statement failed in the leader; transaction rolled back |
-| `LeaderUnavailable` | `reason: LeaderLost \| LeaderFailed \| Unsupported \| SecondaryTabWithoutRouter \| Reset, message` | §12; `LeaderLost` is retried by `mutate` and resubscribed by streams, the others are not |
-| `RawExecDisabled` | — | `exec`/`subscribeRaw` without `allowRawExec` |
-| `SyncDisabled` | — | leader without `syncUrl` |
-| `PresenceAlreadyOpen` | `room` | second `presence` open for one room in one tab |
-| `ReplicaInUse` | — | reset: a leader still held the lock after `closeTimeout` |
-| `PendingWrites` | `count` | reset without `discardPending` over unreleased entries |
-| `ResetFailed` | `message` | reset could not run (unsupported browser, invalid identity, non-finite `closeTimeout`, OPFS error, a throwing `spawnLeader`) |
-| `BrowserStorageError` | `operation, cause` | OPFS / Web Crypto call failed; message names the operation, never the path |
-| `LockError` | `name, message` | Web Locks rejected for a reason other than our own cancellation |
+### Open Questions
+
+None.
 
 ## 16. Performance budget
 
@@ -1940,6 +1970,8 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-TEL-6 | covered | `vocabularies.test` "telemetry, wire errors and client failure or notice vocabularies cannot drift from SPEC §14–15" |
 | INV-ERR-1 | covered | `Transport.test` "Unauthorized reason schema matches the closed catalog in SPEC §15", "a server Unauthorized surfaces its diagnostic reason without changing the unauthorized verdict", "HTTP auth refusals before RPC decoding report unauthorized, retry without halting, and keep the pending mutation; other statuses stay network"; `rpc.test` "push, pull and pokes asserting another principal than the session's run no statement or policy and change no row, even for a bound client", "an app authentication refusal carries authenticationRefused through the public RPC surface", "a client bound to another principal carries clientPrincipalMismatch through the public RPC surface", "push, pull and pokes authenticated as * are Unauthorized before they bind or ledger" |
 | INV-ERR-2 | partial | `SqliteRowStore.test` "a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError"; OPFS diagnostic coverage is in browser scenarios only |
+| INV-ERR-3 | untested | — (catalog equality and exhaustive-mapping compile fixture pending implementation) |
+| INV-ERR-4 | untested | — (notice and operation-outcome regression pending implementation) |
 | INV-PERF-1 | covered | `ordering.test` "without the trigger's advisory lock that reader skips the earlier writer (the ordering check can fail)" (the lock is held; its throughput consequence is not measured) |
 | INV-PERF-2 | covered | `perf-postgres.test` "a pushed mutation adds only its N reads and M writes to the fixed ledger cost" |
 | INV-PERF-3 | covered | `perf-postgres.test` "empty, log and scope-walk pages retain their derived statement and returned-row budgets" |
