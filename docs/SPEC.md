@@ -824,9 +824,10 @@ See Q3. Formally, for one rebase with pending set `P` (before release), undo ima
 | replay all | `Σ_{m∈P∖R} H(m)` handler operations + `|P∖R|` undo writes |
 
 Push-covered rebase: `C = 0`, same undo and replay terms. Staging adds one decode per upsert of a
-known table per page received (INV-CLI-9), so an upsert is decoded twice (staging, install) and
+known table per `PullPage` received (INV-CLI-9), so a staged upsert is decoded twice (staging, install) and
 encoded twice (wire canonical form in `Engine.ts`, then the table's `sqlite.row` codec in
-`SqliteRowStore.write`) between arrival and the replica. Every undo restore is also one
+`SqliteRowStore.write`) between arrival and the replica. Upserts carried by `PullDone` are not
+staged and have only the install decode. Every undo restore is also one
 `sqlite.row` encode. Reading the pending outbox (`storage.pending`) decodes each entry's `undo`
 JSON, so the read itself is `|P|` decodes.
 
@@ -847,7 +848,8 @@ pending on top and recaptures undo).
 
 - OQ-CLI-1: A full rebase per install (Q3) has no incremental path. Whether an install should
   skip undo/replay for entries whose rows the set does not touch is a design question; nothing in
-  the code or tests constrains it beyond INV-CLI-1.
+  the correctness contract constrains it beyond INV-CLI-1. The measured baseline and exact
+  counter gates are in §16; changing the algorithm must consciously revise those cost gates.
 
 ## 10. Sync loop, pokes and presence
 
@@ -1452,7 +1454,9 @@ server-outdated`.
 ### Overview
 
 This chapter states each per-operation cost as the code has it today, in store statements and
-codec passes, so later work can turn them into counters and numbers. Nothing here is a target; a
+codec passes. Test-only counters gate the fixed workloads below; wall times inform decisions,
+never gate CI. A performance claim MUST identify its workload, clean source commit, and
+before/after measurements. Nothing here is a target; a
 change that moves one of these costs is a design change (§0.2) because consumers size their
 batches, page limits and retention against them.
 
@@ -1462,21 +1466,23 @@ batches, page limits and retention against them.
   `next_position()` holds advisory lock `7305797848413072995` until its transaction ends
   (INV-POS-1), so the throughput ceiling of all mutations that write captured rows is one
   transaction per lock hold time, across every server instance.
-- INV-PERF-2: Per pushed mutation (happy path, `k` row writes, `a` authorizations):
+- INV-PERF-2: Per new pushed mutation (happy path): 9 connection statements for `BEGIN`,
   `SET TRANSACTION`, `INSERT clients`, `SELECT clients FOR UPDATE`, `SELECT mutations`,
-  `SAVEPOINT`, `a` × `SELECT scope_grants`, `k` × (1 read + 1 write + 1 trigger-side
-  `next_position()` + 1 log `INSERT`, 2 log inserts for a scope or id move), `RELEASE SAVEPOINT`,
-  `INSERT mutations … RETURNING`, `COMMIT`: 9 + a + 4k statements. Plus per push request: the
-  principal lookup and `resolveTables`. A conflict retry repeats the whole transaction (up to 5
-  attempts).
-- INV-PERF-3: Per pull page (§7.7): state, `client_scopes`, grants, catalog, one `SELECT` per
-  table per walk page, one log `SELECT`, one payload `SELECT` per table with log entries, one ack
-  `SELECT`, then up to four writes outside the snapshot: 8 + t_walk + t_log statements with `t`
-  the tables touched. Plus per request: principal lookup, `clientPolicy`, `registerClient`.
+  `SAVEPOINT`, `RELEASE SAVEPOINT`, `INSERT mutations … RETURNING`, `COMMIT`, plus the
+  handler's row reads, writes and authorizations. For `N` typed `get`s and `M` same-scope
+  `patch`es: `9 + 2N + 3M`. `executeBatch` adds one catalog query per request. App principal
+  lookup/policy SQL is outside this engine budget. Trigger-side `next_position()` and log
+  inserts are additional server work, not connection statements. Retries repeat the transaction.
+- INV-PERF-3: Per pull request (§7.7): `8 + h + w + l + t + 3h + d` connection statements,
+  including registration and controls. The fixed 8 are register, BEGIN, SET, state, readable
+  grants, catalog, acks, COMMIT; `h = 1` for non-null cursor (held lookup and three cursor
+  writes), `w` is walk SELECTs, `l = 1` if the log is read, `t` is payload-table SELECTs,
+  `d = 1` on PullDone (held insert). App principal lookup/policy SQL is excluded.
 - INV-PERF-4: Per install (§9.4, Q3): one SQLite transaction holding the storage's single permit
-  for `U` undo writes + `C` change writes + `Σ H(m)` replay operations + `|P∖R|` undo writes;
-  every upsert of a known table is decoded twice (staging and install) and encoded twice (wire,
-  then `sqlite.row`); one `clearAll` statement per replica table when the set started from null.
+  for `U` undo writes + `C` change writes + `Σ H(m)` replay operations + `|P∖R|` outbox undo
+  updates; one `clearAll` statement per replica table when the set started from null. For the
+  increment fixture below, no settlements and a non-null cursor: exactly `8 + C + 9P`
+  statements, including staged read, bookkeeping and controls.
 - INV-PERF-5: Per push batch on the client (`Engine.push` loops batches until the pending set
   is drained or a batch is stopped): one storage transaction reading `meta` and the whole
   pending outbox (`|P|` undo decodes), one RPC with at most `min(pushBatchSize ?? 50, 100)`
@@ -1488,10 +1494,18 @@ batches, page limits and retention against them.
   heartbeat tick per `heartbeatInterval` per stream; a poke fans out to every stream in the
   process only (§10). A commit costs one `pg_notify` per position allocated (INV-POS-4), i.e.
   one per log row and one per ledger row, coalesced by Postgres within a transaction.
+- INV-PERF-7: The fixed fixtures below MUST also preserve their SELECT-returned-row budgets,
+  including walk lookahead. These count rows returned to the engine, not physical rows scanned
+  by Postgres/SQLite, nor rows returned by INSERT RETURNING.
+
+**Rationale (2026-10-24):** Counters gate, timings inform. Separate client-issued statements
+from trigger-internal work instead of counting both as round trips; the old push shorthand
+mixed those units and the old pull shorthand omitted conditional controls/bookkeeping.
+Keep test-only instrumentation and derive every expected count from the ownership path.
 
 ### Details
 
-Known hot spots the code does not yet measure:
+Known costs and limits of the counters:
 
 - The capture trigger calls `next_position()` once per log row, each taking the advisory lock
   (already held by the transaction after the first call, so re-entrant but still a function
@@ -1501,13 +1515,38 @@ Known hot spots the code does not yet measure:
   per entry.
 - Install decodes staged pages from JSON (`echo_staged.page`) before decoding each upsert:
   the JSON double decode noted in Q3.
-- The replay term `Σ H(m)` runs each pending handler against the SQLite replica with the same
-  authorization reads a server run would do.
+- The replay term `Σ H(m)` runs each pending handler against the SQLite replica. A role lookup
+  does two point reads (own grant and Everyone) there, versus one SELECT on Postgres.
+- Codec passes are code-derived, not counter-gated: staged upserts have a validation decode
+  before persistence and an install decode, plus wire and SQLite-row encodes (§9.4).
+
+#### Asserted workloads
+
+`test/sql-counter.ts` wraps a real reserved Postgres/wa-sqlite connection for serial healthy-path
+fixtures only. It counts executions, including BEGIN/SAVEPOINT/COMMIT, not lazy statement
+construction. It does not measure pool concurrency, commit-failure handling, trigger SQL,
+physical scans or codec invocations. Production code is unchanged.
+
+| fixed operation | connection statements | SELECT-returned rows |
+|---|---|---|
+| one new pushed mutation, N gets / M same-scope patches; one own writer grant, no Everyone grant, three catalog tables | `10 + 2N + 3M`: N=0/M=0 → 10; N=2/M=3 → 23 | `4 + 2N + 2M`: 4 / 14 |
+| empty completed pull, non-null cursor, one held/readable scope | 14 | 6 |
+| completed log pull, same state, K=3 distinct upserts in one table | 15 (one batched payload query) | `6 + 2K` = 12 |
+| initial scope walk, K=3 items, one grant, empty notes, limit 100 | 13 | `6 + K` = 9 |
+| initial scope walk, same rows, limit 2 (unfinished) | 9 | 8 (includes one item lookahead) |
+| install P=3 increment entries / C=7 counter upserts, one staged page, no acks | `8 + 9P + C` = 42 | `6P + 1 + pages` = 20 |
+| same install from null, with grant included in snapshot | 45 (two table clears + grant write) | 20 |
+
+Derivations live beside assertions in `perf-postgres.test.ts` and `perf-install.test.ts`.
+The install fixture starts each pending row at 100, increments by 3 optimistically, then
+receives authoritative 200s: it asserts P restores of 100, C writes of 200, P replay writes
+of 203, P refreshed undo records holding 200, and final pending/cursor state. It exercises
+INV-CLI-1 and INV-CLI-3's full rebase, not merely the aggregate statement count. Pending reads
+currently use **two** SELECTs (undo images then envelopes), each returning P rows.
 
 ### Open Questions
 
-- OQ-PERF-1: No counter today reports statements per operation; the only timed spans are
-  `echo.install` and `echo.rebase`. Turning INV-PERF-2..4 into asserted counts is future work.
+None. OQ-PERF-1 is resolved by the counter gates; OQ-CLI-1 remains the owner's algorithm decision.
 
 ## 17. Invariant registry
 
@@ -1655,15 +1694,16 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-ERR-1 | partial | `Transport.test` "push failures are fatal exactly when SPEC §10 says so, classified by real tags over a real RPC server" (closedness is type-level) |
 | INV-ERR-2 | covered | `SqliteRowStore.test` "a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError"; `scenarios.sh` "OPFS startup failure alone: the tab's LeaderFailed names the operation and the browser's reason, not the app or profile path" |
 | INV-PERF-1 | covered | `ordering.test` "without the trigger's advisory lock that reader skips the earlier writer (the ordering check can fail)" (the lock is held; its throughput consequence is not measured) |
-| INV-PERF-2 | untested | — |
-| INV-PERF-3 | untested | — |
-| INV-PERF-4 | untested | — (only `echo.install`/`echo.rebase` timers exist) |
+| INV-PERF-2 | covered | `perf-postgres.test` "a pushed mutation adds only its N reads and M writes to the fixed ledger cost" |
+| INV-PERF-3 | covered | `perf-postgres.test` "empty, log and scope-walk pages retain their derived statement and returned-row budgets" |
+| INV-PERF-4 | covered | `perf-install.test` "install undoes P entries, writes C changes and replays P handlers without hidden statements" |
 | INV-PERF-5 | untested | — |
 | INV-PERF-6 | partial | `rpc.test` "more open pokes streams than pool connections do not block push or pull, and the server holds one LISTEN" (fan-out and notify counts unmeasured) |
+| INV-PERF-7 | covered | `perf-postgres.test` both budget tests; `perf-install.test` "install undoes P entries, writes C changes and replays P handlers without hidden statements" (SELECT-returned rows, not physical scans) |
 
-Totals: 112 invariants; 95 covered, 9 partial (INV-MUT-2, INV-MUT-8, INV-MUT-9, INV-POS-3,
-INV-PULL-7, INV-PUSH-1, INV-TEL-5, INV-ERR-1, INV-PERF-6), 8 untested (INV-ID-3, INV-POS-5,
-INV-PULL-8, INV-CLI-7, INV-PERF-2, INV-PERF-3, INV-PERF-4, INV-PERF-5).
+Totals: 113 invariants; 99 covered, 9 partial (INV-MUT-2, INV-MUT-8, INV-MUT-9, INV-POS-3,
+INV-PULL-7, INV-PUSH-1, INV-TEL-5, INV-ERR-1, INV-PERF-6), 5 untested (INV-ID-3, INV-POS-5,
+INV-PULL-8, INV-CLI-7, INV-PERF-5).
 
 ## 18. Limits and defaults
 
@@ -1726,7 +1766,6 @@ INV-PULL-8, INV-CLI-7, INV-PERF-2, INV-PERF-3, INV-PERF-4, INV-PERF-5).
 | OQ-BRW-1 | §12 | `awaitOpfsPoolFree` bound (2 s) then `LeaderFailed` with no retry |
 | OQ-TEL-1 | §14 | closed telemetry vocabularies not asserted against a committed list |
 | OQ-ERR-1 | §15 | `Unauthorized` has no `reason`; four conditions share one tag |
-| OQ-PERF-1 | §16 | no statement counters; only install/rebase timers |
 
 ## Appendix C. Browser mechanisms and verification notes (non-normative)
 
