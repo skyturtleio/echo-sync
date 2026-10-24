@@ -301,8 +301,8 @@ export const awaitOpfsPoolFree = (directory: string): Effect.Effect<void, Browse
     }
   }).pipe(
     Effect.retry({
-      times: 100,
-      schedule: Schedule.spaced("20 millis"),
+      // 20 + 40 + … + 5,120 ms = 10,220 ms before the final attempt.
+      schedule: Schedule.exponential("20 millis").pipe(Schedule.upTo({ times: 9 })),
       while: ({ cause }) =>
         cause instanceof DOMException &&
         (cause.name === "NoModificationAllowedError" || cause.name === "InvalidStateError")

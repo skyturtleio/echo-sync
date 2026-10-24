@@ -196,6 +196,44 @@ const r = await echo.exec('SELECT 1')
 return { pass: !r.ok && r.error.reason === 'LeaderFailed' && r.error.message.includes('opening the OPFS pool failed: NotReadableError: injected OPFS startup failure') && !r.error.message.includes('$APP'), r }")"
 ab tab close "$A" >/dev/null
 
+# ── predecessor OPFS handles can outlive its locks ────────────────────────────────────────────────────
+# H queues for the leader lock before B exists, so after A dies it can hold the lock while its dedicated
+# worker acquires every old pool handle. Releasing the lock then starts B's elected leader against a known,
+# still-held pool rather than relying on browser teardown timing.
+opfs_pool_wait() { # $1 = hold duration in ms; $2 = expected result (serve|fail)
+  APP="opfs-pool-$1-$RUN"
+  A=$(open_tab "$BASE/?app=$APP")
+  a=$(ev <<<"$SERVED")
+  H=$(open_tab "$BASE/opfs-holder.html?app=$APP")
+  ev <<<'await echo.holdLeader(); return true' >/dev/null
+  B=$(open_tab "$BASE/?app=$APP")
+  ab tab close "$A" >/dev/null
+  ab tab "$H" >/dev/null
+  held=$(ev <<<'return await echo.holdPool()')
+  ev <<<"setTimeout(() => echo.releasePool(), $1); return true" >/dev/null
+  started=$(date +%s%3N)
+  ev <<<'echo.releaseLeader(); return true' >/dev/null
+  ab tab "$B" >/dev/null
+  if [ "$2" = serve ]; then
+    result=$(ev <<<"const old = '$(jq -r .leaderId <<<"$a")'
+const served = await echo.until(async () => { const s = await echo.status(); const i = await echo.info(); return s.leaderId !== undefined && s.leaderId !== old && i.ok && i.value.leaderId === s.leaderId }, 9000)
+return { served: served === true, status: await echo.status() }")
+    elapsed=$(( $(date +%s%3N) - started ))
+    check "OPFS pool handles held for 4 s after leader death: the new leader waits and serves" "$(jq -nc --argjson h "$held" --argjson r "$result" --argjson ms "$elapsed" '{ pass: ($h.count > 0 and $r.served and $r.status.leaderId != null and $ms >= 3500 and $ms < 9000), handles: $h.count, elapsedMs: $ms, result: $r }')"
+  else
+    result=$(ev <<<'await echo.until(async () => !(await echo.exec("SELECT 1")).ok, 13000)
+const r = await echo.exec("SELECT 1")
+return { r, status: await echo.status() }')
+    elapsed=$(( $(date +%s%3N) - started ))
+    check "OPFS pool handles held past the 10 s bound: the new leader still surfaces LeaderFailed" "$(jq -nc --argjson h "$held" --argjson r "$result" --argjson ms "$elapsed" '{ pass: ($h.count > 0 and ($r.r.ok | not) and $r.r.error.reason == "LeaderFailed" and $r.status.leaderId == null and $ms >= 9500 and $ms < 13000), handles: $h.count, elapsedMs: $ms, result: $r }')"
+  fi
+  ab tab "$H" >/dev/null
+  ev <<<'echo.releasePool(); return true' >/dev/null
+  for t in "$B" "$H"; do ab tab close "$t" >/dev/null; done
+}
+opfs_pool_wait 4000 serve
+opfs_pool_wait 12000 fail
+
 # ── saved means durable ──────────────────────────────────────────────────────────────────────────────
 APP="durable-$RUN"
 T=$(open_tab "$BASE/?app=$APP")

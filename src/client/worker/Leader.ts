@@ -66,11 +66,12 @@ const send = (endpoint: Endpoint, message: FromLeader) => endpoint.postMessage(m
 
 /**
  * Open the database without migrating it: the OPFS host on one end of a channel, the Effect SQL client on
- * the other. The leader and `Reset` both open through here, so there is one OPFS host path.
+ * the other. The leader and `Reset` both open through here, so there is one OPFS host path. A leader has
+ * already waited for its predecessor's pool handles before its tombstone check; reset waits immediately
+ * before opening instead.
  */
 const openConnection = Effect.fn("Leader.openConnection")(function* (identity: Platform.ReplicaIdentity) {
   const poolDirectory = Platform.poolDirectory(identity)
-  yield* Platform.awaitOpfsPoolFree(poolDirectory)
   // Fails here, before SqliteClient's (uninterruptible) wait for "ready" can start.
   const serve = yield* OpfsSqlite.open({ poolDirectory, dbName: Platform.dbName(identity) })
   const channel = new MessageChannel()
@@ -438,6 +439,7 @@ const reset: (message: Reset) => Effect.Effect<ResetOutcome> = Effect.fn("Leader
         } else {
           // Fails closed: a database that does not open or an outbox that cannot be read is `ResetFailed`
           // (below), never "0 pending". The inner scope closes the database and the pool before any removal.
+          yield* Platform.awaitOpfsPoolFree(poolDirectory)
           const count = yield* Effect.scoped(
             Effect.flatMap(openConnection(identity), ({ sql }) => countUnreleased(sql))
           )
@@ -494,6 +496,9 @@ const program = Effect.fn("Leader.program")(
     // The leader lock is held from here until this worker dies.
     const leaderId = crypto.randomUUID()
     yield* Platform.holdLock(Platform.leaderEpochLockName(identity, leaderId))
+    // A dead predecessor's access handles can outlive its locks. Wait after both locks and before inspecting
+    // a reset tombstone, so the next step never races a lingering pool handle.
+    yield* Platform.awaitOpfsPoolFree(Platform.poolDirectory(identity))
     // Before the pool is opened (INV-BRW-8): a replica condemned by an interrupted reset is never served; its
     // removal is completed here and the database below starts fresh, with a new clientId.
     if (yield* completeInterruptedReset(identity)) {

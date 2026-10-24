@@ -1050,8 +1050,15 @@ replica.
 - INV-BRW-2: At most one leader per identity holds the database: election is the leader Web
   Lock (`tryHoldLock` then `holdLock`; `Waiting` is reported only when the first try fails,
   `Elected` once the database is open and the leader serves, `Failed` on any startup failure);
-  the leader then takes its epoch lock, completes any interrupted reset (tombstone), and opens
-  the pool.
+  the leader then takes its epoch lock, waits for a dead predecessor's OPFS access handles with
+  exponential backoff for at most 10.22 s, completes any interrupted reset (tombstone), and
+  opens the pool. Exhausting that bound is `LeaderFailed`; it does not retry.
+
+  **Rationale (2026-10-24):** Browser release of synchronous access handles can lag lock release
+  for several seconds, so the former 2 s fixed poll turned a recoverable handover into a terminal
+  unavailable route. A bounded exponential wait tolerates that lag without hiding a genuinely
+  stuck handle indefinitely; unbounded retry was rejected because `LeaderFailed` remains the
+  diagnostic outcome for a pool that cannot be reclaimed.
 - INV-BRW-3: Leader loss is detected only through the epoch lock's release, never by waiting on
   a dead port. The router accepts a leader announcement only while the epoch lock is held.
 - INV-BRW-4: Handover: in-flight requests fail `LeaderUnavailable{LeaderLost}`; requests issued
@@ -1107,6 +1114,10 @@ replica.
   `Unsupported`). Never a second database owner.
 - INV-BRW-10: Closing the tab client never abandons a transferred port queued for acceptance or
   waiting for its epoch check; leader and router teardown close fresh transfers.
+- INV-BRW-11: After taking the leader and epoch locks, a successor MUST wait for a dead
+  predecessor's OPFS pool access handles before checking the reset tombstone or opening the
+  database. It MUST use the bounded exponential wait in §18, then surface `LeaderFailed` rather
+  than retrying when the handles remain held.
 
 ### Details
 
@@ -1135,7 +1146,8 @@ connection is ignored); and failure to take the tab lock (`Unsupported`, message
 #### 12.2 Leader lifecycle
 
 `leaderWorker(self, options)`: validate identity → election (INV-BRW-2) → epoch lock →
-`completeInterruptedReset` → `awaitOpfsPoolFree` (100 × 20 ms) → open pool → `migrate` (engine
+`awaitOpfsPoolFree` (20 ms exponential through 5.12 s; 10.22 s total) →
+`completeInterruptedReset` → open pool → `migrate` (engine
 steps, registry rebuild check) → `pruneReleased` → serve `LeaderRpcs` and run the sync loop
 (when a `syncUrl` is given) and the pokes follower. A leader without `syncUrl` is a local-only
 replica: `syncStatus`, `requestSync`, `presence` and `track` fail `SyncDisabled`.
@@ -1155,11 +1167,7 @@ kills the `SharedWorker` with its creating tab) is repopulated by the tabs.
 
 ### Open Questions
 
-- OQ-BRW-1: The `awaitOpfsPoolFree` retry inside `openConnection` (after election and the epoch
-  lock; 100 × 20 ms = 2 s) is a bound on how
-  long a dead leader's access handles may linger; what happens after it elapses is a
-  `LeaderFailed`, which tabs surface as `LeaderUnavailable{LeaderFailed}` and do not retry.
-  Whether a longer bound or a retry is wanted is open.
+None.
 
 ## 13. Schema evolution and startup verification
 
@@ -1724,6 +1732,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-BRW-8 | covered | `scenarios.sh` "a reset worker terminated mid-removal after its tombstone: the next LeaderClient starts on a fresh, empty replica with a new clientId; no tombstone or old pool file remains", "a second resetReplica (without discardPending) after an interrupted one answers Done…" |
 | INV-BRW-9 | covered | `scenarios.sh` "fallback: second tab without SharedWorker fails closed with SecondaryTabWithoutRouter", "fallback: after the owning tab closes, the waiting tab takes over the same replica", "identity '.' is refused with LeaderUnavailable{Unsupported}, nothing is opened" |
 | INV-BRW-10 | covered | `worker-lifetime.test` "leader teardown closes fresh transfers discarded before Init, still queued, or delivered to a saved late callback", "router teardown and rejection close fresh connect and announcement peers, including saved late callbacks"; `LeaderClient.test` "closing a client cannot abandon a transferred port queued for acceptance or waiting for its epoch check" |
+| INV-BRW-11 | covered | `scenarios.sh` "OPFS pool handles held for 4 s after leader death: the new leader waits and serves", "OPFS pool handles held past the 10 s bound: the new leader still surfaces LeaderFailed" |
 | INV-SCH-1 | covered | `Migrate.test` "the generator never emits DDL for a rename, drop, lossy type change or unique-set change", "safe changes become exactly the pinned DDL" (group), "a NOT NULL column without a default is added nullable with the SPEC §13 TODO, never SET NOT NULL" |
 | INV-SCH-2 | covered | `Migrate.test` "DDL that depends on a TODO rename or kind change is a TODO too" (group), "an intent naming something the diff does not contain is refused, not ignored" |
 | INV-SCH-3 | covered | `Migrate.test` "migrations are numbered after the highest existing one", "scope_grants is the engine's table and is never planned; no change plans nothing"; `version-gate.e2e` "a client below the generated floor…" (history) |
@@ -1747,7 +1756,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PERF-6 | partial | `rpc.test` "more open pokes streams than pool connections do not block push or pull, and the server holds one LISTEN" (fan-out and notify counts unmeasured) |
 | INV-PERF-7 | covered | `perf-postgres.test` both budget tests; `perf-install.test` "install undoes P entries, writes C changes and replays P handlers without hidden statements" (SELECT-returned rows, not physical scans) |
 
-Totals: 113 invariants; 100 covered, 8 partial (INV-MUT-2, INV-MUT-8, INV-MUT-9, INV-POS-3,
+Totals: 114 invariants; 101 covered, 8 partial (INV-MUT-2, INV-MUT-8, INV-MUT-9, INV-POS-3,
 INV-PULL-7, INV-PUSH-1, INV-TEL-5, INV-PERF-6), 5 untested (INV-ID-3, INV-POS-5,
 INV-PULL-8, INV-CLI-7, INV-PERF-5).
 
@@ -1774,7 +1783,7 @@ INV-PULL-8, INV-CLI-7, INV-PERF-5).
 | log GC retention | caller-supplied (no default) | `gc.ts` | argument |
 | released-row marker retention | 24 h | `Outbox.ts` | `pruneReleased(retentionMillis)` |
 | reset `closeTimeout` | 5 s, must be finite | `ResetReplica.ts` | `closeTimeout` |
-| `awaitOpfsPoolFree` | 100 retries × 20 ms | `platform.ts` | no |
+| `awaitOpfsPoolFree` | exponential 20 ms … 5.12 s, 9 retries / 10.22 s total | `platform.ts` | no |
 | `LeaderLost` retry spacing (`mutate`, `requestSync`, `dismissNotices`) | 50 ms, unbounded | `LeaderClient.ts` | no |
 | resubscribe delay after `LeaderLost` | 50 ms | `LeaderClient.ts` | no |
 | table name | `/^[a-z][a-z0-9_]*$/`, ≤ 48 | `SyncTable.ts` | no |
@@ -1809,7 +1818,7 @@ INV-PULL-8, INV-CLI-7, INV-PERF-5).
 | OQ-PULL-2 | §7 | unknown-table changes skipped at install advance the cursor past rows never stored; untested |
 | OQ-CLI-1 | §9 (Q3), §16 | full rebase: 49.41 ms for 5/50, 651.39 ms for 500/5,000 pending/changes (Bun memory VFS); algorithm decision remains open |
 | OQ-LOOP-1 | §10 | the push halt is in memory per leader; a new leader retries the batch and halts again |
-| OQ-BRW-1 | §12 | `awaitOpfsPoolFree` bound (2 s) then `LeaderFailed` with no retry |
+| OQ-SCH-1 | §13 | new-server-before-migration tolerance of an added column untested |
 | OQ-TEL-1 | §14 | closed telemetry vocabularies not asserted against a committed list |
 
 ## Appendix C. Browser mechanisms and verification notes (non-normative)
@@ -1845,7 +1854,7 @@ Re-verify that protocol on every `@effect/sql-sqlite-wasm` upgrade. Wasm load, p
 uninterruptible, so an open failure must be raised before it. The pool is topped up to six
 files even when nonempty; the VFS otherwise grows only an empty pool, and interrupted creation
 can leave too little capacity for the next write. Access handles can outlive the dead
-worker's locks briefly (OQ-BRW-1).
+worker's locks briefly; the bounded `awaitOpfsPoolFree` handover wait in §12 covers that lag.
 
 Lock waits abort queued requests on interruption and release a grant racing with the abort.
 The cancellation argument currently relies on Effect's default scheduler entering the
