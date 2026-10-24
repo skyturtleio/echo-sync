@@ -61,13 +61,13 @@ const protocolOutcome = Telemetry.byFailure(
       | Protocol.ClientOutdated
       | Protocol.ResnapshotRequired
       | Protocol.ServerUnavailable
-  ) =>
+  ): Telemetry.Outcome =>
     Match.valueTags(error, {
-      Unauthorized: () => "unauthorized",
-      MalformedEnvelope: () => "halted",
-      ClientOutdated: () => "outdated",
-      ResnapshotRequired: () => "resnapshot",
-      ServerUnavailable: () => "unavailable"
+      Unauthorized: (): Telemetry.Outcome => "unauthorized",
+      MalformedEnvelope: (): Telemetry.Outcome => "halted",
+      ClientOutdated: (): Telemetry.Outcome => "outdated",
+      ResnapshotRequired: (): Telemetry.Outcome => "resnapshot",
+      ServerUnavailable: (): Telemetry.Outcome => "unavailable"
     })
 )
 

@@ -16,22 +16,8 @@ import {
   Tracer
 } from "effect"
 
-export type Name =
-  | "echo.enqueue"
-  | "echo.push"
-  | "echo.pull"
-  | "echo.install"
-  | "echo.rebase"
-  | "echo.pokes"
-  | "echo.leader.election"
-  | "echo.leader.handover"
-  | "echo.router.handover"
-  | "echo.server.startup"
-  | "echo.server.push"
-  | "echo.server.pull"
-  | "echo.server.pokes"
-
-const names = new Set<string>([
+/** Every engine span the host's tracer may see; all other spans stay inside the boundary. */
+const spanNames = [
   "echo.enqueue",
   "echo.push",
   "echo.pull",
@@ -45,8 +31,14 @@ const names = new Set<string>([
   "echo.server.push",
   "echo.server.pull",
   "echo.server.pokes"
-])
-const outcomes = new Set<string>([
+] as const
+export type Name = (typeof spanNames)[number]
+const names = new Set<string>(spanNames)
+/** Spans that also record a `<name>.duration` timer. */
+const timed: ReadonlySet<Name> = new Set<Name>(["echo.install", "echo.rebase"])
+
+/** The closed vocabulary of `echo.outcome`, `echo.result` and `echo.reason` (docs/observability.md). */
+const outcomeValues = [
   "ok",
   "credentials",
   "unauthorized",
@@ -71,8 +63,15 @@ const outcomes = new Set<string>([
   "server-end",
   "page",
   "done"
-])
-const counts = new Set<string>([
+] as const
+export type Outcome = (typeof outcomeValues)[number]
+const outcomes = new Set<string>(outcomeValues)
+const isOutcome = (u: unknown): u is Outcome => typeof u === "string" && outcomes.has(u)
+
+/** The counters `count` updates. */
+export type Counter = `${Name}.total` | "echo.leader.loss.total" | "echo.pokes.reconnect.total"
+
+const countKeys = [
   "echo.batch_size",
   "echo.processed",
   "echo.applied",
@@ -88,10 +87,19 @@ const counts = new Set<string>([
   "echo.heartbeats",
   "echo.changes",
   "echo.acks"
-])
+] as const
+const counts = new Set<string>(countKeys)
+
+/** The attributes `annotate` may set; anything else never reaches a span. */
+export type Attributes = {
+  readonly "echo.outcome"?: Outcome
+  readonly "echo.result"?: Outcome
+  readonly "echo.reason"?: Outcome
+  readonly "echo.resnapshot"?: boolean
+} & { readonly [K in (typeof countKeys)[number]]?: number }
 const approved = (key: string, value: unknown) =>
   key === "echo.outcome" || key === "echo.result" || key === "echo.reason"
-    ? typeof value === "string" && outcomes.has(value)
+    ? isOutcome(value)
     : key === "echo.resnapshot"
       ? typeof value === "boolean"
       : counts.has(key) && typeof value === "number" && Number.isSafeInteger(value) && value >= 0
@@ -152,7 +160,8 @@ class SafeSpan extends Tracer.NativeSpan {
 
 const wrapped = new WeakSet<Tracer.Tracer>()
 const wrappedLoggers = new WeakSet<Logger.Logger<unknown, unknown>>()
-const messages = new Set([
+/** The routine log lines; any other message (a dependency's, say) is dropped unless it is a diagnostic. */
+const logMessages = [
   "echo-sync: diagnostics",
   "echo-sync: unknown table change skipped",
   "echo-sync: push halted by an integrity error",
@@ -169,8 +178,11 @@ const messages = new Set([
   "echo router: watching leader epoch failed",
   "echo router: watching tab failed",
   "echo router: leader announcement failed",
-  "presence revocation watch restarting"
-])
+  "presence revocation watch restarting",
+  "echo leader completed the removal of a replica condemned by an interrupted reset"
+] as const
+export type LogMessage = (typeof logMessages)[number]
+const messages = new Set<string>(logMessages)
 
 /** Install before capturing callback runners, not just around handler construction. */
 export const boundary = <A, E, R>(work: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
@@ -272,7 +284,7 @@ export const stream = <A, E, R>(work: Stream.Stream<A, E, R>): Stream.Stream<A, 
  * The outcome of an exit. Interruption, then defects, take precedence; a typed failure is named by the
  * operation's own closed classifier, `failure`. Never copy a tag, error message or input into telemetry.
  */
-export const outcome = <A, E>(exit: Exit.Exit<A, E>, failure: (cause: Cause.Cause<E>) => string): string =>
+export const outcome = <A, E>(exit: Exit.Exit<A, E>, failure: (cause: Cause.Cause<E>) => Outcome): Outcome =>
   Exit.isSuccess(exit)
     ? "ok"
     : Cause.hasInterrupts(exit.cause)
@@ -282,17 +294,17 @@ export const outcome = <A, E>(exit: Exit.Exit<A, E>, failure: (cause: Cause.Caus
         : failure(exit.cause)
 
 /** The classifier of an operation whose typed failures are all `server` outcomes. */
-export const serverFailure = (_cause: Cause.Cause<unknown>): string => "server"
+export const serverFailure = (_cause: Cause.Cause<unknown>): Outcome => "server"
 
 /** A classifier from a name per failure: `halted` if any failure is named so, otherwise the first's. */
 export const byFailure =
-  <E>(name: (error: E) => string) =>
-  (cause: Cause.Cause<E>): string => {
+  <E>(name: (error: E) => Outcome) =>
+  (cause: Cause.Cause<E>): Outcome => {
     const failures = cause.reasons.filter(Cause.isFailReason).map((reason) => name(reason.error))
     return failures.includes("halted") ? "halted" : (failures[0] ?? "server")
   }
 
-export const annotate = (attributes: Record<string, unknown>) =>
+export const annotate = (attributes: Attributes) =>
   Effect.withFiber((fiber) => {
     let parent = Context.getOption(fiber.context, Tracer.ParentSpan)
     while (Option.isSome(parent) && parent.value instanceof SafeSpan) {
@@ -307,20 +319,15 @@ export const annotate = (attributes: Record<string, unknown>) =>
 export const diagnostic = (cause: Cause.Cause<unknown>) =>
   Effect.logDebug("echo-sync: diagnostics", cause).pipe(Effect.annotateLogs({ "echo.diagnostics": true }), boundary)
 
-export const log = (level: "Debug" | "Warn" | "Error", message: string, cause?: Cause.Cause<unknown>) =>
+export const log = (level: "Debug" | "Warn" | "Error", message: LogMessage, cause?: Cause.Cause<unknown>) =>
   Effect.logWithLevel(cause !== undefined && Cause.hasInterrupts(cause) ? "Debug" : level)(message).pipe(
     Effect.andThen(cause === undefined ? Effect.void : diagnostic(cause)),
     boundary
   )
 
-export const count = (name: string, result: string) =>
+export const count = (name: Counter, result: Outcome) =>
   Effect.withFiber((fiber) => {
-    guard(() =>
-      Metric.counter(name, { attributes: { "echo.outcome": outcomes.has(result) ? result : "server" } }).updateUnsafe(
-        1,
-        fiber.context
-      )
-    )
+    guard(() => Metric.counter(name, { attributes: { "echo.outcome": result } }).updateUnsafe(1, fiber.context))
     return Effect.void
   })
 export const pending = (n: number) =>
@@ -342,7 +349,7 @@ export const histogram = (name: "echo.push.batch_size" | "echo.pull.pages", n: n
 export const observeStream = <A, E, R>(
   work: Stream.Stream<A, E, R>,
   name: Name,
-  failure: (cause: Cause.Cause<E>) => string
+  failure: (cause: Cause.Cause<E>) => Outcome
 ): Stream.Stream<A, E, R> =>
   stream(
     Stream.unwrap(
@@ -368,7 +375,7 @@ export const observeStream = <A, E, R>(
 export const observe = <A, E, R>(
   work: Effect.Effect<A, E, R>,
   name: Name,
-  failure: (cause: Cause.Cause<E>) => string
+  failure: (cause: Cause.Cause<E>) => Outcome
 ): Effect.Effect<A, E, R> =>
   boundary(
     Effect.suspend(() => {
@@ -385,20 +392,10 @@ export const observe = <A, E, R>(
                 Option.isSome(parent) && parent.value._tag === "Span"
                   ? parent.value.attributes.get("echo.result")
                   : undefined
-              const idleTimeout =
-                name === "echo.pokes" &&
-                result === "server-end" &&
-                Option.isSome(parent) &&
-                parent.value._tag === "Span" &&
-                parent.value.attributes.get("echo.reason") === "idle-timeout"
-              const value = idleTimeout
-                ? "idle-timeout"
-                : Exit.isSuccess(exit) && typeof recorded === "string" && outcomes.has(recorded)
-                  ? recorded
-                  : result
+              const value = Exit.isSuccess(exit) && isOutcome(recorded) ? recorded : result
               yield* annotate({ "echo.outcome": value })
               yield* count(`${name}.total`, value)
-              if (name === "echo.install" || name === "echo.rebase") {
+              if (timed.has(name)) {
                 const elapsed = (yield* Clock.currentTimeMillis) - started
                 yield* Effect.withFiber((fiber) => {
                   guard(() =>

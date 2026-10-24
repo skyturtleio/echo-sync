@@ -234,12 +234,17 @@ export const make = (options: {
     }
   })
 
-/** A first pull of the pokes stream that ends it (`Cause.Done`) is a clean server end, not a failure. */
-const pokesOutcome = (cause: Cause.Cause<PullTransportError | Cause.Done>): string =>
-  Result.match(Pull.filterNoDone(cause), {
-    onSuccess: (failure) => SyncFailure.classifyPull(failure).outcome,
-    onFailure: () => "server-end"
-  })
+/**
+ * A first pull of the pokes stream that ends it (`Cause.Done`) is a clean server end, not a failure, unless
+ * the idle timeout ended it.
+ */
+const pokesOutcome =
+  (timedOut: () => boolean) =>
+  (cause: Cause.Cause<PullTransportError | Cause.Done>): Telemetry.Outcome =>
+    Result.match(Pull.filterNoDone(cause), {
+      onSuccess: (failure) => SyncFailure.classifyPull(failure).outcome,
+      onFailure: () => (timedOut() ? "idle-timeout" : "server-end")
+    })
 
 /**
  * Follows the server's pokes stream (DESIGN §6, §8, 81a07db): every `poke` wakes the loop, a
@@ -310,7 +315,7 @@ export const followPokes = (options: {
                   )
                 ),
                 "echo.pokes",
-                pokesOutcome
+                pokesOutcome(() => connection.timedOut)
               )
             })
           )

@@ -10,6 +10,7 @@
  * compile until every verdict covers it.
  */
 import { Cause, Data, Match, Option, Schema } from "effect"
+import type { Outcome } from "../../internal/Telemetry.ts"
 import type { RpcClientError } from "effect/rpc"
 import type { Errors, Protocol } from "echo-sync"
 
@@ -131,7 +132,7 @@ export type SyncErrorKind = typeof SyncErrorKind.Type
 /** What one failure means: its status kind and its telemetry outcome (docs/observability.md), which is finer. */
 interface Meaning {
   readonly kind: SyncErrorKind
-  readonly outcome: string
+  readonly outcome: Outcome
 }
 
 /** A push failure's meaning; `halt` is the library-controlled `Halted` reason when it stops pushing (DESIGN §6). */
@@ -139,7 +140,7 @@ interface PushMeaning extends Meaning {
   readonly halt: Option.Option<string>
 }
 
-const meaning = (kind: SyncErrorKind, outcome: string = kind): Meaning => ({ kind, outcome })
+const meaning = (kind: SyncErrorKind, outcome: Outcome = kind): Meaning => ({ kind, outcome })
 const continues = (kind: SyncErrorKind): PushMeaning => ({ kind, outcome: kind, halt: Option.none() })
 const halts = (halt: string): PushMeaning => ({ kind: "server", outcome: "halted", halt: Option.some(halt) })
 
@@ -192,7 +193,7 @@ export interface PushVerdict {
   readonly kind: SyncErrorKind
   /** The `Halted` reason when this push stops pushing (DESIGN §6). */
   readonly halt: Option.Option<string>
-  readonly outcome: string
+  readonly outcome: Outcome
 }
 
 /**
@@ -214,7 +215,7 @@ export const classifyPush = (cause: Cause.Cause<PushFailure>): PushVerdict => {
 
 export interface PullVerdict {
   readonly kind: SyncErrorKind
-  readonly outcome: string
+  readonly outcome: Outcome
 }
 
 /** Verdict on a pull: its first failure; a defect anywhere is a transient `server` failure (it never halts). */

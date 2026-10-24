@@ -6,6 +6,7 @@ import { Errors, Ids, Protocol } from "echo-sync"
 import type * as Engine from "./Engine.ts"
 import * as SyncFailure from "./SyncFailure.ts"
 import * as SyncLoop from "./SyncLoop.ts"
+import { recorder } from "../../../test/telemetry-recorder.ts"
 
 const rpcFailure = () =>
   new RpcClientError.RpcClientError({
@@ -383,4 +384,29 @@ it.effect(
       yield* settle
       expect([connections.n, wakes.n]).toEqual([2, 2])
     })
+)
+
+it.effect("a pokes connection the idle timeout ends must record idle-timeout, and one the server ends server-end", () =>
+  Effect.gen(function* () {
+    const host = recorder()
+    const connections = { n: 0 }
+    // Connection 1 never sends an element (a dead proxy); connection 2 ends at once (a clean server end).
+    const connect = Stream.unwrap(Effect.sync(() => (++connections.n === 1 ? Stream.never : Stream.empty)))
+    yield* Effect.forkChild(
+      SyncLoop.followPokes({
+        connect: Effect.succeed(connect),
+        wake: Effect.void,
+        idleTimeout: "45 seconds"
+      }).pipe(Effect.provideContext(host.context))
+    )
+    yield* settle
+    yield* TestClock.adjust("45 seconds")
+    yield* settle
+    yield* TestClock.adjust("1 second")
+    yield* settle
+    const outcomes = host.spans
+      .filter((span) => span.name === "echo.pokes")
+      .map((span) => span.attributes.find(([key]) => key === "echo.outcome")?.[1])
+    expect(outcomes.slice(0, 2)).toEqual(["idle-timeout", "server-end"])
+  })
 )
