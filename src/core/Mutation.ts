@@ -1,4 +1,4 @@
-import { Cause, DateTime, Effect, Option, Random, Schema } from "effect"
+import { Cause, Data, DateTime, Effect, Option, Random, Schema } from "effect"
 import type { PrincipalId } from "./AccessScope.ts"
 import {
   ConstraintViolated,
@@ -212,8 +212,10 @@ export const make = <const Name extends string, A extends PureSchema, E extends 
   }
 }
 
-export class DuplicateMutation extends Error {
-  override readonly name = "DuplicateMutation"
+export class DuplicateMutation extends Data.TaggedError("DuplicateMutation")<{ readonly message: string }> {
+  constructor(message: string) {
+    super({ message })
+  }
 }
 
 export interface MutationRegistry {

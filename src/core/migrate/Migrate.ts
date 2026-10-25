@@ -14,7 +14,7 @@
  *
  * `scope_grants` is the engine's table (created by `001_engine`) and is never planned here.
  */
-import { Schema } from "effect"
+import { Data, Schema } from "effect"
 import { ScopeGrants } from "../ScopeGrants.ts"
 import { canonicalJson, pgType, type AnySyncTable, type ColumnKind } from "../SyncTable.ts"
 import type { SyncRegistry } from "../Registry.ts"
@@ -65,7 +65,7 @@ export const encodeSnapshot = (snapshot: Snapshot): string =>
 /** Parses and validates a committed snapshot file. Throws `MigrationPlanError` if malformed. */
 export const decodeSnapshot = (text: string): Snapshot => {
   try {
-    return Schema.decodeUnknownSync(Snapshot)(JSON.parse(text))
+    return Schema.decodeUnknownSync(Schema.fromJsonString(Snapshot))(text)
   } catch (error) {
     throw new MigrationPlanError(`manifest snapshot is malformed: ${String(error)}`)
   }
@@ -93,8 +93,10 @@ export interface Intent {
 }
 
 /** An intent that refers to something the diff does not contain; nothing is guessed. */
-export class MigrationPlanError extends Error {
-  override readonly name = "MigrationPlanError"
+export class MigrationPlanError extends Data.TaggedError("MigrationPlanError")<{ readonly message: string }> {
+  constructor(message: string) {
+    super({ message })
+  }
 }
 
 export type Step =

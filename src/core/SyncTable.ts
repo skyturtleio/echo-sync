@@ -1,4 +1,4 @@
-import { DateTime, Predicate, Schema, SchemaAST, SchemaGetter, String as Str } from "effect"
+import { Data, DateTime, Predicate, Schema, SchemaAST, SchemaGetter, String as Str } from "effect"
 import type { AccessScopeId } from "./AccessScope.ts"
 
 // ---------------------------------------------------------------------------------------------
@@ -176,8 +176,12 @@ export interface SyncTable<Name extends string, F extends TableFields, I extends
 // Declaration
 // ---------------------------------------------------------------------------------------------
 
-export class SyncTableDeclarationError extends Error {
-  override readonly name = "SyncTableDeclarationError"
+export class SyncTableDeclarationError extends Data.TaggedError("SyncTableDeclarationError")<{
+  readonly message: string
+}> {
+  constructor(message: string) {
+    super({ message })
+  }
 }
 
 const identifier = /^[a-z][a-z0-9_]*$/

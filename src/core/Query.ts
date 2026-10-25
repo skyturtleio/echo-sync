@@ -1,4 +1,4 @@
-import { Effect, Schema } from "effect"
+import { Data, Effect, Schema } from "effect"
 import type { PureSchema } from "./Mutation.ts"
 import type { EchoStore, ReadError, ReadStore } from "./Store.ts"
 
@@ -64,8 +64,10 @@ export const make = <const Name extends string, A extends PureSchema, S extends 
   }
 }
 
-export class DuplicateQuery extends Error {
-  override readonly name = "DuplicateQuery"
+export class DuplicateQuery extends Data.TaggedError("DuplicateQuery")<{ readonly message: string }> {
+  constructor(message: string) {
+    super({ message })
+  }
 }
 
 export interface QueryRegistry {
