@@ -217,6 +217,54 @@ it.effect("a transient push failure is retried with backoff and clears once a cy
   })
 )
 
+it.effect("wakes advance capped backoff without resetting it; only a clean cycle restores the first delay", () =>
+  Effect.gen(function* () {
+    for (const { base, cap, delays, second } of [
+      { base: 1000, cap: 2500, delays: [1000, 2000, 2500, 2500], second: 2000 },
+      { base: 3000, cap: 1000, delays: [3000, 1000, 1000, 1000], second: 1000 }
+    ]) {
+      let failing = true
+      const { engine, calls } = fakeEngine(() => (failing ? offline() : undefined))
+      const loop = yield* SyncLoop.make({ engine, pendingMutations: noPending, retryDelay: base, maxRetryDelay: cap })
+      const fiber = yield* Effect.forkChild(loop.run)
+      yield* settle
+      for (const delay of delays) {
+        const now = yield* Clock.currentTimeMillis
+        expect(yield* loop.status).toMatchObject({ phase: "backoff", nextRetryAt: now + delay })
+        const before = calls.push
+        yield* TestClock.adjust(137)
+        yield* loop.wake
+        yield* settle
+        expect(calls.push).toBe(before + 1)
+      }
+      // Let a capped wait finish too: a correct deadline alone cannot prove the actual sleep.
+      const cappedAttempt = calls.push
+      yield* TestClock.adjust(cap - 1)
+      expect(calls.push).toBe(cappedAttempt)
+      yield* TestClock.adjust(1)
+      yield* settle
+      expect(calls.push).toBe(cappedAttempt + 1)
+      failing = false
+      yield* loop.wake
+      yield* settle
+      expect(yield* loop.status).toMatchObject({ phase: "idle", nextRetryAt: null, lastError: null })
+      failing = true
+      yield* loop.wake
+      yield* settle
+      const now = yield* Clock.currentTimeMillis
+      expect((yield* loop.status).nextRetryAt).toBe(now + base)
+      const before = calls.push
+      yield* TestClock.adjust(base - 1)
+      expect(calls.push).toBe(before)
+      yield* TestClock.adjust(1)
+      yield* settle
+      expect(calls.push).toBe(before + 1)
+      expect((yield* loop.status).nextRetryAt).toBe(now + base + second)
+      yield* Fiber.interrupt(fiber)
+    }
+  })
+)
+
 it.effect("lastSyncedAt stays null after a cycle whose pull failed, and is set by the first cycle that installs", () =>
   Effect.gen(function* () {
     const calls = { pull: 0 }
@@ -388,6 +436,47 @@ it.effect(
       expect(attempts.length).toBe(4) // a live (heartbeating) connection is not replaced
       expect(wakes.n).toBe(2)
     })
+)
+
+it.effect("pokes reconnect delays cap and reset only after a poke, not a heartbeat or idle timeout", () =>
+  Effect.gen(function* () {
+    for (const { base, cap, delays } of [
+      { base: 1000, cap: 2500, delays: [1000, 2000, 2500, 2500, 1000, 2000] },
+      { base: 3000, cap: 1000, delays: [3000, 1000, 1000, 1000, 3000, 1000] }
+    ]) {
+      let attempts = 0
+      let wakes = 0
+      const fiber = yield* Effect.forkChild(
+        SyncLoop.followPokes({
+          connect: Effect.sync(() => {
+            attempts++
+            if (attempts === 3) return Stream.never
+            if (attempts === 5) return Stream.make(poke)
+            return Stream.make(heartbeat)
+          }),
+          wake: Effect.sync(() => void wakes++),
+          retryDelay: base,
+          maxRetryDelay: cap,
+          idleTimeout: 500
+        })
+      )
+      yield* settle
+      for (const [index, delay] of delays.entries()) {
+        if (index === 2) {
+          yield* TestClock.adjust(500)
+          yield* settle
+        }
+        yield* TestClock.adjust(delay - 1)
+        yield* settle
+        expect(attempts).toBe(index + 1)
+        yield* TestClock.adjust(1)
+        yield* settle
+        expect(attempts).toBe(index + 2)
+      }
+      expect(wakes).toBe(1)
+      yield* Fiber.interrupt(fiber)
+    }
+  })
 )
 
 it.effect("only stream elements wake: a stream with no initial poke wakes nothing until it delivers one", () =>

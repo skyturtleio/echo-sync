@@ -18,6 +18,7 @@ import {
   Pull,
   Queue,
   Result,
+  Schedule,
   Schema,
   Stream,
   SubscriptionRef
@@ -88,6 +89,15 @@ const messages: Record<SyncErrorKind, string> = {
 }
 
 const stoppedBatch: SyncError = { kind: "server", message: "the server stopped the push batch at a transient failure" }
+
+const backoff = (base: number, cap: number) =>
+  Schedule.exponential(base).pipe(
+    // The original policy leaves the first delay uncapped, even when base > cap.
+    // Keep a zero base zero even after exponential's attempt counter overflows its power.
+    Schedule.modifyDelay(({ attempt, duration }) =>
+      Effect.succeed(attempt === 1 || base === 0 ? base : Math.min(Duration.toMillis(duration), cap))
+    )
+  )
 
 /**
  * The status consequences of a failure cause (INV-LOOP-5: defect > integrity > transient), never just
@@ -225,16 +235,19 @@ export const make = (options: {
 
     const run = Effect.gen(function* () {
       yield* Effect.forkChild(followPending)
-      let delay = base
+      const schedule = backoff(base, cap)
+      let step = yield* Schedule.toStep(schedule)
       while (true) {
         const failed = yield* cycle
         if (failed) {
+          const now = yield* Clock.currentTimeMillis
+          // This schedule never ends; advance before racing so a wake cannot reset it.
+          const [, delay] = yield* Effect.orDie(step(now, undefined))
           // Retry after the backoff unless something wakes the loop first.
-          yield* setPhase("backoff", (yield* Clock.currentTimeMillis) + delay)
-          yield* Effect.raceFirst(Queue.take(wakes), Effect.sleep(Duration.millis(delay)))
-          delay = Math.min(delay * 2, cap)
+          yield* setPhase("backoff", now + Duration.toMillis(delay))
+          yield* Effect.raceFirst(Queue.take(wakes), Effect.sleep(delay))
         } else {
-          delay = base
+          step = yield* Schedule.toStep(schedule)
           yield* setPhase("idle")
           yield* Queue.take(wakes)
         }
@@ -290,9 +303,10 @@ export const followPokes = (options: {
     const base = Duration.toMillis(Duration.fromInputUnsafe(options.retryDelay ?? "1 second"))
     const cap = Duration.toMillis(Duration.fromInputUnsafe(options.maxRetryDelay ?? "30 seconds"))
     const idleTimeout = options.idleTimeout ?? "45 seconds"
+    const schedule = backoff(base, cap)
+    let step = yield* Schedule.toStepWithSleep(schedule)
     // Preparation runs first and is never counted as silence; the clock starts when the stream is
     // first pulled, which is when its request is sent, and bounds the first element and every gap.
-    let delay = base
     while (true) {
       const connection = { poked: false, timedOut: false }
       const connect = Stream.transformPull(
@@ -344,7 +358,7 @@ export const followPokes = (options: {
             : Effect.void
         )
       )
-      if (connection.poked) delay = base
+      if (connection.poked) step = yield* Schedule.toStepWithSleep(schedule)
       yield* Telemetry.count(
         "echo.pokes.reconnect.total",
         connection.timedOut
@@ -358,7 +372,7 @@ export const followPokes = (options: {
         "echo-sync: pokes stream ended; reconnecting",
         Exit.isFailure(ended) ? ended.cause : undefined
       )
-      yield* Effect.sleep(Duration.millis(delay))
-      delay = Math.min(delay * 2, cap)
+      // This schedule recurs forever, so Done would be an internal defect.
+      yield* Effect.orDie(step(undefined))
     }
   }).pipe(Telemetry.boundary)
