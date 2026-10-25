@@ -28,6 +28,7 @@ import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import * as FiberSet from "effect/FiberSet"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
 import * as Schedule from "effect/Schedule"
@@ -482,8 +483,9 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
      */
     const live = () => !route.isReset() && scope.state._tag !== "Closed"
     // DOM callbacks start their Effect work here: owned by `topology`, so a reset or the client's close ends it.
-    const fork = <A, E>(effect: Effect.Effect<A, E>) =>
-      live() ? Fiber.runIn(Effect.runForkWith(context)(effect), topology) : undefined
+    const fibers = yield* FiberSet.make().pipe(Scope.provide(topology))
+    const run = yield* FiberSet.runtime(fibers)()
+    const fork = <A, E>(effect: Effect.Effect<A, E>) => (live() ? run(effect) : undefined)
 
     interface Active {
       readonly leaderId: string

@@ -11,7 +11,7 @@
  */
 import * as Effect from "effect/Effect"
 import * as Deferred from "effect/Deferred"
-import * as Fiber from "effect/Fiber"
+import * as FiberSet from "effect/FiberSet"
 import * as Queue from "effect/Queue"
 import * as Telemetry from "../../internal/Telemetry.ts"
 import { type FromRouter, isToRouter, type RouterBroadcast, type ToLeader } from "./messages.ts"
@@ -25,14 +25,14 @@ export interface SharedWorkerScope {
 /** Long-lived host-run router; interrupting it also ends its lock watchers. */
 export const router = (self: SharedWorkerScope): Effect.Effect<void> =>
   Effect.gen(function* () {
-    const scope = yield* Effect.scope
-    const context = yield* Effect.context<never>()
+    const fibers = yield* FiberSet.make<void, never>()
+    const run = yield* FiberSet.runtime(fibers)()
     let open = true
     const ports = new Set<MessagePort>()
     const listeners = new Map<MessagePort, (event: MessageEvent) => void>()
     const fork = (work: Effect.Effect<void>) => {
       if (!open) return undefined
-      return Fiber.runIn(Effect.runForkWith(context)(work), scope)
+      return run(work)
     }
     let identity: Platform.ReplicaIdentity | undefined
     let leader: { readonly leaderId: string; readonly port: MessagePort } | undefined
@@ -41,7 +41,7 @@ export const router = (self: SharedWorkerScope): Effect.Effect<void> =>
     /** The leader each tab was last linked to (by this instance, or as the tab reported in `Hello`). */
     const linked = new Map<string, string>()
 
-    /** Leader announcements, accepted one at a time in arrival order by one fiber owned by `scope`. */
+    /** Leader announcements, accepted one at a time in arrival order by one router-owned fiber. */
     const announcements = yield* Queue.unbounded<{
       readonly replica: Platform.ReplicaIdentity
       readonly announced: { readonly leaderId: string; readonly port: MessagePort }
@@ -76,7 +76,8 @@ export const router = (self: SharedWorkerScope): Effect.Effect<void> =>
             "echo.router.handover",
             Telemetry.serverFailure
           )
-      yield* Effect.forkIn(
+      yield* FiberSet.run(
+        fibers,
         Platform.awaitLockReleased(epoch).pipe(
           Effect.andThen(
             Effect.suspend(() =>
@@ -100,7 +101,7 @@ export const router = (self: SharedWorkerScope): Effect.Effect<void> =>
           ),
           Effect.catchCause((cause) => Telemetry.log("Error", "echo router: watching leader epoch failed", cause))
         ),
-        scope
+        { startImmediately: false }
       )
     })
 

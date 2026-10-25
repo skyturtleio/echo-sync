@@ -2615,11 +2615,12 @@ parents. Host metric attributes, annotations and parent metadata must not contai
 
 Leader OPFS, sync, poke and per-tab RPC fibers are scoped to the leader; pending-count is a
 child of the loop; presence and timeout/pull fibers use subscription scopes. Router callback
-runners capture guarded references with `runForkWith` and attach with `Fiber.runIn`; epoch
-watchers use the long-lived router scope, not the short announcement fiber. Tab connection,
-epoch, deferred close and serialized acceptance runners similarly belong to the client's
-scope; status publication uses `runSyncWith` on captured context. Check closure before
-`runForkWith`, which evaluates synchronously, not only before attaching the fiber.
+runners capture guarded references with `FiberSet.runtime`; the scoped set also owns epoch
+watchers beyond the short announcement fiber. Tab connection, epoch, deferred connection
+close and serialized acceptance runners use a separate set owned by the client's topology
+scope. Status publication uses `runSyncWith` on captured context. Callback runners check
+closure before starting synchronous work. The reset-close runner retains `runForkWith`:
+it must outlive the topology it closes, and the client's finalizer waits for its completion.
 
 The boundary replaces tracer/loggers only; minimum log level, metric registry/attributes and
 other host references inherit normally. Suppressed spans propagate the nearest exported
