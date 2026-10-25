@@ -13,12 +13,13 @@
  * `Mutation.MutationRejection`, and undo images store their table by sync name, resolved through the
  * registry when read (a rebuild empties them, so a name is always registered).
  */
-import { Effect, Option, Schema, Semaphore, type Stream } from "effect"
+import { Deferred, Effect, Option, Schema, type Stream } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
 import { type Errors, Ids, Mutation, Protocol, type Registry, Store, SyncTable } from "echo-sync"
 import * as Outbox from "../Outbox.ts"
 import * as SqliteRowStore from "../SqliteRowStore.ts"
+import type { LocalChange, Revision } from "../Provenance.ts"
 import type * as Engine from "./Engine.ts"
 
 const StoredPage = Schema.fromJsonString(Protocol.PullPage)
@@ -161,6 +162,11 @@ const toEnvelope = (entry: Outbox.OutboxEntry): Effect.Effect<Mutation.MutationE
  */
 /** The engine's storage port plus admission for SQL the leader runs outside the engine. */
 export interface SqliteSyncStorage extends Engine.SyncStorage {
+  readonly localCommit: NonNullable<Engine.SyncStorage["localCommit"]>
+  /** Read only while admitted, alongside the query's rows. */
+  readonly revision: Effect.Effect<Revision>
+  /** Raw SQL is outside the tracked row store. Call under admission before executing it. */
+  readonly invalidateRevision: Effect.Effect<void>
   /**
    * Run `self` holding the storage permit but with no transaction of its own (statements autocommit),
    * so SQL outside the engine (the tab `exec`/`subscribe` RPCs) waits as cancellably as `transaction`.
@@ -176,7 +182,60 @@ export interface SqliteSyncStorage extends Engine.SyncStorage {
 
 export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry): SqliteSyncStorage => {
   const rows = SqliteRowStore.make(sql, registry)
-  const permit = Semaphore.makeUnsafe(1)
+  // The head owns admission even before its fiber resumes. Keeping the owner in the
+  // insertion-ordered set prevents a releasing fiber from barging back in.
+  const admissions = new Set<Deferred.Deferred<void>>()
+  const admit: SqliteSyncStorage["admit"] = (self) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.suspend(() => {
+        const ready = Deferred.makeUnsafe<void>()
+        admissions.add(ready)
+        if (admissions.size === 1) Deferred.doneUnsafe(ready, Effect.void)
+        // Install cleanup before restoring interruption, including while awaiting a
+        // grant. A cancelled head passes ownership on; a cancelled waiter just leaves.
+        return restore(Effect.andThen(Deferred.await(ready), self)).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              const wasHead = admissions.values().next().value === ready
+              admissions.delete(ready)
+              const next = admissions.values().next().value
+              if (wasHead && next !== undefined) Deferred.doneUnsafe(next, Effect.void)
+            })
+          )
+        )
+      })
+    )
+  let revision: Revision = { epoch: crypto.randomUUID(), offset: 0 }
+  let changed = false
+  let appended = false
+  const advance = () => {
+    revision =
+      revision.offset === Number.MAX_SAFE_INTEGER
+        ? { epoch: crypto.randomUUID(), offset: 0 }
+        : { ...revision, offset: revision.offset + 1 }
+  }
+  const touch = <A, E, R>(self: Effect.Effect<A, E, R>) =>
+    Effect.tap(self, () =>
+      Effect.sync(() => {
+        changed = true
+      })
+    )
+  const commit = <A, E, R>(self: Effect.Effect<A, E, R>, local: boolean) =>
+    admit(
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          changed = false
+          appended = false
+          const before = revision
+          // Keep publication masked with COMMIT, but the body (and admission above) cancellable.
+          const value = yield* sql.withTransaction(restore(self))
+          if (changed) advance()
+          const change: LocalChange | null =
+            local && appended && before.epoch === revision.epoch ? { before, after: revision } : null
+          return { value, change }
+        })
+      )
+    ).pipe(Effect.catchIf(isSqlError, (error) => SqliteRowStore.unavailable(Effect.fail(error))))
   const run = <A>(effect: Effect.Effect<A, SqlError, SqlClient.SqlClient>) =>
     SqliteRowStore.unavailable(Effect.provideService(effect, SqlClient.SqlClient, sql))
 
@@ -206,10 +265,12 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
   })
 
   return {
-    admit: (self) => permit.withPermit(self),
+    revision: Effect.sync(() => revision),
+    invalidateRevision: Effect.sync(advance),
+    admit,
     pendingCount: sql.reactive(
       ["echo_outbox"],
-      permit.withPermit(
+      admit(
         Effect.map(
           run(sql<{ readonly n: number }>`SELECT count(*) AS n FROM echo_outbox WHERE released_at IS NULL`),
           (counted) => counted[0]?.n ?? 0
@@ -217,27 +278,31 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
       )
     ),
     // BEGIN/COMMIT failures map like any statement's; the body's own errors pass through unchanged.
-    // `withTransaction` waits for the connection lease uninterruptibly; waiting for `permit` first makes
+    // `withTransaction` waits for the connection lease uninterruptibly; waiting for admission first makes
     // a transaction queued behind a long one (e.g. a pull install) cancellable while it waits. Admission
-    // is serialized, not fair (SPEC Appendix C.1): a fiber that just released may take the permit again
-    // ahead of a waiter. Order between mutations comes from the caller sequencing them, never from here.
-    // The leader runs its own SQL through `admit` or `transaction`, so nothing it serves bypasses the permit.
-    transaction: (self) =>
-      permit
-        .withPermit(sql.withTransaction(self))
-        .pipe(Effect.catchIf(isSqlError, (error) => SqliteRowStore.unavailable(Effect.fail(error)))),
-    rows,
+    // is FIFO (INV-CLI-15) and held through commit/rollback and revision publication. Both transaction
+    // paths share this gate with `admit` and pending counts, so local receipts cannot bypass waiters.
+    transaction: (self) => Effect.map(commit(self, false), ({ value }) => value),
+    localCommit: (self) => commit(self, true),
+    rows: {
+      ...rows,
+      write: (table, id, row) => touch(rows.write(table, id, row)),
+      purgeScope: (scope) => touch(rows.purgeScope(scope)),
+      clearAll: touch(rows.clearAll)
+    },
     meta: Effect.gen(function* () {
       const stored = yield* run(sql<{ readonly value: string }>`SELECT value FROM echo_meta WHERE key = 'sync_meta'`)
       const text = stored[0]?.value
       return text === undefined ? initialMeta : yield* decodeMeta(text)
     }),
     setMeta: (meta) =>
-      Effect.gen(function* () {
-        const value = yield* encodeMeta(meta)
-        yield* run(sql`INSERT INTO echo_meta (key, value) VALUES ('sync_meta', ${value})
+      touch(
+        Effect.gen(function* () {
+          const value = yield* encodeMeta(meta)
+          yield* run(sql`INSERT INTO echo_meta (key, value) VALUES ('sync_meta', ${value})
           ON CONFLICT (key) DO UPDATE SET value = excluded.value`)
-      }),
+        })
+      ),
     pending,
     lookup: (mutationId) =>
       Effect.flatMap(run(Outbox.lookup(mutationId)), (entry) =>
@@ -258,13 +323,15 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
             undo
           })
         )
+        changed = true
+        appended = true
       }),
     setUndo: (seq, undo) =>
       Effect.gen(function* () {
         const text = yield* encodeUndoImages(undo)
         yield* run(sql`UPDATE echo_outbox SET undo = ${text} WHERE seq = ${seq}`)
       }),
-    release: (seqs) => run(Outbox.markReleased(seqs)),
+    release: (seqs) => touch(run(Outbox.markReleased(seqs))),
     staged: Effect.gen(function* () {
       const stored = yield* run(sql<{ readonly page: string }>`SELECT page FROM echo_staged ORDER BY ord`)
       return yield* Effect.forEach(stored, (r) => decodePage(r.page))

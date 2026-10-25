@@ -975,6 +975,18 @@ replay set goes through one function, `rebase`.
   already found nothing to send. Reporting eligible work from the install and retrying a
   deferred push prevents quiet servers from leaving restored pending intent stranded.
 
+- INV-CLI-15: SQLite replica admission MUST be FIFO in order of arrival at the storage gate,
+  across transactions, registered query runs, pending counts and other admitted work. A later
+  arrival MUST NOT overtake an uncancelled waiter. Queued cancellation MUST remove the work
+  without running its body; cancellation racing with a grant MUST NOT strand admission or
+  admit overlapping work. Admission remains held through transaction commit/rollback and
+  cleanup. There are no work-class priorities or preemption of running work.
+
+  **Rationale (2026-10-25):** Reserve admission for the oldest waiter before waking it, rather
+  than releasing a semaphore permit that a new arrival can take first. This prevents barging
+  without splitting query snapshots or installs; it does not bound running-query time or
+  establish a measured latency improvement.
+
 ### Details
 
 #### 9.1 Storage
@@ -986,9 +998,11 @@ SQLite tables, all `STRICT` except the outbox: `echo_meta(key, value)` with keys
 released_at, undo TEXT NOT NULL DEFAULT '[]')` (`undo` is engine schema step 2; a stored
 `engine_schema_version` above the engine's own step count is a defect, not a rebuild), `echo_staged(ord, page)` (the
 `PullPage` JSON as received), `echo_notices(id, notice)`. The replica tables are the registry's
-SQLite DDL. The storage has one permit: every transaction, including a long install, excludes
-every other; a `mutate` queued behind an install can be interrupted while it waits and its
-handler never runs.
+SQLite DDL. The storage has one FIFO admission gate (INV-CLI-15): every transaction, including
+a long install, excludes every other; a `mutate` queued behind an install can be interrupted
+while it waits and its handler never runs. Ordering begins when an effect reaches admission,
+not when a tab invokes an RPC. Await each enqueue to order one tab's calls. This gate is not
+reentrant: storage methods inside an admitted operation use its existing admission.
 
 #### 9.2 Meta
 
@@ -1313,7 +1327,7 @@ replica.
 - INV-BRW-4: Handover: in-flight requests fail `LeaderUnavailable{LeaderLost}`; requests issued
   while no leader is connected wait for the next one; `mutate` fixes its `mutationId` before the
   first attempt and retries `LeaderLost` with it (so a mutation committed on the lost leader
-  lands on INV-CLI-4: one outbox row); `subscribe`, `notices`, `syncStatus` and `presence`
+  lands on INV-CLI-4: one outbox row); `subscribe`, `subscribeSnapshot`, `notices`, `syncStatus` and `presence`
   resubscribe on a defect-free all-`LeaderLost` cause and emit nothing in between;
   `subscribeRaw` ends. A cause with a defect beside `LeaderLost` is not a handover and passes
   through.
@@ -1367,6 +1381,20 @@ replica.
   predecessor's OPFS pool access handles before checking the reset tombstone or opening the
   database. It MUST use the bounded exponential wait in §18, then surface `LeaderFailed` rather
   than retrying when the handles remain held.
+- INV-BRW-12: `subscribeSnapshot` MUST pair query data with the committed replica revision
+  read under the same storage admission. A new optimistic enqueue MAY return a `change`
+  interval covering exactly its commit, never a later snapshot. Rolled-back engine writes MUST NOT
+  advance the revision; duplicate receipts MUST NOT certify a new local interval.
+- INV-BRW-13: `Provenance.classify` MUST require refresh unless the app supplies an incorporated
+  snapshot in the same storage lifetime and already-incorporated local receipts covering every
+  revision through the next snapshot (or the snapshot is unchanged). Coalescing MUST NOT hide
+  unknown/mixed commits, reconciliation, or lifetime changes. A local receipt MUST NOT certify
+  a pull, rejection, rebase, or reset as already incorporated.
+
+**Rationale (2026-10-25):** Exact local commit intervals let apps prove coverage without a
+server-origin audit trail or an engine-retained cause log. A last-writer label or comparison
+to a newer mutation receipt cannot prove that intervening external changes were incorporated;
+conservative refresh is preferable, including for own mutations later reconciled by the server.
 
 ### Details
 
@@ -1403,10 +1431,48 @@ replica: `syncStatus`, `requestSync`, `presence` and `track` fail `SyncDisabled`
 
 #### 12.3 `LeaderRpcs`
 
-`exec`, `enqueue`, `subscribe`, `subscribeRaw`, `leaderInfo`, `syncStatus`, `requestSync`,
+`exec`, `enqueue`, `subscribe`, `subscribeSnapshot`, `subscribeRaw`, `leaderInfo`, `syncStatus`, `requestSync`,
 `presence`, `track`, `notices`, `dismissNotices`, `exportPending`; errors per §15. The tab API
 (`tabApi`) adds id generation, `LeaderLost` retry, resubscription and codec work; a UI adapter
 is a translation of the tab API and adds no sync semantics.
+
+`subscribeSnapshot(query, args)` emits `{ value, revision: { epoch, offset } }`; `value` uses
+the query's success codec. Existing `subscribe` continues to emit only data. Revisions are
+replica-wide, not per query, mutation sequences, server positions, or durable timestamps.
+The opaque random `epoch` identifies one storage lifetime: leader restart/handover, reopening
+after a schema rebuild, and reset/open start a new lifetime. Offsets are comparable only within
+that epoch. Registered reads do not advance them. Every committed tracked row-write transaction,
+outbox append/release, and sync-meta update advances once, even if the final rows are equal.
+Staging alone does not describe a new visible snapshot. Raw diagnostics conservatively advance
+before execution under admission (even reads/failures); arbitrary raw SQL is not a supported
+app write path. No persistent schema or server wire change is required.
+
+An enqueue receipt retains `clientId`, `mutationId`, `seq`, and adds `change: { before, after }`
+for a newly committed local mutation. `after.offset = before.offset + 1` in the same epoch.
+The interval is captured and published with COMMIT before admission is released; concurrent
+pulls cannot be mislabeled as that enqueue. Duplicate retries return `change: null`, including
+a lost response retried after handover; absent metadata from a custom storage is equally unknown.
+Receipts are not persisted or recovered from mutation identity. A rejected local transaction
+returns no receipt. Server rejection, push-covered release, replay, history reset and pull install
+do not produce local intervals, even when they concern the caller's mutation or write equal data.
+Pull rows have no mutation origins; no claim is made that an own ack makes the pulled rows local.
+
+`Provenance.classify(incorporated, next, appliedReceipts)` returns `unchanged`, `local-only`,
+or `refresh-required`. `incorporated` MUST be the revision of a snapshot actually incorporated
+for this query/args; use `undefined` initially or when changing queries/args. `appliedReceipts`
+MUST contain only mutations whose optimistic effects the app already incorporated. A complete
+contiguous cover yields `local-only`, irrespective of receipt order or duplicates. Missing
+receipts, gaps, older `next`, or different epochs require refresh. Receiving an older snapshot
+does not prove the app incorporated any newer snapshot; never advance `incorporated` just
+because a receipt has a larger offset. The same rule applies across a resubscription.
+
+This is provenance, not a UI instruction: the app owns refresh, optimistic equivalence (including
+query sorting/filtering/aggregates), and pending-intent overlays. Applying an older query result
+can still overwrite newer app-local state. A notification can arrive before its receipt; refresh
+conservatively or wait and reclassify. Notice handling remains independent. An app may drop
+receipts at any time (losing optimization only); it can prune them through an incorporated
+snapshot and discard all on epoch change. The engine stores no receipt history and coalesced
+invalidations remain wake hints: the next run's actual snapshot revision supplies coverage.
 
 #### 12.4 Router
 
@@ -2085,6 +2151,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-CLI-12 | covered | `SqliteSyncStorage.test` "an index-only change keeps rows and cursor; a data-shape change rebuilds and resets them together", "a data-shape migration interrupted at any scheduler boundary leaves the old replica or the new one, never a mix" |
 | INV-CLI-13 | covered | `version-gate.e2e` "unknown-table changes must not stall an old client or be lost after its registry update" |
 | INV-CLI-14 | covered | `expiry.e2e` "an epoch rotation resnapshots without losing pushed or unpushed pending mutations; released intent stays lost with the backup"; `Simulation.test` "restoring an earlier log and ledger cannot strand pending intent or mix replicas across epochs", "late push and pull responses from a restored epoch cannot release pending intent or install old rows"; `SyncLoop.test` "a discovered or resumed epoch resnapshot delivers pending intent without an external wake"; `Transport.test` "an epoch-refused pokes connection wakes pull even when the restored server has no new writes" |
+| INV-CLI-15 | covered | `SqliteSyncStorage.test` "queued transactions, reads and pending counts progress before a releasing caller can reenter", "cancelling queued head, middle and tail work never runs it or releases the active transaction", "interruption at every admission handoff boundary leaves transactions atomic and admission usable" |
 | INV-LOOP-1 | covered | `SyncLoop.test` "a transient push failure is retried with backoff and clears once a cycle succeeds"; `Leader.test` "requestSync during backoff runs the next cycle at once and leaves a halted push halted" |
 | INV-LOOP-2 | covered | `SyncLoop.test` "lastSyncedAt stays null after a cycle whose pull failed, and is set by the first cycle that installs", "a stopped push that processed later entries cannot advance lastSyncedAt or halt push"; `Leader.test` "a push whose response is lost keeps the entry pending until the pull installs its ack, and that cycle sets no lastSyncedAt" |
 | INV-LOOP-3 | covered | `SyncLoop.test` "an integrity error halts push for good while pull keeps running"; supplementary browser scenarios cover handover and pending export |
@@ -2112,6 +2179,8 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-BRW-9 | partial | Browser fallback and identity-refusal scenarios; no literal test-title citation |
 | INV-BRW-10 | covered | `worker-lifetime.test` "leader teardown closes fresh transfers discarded before Init, still queued, or delivered to a saved late callback", "router teardown and rejection close fresh connect and announcement peers, including saved late callbacks"; `LeaderClient.test` "closing a client cannot abandon a transferred port queued for acceptance or waiting for its epoch check" |
 | INV-BRW-11 | partial | Browser scenarios cover OPFS handles held for 4 s and past the 10 s bound; no literal test-title citation |
+| INV-BRW-12 | covered | `Leader.test` "snapshot provenance requires every incorporated local receipt and never certifies a rollback or an unknown gap", "every emission of a query is one snapshot: two tables written together never disagree" |
+| INV-BRW-13 | covered | `Leader.test` "snapshot provenance requires every incorporated local receipt and never certifies a rollback or an unknown gap", "reconnecting pull and rejection remain refresh-required between local commits even when their notifications coalesce", "snapshot resubscription after leader loss cannot reuse the old lifetime's local receipts" |
 | INV-SCH-1 | partial | `Migrate.test` "a NOT NULL column without a default is added nullable with the SPEC §13 TODO, never SET NOT NULL", "nullable literal unions generate TEXT and an old JSON manifest requires a manual kind migration"; destructive and safe DDL groups need individual citations |
 | INV-SCH-2 | covered | `Migrate.test` "an intent naming something the diff does not contain is refused, not ignored", "a combined table and column rename is one table TODO and one column TODO, no DDL, no intent error", "an index on a renamed column is a TODO; unrelated changes in the same table stay DDL" |
 | INV-SCH-3 | covered | `Migrate.test` "migrations are numbered after the highest existing one", "scope_grants is the engine's table and is never planned; no change plans nothing"; `version-gate.e2e` "a client below the generated floor stops retrying, can mutate offline, and delivers the original intents after update" (history) |
@@ -2169,6 +2238,7 @@ machine-verifiable literal test-title citations.
 | `LISTEN` reconnect backoff | `min(50 ms · 2^n, 5 s)`, reset once confirmed | `rpc.ts` | no |
 | presence revocation watch restart | 1 s | `rpc.ts` | no |
 | pending-count stream restart (leader) | 1 s after any failure, forever | `SyncLoop.ts` | no |
+| SQLite replica admission | one active operation; FIFO; no priorities, preemption or wait-time bound | `SqliteSyncStorage.ts`, §9.1 | no |
 | ledger expiry retention | default 7 d, minimum 48 h | `gc.ts` | `retention` |
 | log GC retention | caller-supplied (no default) | `gc.ts` | argument |
 | released-row marker retention | 24 h | `Outbox.ts` | `pruneReleased(retentionMillis)` |
@@ -2176,6 +2246,8 @@ machine-verifiable literal test-title citations.
 | `awaitOpfsPoolFree` | exponential 20 ms … 5.12 s, 9 retries / 10.22 s total | `platform.ts` | no |
 | `LeaderLost` retry spacing (`mutate`, `requestSync`, `dismissNotices`) | 50 ms, unbounded | `LeaderClient.ts` | no |
 | resubscribe delay after `LeaderLost` | 50 ms | `LeaderClient.ts` | no |
+| replica revision offset | 0 … `Number.MAX_SAFE_INTEGER`; next advance rotates epoch to offset 0, with no local interval | `SqliteSyncStorage.ts`, §12.3 | no |
+| provenance history retained by engine | none; caller supplies incorporated receipts to classify | `Provenance.ts`, §12.3 | no |
 | table name | `/^[a-z][a-z0-9_]*$/`, ≤ 48 | `SyncTable.ts` | no |
 | column name | snake case, ≤ 63 | `SyncTable.ts` | no |
 | index name | `${table}__${index}` ≤ 63 | `SyncTable.ts` | no |
@@ -2251,10 +2323,12 @@ uninterruptible hold region synchronously after grant. A custom scheduler yieldi
 (or before a shared watcher releases its grant) could retain a granted lock until agent death;
 scheduler-independent resolver cleanup remains deferred.
 
-The storage permit serializes transactions but is not fair: a releasing fiber can barge ahead
-of a waiter. Await each enqueue to order one tab's calls; concurrent calls have no promised
-relative order. `exec` and notices use `admit` (permit, no extra transaction); query emissions
-and engine operations use storage transactions. Raw writes bypass outbox and undo capture.
+The storage gate retains its owner at the head of an insertion-ordered set of Deferreds.
+Release removes that head and signals the next without making admission available to new
+arrivals. A masked enqueue installs cleanup before restoring interruption to waiting and
+execution; cleanup removes a cancelled waiter or passes a cancelled owner's grant onward.
+`exec` and notices use `admit` (no extra transaction); query emissions and engine operations
+use storage transactions. Raw writes bypass outbox and undo capture.
 
 Closing the tab client's scope terminates its candidate immediately, without worker
 finalizers or a drain/flush. A committed enqueue remains in OPFS; an abandoned HTTP push may

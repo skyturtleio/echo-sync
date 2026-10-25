@@ -229,11 +229,13 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
         expect(yield* serverState).toEqual(beforeServer)
         expect(yield* storage.meta).toEqual(beforeMeta)
         expect((yield* storage.rows.scan(Items)).slice(0, 1)).toEqual(beforeRows)
-        expect((yield* storage.pending).map((p) => p.envelope)).toEqual([original, offline])
+        // Local revision receipts are not persisted in the mutation envelope.
+        const envelopes = [original, offline].map((receipt) => Schema.encodeSync(Mutation.MutationEnvelope)(receipt))
+        expect((yield* storage.pending).map((p) => p.envelope)).toEqual(envelopes)
         yield* Fiber.interrupt(running)
         // Reopen the same database with fresh storage/engine handles and the normal registry migration.
         const updated = yield* device(Registry.make([Items, Notes]), transport, sqlite)
-        expect((yield* updated.storage.pending).map((p) => p.envelope)).toEqual([original, offline])
+        expect((yield* updated.storage.pending).map((p) => p.envelope)).toEqual(envelopes)
         const resumed = yield* SyncLoop.make({
           engine: updated.engine,
           pendingMutations: updated.storage.pendingCount

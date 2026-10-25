@@ -39,6 +39,7 @@ import * as Telemetry from "../../internal/Telemetry.ts"
 import { type AccessScope, type Errors, Ids, Mutation, Protocol, type Query } from "echo-sync"
 import { LocallyRejected } from "../sync/Engine.ts"
 import type { SyncStatus } from "../sync/SyncLoop.ts"
+import type { Snapshot } from "../Provenance.ts"
 // Values, so apps get the runtime schemas (and their types) without RPC introspection (SPEC §10).
 export { SyncError, SyncStatus } from "../sync/SyncLoop.ts"
 export { SyncErrorKind } from "../sync/SyncFailure.ts"
@@ -127,6 +128,8 @@ export class LeaderClient extends Context.Service<
     ) => Effect.Effect<Enqueued, SqlFailure | LocallyRejected | LeaderUnavailable>
     /** A registered query's live result, decoded with its `success` schema; survives handover. */
     readonly subscribe: SubscribeFn
+    /** Data and its committed replica revision; refresh policy stays with the app. */
+    readonly subscribeSnapshot: SubscribeSnapshotFn
     /**
      * The raw read escape hatch for the dev harness: declared tables, statements run under `query_only`;
      * `RawExecDisabled` unless the leader allows raw SQL. Ends on handover.
@@ -197,6 +200,11 @@ type SubscribeFn = <A extends Mutation.PureSchema, S extends Mutation.PureSchema
   args: A["Type"]
 ) => Stream.Stream<S["Type"], SubscribeError>
 
+type SubscribeSnapshotFn = <A extends Mutation.PureSchema, S extends Mutation.PureSchema>(
+  query: Query.Query<string, A, S>,
+  args: A["Type"]
+) => Stream.Stream<Snapshot<S["Type"]>, SubscribeError>
+
 const isLeaderLost = (e: unknown): e is LeaderUnavailable => e instanceof LeaderUnavailable && e.reason === "LeaderLost"
 
 // No tight loop while the old connection is not yet marked lost: the next attempt waits for a new leader.
@@ -238,6 +246,7 @@ export interface LeaderCalls {
     envelope: OutboxEnvelope
   ) => Effect.Effect<Enqueued, SqlFailure | LocallyRejected | LeaderUnavailable>
   readonly subscribe: (name: string, args: Schema.Json) => Stream.Stream<Schema.Json, SubscribeError>
+  readonly subscribeSnapshot: (name: string, args: Schema.Json) => Stream.Stream<Snapshot<Schema.Json>, SubscribeError>
   readonly notices: Stream.Stream<ReadonlyArray<StoredNotice>, SqlFailure | LeaderUnavailable>
   readonly dismissNotices: (ids: ReadonlyArray<number>) => Effect.Effect<void, SqlFailure | LeaderUnavailable>
   readonly syncStatus: Stream.Stream<SyncStatus, SyncDisabled | LeaderUnavailable>
@@ -298,6 +307,18 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
         // A leader result that does not decode is a version skew between tab and leader code: a defect.
         return resubscribing(calls.subscribe(query.name, encoded)).pipe(
           Stream.mapEffect((result) => Effect.orDie(decode(result)))
+        )
+      })
+    )
+  const subscribeSnapshot: SubscribeSnapshotFn = (query, args) =>
+    Stream.unwrap(
+      Effect.gen(function* () {
+        const encoded = yield* Effect.orDie(Schema.encodeUnknownEffect(Schema.toCodecJson(query.args))(args))
+        const decode = Schema.decodeUnknownEffect(Schema.toCodecJson(query.success))
+        return resubscribing(calls.subscribeSnapshot(query.name, encoded)).pipe(
+          Stream.mapEffect(({ value, revision }) =>
+            Effect.map(Effect.orDie(decode(value)), (decoded) => ({ value: decoded, revision }))
+          )
         )
       })
     )
@@ -400,6 +421,7 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
   return {
     mutate,
     subscribe,
+    subscribeSnapshot,
     presence,
     track,
     notices: resubscribing(calls.notices),
@@ -504,6 +526,8 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
         {
           enqueue,
           subscribe: (name, args) => route.streamWithLeader((client) => client.subscribe({ name, args })),
+          subscribeSnapshot: (name, args) =>
+            route.streamWithLeader((client) => client.subscribeSnapshot({ name, args })),
           notices: route.streamWithLeader((client) => client.notices()),
           dismissNotices: (ids) => route.withLeader((client) => client.dismissNotices({ ids })),
           syncStatus: route.streamWithLeader((client) => client.syncStatus()),

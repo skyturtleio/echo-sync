@@ -127,7 +127,7 @@ describe.skipIf(!pgAvailable)("replica principal vs. session (SPEC §5) against 
         assert.deepStrictEqual((yield* serverRows).clients, [])
         assert.deepStrictEqual(
           before.local.pending.map((p) => p.envelope),
-          [write]
+          [Schema.encodeSync(Mutation.MutationEnvelope)(write)]
         )
         const loop = yield* SyncLoop.make({
           engine,
@@ -191,7 +191,7 @@ describe.skipIf(!pgAvailable)("replica principal vs. session (SPEC §5) against 
         assert.deepStrictEqual((yield* serverRows).ledger, [])
         assert.deepStrictEqual(
           before.local.pending.map((p) => p.envelope),
-          [write]
+          [Schema.encodeSync(Mutation.MutationEnvelope)(write)]
         )
 
         // Back on alice's session the preserved write is delivered once.

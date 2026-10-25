@@ -2,7 +2,7 @@
 import "../testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { expect, it } from "@effect/vitest"
-import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Scope } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Scope, Stream } from "effect"
 import type { Scheduler } from "effect/Scheduler"
 import * as SqlClient from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation, Protocol, Registry, ScopeGrants, SyncTable } from "echo-sync"
@@ -36,6 +36,173 @@ const entry = (seq: Ids.Seq, mutationId: string) => ({
   envelope: { clientId: Ids.ClientId.make("c"), mutationId: mid(mutationId), seq, name: "t", args: { mutationId } },
   createdAt: 0,
   undo: [{ table: T, id: mutationId, before: Option.none() }]
+})
+
+it.effect("queued transactions, reads and pending counts progress before a releasing caller can reenter", () =>
+  Effect.gen(function* () {
+    const { storage } = yield* makeStorage
+    const before = yield* storage.admit(storage.revision)
+    const order: Array<string> = []
+    const fibers = yield* storage.admit(
+      Effect.gen(function* () {
+        const save = yield* Effect.forkChild(
+          storage.localCommit(
+            Effect.gen(function* () {
+              yield* storage.appendPending(entry(yield* storage.nextSeq, "saved"))
+              order.push("save")
+            })
+          ),
+          { startImmediately: true }
+        )
+        const read = yield* Effect.forkChild(
+          storage.transaction(
+            Effect.map(storage.pending, (pending) => {
+              expect(pending.map((p) => p.envelope.mutationId)).toEqual(["saved"])
+              order.push("read")
+            })
+          ),
+          { startImmediately: true }
+        )
+        const count = yield* Effect.forkChild(Stream.runHead(storage.pendingCount), { startImmediately: true })
+        const install = yield* Effect.forkChild(
+          storage.transaction(
+            Effect.andThen(
+              storage.release([seqOf(1)]),
+              Effect.sync(() => order.push("install"))
+            )
+          ),
+          { startImmediately: true }
+        )
+        return { save, read, count, install }
+      })
+    )
+    // No yield between releasing admission and asking again: the old semaphore barges here.
+    yield* storage.admit(Effect.sync(() => order.push("late")))
+    expect((yield* Fiber.join(fibers.save)).change).toEqual({
+      before,
+      after: { epoch: before.epoch, offset: before.offset + 1 }
+    })
+    yield* Fiber.join(fibers.read)
+    expect(yield* Fiber.join(fibers.count)).toEqual(Option.some(1))
+    yield* Fiber.join(fibers.install)
+    expect(order).toEqual(["save", "read", "install", "late"])
+    expect(yield* storage.admit(storage.revision)).toEqual({ epoch: before.epoch, offset: before.offset + 2 })
+    expect(yield* Stream.runHead(storage.pendingCount)).toEqual(Option.some(0))
+  }).pipe(Effect.provide(Db))
+)
+
+it.effect("cancelling queued head, middle and tail work never runs it or releases the active transaction", () =>
+  Effect.gen(function* () {
+    const { storage, rows } = yield* makeStorage
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const owner = yield* Effect.forkChild(
+      storage.transaction(
+        Effect.gen(function* () {
+          yield* storage.rows.write(T, "owner", Option.some(row("owner")))
+          yield* Deferred.succeed(entered, undefined)
+          yield* Deferred.await(release)
+        })
+      )
+    )
+    yield* Deferred.await(entered)
+    const ran: Array<number> = []
+    const waiters = yield* Effect.forEach([0, 1, 2, 3, 4], (i) =>
+      Effect.forkChild(storage.transaction(Effect.sync(() => ran.push(i))), { startImmediately: true })
+    )
+    for (const i of [0, 2, 4]) {
+      const waiter = waiters[i]
+      if (waiter !== undefined) yield* Fiber.interrupt(waiter)
+    }
+    expect(ran).toEqual([])
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(owner)
+    for (const i of [1, 3]) {
+      const waiter = waiters[i]
+      if (waiter !== undefined) yield* Fiber.join(waiter)
+    }
+    expect(ran).toEqual([1, 3])
+    expect(yield* storage.transaction(rows.ids)).toEqual(["owner"])
+    // Defects and typed failures must also pass ownership on.
+    yield* Effect.exit(storage.admit(Effect.die("defect")))
+    yield* Effect.exit(storage.admit(Effect.fail("failure")))
+    expect(yield* storage.transaction(rows.ids)).toEqual(["owner"])
+  }).pipe(Effect.provide(Db))
+)
+
+it("interruption at every admission handoff boundary leaves transactions atomic and admission usable", async () => {
+  let interrupted = 0
+  const outcomes = new Set<number>()
+  for (let boundary = 1; ; boundary++) {
+    const scope = await Effect.runPromise(Scope.make())
+    const context = await Effect.runPromise(Layer.buildWithScope(Db, scope))
+    const run = Effect.runPromiseExitWith(context)
+    const { storage, rows } = await Effect.runPromiseWith(context)(makeStorage)
+    const controller = new AbortController()
+    let ticks = 0
+    let yielded = false
+    const tasks: Array<() => void> = []
+    const scheduler: Scheduler = {
+      executionMode: "async",
+      shouldYield: () => !yielded && ++ticks === boundary && (yielded = true),
+      makeDispatcher: () => ({
+        scheduleTask: (task) => {
+          tasks.push(task)
+        },
+        flush: () => {
+          while (tasks.length > 0) tasks.shift()?.()
+        }
+      })
+    }
+    const program = Effect.gen(function* () {
+      const waiter = yield* storage.admit(
+        Effect.forkChild(
+          storage.localCommit(
+            Effect.gen(function* () {
+              yield* storage.rows.write(T, "saved", Option.some(row("saved")))
+              yield* storage.appendPending(entry(yield* storage.nextSeq, "saved"))
+            })
+          ),
+          { startImmediately: true }
+        )
+      )
+      // Race a new arrival with release and with cancellation of the granted waiter.
+      yield* storage.admit(Effect.void)
+      yield* Fiber.join(waiter)
+    })
+    const state = { settled: false }
+    const running = run(program, { scheduler, signal: controller.signal }).finally(() => (state.settled = true))
+    while (!state.settled) {
+      if (yielded) controller.abort()
+      tasks.shift()?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+    const exit = await running
+    expect(exit._tag === "Success" || exit.cause.reasons.every((reason) => reason._tag === "Interrupt")).toBe(true)
+    if (exit._tag === "Failure") {
+      interrupted++
+    }
+    const verified = await run(
+      storage.transaction(
+        Effect.gen(function* () {
+          const ids = yield* rows.ids
+          const pending = yield* storage.pending
+          expect(ids).toEqual(pending.map((p) => p.envelope.mutationId))
+          expect(ids.length).toBeLessThanOrEqual(1)
+          expect((yield* storage.revision).offset).toBe(ids.length)
+          outcomes.add(ids.length)
+          expect(yielded || ids.join() === "saved").toBe(true)
+          yield* storage.rows.write(T, "next", Option.some(row("next")))
+          expect(yield* rows.ids).toContain("next")
+        })
+      )
+    )
+    await Effect.runPromise(Scope.close(scope, verified))
+    expect(verified._tag).toBe("Success")
+    if (!yielded) break
+  }
+  expect(interrupted).toBeGreaterThan(10)
+  expect([...outcomes].toSorted()).toEqual([0, 1])
 })
 
 it.live("a transaction failing on one fiber rolls back only its own writes while another fiber commits", () =>

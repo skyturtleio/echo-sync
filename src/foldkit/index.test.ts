@@ -17,6 +17,7 @@ const SECRET = "Bearer secret-token https://internal/sync"
 const calls = (over: Partial<LeaderClient.LeaderCalls>): LeaderClient.LeaderCalls => ({
   enqueue: () => Effect.die("unused"),
   subscribe: () => Stream.die("unused"),
+  subscribeSnapshot: () => Stream.die("unused"),
   notices: Stream.die("unused"),
   dismissNotices: () => Effect.die("unused"),
   syncStatus: Stream.die("unused"),

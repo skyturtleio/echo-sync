@@ -13,6 +13,7 @@ const unused: LeaderConnection = {
   exec: () => Effect.die("exec not expected"),
   enqueue: () => Effect.die("enqueue not expected"),
   subscribe: () => Stream.die("subscribe not expected"),
+  subscribeSnapshot: () => Stream.die("subscribeSnapshot not expected"),
   subscribeRaw: () => Stream.die("subscribeRaw not expected"),
   leaderInfo: () => Effect.die("leaderInfo not expected"),
   syncStatus: () => Stream.die("syncStatus not expected"),

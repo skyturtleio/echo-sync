@@ -25,6 +25,7 @@ import { AccessScope, Ids, Mutation, Protocol, Query, Registry, ScopeGrants, typ
 import * as Engine from "../sync/Engine.ts"
 import * as SqliteSyncStorage from "../sync/SqliteSyncStorage.ts"
 import * as SyncLoop from "../sync/SyncLoop.ts"
+import * as Provenance from "../Provenance.ts"
 import { enqueueAndWake, makeHandlers } from "./Leader.ts"
 import { type LeaderCalls, tabApi } from "./LeaderClient.ts"
 import { LeaderRpcs, LeaderUnavailable } from "./LeaderRpcs.ts"
@@ -47,9 +48,9 @@ it.live("an enqueue cancelled while its COMMIT runs still wakes the loop: the en
     // masks COMMIT: the entry is durable, and the caller's fiber is interrupted on the way out.
     const storage: Engine.SyncStorage = {
       ...real,
-      transaction: <A, E, R>(self: Effect.Effect<A, E, R>) =>
+      localCommit: <A, E, R>(self: Effect.Effect<A, E, R>) =>
         Effect.uninterruptibleMask((restore) =>
-          Effect.tap(restore(real.transaction(self)), () => {
+          Effect.tap(restore(real.localCommit(self)), () => {
             if (!state.gateNext) return Effect.void
             state.gateNext = false
             return Effect.andThen(Deferred.succeed(committed, undefined), Deferred.await(gate))
@@ -161,6 +162,11 @@ const addRaw = Mutation.make("raw.add", {
   args: Schema.Struct({ id: Schema.String }),
   handler: (ctx, { id }) => ctx.store.insert(Raw, { id: RowId.make(id), accessScopeId: scope, body: "x" })
 })
+const rawRows = Query.make("raw.rows", {
+  args: Schema.Struct({}),
+  success: Schema.Array(Schema.String),
+  handler: (db) => Effect.map(db.scan(Raw), (rows) => rows.map((row) => row.id))
+})
 /** Store writes need no services; a test-only guard so the runtime-reached write can be run. */
 const isStoreWrite = (u: unknown): u is Effect.Effect<void, unknown> => Effect.isEffect(u)
 
@@ -201,7 +207,7 @@ const pageDocs = Query.make("docs.page", {
     Effect.map(db.query(Docs).withIndex("by_body").order("desc").after(cursor).take(2), (rows) => rows.map((r) => r.id))
 })
 
-const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
+const leaderRpc = (options: { readonly allowRawExec: boolean; readonly transport?: Engine.Transport }) =>
   Effect.gen(function* () {
     const reactivity = yield* Reactivity.make
     const sql = yield* SqliteClient.makeMemory({ installReactivityHooks: true }).pipe(
@@ -226,7 +232,7 @@ const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
       storage,
       registry: queryRegistry,
       mutations: Mutation.makeRegistry([addRaw]),
-      transport: {
+      transport: options.transport ?? {
         push: () => Effect.die(new Error("no transport")),
         pull: () =>
           Effect.succeed(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "2", expiredThrough: 0 }))
@@ -240,7 +246,7 @@ const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
       loop: undefined,
       presence: undefined,
       actor: me,
-      queries: Query.makeRegistry([pick, pair, flip, docs, searchDocs, pageDocs]),
+      queries: Query.makeRegistry([pick, pair, flip, docs, searchDocs, pageDocs, rawRows]),
       allowRawExec: options.allowRawExec,
       info: { leaderId: "l", clientId: "c", dbName: "test", syncing: false }
     })
@@ -292,10 +298,17 @@ it.live("every emission of a query is one snapshot: two tables written together 
     const { client, storage, put, row } = yield* leaderRpc({ allowRawExec: false })
     const { emissions, next } = yield* collect(
       client
-        .subscribe({ name: "pair", args: {} })
-        .pipe(Stream.mapEffect((u) => Schema.decodeUnknownEffect(pair.success)(u)))
+        .subscribeSnapshot({ name: "pair", args: {} })
+        .pipe(
+          Stream.mapEffect(({ value, revision }) =>
+            Schema.decodeUnknownEffect(pair.success)(value).pipe(
+              Effect.map((decoded) => ({ value: decoded, revision }))
+            )
+          )
+        )
     )
-    expect(yield* next).toEqual({ l: 0, r: 0 })
+    const initial = yield* next
+    expect(initial.value).toEqual({ l: 0, r: 0 })
     const n = 40
     // One transaction writes both tables; a run that read them outside one transaction could see l = r + 1.
     yield* Effect.forkScoped(
@@ -307,14 +320,19 @@ it.live("every emission of a query is one snapshot: two tables written together 
             .pipe(Effect.andThen(Effect.sleep("1 millis")))
       )
     )
-    const seen: Array<{ readonly l: number; readonly r: number }> = []
-    let last = { l: 0, r: 0 }
-    while (last.l < n || last.r < n) {
+    const seen: Array<typeof initial> = []
+    let last = initial
+    while (last.value.l < n || last.value.r < n) {
       last = yield* next
       seen.push(last)
     }
     seen.push(...(yield* Queue.clear(emissions)))
-    expect(seen.filter((e) => e.l !== e.r)).toEqual([])
+    expect(seen.filter((e) => e.value.l !== e.value.r)).toEqual([])
+    // Each writer commits both rows once. A revision read after releasing admission can get ahead
+    // of the result; one based on statement count or mutation seq cannot satisfy this either.
+    for (const snapshot of seen) {
+      expect(snapshot.revision).toEqual({ ...initial.revision, offset: initial.revision.offset + snapshot.value.l })
+    }
   }).pipe(Effect.scoped)
 )
 
@@ -447,6 +465,7 @@ const leaderLost = new LeaderUnavailable({ reason: "LeaderLost", message: "injec
 const passThrough = (client: Effect.Success<ReturnType<typeof leaderRpc>>["client"]): LeaderCalls => ({
   enqueue: (envelope) => client.enqueue({ envelope }),
   subscribe: (name, args) => client.subscribe({ name, args }),
+  subscribeSnapshot: (name, args) => client.subscribeSnapshot({ name, args }),
   notices: client.notices(),
   dismissNotices: (ids) => client.dismissNotices({ ids }),
   syncStatus: client.syncStatus(),
@@ -454,6 +473,172 @@ const passThrough = (client: Effect.Success<ReturnType<typeof leaderRpc>>["clien
   presence: (room, state, revision) => client.presence({ room, tabId: Protocol.TabId.make("tab"), state, revision }),
   track: (room, state, revision) => client.track({ room, tabId: Protocol.TabId.make("tab"), state, revision })
 })
+
+it.live(
+  "snapshot provenance requires every incorporated local receipt and never certifies a rollback or an unknown gap",
+  () =>
+    Effect.gen(function* () {
+      const { client, storage, write, row } = yield* leaderRpc({ allowRawExec: true })
+      const api = tabApi(passThrough(client))
+      const { next } = yield* collect(api.subscribeSnapshot(rawRows, {}))
+      const initial = yield* next
+      expect(initial.value).toEqual([])
+      expect(Provenance.classify(undefined, initial.revision, [])).toBe("refresh-required")
+      const first = yield* api.mutate(addRaw, { id: "a" })
+      const a = yield* next
+      expect(a.value).toEqual(["a"])
+      expect(first.change).toEqual({ before: initial.revision, after: a.revision })
+      expect(first.seq).not.toBe(a.revision.offset)
+      const second = yield* api.mutate(addRaw, { id: "b" })
+      const b = yield* next
+      expect(b.value).toEqual(["a", "b"])
+      // The consumer may coalesce a and b; both intervals, not just the newest receipt, are required.
+      expect(Provenance.classify(initial.revision, b.revision, [second])).toBe("refresh-required")
+      expect(Provenance.classify(initial.revision, b.revision, [second, first, first])).toBe("local-only")
+      expect(Provenance.classify(a.revision, b.revision, [second])).toBe("local-only")
+      expect(Provenance.classify(b.revision, a.revision, [first, second])).toBe("refresh-required")
+
+      const duplicate = yield* api.mutate(addRaw, { id: "a" }, { mutationId: Ids.MutationId.make(first.mutationId) })
+      expect(duplicate.change).toBeNull()
+      expect(duplicate.seq).toBe(first.seq)
+      const rolledBack = yield* Effect.exit(
+        storage.transaction(
+          Effect.andThen(
+            storage.rows.write(Raw, "rollback", Option.some({ id: "rollback", access_scope_id: "s", body: "x" })),
+            Effect.fail("rollback")
+          )
+        )
+      )
+      expect(Exit.isFailure(rolledBack)).toBe(true)
+      const afterRollback = yield* Stream.runHead(api.subscribeSnapshot(rawRows, {})).pipe(
+        Effect.map(Option.getOrThrow)
+      )
+      expect(afterRollback).toEqual(b)
+      expect(Provenance.classify(b.revision, afterRollback.revision, [])).toBe("unchanged")
+      expect(Exit.isFailure(yield* Effect.exit(api.mutate(addRaw, { id: "a" })))).toBe(true)
+      expect(yield* Stream.runHead(api.subscribeSnapshot(rawRows, {})).pipe(Effect.map(Option.getOrThrow))).toEqual(b)
+
+      yield* write(Raw, row("external"))
+      const external = yield* next
+      expect(external.value).toEqual(["a", "b", "external"])
+      const third = yield* api.mutate(addRaw, { id: "c" })
+      const c = yield* next
+      expect(Provenance.classify(b.revision, c.revision, [third])).toBe("refresh-required")
+      expect(Provenance.classify(external.revision, c.revision, [third])).toBe("local-only")
+      yield* client.exec({ sql: "UPDATE raw SET body = 'remote' WHERE id = 'a'", params: [] })
+      const raw = yield* next
+      expect(Provenance.classify(c.revision, raw.revision, [third])).toBe("refresh-required")
+    }).pipe(Effect.scoped)
+)
+
+it.live(
+  "reconnecting pull and rejection remain refresh-required between local commits even when their notifications coalesce",
+  () =>
+    Effect.gen(function* () {
+      let rejectedId = ""
+      let online = false
+      let cursor = "2"
+      const { client, engine, storage } = yield* leaderRpc({
+        allowRawExec: false,
+        transport: {
+          push: () => Effect.die("unused"),
+          pull: () =>
+            online
+              ? Effect.succeed(
+                  decodeDone({
+                    _tag: "PullDone",
+                    changes:
+                      cursor === "2"
+                        ? [
+                            {
+                              _tag: "upsert",
+                              table: "raw",
+                              row: { id: "server", access_scope_id: "s", body: "remote" }
+                            }
+                          ]
+                        : [],
+                    acks: [
+                      {
+                        mutationId: rejectedId,
+                        position: cursor,
+                        outcome: { _tag: "Rejected", error: { _tag: "UnknownMutation", name: "raw.add" } }
+                      }
+                    ],
+                    nextCursor: cursor,
+                    expiredThrough: 0
+                  })
+                )
+              : Effect.fail(pullOffline())
+        }
+      })
+      // A previously installed replica; a reconnect is incremental, not a new scope snapshot.
+      yield* storage.transaction(storage.setMeta({ cursor: position, pushedThrough: 0, resnapshot: false }))
+      const api = tabApi(passThrough(client))
+      const { next } = yield* collect(api.subscribeSnapshot(rawRows, {}))
+      const initial = yield* next
+      const rejected = yield* api.mutate(addRaw, { id: "rejected" })
+      rejectedId = rejected.mutationId
+      const optimistic = yield* next
+      expect(optimistic.value).toEqual(["rejected"])
+      expect(Provenance.classify(initial.revision, optimistic.revision, [rejected])).toBe("local-only")
+      expect(Exit.isFailure(yield* Effect.exit(engine.pull))).toBe(true)
+      expect(yield* Stream.runHead(api.subscribeSnapshot(rawRows, {})).pipe(Effect.map(Option.getOrThrow))).toEqual(
+        optimistic
+      )
+      online = true
+      yield* engine.pull
+      const reconciled = yield* next
+      expect(reconciled.value).toEqual(["server"])
+      expect(Provenance.classify(optimistic.revision, reconciled.revision, [rejected])).toBe("refresh-required")
+      const own = yield* api.mutate(addRaw, { id: "later" })
+      const latest = yield* next
+      expect(latest.value).toEqual(["later", "server"])
+      expect(Provenance.classify(initial.revision, latest.revision, [rejected, own])).toBe("refresh-required")
+      expect(Provenance.classify(reconciled.revision, latest.revision, [own])).toBe("local-only")
+      const notices = yield* Stream.runHead(api.notices).pipe(Effect.map(Option.getOrThrow))
+      expect(notices.map(({ notice }) => notice._tag)).toEqual(["Rejected"])
+      // An own rejection with NO external rows must still undo the local effect and require refresh.
+      rejectedId = own.mutationId
+      cursor = "3"
+      yield* engine.pull
+      const onlyRejection = yield* next
+      expect(onlyRejection.value).toEqual(["server"])
+      expect(Provenance.classify(latest.revision, onlyRejection.revision, [own])).toBe("refresh-required")
+    }).pipe(Effect.scoped)
+)
+
+it.live("snapshot resubscription after leader loss cannot reuse the old lifetime's local receipts", () =>
+  Effect.gen(function* () {
+    const first = yield* leaderRpc({ allowRawExec: false })
+    let active = first.client
+    const lost = yield* Deferred.make<void>()
+    let opens = 0
+    const calls = passThrough(first.client)
+    const api = tabApi({
+      ...calls,
+      subscribeSnapshot: (name, args) =>
+        Stream.suspend(() => {
+          opens++
+          return opens === 1
+            ? calls
+                .subscribeSnapshot(name, args)
+                .pipe(Stream.interruptWhen(Effect.andThen(Deferred.await(lost), Effect.fail(leaderLost))))
+            : active.subscribeSnapshot({ name, args })
+        })
+    })
+    const { next } = yield* collect(api.subscribeSnapshot(rawRows, {}))
+    const initial = yield* next
+    const receipt = yield* api.mutate(addRaw, { id: "old" })
+    const own = yield* next
+    expect(Provenance.classify(initial.revision, own.revision, [receipt])).toBe("local-only")
+    active = (yield* leaderRpc({ allowRawExec: false })).client
+    yield* Deferred.succeed(lost, undefined)
+    const fresh = yield* next
+    expect(fresh.value).toEqual([])
+    expect(fresh.revision.epoch).not.toBe(own.revision.epoch)
+    expect(Provenance.classify(initial.revision, fresh.revision, [receipt])).toBe("refresh-required")
+  }).pipe(Effect.scoped)
+)
 
 it.live("mutate rejects excess args before enqueue rather than silently saving a stripped intent", () =>
   Effect.gen(function* () {
@@ -497,6 +682,7 @@ it.live("mutate retried across LeaderLost after the lost leader committed leaves
         return presented.length === 1 ? Effect.andThen(real, Effect.fail(leaderLost)) : real
       })
     const api = tabApi({ ...passThrough(client), enqueue })
+    const initial = yield* Stream.runHead(api.subscribeSnapshot(rawRows, {})).pipe(Effect.map(Option.getOrThrow))
     const enqueued = yield* api.mutate(addRaw, { id: "r1" })
     expect(presented.length).toBe(2)
     // Fails if a retry minted a new id: the second attempt would append a second entry (and a second apply).
@@ -504,6 +690,10 @@ it.live("mutate retried across LeaderLost after the lost leader committed leaves
     expect(yield* count("echo_outbox")).toBe(1)
     expect(yield* count("raw")).toBe(1)
     expect(enqueued.seq).toBe(1)
+    expect(enqueued.change).toBeNull()
+    const fresh = yield* Stream.runHead(api.subscribeSnapshot(rawRows, {})).pipe(Effect.map(Option.getOrThrow))
+    expect(fresh.value).toEqual(["r1"])
+    expect(Provenance.classify(initial.revision, fresh.revision, [enqueued])).toBe("refresh-required")
   }).pipe(Effect.scoped)
 )
 

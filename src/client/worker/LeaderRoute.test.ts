@@ -15,6 +15,7 @@ const leader = (
   exec: () => Effect.die("unused"),
   enqueue: () => Effect.die("unused"),
   subscribe: () => Stream.die("unused"),
+  subscribeSnapshot: () => Stream.die("unused"),
   subscribeRaw: () => Stream.die("unused"),
   leaderInfo: call,
   syncStatus: stream,

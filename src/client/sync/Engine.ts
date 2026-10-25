@@ -20,6 +20,7 @@ import { Mutation, Protocol, Store } from "../../core/index.ts"
 import type { AccessScope, Errors, Ids, Registry, SyncTable } from "../../core/index.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 import { failureOutcome } from "../../internal/ErrorCatalog.ts"
+import type { LocalChange } from "../Provenance.ts"
 import * as SyncFailure from "./SyncFailure.ts"
 import { MalformedChange, type PullReason, type PushReason, ServerOutdated } from "./SyncFailure.ts"
 
@@ -58,12 +59,20 @@ export type Notice = Mutation.Notice
 type StoreUnavailable = Errors.StoreUnavailable
 
 /**
- * Durable client state. Every method other than `transaction` must be called inside
- * `transaction`. Transactions are serialized, and each one commits or rolls back rows, outbox,
+ * Durable client state. Every method other than `transaction` and `localCommit` must be called inside
+ * one of those transaction boundaries. Transactions are serialized, and each one commits or rolls back rows, outbox,
  * seq counter, meta, staging and notices together, from one decision.
  */
 export interface SyncStorage {
   readonly transaction: <A, E, R>(self: Effect.Effect<A, E, R>) => Effect.Effect<A, E | StoreUnavailable, R>
+  /**
+   * Optional enqueue transaction boundary, with the same admission/rollback semantics as `transaction`.
+   * Certify only a newly appended optimistic mutation, publishing its interval with COMMIT; duplicates
+   * return null. Other engine operations must use `transaction` and cannot produce a local certificate.
+   */
+  readonly localCommit?: <A, E, R>(
+    self: Effect.Effect<A, E, R>
+  ) => Effect.Effect<{ readonly value: A; readonly change: LocalChange | null }, E | StoreUnavailable, R>
   readonly rows: Store.ReplicaRowStore
   readonly meta: Effect.Effect<SyncMeta, StoreUnavailable>
   readonly setMeta: (meta: SyncMeta) => Effect.Effect<void, StoreUnavailable>
@@ -308,7 +317,10 @@ export interface Engine {
     mutationId: Ids.MutationId,
     name: string,
     args: Schema.Json
-  ) => Effect.Effect<Mutation.MutationEnvelope, StoreUnavailable | LocallyRejected>
+  ) => Effect.Effect<
+    Mutation.MutationEnvelope & { readonly change?: LocalChange | null },
+    StoreUnavailable | LocallyRejected
+  >
   /** Sends unprocessed outbox entries in seq order until none remain or the server stops. */
   readonly push: Effect.Effect<PushResult, SyncFailure.PushFailure>
   /** Installs a complete set. `retryPush` asks the loop to deliver intent made eligible by this install. */
@@ -358,7 +370,9 @@ export const make = (options: {
 
     const mutate = (mutationId: Ids.MutationId, name: string, args: Schema.Json) =>
       Telemetry.observe(
-        storage.transaction(
+        (
+          storage.localCommit ?? ((self) => Effect.map(storage.transaction(self), (value) => ({ value, change: null })))
+        )(
           Effect.gen(function* () {
             const known = yield* storage.lookup(mutationId)
             if (Option.isSome(known)) {
@@ -381,7 +395,7 @@ export const make = (options: {
             yield* Telemetry.annotate({ "echo.result": "saved" })
             return envelope
           })
-        ),
+        ).pipe(Effect.map(({ value, change }) => ({ ...value, change }))),
         "echo.enqueue",
         Telemetry.byFailure(failureOutcome)
       )

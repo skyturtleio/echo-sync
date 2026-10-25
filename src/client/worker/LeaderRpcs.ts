@@ -9,6 +9,7 @@ import { AccessScope, Errors, Ids, Mutation, Protocol, Query } from "echo-sync"
 import { LocallyRejected } from "../sync/Engine.ts"
 import { Notice } from "../sync/SqliteSyncStorage.ts"
 import { SyncStatus } from "../sync/SyncLoop.ts"
+import { LocalChange, Revision } from "../Provenance.ts"
 
 /** A SQLite statement failed inside the leader. The transaction (if any) was rolled back. */
 export class SqlFailure extends Schema.TaggedError<SqlFailure>()("SqlFailure", {
@@ -70,7 +71,8 @@ export type OutboxEnvelope = typeof OutboxEnvelope.Type
 export const Enqueued = Schema.Struct({
   clientId: Schema.String,
   mutationId: Schema.String,
-  seq: Schema.Number
+  seq: Schema.Number,
+  change: Schema.optionalKey(Schema.NullOr(LocalChange))
 })
 export type Enqueued = typeof Enqueued.Type
 
@@ -136,6 +138,20 @@ export class LeaderRpcs extends RpcGroup.make(
   Rpc.make("subscribe", {
     payload: { name: Schema.String, args: Schema.Json },
     success: Schema.Json,
+    error: Schema.Union([
+      SqlFailure,
+      Query.UnknownQuery,
+      Query.QueryArgsDecodeFailed,
+      Errors.RowNotFound,
+      Errors.ScopeForbidden,
+      Errors.InvalidRow
+    ]),
+    stream: true
+  }),
+  /** Registered query data and the revision read in the same admitted snapshot. */
+  Rpc.make("subscribeSnapshot", {
+    payload: { name: Schema.String, args: Schema.Json },
+    success: Schema.Struct({ value: Schema.Json, revision: Revision }),
     error: Schema.Union([
       SqlFailure,
       Query.UnknownQuery,

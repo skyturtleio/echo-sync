@@ -17,6 +17,7 @@ import type { WorkerError } from "effect/workers/WorkerError"
 import type { Errors, Protocol, Query } from "echo-sync"
 import type { LocallyRejected } from "../sync/Engine.ts"
 import type { SyncStatus } from "../sync/SyncLoop.ts"
+import type { Snapshot } from "../Provenance.ts"
 import * as LeaderRpcs from "./LeaderRpcs.ts"
 import * as Platform from "./platform.ts"
 
@@ -47,6 +48,10 @@ export interface LeaderConnection {
     | Errors.InvalidRow
     | RpcClientError
   >
+  readonly subscribeSnapshot: (input: {
+    readonly name: string
+    readonly args: Schema.Json
+  }) => Stream.Stream<Snapshot<Schema.Json>, Stream.Error<ReturnType<LeaderConnection["subscribe"]>>>
   readonly subscribeRaw: (input: {
     readonly query: LeaderRpcs.LiveQuery
   }) => Stream.Stream<LeaderRpcs.QueryResult, LeaderRpcs.SqlFailure | LeaderRpcs.RawExecDisabled | RpcClientError>
