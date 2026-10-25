@@ -130,6 +130,10 @@ export const make = (disk: Disk): Engine.SyncStorage => {
         disk.outbox = disk.outbox.filter((e) => !gone.has(e.envelope.seq))
       }),
     staged: Effect.sync(() => disk.staged),
+    stagedProgress: Effect.sync(() => ({
+      continuation: Option.fromNullishOr(disk.staged.at(-1)?.continuation),
+      count: disk.staged.length
+    })),
     stage: (page) =>
       Effect.sync(() => {
         disk.staged = [...disk.staged, page]

@@ -269,6 +269,27 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
       const stored = yield* run(sql<{ readonly page: string }>`SELECT page FROM echo_staged ORDER BY ord`)
       return yield* Effect.forEach(stored, (r) => decodePage(r.page))
     }),
+    stagedProgress: Effect.gen(function* () {
+      // stage only appends and clearStaged deletes the whole set: committed ords are contiguous
+      // within a set (including after rollback), but AUTOINCREMENT does not restart on clear.
+      // Two primary-key end seeks avoid a count(*) scan and returning accumulated page JSON.
+      const stored = yield* run(sql<{ readonly continuation: string | null; readonly count: number }>`
+        SELECT CASE WHEN json_valid(page) THEN
+                 CASE WHEN json_type(page, '$.continuation') = 'text'
+                   THEN json_extract(page, '$.continuation') END
+               END AS continuation,
+               ord - (SELECT min(ord) FROM echo_staged) + 1 AS count
+        FROM echo_staged ORDER BY ord DESC LIMIT 1`)
+      const last = stored[0]
+      return last === undefined
+        ? { continuation: Option.none(), count: 0 }
+        : {
+            continuation: Option.some(
+              yield* Store.decodeStored(Protocol.PullContinuation, "echo_staged", last.continuation)
+            ),
+            count: last.count
+          }
+    }),
     stage: (page) =>
       Effect.gen(function* () {
         const text = yield* encodePage(page)

@@ -123,9 +123,11 @@ costs `O(U) + O(C) + Σ_{m unreleased} H(m)` store operations, and `P` does not 
 page set nor `C` the cost of the outbox: the terms add. A pushed batch that is answered with
 positions at or below the installed cursor triggers the same undo-all/replay-all with `C = 0`.
 Every upsert of a known table is decoded once at staging (to refuse a malformed page before it is
-persisted) and decoded again, then encoded, at install: two decodes and one encode per upsert
-per install. All of this runs inside one SQLite transaction under the storage's single permit, so
-no query runs and no mutation is accepted while it runs. See §9.4, §16 and INV-CLI-3.
+persisted) and decoded again, then encoded, at install. These table-codec passes exclude transport
+codecs, staged-page JSON encode/decode and SQLite-row encoding. For K staged pages, resume reads
+only the tail continuation and count; install reads all K payloads once (INV-PERF-8). Staging and
+network waits are outside the install transaction. The full rebase holds the storage's single
+permit, so no query runs and no mutation is accepted during that transaction. See §9.4, §16 and INV-CLI-3.
 
 ## 1. Scope, non-goals and admissions
 
@@ -1024,6 +1026,21 @@ staged and have only the install decode. Every undo restore is also one
 `sqlite.row` encode. Reading the pending outbox (`storage.pending`) decodes each entry's `undo`
 JSON, so the read itself is `|P|` decodes.
 
+SQLite additionally encodes each staged `PullPage` as JSON once and decodes its whole payload
+once at install, including generic encoded-row validation; transport codecs are separate again.
+Before each request, `stagedProgress` returns only the last continuation and page count, never
+the accumulated payloads. SQLite extracts the continuation from the tail JSON; two primary-key
+end seeks derive count as `last ord - first ord + 1`. Staging only appends and clears whole sets,
+so ords are contiguous within a set, even after rollback; their absolute values need not start at 1.
+Memory storage reads the array tail and length. Across K pages, resume returns O(K) metadata rows
+and SQLite parses O(C) tail payload bytes for fixed-size rows, rather than repeatedly decoding
+all preceding pages. Install still reads the full set exactly once, atomically (INV-PERF-8).
+
+**Rationale (2026-10-25):** Reading all staged pages merely to resume made a K-page pull perform
+K(K+1)/2 page reads before install; the previous cost model omitted that quadratic work and the
+staged-page codecs. Read durable tail metadata instead of caching it in the engine, preserving
+reload and epoch/reset behavior without a schema migration or changing the 500-row default.
+
 #### 9.5 Notices
 
 `Notice = Rejected{envelope, error} | OutcomeUnknown{envelope}`. The engine only appends;
@@ -1812,6 +1829,9 @@ batches, page limits and retention against them.
 - INV-PERF-7: The fixed fixtures below MUST also preserve their SELECT-returned-row budgets,
   including walk lookahead. These count rows returned to the engine, not physical rows scanned
   by Postgres/SQLite, nor rows returned by INSERT RETURNING.
+- INV-PERF-8: Across a K-page pull, resume reads O(K) staged metadata rows, not O(K²) page
+  payloads. Install reads the K staged payloads once. Reopening storage resumes from the durable
+  tail; clearing or rolling back staging changes its progress atomically with the pages (§9.4).
 
 **Rationale (2026-10-24):** Counters gate, timings inform. Separate client-issued statements
 from trigger-internal work instead of counting both as round trips; the old push shorthand
@@ -2061,7 +2081,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-CLI-8 | covered | `Outbox.test` "released rows inside the retention window are not pruned"; expiry E2E additionally covers retries after marker pruning |
 | INV-CLI-9 | covered | `Simulation.test` "a known-table row missing declared keys is server-outdated: no ack, cursor or staging change"; `version-gate.e2e` "a newer client preserves valid staging on server-outdated and converges without rebuilding when the server catches up"; `SyncLoop.test` "a pull that fails with MalformedChange is retried with backoff and never halts push" |
 | INV-CLI-10 | covered | `Simulation.test` "ResnapshotRequired after a suspended pull keeps seqs, pushedThrough and cursor written meanwhile"; `gc.test` "a page set interrupted mid row walk whose position GC passed must resnapshot instead of resuming" |
-| INV-CLI-11 | covered | `SqliteRowStore.test` "a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError" |
+| INV-CLI-11 | covered | `SqliteRowStore.test` "a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError"; `SqliteSyncStorage.test` "resuming corrupt staged JSON or a non-string continuation dies naming echo_staged" |
 | INV-CLI-12 | covered | `SqliteSyncStorage.test` "an index-only change keeps rows and cursor; a data-shape change rebuilds and resets them together", "a data-shape migration interrupted at any scheduler boundary leaves the old replica or the new one, never a mix" |
 | INV-CLI-13 | covered | `version-gate.e2e` "unknown-table changes must not stall an old client or be lost after its registry update" |
 | INV-CLI-14 | covered | `expiry.e2e` "an epoch rotation resnapshots without losing pushed or unpushed pending mutations; released intent stays lost with the backup"; `Simulation.test` "restoring an earlier log and ledger cannot strand pending intent or mix replicas across epochs", "late push and pull responses from a restored epoch cannot release pending intent or install old rows"; `SyncLoop.test` "a discovered or resumed epoch resnapshot delivers pending intent without an external wake"; `Transport.test` "an epoch-refused pokes connection wakes pull even when the restored server has no new writes" |
@@ -2117,6 +2137,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PERF-5 | untested | — |
 | INV-PERF-6 | partial | `rpc.test` "more open pokes streams than pool connections do not block push or pull, and the server holds one LISTEN" (fan-out and notify counts unmeasured) |
 | INV-PERF-7 | covered | `perf-postgres.test` both budget tests; `perf-install.test` "install undoes P entries, writes C changes and replays P handlers without hidden statements" (SELECT-returned rows, not physical scans) |
+| INV-PERF-8 | covered | `perf-install.test` "a resumed K-page pull reads only linear staged rows and installs the whole set once"; `Conformance` syncStorage durability and rollback checks include staged progress |
 | INV-SPEC-1 | covered | `registry.test` "a nonexistent cited test, duplicate invariant or unindexed question cannot pass the registry gate" |
 | INV-SPEC-2 | covered | `vectors.test` "wire messages cannot change their committed decoded values, JSON bytes or variant coverage" |
 
@@ -2135,6 +2156,7 @@ machine-verifiable literal test-title citations.
 | push batch size | `min(pushBatchSize ?? 50, 100)` | `Engine.ts` | `pushBatchSize` |
 | `PushRequest.mutations` | 1 … 100 | `Protocol.ts` | no |
 | `pageLimit` (upserts + tombstones per page) | 500; configured value must be a positive safe integer (INV-PULL-14) | `rpc.ts` | `pageLimit` |
+| staged resume read | at most 1 metadata row per request; full payload set read once at install (INV-PERF-8) | `SqliteSyncStorage.ts`, `Engine.ts` | no |
 | server `heartbeatInterval` (pokes and presence) | 15 s | `rpc.ts` | yes; must stay below clients' `idleTimeout` |
 | client `idleTimeout` (pokes stream, presence stream, presence send) | 45 s | `SyncLoop.ts`, `Presence.ts` | yes; must exceed `heartbeatInterval` |
 | sync loop backoff | 1 s doubling to 30 s, reset on a clean cycle | `SyncLoop.ts` | `retryDelay`, `maxRetryDelay` |

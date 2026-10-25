@@ -1114,6 +1114,7 @@ interface DurableState {
   /** `lookup` of each probed mutation id. */
   readonly known: ReadonlyArray<Option.Option<Mutation.MutationEnvelope>>
   readonly staged: ReadonlyArray<typeof Protocol.PullPage.Type>
+  readonly stagedProgress: { readonly continuation: Option.Option<Protocol.PullContinuation>; readonly count: number }
   /** The seq the next allocation returns. */
   readonly next: number
 }
@@ -1127,7 +1128,8 @@ const durable = (storage: Engine.SyncStorage, ids: ReadonlyArray<string>) =>
         meta: storage.meta,
         pending: storage.pending,
         known: Effect.forEach(ids, (id) => storage.lookup(Ids.MutationId.make(id))),
-        staged: storage.staged
+        staged: storage.staged,
+        stagedProgress: storage.stagedProgress
       })
     )
     .pipe(Effect.flatMap((state) => Effect.map(peekSeq(storage), (next) => canonical({ ...state, next }))))
@@ -1191,6 +1193,7 @@ const syncBefore = canonical({
   pending: [entry(1, "old", 0, [])],
   known: [Option.some(envelope(1, "old")), Option.none()],
   staged: [],
+  stagedProgress: { continuation: Option.none(), count: 0 },
   next: 2
 } satisfies DurableState)
 const syncAfter = canonical({
@@ -1199,6 +1202,7 @@ const syncAfter = canonical({
   pending: [entry(2, "new", 0, [{ table: Tags, id: "t", before: Option.none() }])],
   known: [Option.some(envelope(1, "old")), Option.some(envelope(2, "new"))],
   staged: [page("k")],
+  stagedProgress: { continuation: Option.some(Protocol.PullContinuation.make("k")), count: 1 },
   next: 3
 } satisfies DurableState)
 
@@ -1239,6 +1243,7 @@ export const syncStorage = <R>(make: Effect.Effect<SyncStorageSubject, unknown, 
           pending: [entry(2, "m-b", 1_700_000_000_123, undo)],
           known: [Option.some(envelope(1, "m-a")), Option.some(envelope(2, "m-b")), Option.none()],
           staged: [page("k1"), page("k2")],
+          stagedProgress: { continuation: Option.some(Protocol.PullContinuation.make("k2")), count: 2 },
           next: 3
         }
         yield* expectDurable(fail, "before reopen", storage, ids, want)
@@ -1309,6 +1314,7 @@ export const syncStorage = <R>(make: Effect.Effect<SyncStorageSubject, unknown, 
           pending: [entry(2, "p", 0, undo)],
           known: [Option.some(envelope(1, "r")), Option.some(envelope(2, "p"))],
           staged: [page("k")],
+          stagedProgress: { continuation: Option.some(Protocol.PullContinuation.make("k")), count: 1 },
           next: 3
         }
         const populated = canonical({ items: [item("a")], tags: [tag("b", s2, "x")] })

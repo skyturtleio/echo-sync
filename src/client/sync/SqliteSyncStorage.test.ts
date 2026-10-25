@@ -2,7 +2,7 @@
 import "../testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { expect, it } from "@effect/vitest"
-import { DateTime, Deferred, Effect, Fiber, Layer, Option, Schema, Scope } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Scope } from "effect"
 import type { Scheduler } from "effect/Scheduler"
 import * as SqlClient from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation, Protocol, Registry, ScopeGrants, SyncTable } from "echo-sync"
@@ -121,8 +121,35 @@ it.effect("staged pages and meta round-trip with bigint positions", () =>
     )
     expect(yield* storage.staged).toEqual([page])
     expect((yield* storage.meta).cursor).toBe(2n ** 60n + 1n)
+    yield* storage.transaction(Effect.andThen(storage.stage(page), Effect.fail("rollback"))).pipe(Effect.flip)
+    yield* storage.transaction(storage.stage({ ...page, continuation: Protocol.PullContinuation.make("next") }))
+    expect(yield* storage.transaction(storage.stagedProgress)).toEqual({ continuation: Option.some("next"), count: 2 })
     yield* storage.clearStaged
     expect(yield* storage.staged).toEqual([])
+  }).pipe(Effect.provide(Db))
+)
+
+it.effect("resuming corrupt staged JSON or a non-string continuation dies naming echo_staged", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const storage = SqliteSyncStorage.make(sql, registry)
+    for (const page of [
+      "not json",
+      '{"continuation":42}',
+      '{"continuation":null}',
+      '{"continuation":{}}',
+      '{"continuation":[]}'
+    ]) {
+      yield* sql`DELETE FROM echo_staged`
+      yield* sql`INSERT INTO echo_staged (page) VALUES (${page})`
+      const exit = yield* Effect.exit(storage.transaction(storage.stagedProgress))
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(exit.cause.reasons.filter(Cause.isDieReason).map((reason) => reason.defect)).toEqual([
+          expect.objectContaining({ _tag: "CorruptStorage", table: "echo_staged" })
+        ])
+      }
+    }
   }).pipe(Effect.provide(Db))
 )
 

@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import { Ids } from "../../../core/index.ts"
 import type { Store } from "../../../core/index.ts"
 import * as Conformance from "../../../core/testing/Conformance.ts"
@@ -68,6 +68,7 @@ const closeOnReopen = Effect.sync(() => {
       setUndo: (seq, undo) => live(inner.setUndo(seq, undo)),
       release: (seqs) => live(inner.release(seqs)),
       staged: live(inner.staged),
+      stagedProgress: live(inner.stagedProgress),
       stage: (page) => live(inner.stage(page)),
       clearStaged: live(inner.clearStaged),
       addNotices: (notices) => live(inner.addNotices(notices))
@@ -105,6 +106,7 @@ describe("the suite's expectations come from fixtures, not from the subject (SPE
     setUndo: () => Effect.void,
     release: () => Effect.void,
     staged: Effect.succeed([]),
+    stagedProgress: Effect.succeed({ continuation: Option.none(), count: 0 }),
     stage: () => Effect.void,
     clearStaged: Effect.void,
     addNotices: () => Effect.void

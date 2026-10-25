@@ -90,6 +90,14 @@ export interface SyncStorage {
    * the set with `meta.cursor` and the last staged page's continuation.
    */
   readonly staged: Effect.Effect<ReadonlyArray<PullPage>, StoreUnavailable>
+  /** Durable resume metadata without reading/decoding the accumulated page payloads. */
+  readonly stagedProgress: Effect.Effect<
+    {
+      readonly continuation: Option.Option<Protocol.PullContinuation>
+      readonly count: number
+    },
+    StoreUnavailable
+  >
   readonly stage: (page: PullPage) => Effect.Effect<void, StoreUnavailable>
   readonly clearStaged: Effect.Effect<void, StoreUnavailable>
   readonly addNotices: (notices: ReadonlyArray<Notice>) => Effect.Effect<void, StoreUnavailable>
@@ -504,9 +512,9 @@ export const make = (options: {
           let resnapshots = 0
           while (true) {
             const { meta, staged } = yield* storage.transaction(
-              Effect.all({ meta: storage.meta, staged: storage.staged })
+              Effect.all({ meta: storage.meta, staged: storage.stagedProgress })
             )
-            const continuation = Option.fromNullishOr(staged.at(-1)?.continuation)
+            const continuation = staged.continuation
             const request: Protocol.PullRequest = {
               clientId,
               epoch: meta.epoch ?? null,
@@ -544,7 +552,7 @@ export const make = (options: {
             )
             if (Option.isNone(page)) continue
             const response = page.value
-            yield* Telemetry.annotate({ "echo.pages": staged.length + 1, "echo.resnapshot": pullFrom(meta) === null })
+            yield* Telemetry.annotate({ "echo.pages": staged.count + 1, "echo.resnapshot": pullFrom(meta) === null })
             if (response._tag === "PullPage") {
               // Keep only valid pages: retry the incompatible page from the last valid continuation,
               // rather than persisting its stale payload and resuming after it forever.
@@ -561,7 +569,7 @@ export const make = (options: {
               )
               continue
             }
-            const retryPush = yield* Telemetry.observe(
+            const installedSet = yield* Telemetry.observe(
               storage.transaction(
                 Effect.gen(function* () {
                   const set = yield* storage.staged
@@ -569,22 +577,25 @@ export const make = (options: {
                   if ((current.epoch ?? null) !== (meta.epoch ?? null)) return undefined
                   yield* applyPageSet(context, set, response)
                   const installed = yield* storage.meta
-                  return (yield* storage.pending).some((entry) => entry.envelope.seq > installed.pushedThrough)
+                  const retryPush = (yield* storage.pending).some(
+                    (entry) => entry.envelope.seq > installed.pushedThrough
+                  )
+                  return { retryPush, set }
                 })
               ),
               "echo.install",
               (cause) => SyncFailure.classifyPull(cause).outcome
             )
-            if (retryPush === undefined) continue
-            for (const installed of [...staged, response]) {
+            if (installedSet === undefined) continue
+            for (const installed of [...installedSet.set, response]) {
               for (const ack of installed.acks) transientAnswers.delete(ack.mutationId)
             }
-            yield* Telemetry.histogram("echo.pull.pages", staged.length + 1)
+            yield* Telemetry.histogram("echo.pull.pages", installedSet.set.length + 1)
             yield* Telemetry.annotate({
-              "echo.pages": staged.length + 1,
+              "echo.pages": installedSet.set.length + 1,
               "echo.result": resnapshots > 0 ? "resnapshot" : "ok"
             })
-            return { retryPush }
+            return { retryPush: installedSet.retryPush }
           }
         }),
         "echo.pull",
