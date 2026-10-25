@@ -236,6 +236,42 @@ describe("DDL that depends on a TODO rename or kind change is a TODO too (SPEC Â
 })
 
 describe("safe changes become exactly the pinned DDL", () => {
+  it("nullable literal unions generate TEXT and an old JSON manifest requires a manual kind migration", () => {
+    const table = SyncTable.make("notes", { ...base, status: Schema.NullOr(Schema.Literals(["open", "done"])) })
+    const registry = Registry.make([table])
+    const generated = Migrate.generate({ previous: Migrate.emptySnapshot, registry, existing: [], name: "init" })
+    expect(generated.source).toContain('"status" text COLLATE "C"')
+    expect(generated.source).not.toContain('"status" jsonb')
+    const snapshot = Migrate.decodeSnapshot(generated.snapshot)
+    expect(snapshot.tables[0]?.columns.find((c) => c.name === "status")).toEqual({
+      name: "status",
+      kind: "text",
+      nullable: true
+    })
+    for (const status of [null, "open", "done"]) {
+      const row = { id: "n", access_scope_id: "s", status }
+      for (const codec of [table.postgres.row, table.sqlite.row]) {
+        expect(Schema.encodeSync(codec)(row)).toEqual(row)
+        expect(Schema.decodeUnknownSync(codec)(row)).toEqual(row)
+        expect(() =>
+          Schema.decodeUnknownSync(table.wire)(Schema.decodeUnknownSync(codec)({ ...row, status: "invalid" }))
+        ).toThrow(/open|done/)
+      }
+    }
+    // Reproduce the previously committed storage manifest, not a freshly classified declaration.
+    const old = {
+      ...snapshot,
+      tables: snapshot.tables.map((t) => ({
+        ...t,
+        columns: t.columns.map((c) => (c.name === "status" ? { ...c, kind: "json" as const } : c))
+      }))
+    }
+    const upgrade = Migrate.generate({ previous: old, registry, existing: [generated.id], name: "text_status" })
+    expect(upgrade.source).toContain("notes.status changes kind json â†’ text")
+    expect(upgrade.source).not.toContain("sql.unsafe")
+    expect(Migrate.decodeSnapshot(upgrade.snapshot).tables).toEqual(snapshot.tables)
+  })
+
   it("a NOT NULL column with a default is added with it, then the default is dropped; a nullable one is added plain", () => {
     const v1 = SyncTable.make("notes", { ...base, body: Schema.String })
     const v2 = SyncTable.make("notes", {

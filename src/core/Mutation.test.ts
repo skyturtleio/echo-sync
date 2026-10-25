@@ -62,6 +62,61 @@ const makeStore = () => {
 }
 
 describe("mutation args evolve without breaking queued intents (SPEC §5)", () => {
+  it("unknown nested args are rejected through the wire registry unless stripping is explicitly enabled", async () => {
+    const args = Schema.Struct({
+      customTimes: Schema.Record(Schema.String, Schema.Struct({ minutes: Schema.Int }))
+    })
+    const seen: Array<typeof args.Type> = []
+    const handler = (_: Mutation.MutationContext, value: typeof args.Type) =>
+      Effect.sync(() => {
+        seen.push(value)
+      })
+    const strict = Mutation.make("strict", { args, handler })
+    const loose = Mutation.make("loose", { args, handler, onExcessProperty: "ignore" })
+    const registry = Mutation.makeRegistry([strict, loose])
+    for (const input of [
+      { customTimes: { night: { minutes: 12, typo: 3 } } },
+      { customTimes: { night: { minutes: 12 } }, typo: 3 }
+    ]) {
+      const envelope = Schema.decodeUnknownSync(Schema.toCodecJson(Mutation.MutationEnvelope))({
+        clientId: "c",
+        mutationId: "m",
+        seq: 1,
+        name: "strict",
+        args: input
+      })
+      const error = await Effect.runPromise(Effect.flip(Mutation.run(registry, envelope, ctx())))
+      expect(error).toBeInstanceOf(Mutation.ArgsDecodeFailed)
+      if (error._tag !== "ArgsDecodeFailed") throw error
+      expect(error.message).toContain("typo")
+      const codec = Schema.toCodecJson(Mutation.MutationOutcome)
+      const wire = Schema.encodeSync(codec)({ _tag: "Rejected", error })
+      expect(Schema.decodeUnknownSync(codec)(JSON.parse(JSON.stringify(wire)))).toEqual({ _tag: "Rejected", error })
+      expect(seen).toEqual([])
+    }
+    await Effect.runPromise(
+      Mutation.run(
+        registry,
+        {
+          name: "loose",
+          args: { customTimes: { night: { minutes: 12, typo: 3 } }, typo: 1 }
+        },
+        ctx()
+      )
+    )
+    await Effect.runPromise(
+      Mutation.run(
+        registry,
+        {
+          name: "strict",
+          args: { customTimes: { night: { minutes: 7 } } }
+        },
+        ctx()
+      )
+    )
+    expect(seen).toEqual([{ customTimes: { night: { minutes: 12 } } }, { customTimes: { night: { minutes: 7 } } }])
+  })
+
   it("a v1 envelope still in an outbox decodes through the wire envelope and runs as v2", async () => {
     // Exactly what a v1 client persisted and later pushes, as JSON text.
     const queued = JSON.parse(

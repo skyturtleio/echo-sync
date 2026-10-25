@@ -36,8 +36,8 @@ import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
 import * as Telemetry from "../../internal/Telemetry.ts"
-import { type AccessScope, type Errors, Ids, type Mutation, Protocol, type Query } from "echo-sync"
-import type { LocallyRejected } from "../sync/Engine.ts"
+import { type AccessScope, type Errors, Ids, Mutation, Protocol, type Query } from "echo-sync"
+import { LocallyRejected } from "../sync/Engine.ts"
 import type { SyncStatus } from "../sync/SyncLoop.ts"
 // Values, so apps get the runtime schemas (and their types) without RPC introspection (SPEC §10).
 export { SyncError, SyncStatus } from "../sync/SyncLoop.ts"
@@ -271,9 +271,16 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
   const retryBase = Duration.toMillis(Duration.fromInputUnsafe(tuning.presenceRetryDelay ?? "1 second"))
   const mutate: MutateFn = (mutation, args, options) =>
     Effect.gen(function* () {
-      // A bad value of the mutation's own `args` type is the caller's bug, not an outcome.
-      const encoded: Schema.Json = yield* Effect.orDie(
-        Schema.encodeUnknownEffect(Schema.toCodecJson(mutation.args))(args)
+      const encoded: Schema.Json = yield* Schema.encodeUnknownEffect(Schema.toCodecJson(mutation.args), {
+        onExcessProperty: mutation.onExcessProperty
+      })(args).pipe(
+        Effect.mapError(
+          (e) =>
+            new LocallyRejected({
+              name: mutation.name,
+              error: new Mutation.ArgsDecodeFailed({ name: mutation.name, message: e.message })
+            })
+        )
       )
       // Fixed once, before the first attempt: every retry presents the same idempotency key (INV-BRW-4).
       const mutationId = options?.mutationId ?? Ids.MutationId.make(crypto.randomUUID())

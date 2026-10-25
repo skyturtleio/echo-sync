@@ -125,6 +125,32 @@ const writer = Effect.gen(function* () {
 })
 
 describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
+  it.live("excess mutation args return a ledgered rejection over HTTP without writing the row", () =>
+    Effect.gen(function* () {
+      yield* writer
+      const sql = yield* SqlClient
+      const client = yield* connect
+      const request = push([["m1", "must not write"]])
+      const invalid = {
+        ...request,
+        mutations: Arr.map(request.mutations, (m) => ({
+          ...m,
+          args: { id: "m1", body: "must not write", typo: "lost data" }
+        }))
+      }
+      const result = yield* client.push(invalid)
+      const outcome = result.results[0]?.outcome
+      assert.strictEqual(outcome?._tag, "Rejected")
+      if (outcome?._tag !== "Rejected") throw new Error("expected rejection")
+      assert.strictEqual(outcome.error._tag, "ArgsDecodeFailed")
+      if (outcome.error._tag !== "ArgsDecodeFailed") throw new Error("expected args failure")
+      assert.include(outcome.error.message, "typo")
+      assert.deepStrictEqual(yield* sql`SELECT * FROM items`, [])
+      assert.deepStrictEqual(yield* client.push(invalid), result)
+      assert.deepStrictEqual(yield* sql`SELECT count(*)::int AS n FROM echo_sync.mutations`, [{ n: 1 }])
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
   it.live("clock checks must accept the boundary and old edits without timestamp ordering", () =>
     Effect.gen(function* () {
       yield* writer

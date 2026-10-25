@@ -426,6 +426,36 @@ const passThrough = (client: Effect.Success<ReturnType<typeof leaderRpc>>["clien
   track: (room, state, revision) => client.track({ room, tabId: Protocol.TabId.make("tab"), state, revision })
 })
 
+it.live("mutate rejects excess args before enqueue rather than silently saving a stripped intent", () =>
+  Effect.gen(function* () {
+    const { client, count } = yield* leaderRpc({ allowRawExec: false })
+    const api = tabApi(passThrough(client))
+    const input = { id: "r1", typo: "lost data" }
+    const nested = Mutation.make("nested", {
+      args: Schema.Struct({ customTimes: Schema.Record(Schema.String, Schema.Struct({ minutes: Schema.Int })) }),
+      handler: () => Effect.void
+    })
+    const nestedInput = { customTimes: { night: { minutes: 12, typo: 3 } } }
+    for (const attempt of [api.mutate(addRaw, input), api.mutate(nested, nestedInput)]) {
+      const error = yield* Effect.flip(attempt)
+      expect(error._tag).toBe("LocallyRejected")
+      if (error._tag !== "LocallyRejected") throw error
+      expect(error.error._tag).toBe("ArgsDecodeFailed")
+      if (error.error._tag !== "ArgsDecodeFailed") throw error.error
+      expect(error.error.message).toContain("typo")
+    }
+    expect(yield* count("echo_outbox")).toBe(0)
+    expect(yield* count("raw")).toBe(0)
+    const loose = Mutation.make(addRaw.name, { ...addRaw, onExcessProperty: "ignore" })
+    yield* api.mutate(loose, input)
+    expect(yield* count("echo_outbox")).toBe(1)
+    expect(yield* count("raw")).toBe(1)
+    yield* api.mutate(addRaw, { id: "r2" })
+    expect(yield* count("echo_outbox")).toBe(2)
+    expect(yield* count("raw")).toBe(2)
+  }).pipe(Effect.scoped)
+)
+
 it.live("mutate retried across LeaderLost after the lost leader committed leaves exactly one outbox row", () =>
   Effect.gen(function* () {
     const { client, count } = yield* leaderRpc({ allowRawExec: false })

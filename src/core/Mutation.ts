@@ -133,6 +133,7 @@ export interface Mutation<Name extends string, A extends PureSchema, E extends P
   /** Args schema. Evolve it with a Union of the current shape and upcast old shapes. */
   readonly args: A
   readonly error: E | Schema.Never
+  readonly onExcessProperty: "error" | "ignore"
   readonly handler: (ctx: MutationContext, args: A["Type"]) => Effect.Effect<void, E["Type"] | StoreError>
 }
 
@@ -154,13 +155,17 @@ export const make = <const Name extends string, A extends PureSchema, E extends 
   options: {
     readonly args: A
     readonly error?: E
+    /** Reject unknown args keys by default, including nested objects. `ignore` strips them. */
+    readonly onExcessProperty?: "error" | "ignore"
     readonly handler: (ctx: MutationContext, args: A["Type"]) => Effect.Effect<void, E["Type"] | StoreError>
   }
 ): Mutation<Name, A, E> => {
   const error = options.error ?? Schema.Never
   const errorSchema: PureSchema = error
+  const onExcessProperty = options.onExcessProperty ?? "error"
   const decodeArgs: (u: unknown) => Effect.Effect<A["Type"], Schema.SchemaError> = Schema.decodeUnknownEffect(
-    Schema.toCodecJson(options.args)
+    Schema.toCodecJson(options.args),
+    { onExcessProperty }
   )
   const encodeError = Schema.encodeUnknownEffect(Schema.toCodecJson(errorSchema))
   /**
@@ -196,6 +201,7 @@ export const make = <const Name extends string, A extends PureSchema, E extends 
     name,
     args: options.args,
     error,
+    onExcessProperty,
     handler: options.handler,
     execute: (ctx, args) =>
       decodeArgs(args).pipe(

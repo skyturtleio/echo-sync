@@ -263,6 +263,11 @@ const optionalAtField = (ast: SchemaAST.AST, seen: ReadonlySet<SchemaAST.AST> = 
   return false
 }
 
+// NullOr(Literals(...)) retains a nested Union in Effect's AST. Classification
+// and timestamp codec selection must inspect the same encoded leaves.
+const unionLeaves = (node: SchemaAST.AST): ReadonlyArray<SchemaAST.AST> =>
+  node._tag === "Union" ? node.types.flatMap(unionLeaves) : [node]
+
 /**
  * Classifies a field by its *encoded* side (what is stored), so a transformed field (branded,
  * refined, or decoded into another type) maps by the column it actually occupies.
@@ -278,8 +283,9 @@ const classify = (ast: SchemaAST.AST): Classified | string => {
     const l = leaf(encoded)
     return "problem" in l ? l.problem : { kind: l.kind, nullable: false }
   }
-  const members = encoded.types.filter((t) => t._tag !== "Null")
-  const nullable = members.length !== encoded.types.length
+  const types = unionLeaves(encoded)
+  const members = types.filter((t) => t._tag !== "Null")
+  const nullable = members.length !== types.length
   const [first, ...rest] = members
   if (first === undefined) return "a field cannot be only null"
   if (rest.length === 0) {
@@ -316,7 +322,7 @@ const UtcFromWire = TimestampMillis.pipe(
 const wireFor = (field: Schema.Constraint, c: Classified): Schema.Constraint => {
   if (c.kind !== "timestamp") return Schema.toCodecJson(field)
   const encoded = SchemaAST.toEncoded(field.ast)
-  const stored = encoded._tag === "Union" ? (encoded.types.find((t) => t._tag !== "Null") ?? encoded) : encoded
+  const stored = unionLeaves(encoded).find((t) => t._tag !== "Null") ?? encoded
   const millis = representationId(stored) === "effect/schema/DateTimeUtc" ? UtcFromWire : DateFromWire
   return (c.nullable ? Schema.NullOr(millis) : millis).pipe(Schema.decodeTo(field))
 }

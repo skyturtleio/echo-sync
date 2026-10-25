@@ -253,7 +253,8 @@ synced table is `scope_grants` (§4).
 
 - INV-TBL-1: Every column kind MUST map to exactly one Postgres type, one SQLite type and one
   wire form (table below); a field that cannot be mapped unambiguously MUST be refused at
-  declaration, never guessed.
+  declaration, never guessed. Nested unions of same-kind literals, including
+  `NullOr(Literals(...))`, MUST retain that scalar kind; null adds only nullability.
 - INV-TBL-2: Text MUST compare by Unicode code point in every store: Postgres `COLLATE "C"`,
   SQLite `BINARY`, and the in-memory reference comparator (`Store.compareText`). Index order is
   one definition across dialects: declared key columns ascending with NULL first, then `id`.
@@ -300,6 +301,13 @@ enum/refinement. No FTS query language or generic Boolean predicate builder is i
 | boolean | `Boolean`, boolean literals | boolean | `boolean` | `INTEGER CHECK (c IN (0, 1))` |
 | timestamp | `Schema.Date`, `Schema.DateTimeUtc` | epoch ms number | `timestamptz` | `INTEGER` (epoch ms) |
 | json | `Struct`, `Array`, `Tuple`, `Record`, `Suspend`, a `Union` with a non-literal member or mixing literal kinds (a `Union` of same-kind literals is that kind) | JSON value | `jsonb` | `TEXT` (JSON) |
+
+**Rationale (2026-10-25):** Flatten field-level unions for classification, preserving the
+original codec's literal validation. `NullOr(Literals(["open", "done"]))` is nullable TEXT,
+not JSONB; treating the nested union as JSON contradicted the type mapping. Existing manifests
+recording JSON require a manual json → text migration (§13), change `dataHash`, and rebuild
+replicas. Do not cast JSONB directly to text (that retains JSON string quotes): validate and
+backfill extracted scalar strings, preserving SQL NULL, before switching readers/writers.
 
 `NullOr(x)` makes a column nullable. Rejected at declaration: bare `Schema.Number`, `BigInt`,
 `Symbol`, `Undefined`/optional keys at the top level, `Unknown`/`Any`, `Enum`, other declarations
@@ -515,6 +523,23 @@ clients under the existing version policy instead of imposing a new engine versi
   **Rationale (2026-10-24):** An epoch refusal did not attempt the mutation, and a response from
   invalidated history says nothing about its new execution. Neither may exhaust pending intent
   or erase genuine transient answers; validate the response epoch before publishing counts.
+
+- INV-MUT-18: `Mutation.make` MUST default `onExcessProperty` to `"error"` for args
+  encoding and decoding, including nested structs and record values. Unknown keys not covered
+  by declared fields/index signatures MUST fail before the handler. The tab's `mutate` MUST
+  fail `LocallyRejected{error: ArgsDecodeFailed{name, message}}` before enqueue/upload;
+  registry decoding on the server MUST yield a ledgered `Rejected{ArgsDecodeFailed}`, not
+  Applied or a transient response. Messages retain the schema's offending-key path.
+  Explicit `onExcessProperty: "ignore"` restores stripping on both sides. Schema's empty
+  struct retains its non-nullish semantics; use a record with `Schema.Never` values for a
+  strictly empty object. Arbitrary keys permitted by a record are not excess keys.
+
+**Rationale (2026-10-25):** Rejecting a mistyped field is safer than silently losing user data.
+Strict-by-default replaces implicit stripping, with a per-mutation opt-out for deliberate
+compatibility. Check encoding in the tab as well as decoding in the shared registry, otherwise
+the tab erases evidence before validation. Encoding failures now use the same typed local
+rejection instead of dying. Queued old args still need explicit union/upcast compatibility;
+deploy matching definitions on both sides. Existing rejection wire tags remain unchanged.
 
 ### Details
 
@@ -1922,6 +1947,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 
 ### Retired rules
 
+- **Retired (2026-10-25):** Implicit mutation-args excess-key stripping and defects for tab args encoding failures; strict-by-default typed rejections supersede them (INV-MUT-18, §5).
 - **Retired (2026-10-25):** Deferral of all local text search (2026-10-21); literal search now ships under INV-TBL-6–8, while linguistic FTS remains a non-goal.
 - **Retired (2026-10-22):** Apps must close all tab clients before `resetReplica` (2026-10-21); engine-owned coordinated close supersedes this prerequisite (INV-BRW-7, §12).
 - **Retired (2026-10-24):** Server-time `ctx.now` for every mutation (former INV-MUT-8); writer time with a future-skew bound supersedes it except for pre-field clients (INV-MUT-11–14, §5).
@@ -1935,7 +1961,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-ID-3 | untested | — |
 | INV-ID-4 | covered | `Outbox.test` "an enqueue retried after its original was released returns the original seq and is not pending"; `ledger.test` "a resubmitted envelope (lost response) returns the recorded outcome and position without re-executing" |
 | INV-ID-5 | covered | `ledger.test` "a client id registered to one principal is refused to another"; `session-switch.e2e` "a fresh replica first synced under another principal's session binds no client, ledgers nothing and installs none of its data" |
-| INV-TBL-1 | covered | `SyncTable.test` "rejects a bare Schema.Number instead of guessing integer or double", "rejects leaves with no portable column (bigint, binary, enum, optional key)", "SQLite stores and returns every supported leaf type unchanged (boundaries, nulls, empty strings)", "Postgres stores and returns every supported leaf type unchanged (boundaries, nulls, empty strings)" |
+| INV-TBL-1 | covered | `SyncTable.test` "rejects a bare Schema.Number instead of guessing integer or double", "rejects leaves with no portable column (bigint, binary, enum, optional key)", "SQLite stores and returns every supported leaf type unchanged (boundaries, nulls, empty strings)", "Postgres stores and returns every supported leaf type unchanged (boundaries, nulls, empty strings)"; `Migrate.test` "nullable literal unions generate TEXT and an old JSON manifest requires a manual kind migration" |
 | INV-TBL-2 | covered | `Store.test` "the reference orders text by code point, NULL first ascending, id as tiebreak"; `SqliteRowStore.test` "range returns exactly core's reference rows in core's reference order (seeded random plans)" |
 | INV-TBL-3 | covered | `SyncTable.test` "does not change when only indexes change (adding an index must not force a re-download)", "does not change for documentation annotations or field order", "ignores refinements, brands and nested JSON schemas: validation is not storage (SPEC §3)", "changes when the storage shape changes (nullability, column kind, column set, table name)" |
 | INV-TBL-4 | covered | `Simulation.test` "a pulled row is stored in canonical wire form (excess columns dropped, values normalized)"; `scopes.test` "pulled rows are the wire form: epoch-ms timestamps, and no column the SyncTable does not declare (INV-TBL-4)" |
@@ -1968,6 +1994,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-MUT-15 | covered | `Simulation.test` "eight transient answers release only the exhausted effect and push the next entry", "a forever-transient mutation cannot prevent simulation convergence or corrupt the replica" |
 | INV-MUT-16 | covered | `Simulation.test` "seven transient answers followed by applied do not discard the mutation", "a leader restart resets transient answers without discarding intent" |
 | INV-MUT-17 | covered | `Simulation.test` "network failures between transient answers do not exhaust the mutation early", "a failed exhaustion transaction preserves the optimistic replica and prior answer count", "a failed processed-prefix transaction cannot count its transient stop", "epoch refusals and stale short responses cannot exhaust pending intent or reset real transient answers" |
+| INV-MUT-18 | covered | `Mutation.test` "unknown nested args are rejected through the wire registry unless stripping is explicitly enabled"; `Leader.test` "mutate rejects excess args before enqueue rather than silently saving a stripped intent"; `rpc.test` "excess mutation args return a ledgered rejection over HTTP without writing the row" |
 | INV-POS-1 | covered | `ordering.test` "a reader pulling after a later writer commits never skips an earlier writer still in flight", "without the trigger's advisory lock that reader skips the earlier writer (the ordering check can fail)", "a reader advancing its cursor during many random out-of-order commits never misses a change (stress)" |
 | INV-POS-2 | covered | `capture.test` "TRUNCATE on a synced table fails instead of silently bypassing the log", "writes from outside any mutator (scripts, cascades) are captured like any other" |
 | INV-POS-3 | partial | `scopes.test` "a scope move deletes the row for old-scope readers and delivers it to new-scope readers" (payload-free log rows untested) |
@@ -2036,7 +2063,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-BRW-9 | partial | Browser fallback and identity-refusal scenarios; no literal test-title citation |
 | INV-BRW-10 | covered | `worker-lifetime.test` "leader teardown closes fresh transfers discarded before Init, still queued, or delivered to a saved late callback", "router teardown and rejection close fresh connect and announcement peers, including saved late callbacks"; `LeaderClient.test` "closing a client cannot abandon a transferred port queued for acceptance or waiting for its epoch check" |
 | INV-BRW-11 | partial | Browser scenarios cover OPFS handles held for 4 s and past the 10 s bound; no literal test-title citation |
-| INV-SCH-1 | partial | `Migrate.test` "a NOT NULL column without a default is added nullable with the SPEC §13 TODO, never SET NOT NULL"; destructive and safe DDL groups need individual citations |
+| INV-SCH-1 | partial | `Migrate.test` "a NOT NULL column without a default is added nullable with the SPEC §13 TODO, never SET NOT NULL", "nullable literal unions generate TEXT and an old JSON manifest requires a manual kind migration"; destructive and safe DDL groups need individual citations |
 | INV-SCH-2 | covered | `Migrate.test` "an intent naming something the diff does not contain is refused, not ignored", "a combined table and column rename is one table TODO and one column TODO, no DDL, no intent error", "an index on a renamed column is a TODO; unrelated changes in the same table stay DDL" |
 | INV-SCH-3 | covered | `Migrate.test` "migrations are numbered after the highest existing one", "scope_grants is the engine's table and is never planned; no change plans nothing"; `version-gate.e2e` "a client below the generated floor stops retrying, can mutate offline, and delivers the original intents after update" (history) |
 | INV-SCH-4 | covered | `startup.test` "a server whose database drifted from the registry never serves; restored, it serves", "a registry table the app migrations never created fails startup as a Drift naming it, not a bare SqlError" |
@@ -2074,6 +2101,7 @@ machine-verifiable literal test-title citations.
 |---|---|---|---|
 | `wireVersion` | 1 | `Protocol.ts` | no |
 | mutation future-clock skew bound | 30,000 ms (strictly greater rejects) | `Protocol.maxMutationFutureSkewMillis`, `rpc.ts` | no |
+| mutation args excess keys | reject, including nested keys | `Mutation.make`, `LeaderClient.ts` | `onExcessProperty: "ignore"` opts into stripping |
 | `engine_state.require_epoch` | false on migration; true after restore | migration 004, §11.1 | operator, never disable after restore |
 | push batch size | `min(pushBatchSize ?? 50, 100)` | `Engine.ts` | `pushBatchSize` |
 | `PushRequest.mutations` | 1 … 100 | `Protocol.ts` | no |

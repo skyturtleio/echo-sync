@@ -115,6 +115,11 @@ default export `Effect` over `SqlClient`, and `Startup` runs them in their own h
 compares the registry against the committed snapshot `migrations/manifest.json` and emits only
 safe DDL. Renames, drops and backfills become commented TODOs.
 
+Server-only tables (for example `users`) use ordinary hand-written `NNN_name` modules
+alongside generated SyncTable migrations, in the same `appMigrations` record and numbering
+sequence. Include their ids in `existing` when generating; they do not belong in the sync
+registry or its manifest.
+
 ```ts
 import { Migrate } from "echo-sync"
 const previous = Migrate.decodeSnapshot(await Bun.file("migrations/manifest.json").text()) // or Migrate.emptySnapshot
