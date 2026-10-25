@@ -1793,6 +1793,27 @@ hooks and FTS transactional maintenance through undo/install/purge need fresh ve
 No custom artifact was built: its size delta and runtime compatibility are unverified, not
 claimed regressions. FTS shadow-index write amplification would also need a new §16 budget.
 
+Search sizing probe (2026-10-25), clean source
+[`3c84ef5`](https://github.com/skyturtleio/echo-sync/commit/3c84ef50f7b246d877681609ffbb2797996c0738):
+Bun 1.3.10, Linux x64 orb, pinned wasm 3.47.0, memory VFS. Synthetic rows used one readable
+scope and `airport %06d manufacturer model variant crew alice remarks training flight`,
+with an ordinary `(text, id)` index. The real typed query plus storage transaction was timed;
+setup excluded, 30-result cap, one initial call then five warm calls per query. Expected
+result counts (0 for absent substring, 30 for prefix) were checked. Browser regression work
+ran concurrently, so these are sizing observations, not isolated latency guarantees.
+
+| rows | absent substring, first / warm range (ms) | `airport 000` prefix, first / warm range (ms) |
+|---|---|---|
+| 423 | 5.02 / 1.58–3.00 | 2.76 / 1.47–2.78 |
+| 5,000 | 2.75 / 2.12–4.90 | 1.11 / 0.88–3.78 |
+| 84,000 | 21.74 / 21.58–40.19 | 1.65 / 1.13–1.41 |
+
+A separate SQLite EXPLAIN of a simplified prefix-range SELECT, without the authorization
+semi-join, reported `SEARCH ... USING INDEX search_perf__by_text (text>? AND text<?)`.
+This is an initial baseline for the new primitive,
+not a before/after speedup claim or a SkyTime dataset/device measurement. OPFS, network,
+actual long flight remarks and mobile Safari costs were not measured by this probe.
+
 Other existing costs:
 
 - The capture trigger calls `next_position()` once per log row, each taking the advisory lock

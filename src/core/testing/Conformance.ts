@@ -19,7 +19,19 @@
  * Every expectation is a constant derived from the fixture the check wrote, never an observation
  * of a subject (SPEC §17): a subject whose writes are no-ops fails every check.
  */
-import { Array as Arr, Cause, DateTime, Deferred, Effect, Exit, Fiber, Option, Schema, Scheduler } from "effect"
+import {
+  Array as Arr,
+  Cause,
+  DateTime,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Option,
+  Schema,
+  SchemaGetter,
+  Scheduler
+} from "effect"
 import type { Scope } from "effect"
 import type * as Engine from "../../client/sync/Engine.ts"
 import { AccessScope, Ids, Protocol, ScopeGrants, Store, SyncTable } from "../index.ts"
@@ -507,6 +519,25 @@ export const search = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>) =>
         yield* assertIds(yield* query.contains("label", "école").collect, [])
         yield* assertIds(yield* query.contains("label", "E\u0301cole").collect, [])
         yield* assertIds(yield* query.contains("label", "École").collect, ["case"])
+        const Transformed = SyncTable.make(
+          Items.name,
+          {
+            ...Items.fields,
+            label: Schema.String.pipe(
+              Schema.decodeTo(Schema.String, {
+                decode: SchemaGetter.transform((s: string) => `decoded:${s}`),
+                encode: SchemaGetter.transform((s: string) => s.slice("decoded:".length))
+              })
+            )
+          },
+          { indexes: { by_label: ["label"] } }
+        )
+        const transformed = yield* store
+          .query(Transformed)
+          .withIndex("by_label", (q) => q.prefix("label", "Éc"))
+          .contains("label", "cole").collect
+        if (transformed.length !== 1 || transformed[0]?.label !== "decoded:École")
+          return yield* fail("search used decoded text or failed to decode its result")
         const dependencies = yield* reads
         if (!dependencies.has(Items.name) || !dependencies.has(ScopeGrants.ScopeGrants.name))
           return yield* fail("missing reactive dependencies")
