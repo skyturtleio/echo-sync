@@ -21,7 +21,7 @@
  * key ends the older server stream (SPEC §10.2); the older one is always ours and already abandoned
  * here, so that is expected. Presence never touches the replica or the outbox.
  */
-import { Cause, Deferred, Duration, Effect, Exit, Queue, type Schema, Stream } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Queue, Schedule, type Schema, Stream } from "effect"
 import type { AccessScope, Protocol } from "echo-sync"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
@@ -78,6 +78,10 @@ export const make = <E, F extends E>(options: {
   const idleTimeout = options.idleTimeout ?? "45 seconds"
   const base = Duration.toMillis(Duration.fromInputUnsafe(options.retryDelay ?? "1 second"))
   const cap = Duration.toMillis(Duration.fromInputUnsafe(options.maxRetryDelay ?? "30 seconds"))
+  const backoff = Schedule.min([Schedule.exponential(base), Schedule.spaced(cap)]).pipe(
+    // The first wait is the base even when configured above the cap.
+    Schedule.modifyDelay(({ attempt, duration }) => Effect.succeed(attempt === 1 ? base : duration))
+  )
   const subscriptions = new Map<string, Subscription>()
 
   /**
@@ -88,7 +92,7 @@ export const make = <E, F extends E>(options: {
    */
   const deliver = (sub: Subscription, room: AccessScope.AccessScopeId, tabId: Protocol.TabId, sent: number) =>
     Effect.gen(function* () {
-      let delay = base
+      let wait = yield* Schedule.toStepWithSleep(backoff)
       while (true) {
         // Replaced before the check, so a `track` after the check always wakes the next wait.
         const wake = Deferred.makeUnsafe<void>()
@@ -105,12 +109,12 @@ export const make = <E, F extends E>(options: {
         )
         if (Exit.isSuccess(attempt)) {
           sent = revision
-          delay = base
+          wait = yield* Schedule.toStepWithSleep(backoff)
           continue
         }
         yield* Telemetry.log("Debug", "echo-sync: presence track failed; retrying", attempt.cause)
-        yield* Effect.sleep(Duration.millis(delay))
-        delay = Math.min(delay * 2, cap)
+        // This schedule recurs forever; its step cannot signal Done.
+        yield* Effect.orDie(wait(undefined))
       }
     })
 
@@ -142,7 +146,7 @@ export const make = <E, F extends E>(options: {
             })
         )
         if (sub === undefined) return yield* Queue.end(out)
-        let delay = base
+        let wait = yield* Schedule.toStepWithSleep(backoff)
         while (true) {
           sub.restart = Deferred.makeUnsafe<void>()
           // One synchronous read: the join carries a genuine (state, revision) pair, the sender's baseline.
@@ -183,10 +187,9 @@ export const make = <E, F extends E>(options: {
               .find(options.isFatal)
             if (fatal !== undefined) return yield* Effect.fail(fatal)
           }
-          if (delivered) delay = base
-          yield* Effect.raceFirst(Effect.sleep(Duration.millis(delay)), Deferred.await(sub.replaced))
+          if (delivered) wait = yield* Schedule.toStepWithSleep(backoff)
+          yield* Effect.raceFirst(Effect.orDie(wait(undefined)), Deferred.await(sub.replaced))
           if (Deferred.isDoneUnsafe(sub.replaced)) return yield* Queue.end(out)
-          delay = Math.min(delay * 2, cap)
         }
       })
     )

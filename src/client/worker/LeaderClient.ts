@@ -354,7 +354,11 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
    */
   const deliver = (room: AccessScope.AccessScopeId, cell: Cell, sent: number) =>
     Effect.gen(function* () {
-      let delay = retryBase
+      const backoff = Schedule.min([Schedule.exponential(retryBase), Schedule.spaced(30_000)]).pipe(
+        // The first wait is the base even when configured above the cap.
+        Schedule.modifyDelay(({ attempt, duration }) => Effect.succeed(attempt === 1 ? retryBase : duration))
+      )
+      let wait = yield* Schedule.toStepWithSleep(backoff)
       while (true) {
         const wake = Deferred.makeUnsafe<void>()
         cell.wake = wake
@@ -366,11 +370,11 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
         const attempt = yield* Effect.exit(calls.track(room, state, revision).pipe(Effect.timeout(sendTimeout)))
         if (Exit.isSuccess(attempt)) {
           sent = revision
-          delay = retryBase
+          wait = yield* Schedule.toStepWithSleep(backoff)
           continue
         }
-        yield* Effect.sleep(Duration.millis(delay))
-        delay = Math.min(delay * 2, 30_000)
+        // This schedule recurs forever; its step cannot signal Done.
+        yield* Effect.orDie(wait(undefined))
       }
     })
   const presence: PresenceFn = (room, state) =>
