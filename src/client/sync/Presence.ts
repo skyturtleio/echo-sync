@@ -58,8 +58,6 @@ interface Subscription {
   revision: number
   /** Completed by `track`; replaced by the delivery fiber before each check. */
   wake: Deferred.Deferred<void>
-  /** Completing it ends the current connection (the subscription then rejoins). */
-  restart: Deferred.Deferred<void>
   /** Completed when a newer subscription for the same key replaces this one. */
   readonly replaced: Deferred.Deferred<void>
 }
@@ -133,7 +131,6 @@ export const make = <E, F extends E>(options: {
               state,
               revision,
               wake: Deferred.makeUnsafe<void>(),
-              restart: Deferred.makeUnsafe<void>(),
               replaced: Deferred.makeUnsafe<void>()
             }
             subscriptions.set(k, fresh)
@@ -148,7 +145,6 @@ export const make = <E, F extends E>(options: {
         if (sub === undefined) return yield* Queue.end(out)
         let wait = yield* Schedule.toStepWithSleep(backoff)
         while (true) {
-          sub.restart = Deferred.makeUnsafe<void>()
           // One synchronous read: the join carries a genuine (state, revision) pair, the sender's baseline.
           const { state: joinedState, revision: joinedRevision } = sub
           const joined = Deferred.makeUnsafe<void>()
@@ -165,7 +161,6 @@ export const make = <E, F extends E>(options: {
                 const connection = yield* upstream.room({ room, tabId, state: joinedState, revision: joinedRevision })
                 yield* connection.pipe(
                   Stream.timeout(idleTimeout),
-                  Stream.interruptWhen(Deferred.await(sub.restart)),
                   Stream.runForEach((element) =>
                     element._tag === "heartbeat"
                       ? Effect.void

@@ -60,6 +60,36 @@ const fakeServer = makeServer()
 const settle = Effect.repeat(Effect.yieldNow, { times: 50 })
 const dropped = () => new Protocol.ServerUnavailable({ message: "dropped" })
 
+it.effect("replacement ends the old stream during a connection or backoff without unregistering the newer sender", () =>
+  Effect.gen(function* () {
+    for (const inBackoff of [false, true]) {
+      const server = yield* fakeServer
+      const presence = Presence.make({ upstream: server.upstream, isFatal: Transport.isFatalPresence })
+      const old = yield* Effect.forkChild(Stream.runDrain(presence.join({ room, tabId, state: "old", revision: 2 })))
+      const first = yield* server.nextConnection
+      if (inBackoff) yield* Queue.fail(first, dropped())
+      yield* settle
+      // Equal revisions replace too; a lower revision is covered separately below.
+      const newer = yield* Effect.forkChild(Stream.runDrain(presence.join({ room, tabId, state: "new", revision: 2 })))
+      const second = yield* server.nextConnection
+      yield* Queue.offer(second, snapshot("new"))
+      yield* settle
+      // No clock advance: replacement must end even a subscription sleeping in backoff.
+      expect(old.pollUnsafe()?._tag).toBe("Success")
+      yield* presence.track({ room, tabId, state: "tracked", revision: 3 })
+      yield* settle
+      expect(server.tracks).toEqual(["tracked"])
+      yield* TestClock.adjust("2 seconds")
+      expect(server.joins).toEqual(["old", "new"])
+      expect(newer.pollUnsafe()).toBeUndefined()
+      yield* Fiber.interrupt(newer)
+      yield* presence.track({ room, tabId, state: "closed", revision: 4 })
+      yield* settle
+      expect(server.tracks).toEqual(["tracked"])
+    }
+  })
+)
+
 it.effect(
   "heartbeats never reach the tab stream; a silent connection is rejoined with the latest tracked state and the stream stays open",
   () =>
