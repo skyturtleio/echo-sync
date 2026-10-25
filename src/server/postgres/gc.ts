@@ -1,4 +1,4 @@
-import { Clock, Duration, Effect, Schema } from "effect"
+import { DateTime, Duration, Effect, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
@@ -12,8 +12,8 @@ import * as Telemetry from "../../internal/Telemetry.ts"
  */
 export const collectGarbage = Effect.fnUntraced(function* (retention: Duration.Input) {
   const sql = yield* SqlClient
-  const now = yield* Clock.currentTimeMillis
-  const cutoff = new Date(now - Duration.toMillis(retention)).toISOString()
+  const now = yield* DateTime.now
+  const cutoff = DateTime.formatIso(DateTime.subtractDuration(now, retention))
   return yield* sql.withTransaction(
     Effect.gen(function* () {
       const rows = yield* sql<{ gc_horizon: bigint; deleted: bigint }>`
@@ -71,8 +71,8 @@ export const expireLedger = (options?: { readonly retention?: Duration.Input | u
       })
     }
     const sql = yield* SqlClient
-    const now = yield* Clock.currentTimeMillis
-    const cutoff = new Date(now - Duration.toMillis(retention)).toISOString()
+    const now = yield* DateTime.now
+    const cutoff = DateTime.formatIso(DateTime.subtractDuration(now, retention))
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         const raised = yield* sql<{ client_id: string; expired_through: bigint; expired: bigint }>`

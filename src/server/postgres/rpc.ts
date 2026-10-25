@@ -4,7 +4,7 @@ import {
   Context,
   DateTime,
   Deferred,
-  Duration,
+  type Duration,
   Effect,
   Layer,
   Option,
@@ -13,6 +13,7 @@ import {
   Queue,
   Ref,
   Result,
+  Schedule,
   Schema,
   Stream
 } from "effect"
@@ -230,11 +231,10 @@ interface ListenSession {
 }
 
 /**
- * Delay before the `attempt`-th consecutive `LISTEN` retry (0-based): exponential from 50 ms,
- * capped at 5 s. The count resets once a `LISTEN` is confirmed, so a loss after a healthy period
- * starts again at 50 ms.
+ * Consecutive `LISTEN` retries: exponential from 50 ms, capped at 5 s. A fresh stepper once
+ * `LISTEN` is confirmed makes a loss after a healthy period start again at 50 ms.
  */
-const listenBackoff = (attempt: number) => Duration.millis(Math.min(50 * 2 ** attempt, 5_000))
+const listenBackoff = Schedule.min([Schedule.exponential("50 millis"), Schedule.spaced("5 seconds")])
 
 /**
  * The process's single `LISTEN` on `pokeChannel` (SPEC §10.1). `PgClient.listen` reserves a pool
@@ -268,7 +268,17 @@ export const sharedPokes = (
   Effect.gen(function* () {
     const current = yield* Ref.make(Option.none<ListenSession>())
     const ready = yield* Deferred.make<void>()
-    const attempts = yield* Ref.make(0)
+    const makeBackoff = Schedule.toStepWithSleep(
+      listenBackoff.pipe(
+        Schedule.tap((metadata) =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(ready, undefined)
+            if (options.onBackoff !== undefined) yield* options.onBackoff(metadata.duration)
+          })
+        )
+      )
+    )
+    const retryStep = yield* Ref.make(yield* makeBackoff)
     const session = Effect.scoped(
       Effect.gen(function* () {
         const queue = yield* pg.listen(pokeChannel)
@@ -282,7 +292,7 @@ export const sharedPokes = (
             Effect.andThen(Effect.sleep(options.heartbeatInterval), PubSub.publish(live.heartbeats, undefined))
           )
         )
-        yield* Ref.set(attempts, 0)
+        yield* Ref.set(retryStep, yield* makeBackoff)
         yield* Ref.set(current, Option.some(live))
         yield* Deferred.succeed(ready, undefined)
         const error = yield* Effect.flip(
@@ -294,10 +304,8 @@ export const sharedPokes = (
       })
     )
     const backoff = Effect.gen(function* () {
-      yield* Deferred.succeed(ready, undefined)
-      const delay = listenBackoff(yield* Ref.getAndUpdate(attempts, (n) => n + 1))
-      if (options.onBackoff !== undefined) yield* options.onBackoff(delay)
-      yield* Effect.sleep(delay)
+      const step = yield* Ref.get(retryStep)
+      yield* step(undefined)
     })
     yield* Effect.forkScoped(Effect.forever(Effect.catch(session, () => backoff)))
     yield* Deferred.await(ready)

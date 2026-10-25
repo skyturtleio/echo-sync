@@ -1,4 +1,4 @@
-import { Effect, Layer, Option, Redacted, Schema } from "effect"
+import { Clock, Config, Effect, Layer, Option, Random, Redacted, Schema } from "effect"
 import * as PgClient from "@effect/sql-pg/PgClient"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
@@ -31,23 +31,25 @@ export const createSynced = (table: SyncTable.AnySyncTable) =>
  * Postgres tests run only when `ECHO_PG_URL` is set (see AGENTS.md "Local environment"), so
  * `bun run check` stays usable without a database. `bun run test:pg` sets it.
  */
-const adminUrl = process.env["ECHO_PG_URL"]
-export const pgAvailable = adminUrl !== undefined && adminUrl !== ""
+const adminUrl = Effect.runSync(Config.String("ECHO_PG_URL").pipe(Config.withDefault("")))
+export const pgAvailable = adminUrl !== ""
 
 const admin = (statement: string) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient
     yield* sql.unsafe(statement)
-  }).pipe(Effect.provide(PgClient.layer({ url: Redacted.make(adminUrl ?? ""), maxConnections: 1 })))
+  }).pipe(Effect.provide(PgClient.layer({ url: Redacted.make(adminUrl), maxConnections: 1 })))
 
 /** A fresh, empty database (no engine schema), dropped afterwards; `with` is appended to CREATE DATABASE. */
 export const emptyDatabase = (with_ = "") =>
   Layer.unwrap(
     Effect.gen(function* () {
-      const name = `echo_test_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+      const now = yield* Clock.currentTimeMillis
+      const random = yield* Random.next
+      const name = `echo_test_${now.toString(36)}_${random.toString(36).slice(2, 8)}`
       yield* admin(`CREATE DATABASE ${name} ${with_}`)
       yield* Effect.addFinalizer(() => Effect.orDie(admin(`DROP DATABASE ${name} WITH (FORCE)`)))
-      const url = new URL(adminUrl ?? "")
+      const url = new URL(adminUrl)
       url.pathname = `/${name}`
       return PgClient.layer({ url: Redacted.make(url.toString()), maxConnections: 80 })
     })
