@@ -40,6 +40,54 @@ export const registry = Registry.make([Todos]) // adds the engine's scope_grants
 SPEC §3 lists the field types that map to columns. A table's Postgres DDL is
 `table.postgres.createTable` / `createIndexes`, and you never write it by hand (see §3).
 
+### Local text search
+
+Declare ordinary normalized text columns. The app recomputes them on every source edit,
+including imports and server-side writes; the engine does not derive them automatically.
+
+```ts
+import { AccessScope, Query, Search, SyncTable } from "echo-sync"
+import { Schema } from "effect"
+
+const Aircraft = SyncTable.make("aircraft", {
+  id: Schema.String.pipe(Schema.brand("AircraftId")),
+  accessScopeId: AccessScope.AccessScopeId,
+  designator: Schema.String,
+  searchText: Search.Text
+}, { indexes: { by_designator: ["designator"], by_search: ["searchText"] } })
+
+// In the importer/mutation: store this alongside the source fields.
+const searchable = (manufacturer: string, model: string, variant: string) =>
+  Search.Text.make(Search.normalize([manufacturer, model, variant].join(" ")))
+
+export const findAircraft = Query.make("aircraft.search", {
+  args: Schema.String,
+  success: Schema.Array(Aircraft.Row),
+  handler: (db, input) => db.query(Aircraft).withIndex("by_designator")
+    .contains("searchText", Search.normalize(input)).take(30)
+})
+// For indexed starts-with suggestions, in a Query.make handler:
+// db.query(Aircraft).withIndex("by_search", q =>
+//   q.prefix("searchText", Search.normalize(input))).take(30)
+```
+
+Register `findAircraft` in the leader's `Query.makeRegistry`; subscribe through the existing
+typed client `subscribe(findAircraft, input)` API. Search subscriptions update after ordinary
+row changes and grant revocation. For flights, combine remarks and crew into a search field
+and select a scope/date index to return recent matching flights. For large airport catalogs,
+use separate indexed normalized code/name fields for prefix suggestions.
+
+This is literal search, not FTS: `%`, `_`, quotes and backslashes are data; multiple words
+form one contiguous substring. Normalization lowercases and collapses whitespace, retaining
+accents (no stemming, ranking, fuzzy matching or full Unicode case folding). Operators also
+work on existing string-valued text columns, with no implicit normalization. NULL never matches;
+empty input matches all non-null text. A second `contains` replaces the first. The selected
+index defines ordering, not relevance, and scope/text filtering happens before `take`.
+Contains may scan every candidate; a result limit is not a latency bound.
+
+Adding these columns requires the normal PostgreSQL migration/backfill and replica rebuild.
+Normalization changes require an explicit data backfill even if the storage shape is unchanged.
+
 ## 2. Mutations
 
 A mutation is a named handler over `ctx.store` (SPEC §5). It runs optimistically on the client and

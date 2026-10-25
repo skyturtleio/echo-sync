@@ -118,6 +118,10 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
             where.push(`${q(ranged.name)} ${bound.value.inclusive ? loose : strict} $${params.length}`)
           }
         }
+        if (plan.text !== undefined) {
+          params.push(plan.text.needle)
+          where.push(`strpos(t.${q(plan.text.column.name)}, $${params.length}) > 0`)
+        }
         if (Option.isSome(plan.readableBy)) {
           // Readable: a grant for one of the principals on the row's scope (any role satisfies
           // reader), through scope_grants' unique (access_scope_id, principal_id), in this snapshot.

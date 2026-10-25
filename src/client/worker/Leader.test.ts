@@ -187,6 +187,13 @@ const docs = Query.make("docs", {
   handler: (db) => Effect.map(db.query(Docs).withIndex("by_body").collect, (rows) => rows.length)
 })
 
+const searchDocs = Query.make("docs.search", {
+  args: Schema.String,
+  success: Schema.Array(Schema.String),
+  handler: (db, needle) =>
+    Effect.map(db.query(Docs).withIndex("by_body").contains("body", needle).take(5), (rows) => rows.map((r) => r.id))
+})
+
 const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
   Effect.gen(function* () {
     const reactivity = yield* Reactivity.make
@@ -226,7 +233,7 @@ const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
       loop: undefined,
       presence: undefined,
       actor: me,
-      queries: Query.makeRegistry([pick, pair, flip, docs]),
+      queries: Query.makeRegistry([pick, pair, flip, docs, searchDocs]),
       allowRawExec: options.allowRawExec,
       info: { leaderId: "l", clientId: "c", dbName: "test", syncing: false }
     })
@@ -366,6 +373,24 @@ it.live("a registered query that writes fails, commits nothing, and leaves the n
     expect(yield* flagBody).toBe("c")
     yield* engine.mutate(Ids.MutationId.make("m1"), "raw.add", { id: "r1" })
     expect(yield* count("raw")).toBe(1)
+  }).pipe(Effect.scoped)
+)
+
+it.live("a registered search re-emits after edits, deletes and grant revocation", () =>
+  Effect.gen(function* () {
+    const { client, storage, write, row } = yield* leaderRpc({ allowRawExec: false })
+    yield* write(Docs, row("d1", "crew alice"))
+    yield* write(Docs, row("d2", "crew bob"))
+    const { next } = yield* collect(client.subscribe({ name: "docs.search", args: "alice" }))
+    expect(yield* next).toEqual(["d1"])
+    yield* write(Docs, row("d2", "alice training"))
+    expect(yield* next).toEqual(["d2", "d1"])
+    yield* storage.transaction(storage.rows.write(Docs, "d1", Option.none()))
+    expect(yield* next).toEqual(["d2"])
+    yield* storage.transaction(
+      storage.rows.write(ScopeGrants.ScopeGrants, ScopeGrants.grantId(scope, me), Option.none())
+    )
+    expect(yield* next).toEqual([])
   }).pipe(Effect.scoped)
 )
 

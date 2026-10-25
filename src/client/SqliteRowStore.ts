@@ -90,6 +90,10 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
             where.push(`${q(ranged.name)} ${bound.value.inclusive ? loose : strict} ?`)
           }
         }
+        if (plan.text !== undefined) {
+          params.push(plan.text.needle)
+          where.push(`instr(t.${q(plan.text.column.name)}, ?) > 0`)
+        }
         if (Option.isSome(plan.readableBy)) {
           // Readable: a grant for one of the principals on the row's scope (any role satisfies
           // reader), found through scope_grants' unique (access_scope_id, principal_id).

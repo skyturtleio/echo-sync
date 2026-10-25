@@ -21,6 +21,14 @@ const Todos = SyncTable.make(
 )
 
 export const queries = (db: EchoStore) => [
+  db
+    .query(Todos)
+    .withIndex("by_project", (q) => q.prefix("projectId", "ab"))
+    .contains("projectId", "%"),
+  // @ts-expect-error numeric fields cannot be searched as text
+  db.query(Todos).withIndex("by_project").contains("rank", "1"),
+  // @ts-expect-error prefix must name the next text index field
+  db.query(Todos).withIndex("by_project", (q) => q.prefix("rank", "1")),
   db.query(Todos).withIndex("by_project", (q) => q.eq("projectId", null).eq("rank", 1).gte("at", new Date(0))),
   db.query(Todos).withIndex("by_project", (q) => q.eq("projectId", "p").gt("rank", 1).lt("rank", 5)),
   // @ts-expect-error unknown index name

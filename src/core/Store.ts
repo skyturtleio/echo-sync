@@ -19,6 +19,7 @@ import {
   type StoreUnavailable
 } from "./Errors.ts"
 import { grantId, ScopeGrants } from "./ScopeGrants.ts"
+import * as Search from "./Search.ts"
 import type { AnySyncTable, Column, EncodedRow, Index } from "./SyncTable.ts"
 
 // ---------------------------------------------------------------------------------------------
@@ -94,6 +95,7 @@ export interface Bound {
  */
 export interface IndexRangePlan {
   readonly index: Index
+  readonly text?: { readonly column: Column; readonly needle: string }
   readonly eq: ReadonlyArray<KeyValue>
   readonly lower: Option.Option<Bound>
   readonly upper: Option.Option<Bound>
@@ -104,6 +106,10 @@ export interface IndexRangePlan {
 
 /** Reference predicate for `plan` (MemoryStore uses it; SQL stores must agree). */
 export const planMatches = (plan: IndexRangePlan, row: EncodedRow): boolean => {
+  if (plan.text !== undefined) {
+    const value = row[plan.text.column.name]
+    if (typeof value !== "string" || !value.includes(plan.text.needle)) return false
+  }
   for (const [i, value] of plan.eq.entries()) {
     const c = plan.index.key[i]
     if (c === undefined || compareKeyValue(row[c.name] ?? null, value) !== 0) return false
@@ -229,6 +235,7 @@ type Tail<Fs> = Fs extends readonly [unknown, ...infer R] ? R : readonly []
 type ValueOf<Row, K> = K extends keyof Row ? Row[K] : never
 
 interface RangeState {
+  readonly prefix?: readonly [field: string, value: string]
   readonly eq: ReadonlyArray<readonly [field: string, value: unknown]>
   readonly lower: Option.Option<readonly [field: string, value: unknown, inclusive: boolean]>
   readonly upper: Option.Option<readonly [field: string, value: unknown, inclusive: boolean]>
@@ -258,6 +265,10 @@ export class LowerBounded<Row, K> extends IndexRange {
  * out-of-order fields and wrongly typed values do not compile.
  */
 export class IndexRangeBuilder<Row, Fs> extends IndexRange {
+  /** Literal prefix of the next text index field; uses BINARY/C range bounds, not LIKE. */
+  prefix(field: Head<Fs> & TextField<Row>, value: string): IndexRange {
+    return new IndexRange({ ...this.state, prefix: [field, value] })
+  }
   eq(field: Head<Fs> & string, value: ValueOf<Row, Head<Fs>>): IndexRangeBuilder<Row, Tail<Fs>> {
     return new IndexRangeBuilder<Row, Tail<Fs>>({ ...this.state, eq: [...this.state.eq, [field, value]] })
   }
@@ -277,7 +288,13 @@ export class IndexRangeBuilder<Row, Fs> extends IndexRange {
 
 export type IndexFields<T extends AnySyncTable, K extends keyof T["indexes"]> = T["indexes"][K]["fields"]
 
+export type TextField<Row> = {
+  [K in keyof Row & string]: NonNullable<Row[K]> extends string ? K : never
+}[keyof Row & string]
+
 export interface OrderedQuery<Row, E> {
+  /** One literal substring predicate, applied before the limit. A later call replaces it. */
+  readonly contains: (field: TextField<Row>, needle: string) => OrderedQuery<Row, E>
   readonly order: (order: "asc" | "desc") => OrderedQuery<Row, E>
   readonly take: (n: number) => Effect.Effect<ReadonlyArray<Row>, E>
   readonly first: Effect.Effect<Option.Option<Row>, E>
@@ -578,12 +595,30 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
         const built = (range ?? ((q) => q))(
           new IndexRangeBuilder({ eq: [], lower: Option.none(), upper: Option.none() })
         ).state
-        const run = (order: "asc" | "desc", limit: Option.Option<number>) =>
+        const run = (order: "asc" | "desc", limit: Option.Option<number>, text?: readonly [string, string]) =>
           Effect.gen(function* () {
             yield* read(table)
             if (index === undefined) {
               return yield* new InvalidRow({ table: table.name, message: `unknown index ${name}` })
             }
+            const textColumn = (field: string, needle: string) => {
+              const column = table.columns.find((c) => c.field === field)
+              return column?.kind === "text" && Search.isPortable(needle)
+                ? Effect.succeed(column)
+                : Effect.fail(
+                    new InvalidRow({
+                      table: table.name,
+                      message: "search requires a text column and portable Unicode without NUL"
+                    })
+                  )
+            }
+            const predicate =
+              text === undefined
+                ? undefined
+                : {
+                    column: yield* textColumn(text[0], text[1]),
+                    needle: text[1]
+                  }
             const eq: Array<KeyValue> = []
             for (const [field, value] of built.eq) eq.push(yield* toKeyValue(table, field, value))
             const bound = (b: Option.Option<readonly [string, unknown, boolean]>) =>
@@ -600,6 +635,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
             // the store stops after `limit` readable rows.
             const plan: IndexRangePlan = {
               index,
+              ...(predicate === undefined ? {} : { text: predicate }),
               eq,
               lower: yield* bound(built.lower),
               upper: yield* bound(built.upper),
@@ -607,15 +643,33 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
               readableBy: Option.some([options.actor, Everyone]),
               limit
             }
+            let selected = plan
+            if (built.prefix !== undefined) {
+              const [field, value] = built.prefix
+              const column = yield* textColumn(field, value)
+              if (index.key[eq.length]?.name !== column.name) {
+                return yield* new InvalidRow({ table: table.name, message: "prefix must name the next index field" })
+              }
+              const end = Search.prefixEnd(value)
+              selected = {
+                ...plan,
+                lower: Option.some({ value, inclusive: true }),
+                upper: end === undefined ? Option.none() : Option.some({ value: end, inclusive: false })
+              }
+            }
             // The semi-join reads `scope_grants`: a grant change can change this result (INV-BRW-6).
             if (Option.isSome(plan.readableBy)) yield* read(ScopeGrants)
-            return yield* Effect.forEach(yield* rows.range(table, plan), (row) => decode(table, row))
+            return yield* Effect.forEach(yield* rows.range(table, selected), (row) => decode(table, row))
           })
-        const ordered = (order: "asc" | "desc"): OrderedQuery<RowOf<T>, InvalidRow | StoreUnavailable> => ({
-          order: (next) => ordered(next),
-          take: (n) => run(order, Option.some(n)),
-          first: run(order, Option.some(1)).pipe(Effect.map((rs) => Option.fromNullishOr(rs[0]))),
-          collect: run(order, Option.none())
+        const ordered = (
+          order: "asc" | "desc",
+          text?: readonly [string, string]
+        ): OrderedQuery<RowOf<T>, InvalidRow | StoreUnavailable> => ({
+          contains: (field, needle) => ordered(order, [field, needle]),
+          order: (next) => ordered(next, text),
+          take: (n) => run(order, Option.some(n), text),
+          first: run(order, Option.some(1), text).pipe(Effect.map((rs) => Option.fromNullishOr(rs[0]))),
+          collect: run(order, Option.none(), text)
         })
         return ordered("asc")
       }

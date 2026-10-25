@@ -20,6 +20,14 @@ const mustCatch = (label: string, checks: ReadonlyArray<Conformance.Check<never>
 }
 
 describe("MemoryStore conforms to ReplicaRowStore (the reference semantics)", () => {
+  it.effect("literal search filters before limits and prefix ranges preserve Unicode boundaries", () =>
+    Conformance.search(
+      Effect.sync(() => {
+        const rows = MemoryStore.make()
+        return { rows, transaction: rows.transaction }
+      })
+    )
+  )
   register(
     Conformance.replicaRowStore(
       Effect.sync(() => {

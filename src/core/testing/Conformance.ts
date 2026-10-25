@@ -418,7 +418,109 @@ const randomPlan = (rng: ReturnType<typeof prng>, rows: ReadonlyArray<SyncTable.
 const describePlan = (plan: Store.IndexRangePlan) =>
   canonical({ index: plan.index.name, eq: plan.eq, lower: plan.lower, upper: plan.upper, order: plan.order })
 
+/** Public typed query contract, shared by memory, wasm SQLite and PostgreSQL. */
+export const search = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>) =>
+  use(make, ({ rows, transaction }) =>
+    transaction(
+      Effect.gen(function* () {
+        const fail = violation("literal search")
+        for (const [id, row] of GRANTS) yield* rows.write(ScopeGrants.ScopeGrants, id, Option.some(row))
+        const data = [
+          item("a", { accessScopeId: theirs, label: "%_\\'" }),
+          item("b", { accessScopeId: mine, label: "unrelated" }),
+          item("c", { accessScopeId: mine, label: "xx%_\\'yy" }),
+          item("d", { accessScopeId: open, label: "%_\\'" }),
+          item("e", { accessScopeId: mine, label: null }),
+          item("f", { accessScopeId: mine, label: "😀x" }),
+          item("g", { accessScopeId: mine, label: "😁" }),
+          item("h", { accessScopeId: mine, label: "\u{10ffff}x" }),
+          item("i", { accessScopeId: mine, label: "\ud7ffx" }),
+          item("j", { accessScopeId: mine, label: "\ue000" })
+        ]
+        for (const row of data) yield* rows.write(Items, String(row["id"]), Option.some(row))
+        const { store, reads } = Store.make(rows, {
+          actor: u1,
+          now: DateTime.makeUnsafe(0),
+          roleFor: Store.roleFromGrants(rows, u1),
+          claimScope: Store.claimFromGrants(rows)
+        })
+        const assertIds = (actual: ReadonlyArray<Item>, expected: ReadonlyArray<string>) =>
+          canonical(actual.map((r) => r.id)) === canonical(expected)
+            ? Effect.void
+            : fail(`got ${canonical(actual.map((r) => r.id))}, expected ${canonical(expected)}`)
+        const query = store.query(Items).withIndex("by_score").contains("label", "%_\\'")
+        yield* assertIds(yield* query.take(1), ["c"])
+        yield* assertIds(yield* query.order("desc").take(1), ["d"])
+        yield* assertIds(yield* query.take(0), [])
+        yield* assertIds(yield* query.collect, ["c", "d"])
+        const first = yield* query.first
+        if (Option.isNone(first) || first.value.id !== "c") return yield* fail("first ignored the predicate")
+        yield* assertIds(yield* query.contains("label", "missing").collect, [])
+        yield* assertIds(yield* query.contains("label", "").take(4), ["b", "c", "d", "f"])
+        for (const [prefix, expected] of [
+          ["😀", ["f"]],
+          ["\u{10ffff}", ["h"]],
+          ["\ud7ff", ["i"]],
+          ["%_\\'", ["d"]]
+        ] as const) {
+          yield* assertIds(
+            yield* store.query(Items).withIndex("by_rank_label", (q) => q.eq("rank", null).prefix("label", prefix))
+              .collect,
+            expected
+          )
+        }
+        yield* assertIds(
+          yield* store
+            .query(Items)
+            .withIndex("by_label_rank", (q) => q.prefix("label", ""))
+            .take(1),
+          ["d"]
+        )
+        for (const invalid of ["\0", "\ud800"]) {
+          const result = yield* Effect.flip(query.contains("label", invalid).collect)
+          if (!(result instanceof Errors.InvalidRow)) return yield* fail("invalid Unicode was accepted")
+          const prefixResult = yield* Effect.flip(
+            store.query(Items).withIndex("by_label_rank", (q) => q.prefix("label", invalid)).collect
+          )
+          if (!(prefixResult instanceof Errors.InvalidRow)) return yield* fail("invalid prefix was accepted")
+        }
+        const Refined = SyncTable.make(
+          Items.name,
+          { ...Items.fields, label: Schema.Literal("😀x") },
+          { indexes: { by_label: ["label"] } }
+        )
+        yield* assertIds(
+          yield* store
+            .query(Refined)
+            .withIndex("by_label", (q) => q.prefix("label", "😀"))
+            .contains("label", "x").collect,
+          ["f"]
+        )
+        yield* assertIds(
+          yield* store
+            .query(Refined)
+            .withIndex("by_label", (q) => q.prefix("label", "😀"))
+            .contains("label", "absent").collect,
+          []
+        )
+        yield* rows.write(Items, "case", Option.some(item("case", { accessScopeId: mine, label: "École" })))
+        yield* assertIds(yield* query.contains("label", "école").collect, [])
+        yield* assertIds(yield* query.contains("label", "E\u0301cole").collect, [])
+        yield* assertIds(yield* query.contains("label", "École").collect, ["case"])
+        const dependencies = yield* reads
+        if (!dependencies.has(Items.name) || !dependencies.has(ScopeGrants.ScopeGrants.name))
+          return yield* fail("missing reactive dependencies")
+        yield* rows.write(Items, "c", Option.some(item("c", { accessScopeId: mine, label: "edited" })))
+        yield* assertIds(yield* query.collect, ["d"])
+        yield* rows.write(ScopeGrants.ScopeGrants, ScopeGrants.grantId(open, AccessScope.Everyone), Option.none())
+        yield* assertIds(yield* query.collect, [])
+        return 16
+      })
+    )
+  )
+
 export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): ReadonlyArray<Check<R>> => [
+  check("literal search filters before limits and prefix ranges preserve Unicode boundaries", search(make)),
   check(
     "range returns exactly Store.planMatches rows in Store.planOrder, and scan orders by id code point (seeded random plans)",
     Effect.gen(function* () {

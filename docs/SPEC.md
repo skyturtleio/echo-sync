@@ -150,7 +150,8 @@ The engine does not and, at this pin, will not:
 - forget idle clients (`echo_sync.clients`, `client_scopes`, ledger identities and floors are
   kept forever: a forgotten floor turns a lost-ack resubmission into a double apply);
 - run more than one synced-write transaction at a time on the server (§6);
-- offer full-text search in the replica (the pinned wa-sqlite build has no FTS5);
+- offer linguistic full-text search, ranking, stemming or fuzzy matching in the replica;
+  literal substring and indexed prefix search are supported (§3);
 - ship a UI adapter other than FoldKit (`echo-sync/foldkit`), or carry any UI-framework
   knowledge in `src/core`, `src/client` or `src/server`.
 
@@ -161,9 +162,12 @@ was deferred past the v1 vertical slice in favor of row-by-row scope walks (§7)
 indefinitely because TypeScript is the only planned client language; revisit only when a
 non-TypeScript client is planned.
 
-**Rationale (2026-10-21):** Local full-text search was deferred because the pinned wa-sqlite
-build lacks FTS5; a custom build versus non-FTS search must be decided before a consumer
-requiring full-text search is ported (requirement confirmed 2026-10-22).
+**Rationale (2026-10-25):** Choose normalized ordinary text columns and literal substring/prefix
+queries for the SkyTime pilot-logbook consumer (423 aircraft types, thousands of flights;
+84k airports remain optional). Reject a custom FTS5 build for now: these requirements do not
+need linguistic tokenization or ranking, and ordinary columns preserve existing transactional
+install/undo/purge semantics without a second index-maintenance lifecycle. This supersedes the
+2026-10-21 deferral; large substring workloads must be measured, not presumed indexed (§16).
 
 **Rationale (2026-10-22):** Edge/serverless composition remains unscheduled: the wire and
 client are runtime-agnostic, but the process-scoped shared `LISTEN`/`PubSub` and in-memory
@@ -264,6 +268,27 @@ synced table is `scope_grants` (§4).
   case ≤ 63 characters and round-tripping camelCase ↔ snake_case; index name such that
   `${table}__${index}` ≤ 63 characters; no index on a JSON column; no two registry tables with
   one sync name (`scope_grants` included).
+- INV-TBL-6: `contains(field, needle)` MUST match a literal substring of stored text, with
+  no implicit normalization or wildcard interpretation. NULL never matches; an empty needle
+  matches every non-null text. Index conditions, text matching and readable scope MUST all
+  apply before ordering/limit; the chosen index order and id tiebreak remain unchanged.
+  A second `contains` replaces the first. Search needles with NUL or unpaired surrogates,
+  and fields not stored as text, MUST fail `InvalidRow`.
+- INV-TBL-7: `prefix(field, value)` MUST constrain the next text index field after equality
+  keys to its literal code-point prefix. Empty prefix matches every non-null text; no upper
+  successor means no upper bound. Bounds MUST NOT be validated as complete field values.
+  Prefix and contains compose. Prefix input has INV-TBL-6's portability validation.
+- INV-TBL-8: `Search.normalize` MUST apply NFC, locale-independent lowercase, NFC again,
+  collapse JavaScript whitespace runs to ASCII space and trim. Accents/punctuation remain;
+  this is not Unicode case folding. `Search.Text` MUST validate (not transform) that canonical
+  form and refuse NUL/unpaired surrogates. It is an ordinary synced text column, not a derived
+  field: the app MUST maintain it alongside its source fields.
+
+**Rationale (2026-10-25):** Literal operators also accept existing string-valued text columns;
+normalization is explicit so existing text does not silently acquire different semantics.
+Use `instr`/`strpos`, not LIKE with dialect-dependent case/wildcard behavior. Prefix uses a
+BINARY/C range with the next Unicode-scalar successor, which need not satisfy a field's
+enum/refinement. No FTS query language or generic Boolean predicate builder is introduced.
 
 ### Details
 
@@ -299,6 +324,19 @@ Postgres; the same without `NULLS FIRST` in SQLite, where NULL already sorts fir
 **The comparator.** `Store.planOrder` and `Store.planMatches` are the reference semantics every
 `RowStore` must match; `Conformance.rowStore` checks `range` against them with seeded random
 plans, and `scan` orders by `id` code point.
+
+**Search.** Declare `searchText: Search.Text` and ordinary indexes in `SyncTable.make`.
+Set it with `Search.Text.make(Search.normalize(source))` in importers and mutation handlers.
+`normalize` itself does not validate portability. Use `Query.make` with
+`db.query(Table).withIndex("by_date").contains("searchText", Search.normalize(input)).take(30)`,
+or `withIndex("by_name", q => q.prefix("searchText", Search.normalize(input)))`.
+The selected substring column need not belong to the index. Needles address stored text,
+not a custom field codec's decoded representation. NULL text remains unsearchable. Multiword
+input is one contiguous substring, not ANDed terms; combining fields can create cross-field
+matches, so the app owns separators and composition. Queries retain §12's snapshot and
+reactivity rules. Adding a column needs normal app migration/backfill and changes `dataHash`;
+an index-only addition does not. Changing normalization rules later needs explicit backfill
+and compatible rollout: schema refinements are not part of `dataHash`.
 
 ### Open Questions
 
@@ -1735,6 +1773,28 @@ installation and stranded restored intent; the full-rebase fixture itself is unc
 
 Known costs and limits of the counters:
 
+- Search adds no SQL statements to writes, install or replay. Normalization is app work on
+  writes; extra text bytes and any ordinary B-tree indexes add storage/write cost. Contains
+  is a SQL predicate in one range SELECT, potentially scanning every candidate text byte;
+  `take(n)` bounds returned rows, not work or the leader's permit hold. Prefix is an index
+  range (provided preceding keys are equalities), not a leading-wildcard scan. Neither gives
+  a latency guarantee. Use separate indexed code/name fields for a large airport catalog.
+
+**Rationale (2026-10-25):** Keep the pinned synchronous `@effect/wa-sqlite` 0.1.2 artifact:
+its wasm is 592,945 bytes and loader 123,238 bytes uncompressed. A custom FTS5 build is feasible,
+not inherently incompatible with OPFS: `OpfsSqlite` would import the matching generated
+JS/wasm pair and pass the same module to `WaSqlite.Factory` and `AccessHandlePoolVFS`.
+The upstream Makefile exposes `CFLAGS_EXTRA` (for `-DSQLITE_ENABLE_FTS5`) and a Nix lock/toolchain
+(Emscripten 3.1.67), but upstream inspected at
+[`fe29e3e`](https://github.com/effect-ts/wa-sqlite/commit/fe29e3e35a78823b7209ff50172884170cb56d85)
+targets SQLite 3.50.4, not installed 3.47.0. Shipping that alternative requires pinned source,
+amalgamation/toolchain/flags, checksums and a reproducible JS/wasm pair; OPFS, exports, update
+hooks and FTS transactional maintenance through undo/install/purge need fresh verification.
+No custom artifact was built: its size delta and runtime compatibility are unverified, not
+claimed regressions. FTS shadow-index write amplification would also need a new §16 budget.
+
+Other existing costs:
+
 - The capture trigger calls `next_position()` once per log row, each taking the advisory lock
   (already held by the transaction after the first call, so re-entrant but still a function
   call and a `pg_notify`).
@@ -1841,6 +1901,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 
 ### Retired rules
 
+- **Retired (2026-10-25):** Deferral of all local text search (2026-10-21); literal search now ships under INV-TBL-6–8, while linguistic FTS remains a non-goal.
 - **Retired (2026-10-22):** Apps must close all tab clients before `resetReplica` (2026-10-21); engine-owned coordinated close supersedes this prerequisite (INV-BRW-7, §12).
 - **Retired (2026-10-24):** Server-time `ctx.now` for every mutation (former INV-MUT-8); writer time with a future-skew bound supersedes it except for pre-field clients (INV-MUT-11–14, §5).
 
@@ -1858,6 +1919,9 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-TBL-3 | covered | `SyncTable.test` "does not change when only indexes change (adding an index must not force a re-download)", "does not change for documentation annotations or field order", "ignores refinements, brands and nested JSON schemas: validation is not storage (SPEC §3)", "changes when the storage shape changes (nullability, column kind, column set, table name)" |
 | INV-TBL-4 | covered | `Simulation.test` "a pulled row is stored in canonical wire form (excess columns dropped, values normalized)"; `scopes.test` "pulled rows are the wire form: epoch-ms timestamps, and no column the SyncTable does not declare (INV-TBL-4)" |
 | INV-TBL-5 | covered | `SyncTable.test` "rejects field names that do not survive camelCase ↔ snake_case", "rejects indexes on JSON columns and on unknown fields", "a registry rejects two tables with the same sync name, including the system grants table" |
+| INV-TBL-6 | covered | `Conformance.test` "literal search filters before limits and prefix ranges preserve Unicode boundaries" (shared memory/SQLite/Postgres fixture); `Leader.test` "a registered search re-emits after edits, deletes and grant revocation" |
+| INV-TBL-7 | covered | `Conformance.test` "literal search filters before limits and prefix ranges preserve Unicode boundaries"; compile-errors.typecheck checks field selection |
+| INV-TBL-8 | covered | `Search.test` "search text normalizes case and whitespace without removing accents or interpreting punctuation" |
 | INV-ACL-1 | covered | `Store.test` "queries return the first n rows the actor can read (own or * grant), skipping unreadable ones in index order", "writes need writer on the row's scope, and a scope move needs it on both scopes" |
 | INV-ACL-2 | covered | `Store.test` "writes need writer on the row's scope, and a scope move needs it on both scopes"; `scopes.test` "a scope move deletes the row for old-scope readers and delivers it to new-scope readers" |
 | INV-ACL-3 | covered | `Store.test` "a non-owner can delete only its own grant, and a write after relinquishing it is ScopeForbidden" |
@@ -2015,6 +2079,9 @@ machine-verifiable literal test-title citations.
 | table name | `/^[a-z][a-z0-9_]*$/`, ≤ 48 | `SyncTable.ts` | no |
 | column name | snake case, ≤ 63 | `SyncTable.ts` | no |
 | index name | `${table}__${index}` ≤ 63 | `SyncTable.ts` | no |
+| text search predicates per ordered query | one `contains` (later call replaces); optional index prefix | `Store.ts` | no |
+| text search result limit | none for `collect`; 1 for `first`; explicit non-negative safe integer for `take` | `Store.ts` | caller |
+| search input | Unicode scalars without NUL; no engine length cap | `Search.ts`, `Store.ts` | no |
 | `appId`, `profile` | `^(?!\.+$)[A-Za-z0-9._-]+$`, ≤ 255 UTF-8 bytes each | `platform.ts` | no |
 | database name (`echo-sync/<appId>/<profile>.db`) | ≤ 502 | `platform.ts` | no |
 | advisory locks | position `7305797848413072995`, attach `…996`, schema bootstrap `…997` | migrations, `schema.ts` | no |
