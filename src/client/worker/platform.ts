@@ -4,11 +4,16 @@
  * SharedWorker.
  */
 /// <reference lib="webworker" />
+import * as BrowserCrypto from "@effect/platform-browser/BrowserCrypto"
+import * as Crypto from "effect/Crypto"
 import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
+import * as Hex from "effect/encoding/Hex"
+import * as Option from "effect/Option"
 import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
+import * as Stream from "effect/Stream"
 
 const noop = () => {}
 
@@ -86,10 +91,18 @@ export const poolDirectory = ({ appId, profile }: ReplicaIdentity): string => `e
  * (SHA-256, hex) rather than embedded so the name fits `maxSegmentBytes` for every valid profile.
  */
 export const tombstoneName = ({ profile }: ReplicaIdentity): Effect.Effect<string, BrowserStorageError> =>
-  storageCall("hashing the profile for its reset tombstone", async () => {
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(profile)))
-    return `~reset-${Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("")}`
-  })
+  Effect.flatMap(Crypto.Crypto, (crypto) => crypto.digest("SHA-256", new TextEncoder().encode(profile))).pipe(
+    Effect.map((digest) => `~reset-${Hex.encode(digest)}`),
+    Effect.mapError(
+      (error) =>
+        new BrowserStorageError({
+          operation: "hashing the profile for its reset tombstone",
+          cause: error.cause ?? error
+        })
+    ),
+    // Keep Web Crypto lazy: only tombstone operations need this service, not worker startup.
+    Effect.provide(BrowserCrypto.layer)
+  )
 
 /** Exclusive lock held by exactly one leader worker per replica for its whole lifetime. */
 /** Name of the router SharedWorker and of the BroadcastChannel its instances announce themselves on. */
@@ -147,29 +160,8 @@ const lockError = (name: string, cause: unknown) => new LockError({ name, messag
 const request = (
   name: string,
   options: { readonly mode: LockMode; readonly ifAvailable?: true; readonly withinMillis?: number }
-): Effect.Effect<(() => void) | undefined, LockError> =>
-  Effect.callback<(() => void) | undefined, LockError>((resume, interrupted) => {
-    // A deadline gives up the wait with `undefined`. Exactly one of the deadline and the grant decides, both on
-    // this thread: a grant whose callback runs after the deadline fired sees `signal.aborted` and is released
-    // at once, so a waiter that gave up never ends up holding the lock.
-    // One signal for both the deadline and interruption, without `AbortSignal.any` (Safari < 17.4 lacks it).
-    const deadline = new AbortController()
-    const signal = deadline.signal
-    interrupted.addEventListener("abort", () => deadline.abort(), { once: true })
-    let granted = false
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const within = options.withinMillis
-    if (within !== undefined && Number.isFinite(within)) {
-      timer = setTimeout(
-        () => {
-          if (granted || signal.aborted) return
-          deadline.abort()
-          resume(Effect.succeed(undefined))
-        },
-        Math.min(Math.max(within, 0), 2_147_483_647)
-      )
-      interrupted.addEventListener("abort", () => clearTimeout(timer))
-    }
+): Effect.Effect<(() => void) | undefined, LockError> => {
+  const acquire = Effect.callback<(() => void) | undefined, LockError>((resume, signal) => {
     // `signal` and `ifAvailable` cannot be combined; an ifAvailable request never queues anyway.
     const lockOptions: LockOptions = options.ifAvailable
       ? { mode: options.mode, ifAvailable: true }
@@ -185,9 +177,6 @@ const request = (
         const held = new Promise<void>((resolve) => {
           release = resolve
         })
-        // Decided: the deadline no longer applies.
-        granted = true
-        clearTimeout(timer)
         resume(Effect.succeed(release))
         return held
       })
@@ -195,6 +184,15 @@ const request = (
         if (!signal.aborted) resume(Effect.fail(lockError(name, cause)))
       })
   })
+  const within = options.withinMillis
+  return within !== undefined && Number.isFinite(within)
+    ? acquire.pipe(
+        // Timeout interrupts the callback, aborting the queued request. A late grant sees the aborted signal.
+        Effect.timeoutOption(Math.min(Math.max(within, 0), 2_147_483_647)),
+        Effect.map(Option.getOrUndefined)
+      )
+    : acquire
+}
 
 /** Releases the granted lock when the enclosing scope closes; the wait itself stays interruptible. */
 const holdUntilScopeCloses = (acquire: Effect.Effect<(() => void) | undefined, LockError>) =>
@@ -290,16 +288,27 @@ export const awaitOpfsPoolFree = (directory: string): Effect.Effect<void, Browse
     } catch {
       return
     }
-    // `entries()` is in the WHATWG spec and every engine that has OPFS, but not in TS's DOM lib yet.
+    // `values()` is in the WHATWG spec and every OPFS engine, but not in TS's DOM lib yet.
     // oxlint-disable-next-line typescript/consistent-type-assertions -- platform edge, see above
     const iterable = dir as unknown as { values(): AsyncIterable<FileSystemHandle> }
-    for await (const handle of iterable.values()) {
-      if (handle instanceof FileSystemFileHandle) {
-        const access = await handle.createSyncAccessHandle()
-        access.close()
-      }
-    }
+    return iterable.values()
   }).pipe(
+    Effect.flatMap((entries) => {
+      if (entries === undefined) return Effect.void
+      return Stream.fromAsyncIterable(
+        entries,
+        (cause) => new BrowserStorageError({ operation: "waiting for the OPFS pool to be free", cause })
+      ).pipe(
+        Stream.runForEach((handle) =>
+          handle instanceof FileSystemFileHandle
+            ? storageCall("waiting for the OPFS pool to be free", async () => {
+                const access = await handle.createSyncAccessHandle()
+                access.close()
+              })
+            : Effect.void
+        )
+      )
+    }),
     Effect.retry({
       // 20 + 40 + … + 5,120 ms = 10,220 ms before the final attempt.
       schedule: Schedule.exponential("20 millis").pipe(Schedule.upTo({ times: 9 })),
