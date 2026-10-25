@@ -284,6 +284,16 @@ synced table is `scope_grants` (§4).
   this is not Unicode case folding. `Search.Text` MUST validate (not transform) that canonical
   form and refuse NUL/unpaired surrogates. It is an ordinary synced text column, not a derived
   field: the app MUST maintain it alongside its source fields.
+- INV-TBL-9: `after(cursor)` and `before(cursor)` MUST impose exclusive lexicographic bounds
+  on the full selected index key, including implicit `id`, relative to the final query order.
+  All predicates and readability MUST apply before LIMIT in every store. Cursors use decoded
+  field values encoded by their column codecs, preserve NULL/code-point ordering, and do not
+  require the boundary row to exist. Even empty pages MUST record table and grant dependencies
+  under INV-BRW-6. Separate pages are separate snapshots, not a historical snapshot.
+
+**Rationale (2026-10-25):** Full indexed-field objects accept returned rows directly and keep
+cursor types independent of equality/range builder stages. The implicit id already exists in
+physical indexes; exposing a tuple seek avoids rereading entire tied groups without migrations.
 
 **Rationale (2026-10-25):** Literal operators also accept existing string-valued text columns;
 normalization is explicit so existing text does not silently acquire different semantics.
@@ -332,6 +342,24 @@ Postgres; the same without `NULLS FIRST` in SQLite, where NULL already sorts fir
 **The comparator.** `Store.planOrder` and `Store.planMatches` are the reference semantics every
 `RowStore` must match; `Conformance.rowStore` checks `range` against them with seeded random
 plans, and `scan` orders by `id` code point.
+
+**Keyset pages.** After `withIndex`, `.after({ ...indexedFields, id })` and `.before(...)`
+intersect with equality/scalar ranges, prefix, contains and readable scope. Include all declared
+index fields, even equality-prefix fields; other row fields are ignored. Values are decoded
+domain values (e.g. `Date`, not epoch ms). Missing/invalid fields or encoded text containing NUL
+or unpaired surrogates fail `InvalidRow`. `id` remains forbidden in declared index fields:
+the engine appends it implicitly. Existing indexes, hashes and migrations do not change.
+Ascending after means key > cursor; descending after means key < cursor; before is the inverse.
+Calling `order` after a cursor changes its interpretation too. Each side replaces its previous
+bound; both sides intersect. `take(n)` always takes the first n matches in final query order:
+before does not secretly reverse the limit to select the nearest previous page. To fetch that
+page, reverse order, use after, then reverse the result for presentation.
+Inserts behind a cursor do not shift its boundary; inserts ahead can appear on subsequent pages.
+Deletes need no cursor repair. Updates moving keys across the boundary can repeat or omit rows
+across separate reads; use live subscriptions when page contents must refresh.
+SQL uses native row comparisons for non-nullable keys and a null-aware lexicographic disjunction
+otherwise. Index availability does not guarantee a planner's access path, or bound the work of
+substring/readability filters. Pagination never narrows reactive dependencies to returned ids.
 
 **Search.** Declare `searchText: Search.Text` and ordinary indexes in `SyncTable.make`.
 Set it with `Search.Text.make(Search.normalize(source))` in importers and mutation handlers.
@@ -1969,6 +1997,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-TBL-6 | covered | `Conformance.test` "literal search filters before limits and prefix ranges preserve Unicode boundaries" (shared memory/SQLite/Postgres fixture); `Leader.test` "a registered search re-emits after edits, deletes and grant revocation" |
 | INV-TBL-7 | covered | `Conformance.test` "literal search filters before limits and prefix ranges preserve Unicode boundaries"; compile-errors.typecheck checks field selection |
 | INV-TBL-8 | covered | `Search.test` "search text normalizes case and whitespace without removing accents or interpreting punctuation" |
+| INV-TBL-9 | covered | `Conformance.test` "keyset pages preserve ties, direction, nulls and cursor boundaries across intervening inserts" (shared memory/SQLite/Postgres fixture); `Leader.test` "an empty cursor page re-emits on inserts, refills after deletes and observes key moves and revocation" |
 | INV-ACL-1 | covered | `Store.test` "queries return the first n rows the actor can read (own or * grant), skipping unreadable ones in index order", "writes need writer on the row's scope, and a scope move needs it on both scopes" |
 | INV-ACL-2 | covered | `Store.test` "writes need writer on the row's scope, and a scope move needs it on both scopes"; `scopes.test` "a scope move deletes the row for old-scope readers and delivers it to new-scope readers" |
 | INV-ACL-3 | covered | `Store.test` "a non-owner can delete only its own grant, and a write after relinquishing it is ScopeForbidden" |
@@ -2129,6 +2158,7 @@ machine-verifiable literal test-title citations.
 | column name | snake case, ≤ 63 | `SyncTable.ts` | no |
 | index name | `${table}__${index}` ≤ 63 | `SyncTable.ts` | no |
 | text search predicates per ordered query | one `contains` (later call replaces); optional index prefix | `Store.ts` | no |
+| keyset bounds per ordered query | one exclusive `after` and one exclusive `before`; later call replaces same side | `Store.ts` | no |
 | text search result limit | none for `collect`; 1 for `first`; explicit non-negative safe integer for `take` | `Store.ts` | caller |
 | search input | Unicode scalars without NUL; no engine length cap | `Search.ts`, `Store.ts` | no |
 | `appId`, `profile` | `^(?!\.+$)[A-Za-z0-9._-]+$`, ≤ 255 UTF-8 bytes each | `platform.ts` | no |

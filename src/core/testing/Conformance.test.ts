@@ -6,7 +6,16 @@ import * as MemoryStore from "./MemoryStore.ts"
 
 const register = (checks: ReadonlyArray<Conformance.Check<never>>) => {
   for (const check of checks) {
-    it.effect(check.name, () => Effect.map(check.run, (cases) => assert.isAbove(cases, 0)), 60_000)
+    const run = () => Effect.map(check.run, (cases) => assert.isAbove(cases, 0))
+    if (
+      check.name === "keyset pages preserve ties, direction, nulls and cursor boundaries across intervening inserts"
+    ) {
+      it.effect(
+        "keyset pages preserve ties, direction, nulls and cursor boundaries across intervening inserts",
+        run,
+        60_000
+      )
+    } else it.effect(check.name, run, 60_000)
   }
 }
 

@@ -81,6 +81,8 @@ export interface Bound {
  * - and, on key column `eq.length`, within `lower`/`upper` (a bound never matches `null`),
  * - ordered by the full index key (`index.key`, which ends with `id`) in `order`;
  *   `asc` ⇒ NULLS FIRST, `desc` ⇒ NULLS LAST on every column.
+ * - optional `after`/`before` contain one wire value per full index key column and impose
+ *   exclusive bounds relative to `order`, intersecting every other predicate before limit.
  * `eq` and bound values are wire values; a SQL RowStore binds each through its key column's
  * dialect codec (`column.sqlite` / `column.postgres`), e.g. a timestamp bound is epoch ms on
  * the wire and a `Date` for Postgres.
@@ -95,6 +97,8 @@ export interface Bound {
  */
 export interface IndexRangePlan {
   readonly index: Index
+  readonly after?: ReadonlyArray<KeyValue>
+  readonly before?: ReadonlyArray<KeyValue>
   readonly text?: { readonly column: Column; readonly needle: string }
   readonly eq: ReadonlyArray<KeyValue>
   readonly lower: Option.Option<Bound>
@@ -106,6 +110,17 @@ export interface IndexRangePlan {
 
 /** Reference predicate for `plan` (MemoryStore uses it; SQL stores must agree). */
 export const planMatches = (plan: IndexRangePlan, row: EncodedRow): boolean => {
+  for (const side of ["after", "before"] as const) {
+    const cursor = plan[side]
+    if (cursor === undefined) continue
+    let comparison = 0
+    for (const [i, column] of plan.index.key.entries()) {
+      comparison = compareKeyValue(row[column.name] ?? null, cursor[i] ?? null)
+      if (comparison !== 0) break
+    }
+    const greater = (side === "after") === (plan.order === "asc")
+    if (greater ? comparison <= 0 : comparison >= 0) return false
+  }
   if (plan.text !== undefined) {
     const value = row[plan.text.column.name]
     if (typeof value !== "string" || !value.includes(plan.text.needle)) return false
@@ -292,10 +307,18 @@ export type TextField<Row> = {
   [K in keyof Row & string]: NonNullable<Row[K]> extends string ? K : never
 }[keyof Row & string]
 
-export interface OrderedQuery<Row, E> {
+export type IndexCursor<T extends AnySyncTable, K extends keyof T["indexes"]> = Pick<
+  RowOf<T>,
+  Extract<IndexFields<T, K>[number] | "id", keyof RowOf<T>>
+>
+
+export interface OrderedQuery<Row, E, Cursor = Row> {
   /** One literal substring predicate, applied before the limit. A later call replaces it. */
-  readonly contains: (field: TextField<Row>, needle: string) => OrderedQuery<Row, E>
-  readonly order: (order: "asc" | "desc") => OrderedQuery<Row, E>
+  readonly contains: (field: TextField<Row>, needle: string) => OrderedQuery<Row, E, Cursor>
+  readonly order: (order: "asc" | "desc") => OrderedQuery<Row, E, Cursor>
+  /** Exclusive full index key, including implicit id, relative to the final order. */
+  readonly after: (cursor: Cursor) => OrderedQuery<Row, E, Cursor>
+  readonly before: (cursor: Cursor) => OrderedQuery<Row, E, Cursor>
   readonly take: (n: number) => Effect.Effect<ReadonlyArray<Row>, E>
   readonly first: Effect.Effect<Option.Option<Row>, E>
   readonly collect: Effect.Effect<ReadonlyArray<Row>, E>
@@ -305,7 +328,7 @@ export interface TableQuery<T extends AnySyncTable, E> {
   readonly withIndex: <K extends keyof T["indexes"] & string>(
     index: K,
     range?: (q: IndexRangeBuilder<RowOf<T>, IndexFields<T, K>>) => IndexRange
-  ) => OrderedQuery<RowOf<T>, E>
+  ) => OrderedQuery<RowOf<T>, E, IndexCursor<T, K>>
 }
 
 /** Errors of reads. Rows in scopes the actor cannot read are skipped by queries. */
@@ -590,12 +613,21 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
       }),
 
     query: <T extends AnySyncTable>(table: T): TableQuery<T, InvalidRow | StoreUnavailable> => ({
-      withIndex: (name, range) => {
+      withIndex: <K extends keyof T["indexes"] & string>(
+        name: K,
+        range?: (q: IndexRangeBuilder<RowOf<T>, IndexFields<T, K>>) => IndexRange
+      ) => {
         const index = table.indexes[name]
         const built = (range ?? ((q) => q))(
           new IndexRangeBuilder({ eq: [], lower: Option.none(), upper: Option.none() })
         ).state
-        const run = (order: "asc" | "desc", limit: Option.Option<number>, text?: readonly [string, string]) =>
+        type Cursors = { readonly after?: IndexCursor<T, K>; readonly before?: IndexCursor<T, K> }
+        const run = (
+          order: "asc" | "desc",
+          limit: Option.Option<number>,
+          cursors: Cursors,
+          text?: readonly [string, string]
+        ) =>
           Effect.gen(function* () {
             yield* read(table)
             if (index === undefined) {
@@ -621,6 +653,26 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
                   }
             const eq: Array<KeyValue> = []
             for (const [field, value] of built.eq) eq.push(yield* toKeyValue(table, field, value))
+            const encodedCursors: { after?: ReadonlyArray<KeyValue>; before?: ReadonlyArray<KeyValue> } = {}
+            for (const side of ["after", "before"] as const) {
+              if (!Object.hasOwn(cursors, side)) continue
+              const cursor: unknown = cursors[side]
+              const values: Array<KeyValue> = []
+              for (const column of index.key) {
+                if (typeof cursor !== "object" || cursor === null || !Object.hasOwn(cursor, column.field)) {
+                  return yield* new InvalidRow({ table: table.name, message: `cursor requires ${column.field}` })
+                }
+                const value = yield* toKeyValue(table, column.field, Reflect.get(cursor, column.field))
+                if (typeof value === "string" && !Search.isPortable(value)) {
+                  return yield* new InvalidRow({
+                    table: table.name,
+                    message: "cursor requires portable Unicode without NUL"
+                  })
+                }
+                values.push(value)
+              }
+              encodedCursors[side] = values
+            }
             const bound = (b: Option.Option<readonly [string, unknown, boolean]>) =>
               Option.isNone(b)
                 ? Effect.succeed(Option.none<Bound>())
@@ -635,6 +687,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
             // the store stops after `limit` readable rows.
             const plan: IndexRangePlan = {
               index,
+              ...encodedCursors,
               ...(predicate === undefined ? {} : { text: predicate }),
               eq,
               lower: yield* bound(built.lower),
@@ -663,13 +716,16 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
           })
         const ordered = (
           order: "asc" | "desc",
+          cursors: Cursors = {},
           text?: readonly [string, string]
-        ): OrderedQuery<RowOf<T>, InvalidRow | StoreUnavailable> => ({
-          contains: (field, needle) => ordered(order, [field, needle]),
-          order: (next) => ordered(next, text),
-          take: (n) => run(order, Option.some(n), text),
-          first: run(order, Option.some(1), text).pipe(Effect.map((rs) => Option.fromNullishOr(rs[0]))),
-          collect: run(order, Option.none(), text)
+        ): OrderedQuery<RowOf<T>, InvalidRow | StoreUnavailable, IndexCursor<T, K>> => ({
+          contains: (field, needle) => ordered(order, cursors, [field, needle]),
+          order: (next) => ordered(next, cursors, text),
+          after: (cursor) => ordered(order, { ...cursors, after: cursor }, text),
+          before: (cursor) => ordered(order, { ...cursors, before: cursor }, text),
+          take: (n) => run(order, Option.some(n), cursors, text),
+          first: run(order, Option.some(1), cursors, text).pipe(Effect.map((rs) => Option.fromNullishOr(rs[0]))),
+          collect: run(order, Option.none(), cursors, text)
         })
         return ordered("asc")
       }

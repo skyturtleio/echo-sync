@@ -107,6 +107,7 @@ export const Items = SyncTable.make(
       by_label_rank: ["label", "rank"],
       by_rank_label: ["rank", "label"],
       by_flag_at: ["flag", "at"],
+      by_scope_score: ["accessScopeId", "score"],
       by_score: ["score"]
     }
   }
@@ -418,6 +419,8 @@ const randomPlan = (rng: ReturnType<typeof prng>, rows: ReadonlyArray<SyncTable.
   }
   return {
     index,
+    ...(rng.chance(0.6) ? { after: index.key.map((c) => valueOf(c, true)) } : {}),
+    ...(rng.chance(0.4) ? { before: index.key.map((c) => valueOf(c, true)) } : {}),
     eq,
     lower: bound(),
     upper: bound(),
@@ -538,6 +541,14 @@ export const search = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>) =>
           .contains("label", "cole").collect
         if (transformed.length !== 1 || transformed[0]?.label !== "decoded:École")
           return yield* fail("search used decoded text or failed to decode its result")
+        const transformedBoundary = transformed[0]
+        if (transformedBoundary === undefined) return yield* fail("missing transformed boundary")
+        const beyond = yield* store
+          .query(Transformed)
+          .withIndex("by_label")
+          .after(transformedBoundary)
+          .contains("label", "École").collect
+        if (beyond.length !== 0) return yield* fail("cursor did not encode its decoded field")
         const dependencies = yield* reads
         if (!dependencies.has(Items.name) || !dependencies.has(ScopeGrants.ScopeGrants.name))
           return yield* fail("missing reactive dependencies")
@@ -551,6 +562,164 @@ export const search = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>) =>
   )
 
 export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): ReadonlyArray<Check<R>> => [
+  check(
+    "keyset pages preserve ties, direction, nulls and cursor boundaries across intervening inserts",
+    use(make, ({ rows, transaction }) =>
+      Effect.gen(function* () {
+        const fail = violation("keyset pagination")
+        yield* transaction(
+          Effect.gen(function* () {
+            for (const [id, row] of GRANTS) yield* rows.write(ScopeGrants.ScopeGrants, id, Option.some(row))
+            for (const id of ["a", "b", "c", "d", "e", "f", "g", "h", "i"]) {
+              yield* rows.write(
+                Items,
+                id,
+                Option.some(
+                  item(id, {
+                    accessScopeId: mine,
+                    score: 10,
+                    label: "tie",
+                    rank: 3,
+                    at: new Date(1234)
+                  })
+                )
+              )
+            }
+            yield* rows.write(Items, "hidden", Option.some(item("hidden", { accessScopeId: theirs, score: 10 })))
+            yield* rows.write(Items, "null", Option.some(item("null", { accessScopeId: mine, score: 9 })))
+          })
+        )
+        const { store, reads } = Store.make(rows, {
+          actor: u1,
+          now: DateTime.makeUnsafe(0),
+          roleFor: Store.roleFromGrants(rows, u1),
+          claimScope: Store.claimFromGrants(rows)
+        })
+        const assertIds = (actual: ReadonlyArray<Item>, expected: ReadonlyArray<string>) =>
+          canonical(actual.map((r) => r.id)) === canonical(expected)
+            ? Effect.void
+            : fail(`got ${canonical(actual.map((r) => r.id))}, expected ${canonical(expected)}`)
+        const query = store.query(Items).withIndex("by_score", (q) => q.eq("score", 10))
+        for (const order of ["asc", "desc"] as const) {
+          const expected =
+            order === "asc"
+              ? ["a", "b", "c", "d", "e", "f", "g", "h", "i"]
+              : ["i", "h", "g", "f", "e", "d", "c", "b", "a"]
+          let page = query.order(order)
+          for (let offset = 0; offset <= 9; offset += 3) {
+            const result = yield* transaction(page.take(3))
+            yield* assertIds(result, expected.slice(offset, offset + 3))
+            const last = result.at(-1)
+            if (last !== undefined) page = page.after(last)
+          }
+        }
+        const cursor = { score: 10, id: ItemId.make("f") }
+        const scopedPage = store
+          .query(Items)
+          .withIndex("by_scope_score", (q) => q.eq("accessScopeId", mine))
+          .after({ accessScopeId: mine, ...cursor })
+        yield* assertIds(yield* transaction(scopedPage.take(2)), ["g", "h"])
+        yield* assertIds(yield* transaction(scopedPage.order("desc").take(2)), ["e", "d"])
+        yield* assertIds(yield* transaction(query.after(cursor).order("desc").take(2)), ["e", "d"])
+        yield* assertIds(yield* transaction(query.order("desc").before(cursor).take(2)), ["i", "h"])
+        yield* assertIds(yield* transaction(query.after({ score: 10, id: ItemId.make("b") }).before(cursor).collect), [
+          "c",
+          "d",
+          "e"
+        ])
+        yield* assertIds(
+          yield* transaction(
+            query
+              .after(cursor)
+              .after({ score: 10, id: ItemId.make("h") })
+              .take(2)
+          ),
+          ["i"]
+        )
+        yield* assertIds(yield* transaction(query.after(cursor).take(0)), [])
+        yield* assertIds(yield* transaction(query.after({ score: 9, id: ItemId.make("z") }).take(2)), ["a", "b"])
+        yield* assertIds(yield* transaction(query.after({ score: 11, id: ItemId.make("a") }).take(2)), [])
+        const first = yield* transaction(query.after(cursor).first)
+        if (Option.isNone(first) || first.value.id !== "g") return yield* fail("first did not seek")
+        // Another writer commits on both sides of the cursor, and removes the boundary row.
+        const writer = yield* Effect.forkChild(
+          transaction(
+            Effect.gen(function* () {
+              for (const id of ["f1", "e1"])
+                yield* rows.write(Items, id, Option.some(item(id, { accessScopeId: mine, score: 10 })))
+              yield* rows.write(Items, "f", Option.none())
+            })
+          )
+        )
+        yield* Fiber.join(writer)
+        yield* assertIds(yield* transaction(query.order("desc").after(cursor).take(3)), ["e1", "e", "d"])
+        yield* assertIds(yield* transaction(query.after(cursor).take(3)), ["f1", "g", "h"])
+        const dated = store.query(Items).withIndex("by_flag_at", (q) => q.eq("flag", false))
+        const dateCursor = { flag: false, at: new Date(1234), id: ItemId.make("d") }
+        yield* assertIds(yield* transaction(dated.after(dateCursor).order("desc").take(4)), ["c", "b", "a", "null"])
+        yield* assertIds(yield* transaction(dated.before({ flag: false, at: null, id: ItemId.make("null") }).collect), [
+          "e1",
+          "f1"
+        ])
+        const composed = store
+          .query(Items)
+          .withIndex("by_label_rank", (q) => q.prefix("label", "ti"))
+          .after({ label: "tie", rank: 3, id: ItemId.make("c") })
+          .contains("label", "ie")
+          .order("desc")
+        yield* assertIds(yield* transaction(composed.take(2)), ["b", "a"])
+        yield* assertIds(
+          yield* transaction(
+            store
+              .query(Items)
+              .withIndex("by_label_rank", (q) => q.eq("label", "tie").gte("rank", 3))
+              .after({ label: "tie", rank: 3, id: ItemId.make("g") })
+              .take(2)
+          ),
+          ["h", "i"]
+        )
+        const empty = store
+          .query(Items)
+          .withIndex("by_score")
+          .after({ score: 20, id: ItemId.make("z") })
+        yield* assertIds(yield* transaction(empty.collect), [])
+        const dependencies = yield* reads
+        if (!dependencies.has(Items.name) || !dependencies.has(ScopeGrants.ScopeGrants.name))
+          return yield* fail("empty page lost dependencies")
+        for (const id of ["\0", "\ud800"]) {
+          const error = yield* Effect.flip(transaction(query.after({ score: 10, id: ItemId.make(id) }).collect))
+          if (!(error instanceof Errors.InvalidRow)) return yield* fail("nonportable cursor accepted")
+        }
+        for (const invalid of [
+          // @ts-expect-error untyped caller omits the implicit id
+          query.after({ score: 10 }),
+          // @ts-expect-error untyped caller supplies the wrong field type
+          query.before({ score: "10", id: ItemId.make("a") }),
+          // @ts-expect-error untyped caller supplies no cursor object
+          query.after(undefined)
+        ]) {
+          const error = yield* Effect.flip(transaction(invalid.collect))
+          if (!(error instanceof Errors.InvalidRow)) return yield* fail("invalid cursor accepted")
+        }
+        yield* transaction(
+          Effect.gen(function* () {
+            for (const id of ["\uffff", "😀"])
+              yield* rows.write(Items, id, Option.some(item(id, { accessScopeId: mine, label: "unicode" })))
+          })
+        )
+        yield* assertIds(
+          yield* transaction(
+            store
+              .query(Items)
+              .withIndex("by_label_rank", (q) => q.eq("label", "unicode").eq("rank", null))
+              .after({ label: "unicode", rank: null, id: ItemId.make("\uffff") }).collect
+          ),
+          ["😀"]
+        )
+        return 24
+      })
+    )
+  ),
   check("literal search filters before limits and prefix ranges preserve Unicode boundaries", search(make)),
   check(
     "range returns exactly Store.planMatches rows in Store.planOrder, and scan orders by id code point (seeded random plans)",

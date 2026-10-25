@@ -194,6 +194,13 @@ const searchDocs = Query.make("docs.search", {
     Effect.map(db.query(Docs).withIndex("by_body").contains("body", needle).take(5), (rows) => rows.map((r) => r.id))
 })
 
+const pageDocs = Query.make("docs.page", {
+  args: Schema.Struct({ body: Schema.String, id: RowId }),
+  success: Schema.Array(Schema.String),
+  handler: (db, cursor) =>
+    Effect.map(db.query(Docs).withIndex("by_body").order("desc").after(cursor).take(2), (rows) => rows.map((r) => r.id))
+})
+
 const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
   Effect.gen(function* () {
     const reactivity = yield* Reactivity.make
@@ -233,7 +240,7 @@ const leaderRpc = (options: { readonly allowRawExec: boolean }) =>
       loop: undefined,
       presence: undefined,
       actor: me,
-      queries: Query.makeRegistry([pick, pair, flip, docs, searchDocs]),
+      queries: Query.makeRegistry([pick, pair, flip, docs, searchDocs, pageDocs]),
       allowRawExec: options.allowRawExec,
       info: { leaderId: "l", clientId: "c", dbName: "test", syncing: false }
     })
@@ -373,6 +380,28 @@ it.live("a registered query that writes fails, commits nothing, and leaves the n
     expect(yield* flagBody).toBe("c")
     yield* engine.mutate(Ids.MutationId.make("m1"), "raw.add", { id: "r1" })
     expect(yield* count("raw")).toBe(1)
+  }).pipe(Effect.scoped)
+)
+
+it.live("an empty cursor page re-emits on inserts, refills after deletes and observes key moves and revocation", () =>
+  Effect.gen(function* () {
+    const { client, storage, write, row } = yield* leaderRpc({ allowRawExec: false })
+    const { next } = yield* collect(client.subscribe({ name: "docs.page", args: { body: "tie", id: "d4" } }))
+    expect(yield* next).toEqual([])
+    yield* write(Docs, row("d1", "tie"))
+    expect(yield* next).toEqual(["d1"])
+    yield* write(Docs, row("d2", "tie"))
+    expect(yield* next).toEqual(["d2", "d1"])
+    yield* write(Docs, row("d3", "tie"))
+    expect(yield* next).toEqual(["d3", "d2"])
+    yield* storage.transaction(storage.rows.write(Docs, "d3", Option.none()))
+    expect(yield* next).toEqual(["d2", "d1"])
+    yield* write(Docs, row("d2", "zzz"))
+    expect(yield* next).toEqual(["d1"])
+    yield* storage.transaction(
+      storage.rows.write(ScopeGrants.ScopeGrants, ScopeGrants.grantId(scope, me), Option.none())
+    )
+    expect(yield* next).toEqual([])
   }).pipe(Effect.scoped)
 )
 

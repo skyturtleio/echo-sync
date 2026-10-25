@@ -3,6 +3,7 @@ import { Effect, Option, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
 import { Errors, ScopeGrants, Store, type SyncTable } from "echo-sync"
+import * as Keyset from "../../internal/Keyset.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
 /**
@@ -118,6 +119,12 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
             where.push(`${q(ranged.name)} ${bound.value.inclusive ? loose : strict} $${params.length}`)
           }
         }
+        where.push(
+          ...Keyset.predicates(plan, (column, value) => {
+            params.push(bindColumn(column, value))
+            return `$${params.length}`
+          })
+        )
         if (plan.text !== undefined) {
           params.push(plan.text.needle)
           where.push(`strpos(t.${q(plan.text.column.name)}, $${params.length}) > 0`)

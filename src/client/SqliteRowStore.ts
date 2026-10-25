@@ -15,6 +15,7 @@ import { Effect, Option, Schema } from "effect"
 import type * as SqlClient from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
 import { Errors, ScopeGrants, type Registry, Store, type SyncTable } from "echo-sync"
+import * as Keyset from "../internal/Keyset.ts"
 
 type Table = SyncTable.AnySyncTable
 type Value = SyncTable.SqliteValue
@@ -90,6 +91,12 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
             where.push(`${q(ranged.name)} ${bound.value.inclusive ? loose : strict} ?`)
           }
         }
+        where.push(
+          ...Keyset.predicates(plan, (column, value) => {
+            params.push(Schema.encodeSync(column.sqlite)(value))
+            return `?${params.length}`
+          })
+        )
         if (plan.text !== undefined) {
           params.push(plan.text.needle)
           where.push(`instr(t.${q(plan.text.column.name)}, ?) > 0`)

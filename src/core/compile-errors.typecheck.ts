@@ -23,6 +23,34 @@ const Todos = SyncTable.make(
 export const queries = (db: EchoStore) => [
   db
     .query(Todos)
+    .withIndex("by_project", (q) => q.eq("projectId", null))
+    .after({ projectId: null, rank: 2, at: new Date(0), id: TodoId.make("a") })
+    .order("desc")
+    .take(10),
+  db
+    .query(Todos)
+    .withIndex("by_project", (q) => q.eq("projectId", null))
+    // @ts-expect-error cursor includes equality-prefix fields too
+    .after({ rank: 2, at: new Date(0), id: TodoId.make("a") }),
+  db
+    .query(Todos)
+    .withIndex("by_project")
+    // @ts-expect-error implicit id is mandatory
+    .before({ projectId: null, rank: 2, at: new Date(0) }),
+  db
+    .query(Todos)
+    .withIndex("by_project")
+    // @ts-expect-error cursor date is a decoded Date, not epoch milliseconds
+    .after({ projectId: null, rank: 2, at: 0, id: TodoId.make("a") }),
+  db
+    .query(Todos)
+    .withIndex("by_project")
+    .order("desc")
+    .contains("projectId", "p")
+    // @ts-expect-error fluent operations preserve cursor brands
+    .after({ projectId: null, rank: 2, at: new Date(0), id: "a" }),
+  db
+    .query(Todos)
     .withIndex("by_project", (q) => q.prefix("projectId", "ab"))
     .contains("projectId", "%"),
   // @ts-expect-error numeric fields cannot be searched as text

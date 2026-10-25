@@ -88,6 +88,39 @@ Contains may scan every candidate; a result limit is not a latency bound.
 Adding these columns requires the normal PostgreSQL migration/backfill and replica rebuild.
 Normalization changes require an explicit data backfill even if the storage shape is unchanged.
 
+### Keyset pagination
+
+Every declared index already ends with implicit `id`, including its physical SQLite/Postgres
+index. Do not declare `id` yourself. For an existing `by_scope_date: ["accessScopeId", "date"]`
+index, no schema/index migration is needed:
+
+```ts
+// In a registered Query.make handler; last is the previous page's last row.
+db.query(Flights)
+  .withIndex("by_scope_date", q => q.eq("accessScopeId", scope))
+  .order("desc")
+  .after({ accessScopeId: scope, date: last.date, id: last.id })
+  .take(N)
+// .after(last) also works. Omit .after(...) for the first page.
+```
+
+The cursor includes **all declared index fields plus id**, in decoded/domain form (use a
+`Date` for a `Schema.Date` field). Descending order reverses both date and id. A page can split
+a date tie group without skipping or repeating unchanged rows; the boundary row need not
+still exist. NULL is smallest ascending, largest descending. Cursors compose with scalar
+ranges, prefix and contains; all predicates and scope checks run before `take`.
+
+`before(cursor)` selects strictly earlier keys in the final order, and `take` still returns
+the first N in that order, not the closest N to the cursor. For the nearest previous page,
+reverse order, use `after`, then reverse the returned array. Repeating either bound replaces
+that side; after and before together intersect. Calling `order` later affects both bounds.
+
+Pages are separate snapshots: inserts behind the boundary do not shift it; inserts ahead may
+appear, and updates moving keys across it may repeat or omit rows across reads. Registered
+page subscriptions (even empty pages) retain ordinary table/grant invalidation and refresh
+after writes or revocation. Non-nullable keys use SQL tuple seeks; nullable keys use equivalent
+null-aware predicates. Planner choices and selective text/scope filters can still add work.
+
 ## 2. Mutations
 
 A mutation is a named handler over `ctx.store` (SPEC §5). It runs optimistically on the client and
