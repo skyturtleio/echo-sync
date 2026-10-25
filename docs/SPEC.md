@@ -120,7 +120,9 @@ entries the base settles, then re-run the handler of **every** remaining pending
 its fresh undo images. With `P` pending entries, `U` the total number of undo images they hold, `C`
 the number of changes in the page set and `H(m)` the cost of mutation `m`'s handler, one install
 costs `O(U) + O(C) + Σ_{m unreleased} H(m)` store operations, and `P` does not shrink the cost of a
-page set nor `C` the cost of the outbox: the terms add. A pushed batch that is answered with
+page set nor `C` the cost of the outbox: the terms add. SQLite groups consecutive same-table
+upserts within each page into multi-row statements (§9.4); per-row codec work remains linear.
+A pushed batch that is answered with
 positions at or below the installed cursor triggers the same undo-all/replay-all with `C = 0`.
 Every upsert of a known table is decoded once at staging (to refuse a malformed page before it is
 persisted) and decoded again, then encoded, at install. These table-codec passes exclude transport
@@ -1013,9 +1015,11 @@ epoch in pre-upgrade storage means unnegotiated, like `null`. The pull request's
 #### 9.3 Install
 
 `applyPageSet(pages, done)`: `install` = (`clearAll` if the set started from null) then
-`applyChange` for every change of every page in order; `scopePurged` → `purgeScope`,
+`applyChanges` for every page in order; `scopePurged` → `purgeScope`,
 `tombstone` → delete, `upsert` → decode through `table.wire`, encode again, write the canonical
-form. Acks of the whole set settle entries by `mutationId` (`Applied` → no notice; `Rejected` →
+form. Consecutive upserts of one known table in one page use `ReplicaRowStore.writeMany` in
+arrival order; duplicate ids retain the last row. Batches never cross a table change, tombstone,
+purge, or page boundary, preserving §7.6's last-mention-wins order. Acks of the whole set settle entries by `mutationId` (`Applied` → no notice; `Rejected` →
 `Rejected` notice; `Rejected{ClientExpired}` → `OutcomeUnknown` notice); an unacked entry with
 `seq ≤ done.expiredThrough` settles as `OutcomeUnknown`. Then `cursor = nextCursor`,
 `resnapshot = false`, staging cleared, all in the same transaction.
@@ -1028,14 +1032,14 @@ See Q3. Formally, for one rebase with pending set `P` (before release), undo ima
 | step | store operations |
 |---|---|
 | undo all | `U` writes (restore each pre-image) |
-| install | `C` changes; per upsert: 1 wire decode, 1 wire encode, 1 SQLite-row encode, 1 write; per tombstone: 1 write; per purge: 1 statement per table |
+| install | `C` changes; per upsert: 1 wire decode, 1 wire encode, 1 SQLite-row encode; one multi-row write per consecutive same-table run/chunk; per tombstone: 1 write; per purge: 1 statement per table |
 | settle | `|P|` map lookups; `|R|` releases; one notice insert per rejected/unknown |
 | replay all | `Σ_{m∈P∖R} H(m)` handler operations + `|P∖R|` undo writes |
 
 Push-covered rebase: `C = 0`, same undo and replay terms. Staging adds one decode per upsert of a
 known table per `PullPage` received (INV-CLI-9), so a staged upsert is decoded twice (staging, install) and
 encoded twice (wire canonical form in `Engine.ts`, then the table's `sqlite.row` codec in
-`SqliteRowStore.write`) between arrival and the replica. Upserts carried by `PullDone` are not
+`SqliteRowStore.writeMany`) between arrival and the replica. Upserts carried by `PullDone` are not
 staged and have only the install decode. Every undo restore is also one
 `sqlite.row` encode. Reading the pending outbox (`storage.pending`) decodes each entry's `undo`
 JSON, so the read itself is `|P|` decodes.
@@ -1054,6 +1058,24 @@ all preceding pages. Install still reads the full set exactly once, atomically (
 K(K+1)/2 page reads before install; the previous cost model omitted that quadratic work and the
 staged-page codecs. Read durable tail metadata instead of caching it in the engine, preserving
 reload and epoch/reset behavior without a schema migration or changing the 500-row default.
+
+For a run of N upserts with W table columns, SQLite issues `ceil(N / floor(32766 / W))`
+statements. 32766 is the pinned wa-sqlite build's `MAX_VARIABLE_NUMBER`, verified by its
+`PRAGMA compile_options`, not a page-size tuning result. Table column order, upsert SQL parts
+and row encoders are prepared once per table; a bounded cache retains the single-row SQL and
+the latest multi-row statement size. SQLite-row encoding is performed over each chunk as an
+array. All changes still share the original install transaction, FIFO admission and one
+conservative revision publication. Update hooks and their port messages remain per row.
+
+**Rationale (2026-10-25):** Batch adjacent upserts rather than sending one OPFS protocol message
+and preparing one SQLite statement per row. Do not group by table across deletes/purges or
+split the transaction: either would change installation semantics; retain the existing page limit.
+
+**Rationale (2026-10-25):** Keep table validation at staging and canonicalization at install.
+`dataHash` describes column shape, not arbitrary refinements or transform functions, so it
+cannot certify persisted rows against a new client codec. Skipping the install codec pair on
+that hash alone was rejected; a sound codec-version contract remains future work. Staging format,
+codec pass counts and INV-PERF-8's linear read budget are unchanged by batching.
 
 #### 9.5 Notices
 
@@ -1875,9 +1897,9 @@ batches, page limits and retention against them.
   writes), `w` is walk SELECTs, `l = 1` if the log is read, `t` is payload-table SELECTs,
   `d = 1` on PullDone (held insert). App principal lookup/policy SQL is excluded.
 - INV-PERF-4: Per install (§9.4, Q3): one SQLite transaction holding the storage's single permit
-  for `U` undo writes + `C` change writes + `Σ H(m)` replay operations + `|P∖R|` outbox undo
+  for `U` undo writes + batched `C` change writes + `Σ H(m)` replay operations + `|P∖R|` outbox undo
   updates; one `clearAll` statement per replica table when the set started from null. For the
-  increment fixture below, no settlements and a non-null cursor: exactly `8 + C + 9P`
+  increment fixture below (500 upserts/page), no settlements and a non-null cursor: exactly `8 + ceil(C/500) + 9P`
   statements, including staged read, bookkeeping and controls. `Engine.pull` additionally
   checks current epoch before install (one meta SELECT), then reads installed meta and pending
   eligibility (three SELECTs, `1 + 2P` returned rows) to schedule restored intent without a wake.
@@ -1982,8 +2004,8 @@ physical scans or codec invocations. Production code is unchanged.
 | completed log pull, same state, K=3 distinct upserts in one table | 16 (one batched payload query) | `7 + 2K` = 13 |
 | initial scope walk, K=3 items, one grant, empty notes, limit 100 | 14 | `7 + K` = 10 |
 | initial scope walk, same rows, limit 2 (unfinished) | 10 | 9 (includes one item lookahead) |
-| install P=3 increment entries / C=7 counter upserts, one staged page, no acks | `8 + 9P + C` = 42 | `6P + 1 + pages` = 20 |
-| same install from null, with grant included in snapshot | 45 (two table clears + grant write) | 20 |
+| install P=3 increment entries / C=7 counter upserts, one staged page, no acks | `8 + 9P + ceil(C/500)` = 36 | `6P + 1 + pages` = 20 |
+| same install from null, with grant included in snapshot | 39 (two table clears + grant write) | 20 |
 
 Derivations live beside assertions in `perf-postgres.test.ts` and `perf-install.test.ts`.
 The install fixture starts each pending row at 100, increments by 3 optimistically, then
@@ -1992,7 +2014,21 @@ of 203, P refreshed undo records holding 200, and final pending/cursor state. It
 INV-CLI-1 and INV-CLI-3's full rebase, not merely the aggregate statement count. Pending reads
 currently use **two** SELECTs (undo images then envelopes), each returning P rows.
 
-#### Install measurement receipts (2026-10-24)
+#### Browser bootstrap measurement
+
+`bash examples/browser-spike/bootstrap.sh` runs 10k and 100k four-column todos, three trials
+each, through Chromium, SharedWorker, the leader, OPFS and the real example server. It requires
+a clean committed tree and prints its revision. Use a fresh `ECHO_SLICE_DB` for each campaign
+with the supervised server/Vite setup in AGENTS.md; `SIZES=100 TRIALS=1` is a smoke check.
+Each trial seeds an isolated scope/principal, opens a fresh replica, observes a live-query
+snapshot with the full count and ten validated rows, then validates every row in chunks and
+resets OPFS. `firstUsableQueryMs` includes client construction through that first result, not
+seeding, navigation or later full-data validation. `longestInstallMs` is the maximum completed
+`echo.install` attempt span: it includes admission wait and the full transaction through commit,
+so it is an upper bound on permit hold, not a direct hold measurement. Browser caches and
+Postgres buffers are warm; localhost results do not establish phone, Safari or WAN latency.
+
+#### Historical unbatched install measurement receipts (2026-10-24)
 
 Clean source: [`9ba93ee7b2724da172ba883e17eecbff9439d60e`](https://github.com/skyturtleio/echo-sync/commit/9ba93ee7b2724da172ba883e17eecbff9439d60e).
 Command: `bun test/perf-install.ts` (refuses a dirty tree and prints its source SHA).
@@ -2060,6 +2096,8 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
   `noPropertyAccessFromIndexSignature` for a git dependency was rejected.
 
 ### Retired rules
+
+- **Retired (2026-10-25):** One SQLite statement per installed upsert (former INV-PERF-4 cost); consecutive same-table runs now use parameter-bounded multi-row upserts (§9.4), with unchanged atomicity and row order.
 
 - **Retired (2026-10-25):** Implicit mutation-args excess-key stripping and defects for tab args encoding failures; strict-by-default typed rejections supersede them (INV-MUT-18, §5).
 - **Retired (2026-10-25):** Deferral of all local text search (2026-10-21); literal search now ships under INV-TBL-6–8, while linguistic FTS remains a non-goal.
@@ -2202,7 +2240,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PERF-1 | covered | `ordering.test` "without the trigger's advisory lock that reader skips the earlier writer (the ordering check can fail)" (the lock is held; its throughput consequence is not measured) |
 | INV-PERF-2 | covered | `perf-postgres.test` "a pushed mutation adds only its N reads and M writes to the fixed ledger cost" |
 | INV-PERF-3 | covered | `perf-postgres.test` "empty, log and scope-walk pages retain their derived statement and returned-row budgets" |
-| INV-PERF-4 | covered | `perf-install.test` "install undoes P entries, writes C changes and replays P handlers without hidden statements" |
+| INV-PERF-4 | covered | `perf-install.test` "install undoes P entries, writes C changes and replays P handlers without hidden statements", "batched replica upserts keep the last duplicate and split before SQLite's parameter limit", "install batches never move upserts across a tombstone, scope purge, or page boundary" |
 | INV-PERF-5 | untested | — |
 | INV-PERF-6 | partial | `rpc.test` "more open pokes streams than pool connections do not block push or pull, and the server holds one LISTEN" (fan-out and notify counts unmeasured) |
 | INV-PERF-7 | covered | `perf-postgres.test` both budget tests; `perf-install.test` "install undoes P entries, writes C changes and replays P handlers without hidden statements" (SELECT-returned rows, not physical scans) |
@@ -2226,6 +2264,7 @@ machine-verifiable literal test-title citations.
 | `PushRequest.mutations` | 1 … 100 | `Protocol.ts` | no |
 | `pageLimit` (upserts + tombstones per page) | 500; configured value must be a positive safe integer (INV-PULL-14) | `rpc.ts` | `pageLimit` |
 | staged resume read | at most 1 metadata row per request; full payload set read once at install (INV-PERF-8) | `SqliteSyncStorage.ts`, `Engine.ts` | no |
+| SQLite upsert batch | at most `floor(32766 / columnCount)` rows, never across page/table/delete/purge boundaries at install | `SqliteRowStore.ts`, `Engine.ts` | pinned wasm parameter limit, not a tuning option |
 | server `heartbeatInterval` (pokes and presence) | 15 s | `rpc.ts` | yes; must stay below clients' `idleTimeout` |
 | client `idleTimeout` (pokes stream, presence stream, presence send) | 45 s | `SyncLoop.ts`, `Presence.ts` | yes; must exceed `heartbeatInterval` |
 | sync loop backoff | 1 s doubling to 30 s, reset on a clean cycle | `SyncLoop.ts` | `retryDelay`, `maxRetryDelay` |

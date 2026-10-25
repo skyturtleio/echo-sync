@@ -287,6 +287,7 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
     rows: {
       ...rows,
       write: (table, id, row) => touch(rows.write(table, id, row)),
+      writeMany: (table, batch) => touch(rows.writeMany(table, batch)),
       purgeScope: (scope) => touch(rows.purgeScope(scope)),
       clearAll: touch(rows.clearAll)
     },

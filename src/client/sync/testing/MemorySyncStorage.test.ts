@@ -54,6 +54,7 @@ const closeOnReopen = Effect.sync(() => {
       rows: {
         read: (table, id) => live(inner.rows.read(table, id)),
         write: (table, id, row) => live(inner.rows.write(table, id, row)),
+        writeMany: (table, rows) => live(inner.rows.writeMany(table, rows)),
         range: (table, plan) => live(inner.rows.range(table, plan)),
         scan: (table) => live(inner.rows.scan(table)),
         purgeScope: (scopeId) => live(inner.rows.purgeScope(scopeId)),
@@ -89,6 +90,7 @@ describe("the suite's expectations come from fixtures, not from the subject (SPE
   const noopRows: Store.ReplicaRowStore = {
     read: () => Effect.succeedNone,
     write: () => Effect.void,
+    writeMany: () => Effect.void,
     range: () => Effect.succeed([]),
     scan: () => Effect.succeed([]),
     purgeScope: () => Effect.void,

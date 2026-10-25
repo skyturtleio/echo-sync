@@ -36,7 +36,44 @@ const decodeRows = (table: Table, rows: ReadonlyArray<unknown>) =>
 const bind = (column: SyncTable.Column, value: Schema.Json): Effect.Effect<Value> =>
   Effect.orDie(Schema.encodeEffect(column.sqlite)(value))
 
+// MAX_VARIABLE_NUMBER in the pinned wa-sqlite build (PRAGMA compile_options), also used by OPFS.
+const maxParameters = 32766
+
+const upsert = (table: Table) => {
+  const names = table.columns.map((c) => c.name)
+  const updates = names.filter((n) => n !== "id").map((n) => `${q(n)} = excluded.${q(n)}`)
+  const prefix = `INSERT INTO ${q(table.name)} (${names.map(q).join(", ")}) VALUES `
+  const tuple = `(${names.map(() => "?").join(", ")})`
+  const suffix = ` ON CONFLICT ("id") DO ${updates.length === 0 ? "NOTHING" : `UPDATE SET ${updates.join(", ")}`}`
+  const single = prefix + tuple + suffix
+  // One bounded cache entry for the latest batch size, in addition to the single-row statement.
+  let lastSize = 0
+  let lastSql = ""
+  return {
+    names,
+    batchSize: Math.floor(maxParameters / names.length),
+    encode: Schema.encodeEffect(table.sqlite.row),
+    encodeMany: Schema.encodeEffect(Schema.Array(table.sqlite.row)),
+    statement: (size: number) => {
+      if (size === 1) return single
+      if (size !== lastSize) {
+        lastSql = prefix + Array.from({ length: size }, () => tuple).join(", ") + suffix
+        lastSize = size
+      }
+      return lastSql
+    }
+  }
+}
+
 export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry): Store.ReplicaRowStore => {
+  const upserts = new WeakMap<Table, ReturnType<typeof upsert>>()
+  const upsertFor = (table: Table) => {
+    const existing = upserts.get(table)
+    if (existing !== undefined) return existing
+    const created = upsert(table)
+    upserts.set(table, created)
+    return created
+  }
   // The table is aliased `t`, so a readable-scope semi-join on scope_grants can name it.
   const select = (table: Table, where: string, params: ReadonlyArray<Value>, orderBy: string, limit = "") =>
     unavailable(sql.unsafe(`SELECT t.* FROM ${q(table.name)} AS t${where} ORDER BY ${orderBy}${limit}`, params)).pipe(
@@ -51,17 +88,28 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
       Option.isNone(row)
         ? Effect.asVoid(unavailable(sql.unsafe(`DELETE FROM ${q(table.name)} WHERE "id" = ?`, [id])))
         : Effect.gen(function* () {
-            const stored = yield* Effect.orDie(Schema.encodeEffect(table.sqlite.row)({ ...row.value, id }))
-            const names = table.columns.map((c) => c.name)
-            const updates = names.filter((n) => n !== "id").map((n) => `${q(n)} = excluded.${q(n)}`)
+            const plan = upsertFor(table)
+            const stored = yield* Effect.orDie(plan.encode({ ...row.value, id }))
             yield* unavailable(
               sql.unsafe(
-                `INSERT INTO ${q(table.name)} (${names.map(q).join(", ")}) VALUES (${names.map(() => "?").join(", ")})
-                 ON CONFLICT ("id") DO ${updates.length === 0 ? "NOTHING" : `UPDATE SET ${updates.join(", ")}`}`,
-                names.map((n) => stored[n] ?? null)
+                plan.statement(1),
+                plan.names.map((n) => stored[n] ?? null)
               )
             )
           }),
+
+    writeMany: Effect.fnUntraced(function* (table, rows) {
+      const plan = upsertFor(table)
+      for (let offset = 0; offset < rows.length; offset += plan.batchSize) {
+        const stored = yield* Effect.orDie(plan.encodeMany(rows.slice(offset, offset + plan.batchSize)))
+        yield* unavailable(
+          sql.unsafe(
+            plan.statement(stored.length),
+            stored.flatMap((row) => plan.names.map((n) => row[n] ?? null))
+          )
+        )
+      }
+    }),
 
     range: (table, plan) =>
       Effect.gen(function* () {

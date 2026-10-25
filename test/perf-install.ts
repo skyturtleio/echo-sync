@@ -95,7 +95,7 @@ if (import.meta.main) {
   ]) {
     const result = await Effect.runPromise(installFixture(p, c).pipe(Effect.scoped, Effect.provide(Reactivity.layer)))
     // Validate outside the timed region; never quote timings for a broken install.
-    assert.equal(result.statements.length, 8 + 9 * p + c)
+    assert.equal(result.statements.length, 8 + 9 * p + Math.ceil(c / 500))
     assert.equal(result.final.pending.length, p)
     assert.equal(result.final.rows.length, c)
     assert.equal(result.final.meta.cursor, 2n)

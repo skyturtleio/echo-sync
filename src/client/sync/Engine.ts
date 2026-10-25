@@ -234,25 +234,48 @@ const decodeRow = (table: SyncTable.AnySyncTable, row: SyncTable.EncodedRow) =>
     )
   )
 
-const applyChange = (storage: SyncStorage, registry: Registry.SyncRegistry, change: Protocol.Change) =>
-  Effect.gen(function* () {
-    if (change._tag === "scopePurged") return yield* storage.rows.purgeScope(change.scopeId)
+const canonicalRow = Effect.fnUntraced(function* (table: SyncTable.AnySyncTable, wire: SyncTable.EncodedRow) {
+  // Protocol's row is a generic JSON record; only the table's codec knows its fields. Store the
+  // canonical re-encoding (excess columns dropped, values normalized), as every writer does.
+  const malformed = (error: Schema.SchemaError) => new MalformedChange({ table: table.name, message: error.message })
+  const decoded = yield* decodeRow(table, wire)
+  const row = yield* Schema.encodeEffect(table.wire)(decoded).pipe(Effect.mapError(malformed))
+  return { ...row, id: decoded.id }
+})
+
+const applyChanges = Effect.fnUntraced(function* (
+  storage: SyncStorage,
+  registry: Registry.SyncRegistry,
+  changes: ReadonlyArray<Protocol.Change>
+) {
+  for (let i = 0; i < changes.length;) {
+    const change = changes[i++]
+    if (change === undefined) break
+    if (change._tag === "scopePurged") {
+      yield* storage.rows.purgeScope(change.scopeId)
+      continue
+    }
     const table = registry.get(change.table)
     if (Option.isNone(table)) {
-      // SPEC §7: during a deploy that adds a synced table, clients on the old registry receive
-      // its rows; they arrive with the next app version, whose manifest change rebuilds the
-      // replica from null. Failing here would stop sync for every stale client.
-      return yield* Telemetry.log("Debug", "echo-sync: unknown table change skipped")
+      // A later registry update rebuilds and receives these previously unknown rows (§7).
+      yield* Telemetry.log("Debug", "echo-sync: unknown table change skipped")
+      continue
     }
-    if (change._tag === "tombstone") return yield* storage.rows.write(table.value, change.id, Option.none())
-    // Protocol's row is a generic JSON record; only the table's codec knows its fields. Store the
-    // canonical re-encoding (excess columns dropped, values normalized), as every writer does.
-    const malformed = (error: Schema.SchemaError) =>
-      new MalformedChange({ table: change.table, message: error.message })
-    const decoded = yield* decodeRow(table.value, change.row)
-    const row = yield* Schema.encodeEffect(table.value.wire)(decoded).pipe(Effect.mapError(malformed))
-    yield* storage.rows.write(table.value, decoded.id, Option.some(row))
-  })
+    if (change._tag === "tombstone") {
+      yield* storage.rows.write(table.value, change.id, Option.none())
+      continue
+    }
+    const rows = [yield* canonicalRow(table.value, change.row)]
+    // Only consecutive upserts in this page: never reorder across tables, deletes or purges.
+    while (true) {
+      const next = changes[i]
+      if (next?._tag !== "upsert" || next.table !== change.table) break
+      rows.push(yield* canonicalRow(table.value, next.row))
+      i++
+    }
+    yield* storage.rows.writeMany(table.value, rows)
+  }
+})
 
 /**
  * Installs a complete page set: the staged `PullPage`s followed by their `PullDone`. Must run
@@ -272,7 +295,7 @@ export const applyPageSet = (
     const set: ReadonlyArray<Protocol.PullResponse> = [...pages, done]
     const install = Effect.gen(function* () {
       if (pullFrom(meta) === null) yield* storage.rows.clearAll
-      for (const page of set) for (const change of page.changes) yield* applyChange(storage, context.registry, change)
+      for (const page of set) yield* applyChanges(storage, context.registry, page.changes)
     })
     const outcomes = new Map(set.flatMap((page) => page.acks.map((ack) => [ack.mutationId, ack.outcome])))
     yield* rebase(context, install, (envelope) => {

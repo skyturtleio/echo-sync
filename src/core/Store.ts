@@ -233,6 +233,12 @@ export interface RowStore {
 
 /** Replica-only operations (SQLite, MemoryStore). The server never purges or clears. */
 export interface ReplicaRowStore extends RowStore {
+  /** Upsert canonical wire rows in order, using each row's id. Duplicate ids: last row wins.
+   * Joins the caller's transaction just like write; batching never permits partial installation. */
+  readonly writeMany: (
+    table: AnySyncTable,
+    rows: ReadonlyArray<EncodedRow>
+  ) => Effect.Effect<void, StoreUnavailable | ConstraintViolated>
   /** Delete every replicated row whose `access_scope_id` is `scopeId`, in every table. */
   readonly purgeScope: (scopeId: AccessScopeId) => Effect.Effect<void, StoreUnavailable>
   /** Delete every replicated row (not outbox, not staging). Used only for a null-cursor install. */

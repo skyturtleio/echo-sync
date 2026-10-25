@@ -4,12 +4,101 @@ import { Effect, Option } from "effect"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import { SqlClient } from "effect/sql/SqlClient"
 import { makeCompilerSqlite } from "effect/sql/Statement"
-import { Ids, Protocol } from "echo-sync"
+import { AccessScope, Ids, Protocol } from "echo-sync"
 import { clientRegistry, Counters, mutations, principal } from "../src/core/testing/SimApp.ts"
 import * as Engine from "../src/client/sync/Engine.ts"
 import * as SqliteSyncStorage from "../src/client/sync/SqliteSyncStorage.ts"
 import { countingClient } from "./sql-counter.ts"
 import { installFixture } from "./perf-install.ts"
+
+const upsert = (id: string, value: number): Protocol.Change => ({
+  _tag: "upsert",
+  table: "counters",
+  row: { id, access_scope_id: "s", value, updated_at: 0 }
+})
+
+it.live("batched replica upserts keep the last duplicate and split before SQLite's parameter limit", () =>
+  Effect.gen(function* () {
+    const source = yield* SqliteClient.makeMemory({})
+    yield* SqliteSyncStorage.migrate(clientRegistry).pipe(Effect.provideService(SqlClient, source))
+    const counter = yield* countingClient(source, makeCompilerSqlite())
+    const storage = SqliteSyncStorage.make(counter.client, clientRegistry)
+    // Four columns: 8192 rows cross the pinned SQLite's 32766-bind limit.
+    const rows = Array.from({ length: 8192 }, (_, i) => ({
+      id: `i-${i}`,
+      access_scope_id: "s",
+      value: i,
+      updated_at: 0
+    }))
+    rows.splice(1, 0, { id: "i-0", access_scope_id: "s", value: -7, updated_at: 0 })
+    rows.push({ id: "i-8191", access_scope_id: "s", value: -9, updated_at: 0 })
+    rows.push({ id: "i-1", access_scope_id: "s", value: -11, updated_at: 0 })
+    const revision = yield* storage.transaction(storage.revision)
+    // The first chunk really writes; a bad integer in chunk two must roll it back,
+    // including the new provenance wrapper's revision publication.
+    expect(
+      (yield* Effect.exit(
+        storage.transaction(
+          storage.rows.writeMany(Counters, [...rows, { id: "bad", access_scope_id: "s", value: 0.5, updated_at: 0 }])
+        )
+      ))._tag
+    ).toBe("Failure")
+    expect(yield* storage.transaction(storage.rows.scan(Counters))).toEqual([])
+    expect(yield* storage.transaction(storage.revision)).toEqual(revision)
+    counter.reset()
+    yield* storage.transaction(storage.rows.writeMany(Counters, rows))
+    const writes = counter.statements.filter((s) => s.sql.startsWith('INSERT INTO "counters"'))
+    expect(writes).toHaveLength(2)
+    expect(writes.every((s) => s.params.length <= 32766)).toBe(true)
+    expect(yield* storage.transaction(storage.rows.read(Counters, "i-0"))).toEqual(Option.some(rows[1]))
+    expect(yield* storage.transaction(storage.rows.read(Counters, "i-8191"))).toEqual(
+      Option.some({ id: "i-8191", access_scope_id: "s", value: -9, updated_at: 0 })
+    )
+    expect(yield* storage.transaction(storage.rows.read(Counters, "i-1"))).toEqual(Option.some(rows.at(-1)))
+    expect(yield* storage.transaction(storage.rows.scan(Counters))).toHaveLength(8192)
+    expect(yield* storage.transaction(storage.revision)).toEqual({ ...revision, offset: revision.offset + 1 })
+  }).pipe(Effect.scoped, Effect.provide(Reactivity.layer))
+)
+
+it.live("install batches never move upserts across a tombstone, scope purge, or page boundary", () =>
+  Effect.gen(function* () {
+    const source = yield* SqliteClient.makeMemory({})
+    yield* SqliteSyncStorage.migrate(clientRegistry).pipe(Effect.provideService(SqlClient, source))
+    const storage = SqliteSyncStorage.make(source, clientRegistry)
+    yield* storage.transaction(
+      Engine.applyPageSet(
+        { storage, registry: clientRegistry, mutations, actor: principal("alice") },
+        [
+          {
+            _tag: "PullPage",
+            acks: [],
+            continuation: Protocol.PullContinuation.make("a"),
+            changes: [
+              upsert("x", 1),
+              upsert("y", 2),
+              upsert("x", 3),
+              { _tag: "tombstone", table: "counters", id: "x" },
+              upsert("x", 4),
+              { _tag: "scopePurged", scopeId: AccessScope.AccessScopeId.make("s") },
+              upsert("z", 5)
+            ]
+          },
+          { _tag: "PullPage", acks: [], continuation: Protocol.PullContinuation.make("b"), changes: [upsert("x", 6)] }
+        ],
+        {
+          _tag: "PullDone",
+          acks: [],
+          nextCursor: Ids.Position.make(1n),
+          expiredThrough: Ids.SeqFloor.make(0),
+          changes: [upsert("x", 7), { _tag: "tombstone", table: "counters", id: "z" }]
+        }
+      )
+    )
+    expect(yield* storage.transaction(storage.rows.scan(Counters))).toEqual([
+      { id: "x", access_scope_id: "s", value: 7, updated_at: 0 }
+    ])
+  }).pipe(Effect.scoped, Effect.provide(Reactivity.layer))
+)
 
 it.live("a resumed K-page pull reads only linear staged rows and installs the whole set once", () =>
   Effect.gen(function* () {
@@ -97,19 +186,26 @@ it.live("install undoes P entries, writes C changes and replays P handlers witho
       // Engine install: BEGIN + staged SELECT + meta SELECT + pending (undo SELECT,
       // Outbox.pending SELECT) + setMeta + clearStaged + COMMIT = 8.
       // Each pending increment: undo write 1; replay get (row + 2 grants) 3,
-      // patch (row + 2 grants + write) 4, setUndo 1 => 9P. Install = C writes.
+      // patch (row + 2 grants + write) 4, setUndo 1 => 9P. Install = one upsert per 500-row page.
       // Null cursor adds clearAll for 2 tables + the snapshot's grant write.
-      expect(result.statements).toHaveLength(8 + 9 * p + c + (snapshot ? 3 : 0))
+      expect(result.statements).toHaveLength(8 + 9 * p + Math.ceil(c / 500) + (snapshot ? 3 : 0))
       // Each pending is returned twice; replay reads 2 counter rows + own grant twice
       // (Everyone absent). Meta 1 and one staged JSON row: 6P + 2 returned rows.
       expect(result.statements.reduce((sum, s) => sum + s.rows, 0)).toBe(6 * p + 2)
       const writes = result.statements.filter((s) => s.sql.startsWith('INSERT INTO "counters"'))
-      expect(writes).toHaveLength(p + c + p)
+      expect(writes).toHaveLength(p + Math.ceil(c / 500) + p)
       // Identities/order also catch undoing one entry P times: authoritative writes
       // would hide that mistake in the final replica. Restore is reverse seq order.
       const idColumn = Counters.columns.findIndex((column) => column.name === "id")
       const valueColumn = Counters.columns.findIndex((column) => column.name === "value")
-      expect(writes.map((s) => [s.params[idColumn], s.params[valueColumn]])).toEqual([
+      expect(
+        writes.flatMap((s) =>
+          Array.from({ length: s.params.length / Counters.columns.length }, (_, i) => [
+            s.params[i * Counters.columns.length + idColumn],
+            s.params[i * Counters.columns.length + valueColumn]
+          ])
+        )
+      ).toEqual([
         ...Array.from({ length: p }, (_, i) => [`i-${p - 1 - i}`, 100]),
         ...Array.from({ length: c }, (_, i) => [`i-${i}`, 200]),
         ...Array.from({ length: p }, (_, i) => [`i-${i}`, 203])

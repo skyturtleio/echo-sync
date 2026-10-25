@@ -93,6 +93,10 @@ export const make = (disk: Disk): Engine.SyncStorage => {
       range: disk.replica.range,
       scan: disk.replica.scan,
       write: (table, id, row) => Effect.andThen(crashPoint, disk.replica.write(table, id, row)),
+      writeMany: (table, rows) =>
+        Effect.forEach(rows, (row) => Effect.andThen(crashPoint, disk.replica.writeMany(table, [row])), {
+          discard: true
+        }),
       purgeScope: (scopeId) => Effect.andThen(crashPoint, disk.replica.purgeScope(scopeId)),
       clearAll: Effect.andThen(crashPoint, disk.replica.clearAll)
     },

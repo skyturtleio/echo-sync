@@ -50,6 +50,10 @@ export const make = (initial: Tables = new Map()): MemoryStore => {
         if (Option.isSome(row)) tableOf(table.name).set(id, row.value)
         else tables.get(table.name)?.delete(id)
       }),
+    writeMany: (table, rows) =>
+      Effect.sync(() => {
+        for (const row of rows) tableOf(table.name).set(String(row["id"]), row)
+      }),
     range: (table, plan) =>
       Effect.andThen(
         Store.checkLimit(plan.limit),
