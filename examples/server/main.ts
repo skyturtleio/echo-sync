@@ -104,6 +104,27 @@ const adminRoute = (url: URL): Effect.Effect<Response, unknown, SqlClient> =>
     const sql = yield* SqlClient
     const q = (name: string) => url.searchParams.get(name) ?? ""
     switch (url.pathname) {
+      case "/admin/bootstrap-seed": {
+        const count = Number(q("count"))
+        if (!Number.isSafeInteger(count) || count < 1 || count > 100_000) {
+          return new Response("count must be 1..100000", { status: 400 })
+        }
+        // Server-minted identities: no previous run's rows or grants can enter this snapshot.
+        const scope = AccessScope.AccessScopeId.make(`bootstrap-${crypto.randomUUID()}`)
+        const principal = AccessScope.PrincipalId.make(`bootstrap-${crypto.randomUUID()}`)
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`INSERT INTO echo_sync.access_scopes (id) VALUES (${scope})`
+            yield* sql`INSERT INTO echo_sync.scope_grants (id, access_scope_id, principal_id, role, granted_at)
+            VALUES (${ScopeGrants.grantId(scope, principal)}, ${scope}, ${principal}, 'reader', now())`
+            yield* sql`INSERT INTO todos (id, access_scope_id, title, note)
+            SELECT ${scope} || '-' || lpad(i::text, 6, '0'), ${scope}, 'Todo ' || i::text,
+              CASE WHEN i % 3 = 0 THEN NULL ELSE 'Note ' || i::text || ' café' END
+            FROM generate_series(1, ${count}::integer) AS g(i)`
+          })
+        )
+        return json({ scope, principal, count })
+      }
       case "/admin/grant": {
         const scope = AccessScope.AccessScopeId.make(q("scope"))
         const principal = AccessScope.PrincipalId.make(q("principal"))
