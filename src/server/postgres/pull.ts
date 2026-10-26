@@ -358,10 +358,10 @@ const walkPage = Effect.fnUntraced(function* (
     const rows = yield* sql.unsafe<Record<string, unknown>>(
       `SELECT ${selectList(table, "t")} FROM ${q(schema)}.${q(table.name)} t
        WHERE t.access_scope_id = $1
-         AND ($2::text IS NULL OR t.id::text COLLATE "C" > $2::text COLLATE "C")
+         ${afterRowId === null ? "" : 'AND t.id COLLATE "C" > $2::text COLLATE "C"'}
        ORDER BY t.id::text COLLATE "C"
-       LIMIT $3`,
-      [scopeId, afterRowId, remaining + 1]
+       LIMIT $${afterRowId === null ? 2 : 3}`,
+      afterRowId === null ? [scopeId, remaining + 1] : [scopeId, afterRowId, remaining + 1]
     )
     for (const raw of rows.slice(0, remaining)) {
       const payload = yield* payloadOf(table, raw)

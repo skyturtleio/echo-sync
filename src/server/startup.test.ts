@@ -266,7 +266,10 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
       const appMigrations = {
         "001_init": Effect.gen(function* () {
           const db = yield* SqlClient
-          for (const table of [Items, Notes]) yield* db.unsafe(table.postgres.createTable)
+          for (const table of [Items, Notes]) {
+            yield* db.unsafe(table.postgres.createTable)
+            for (const ddl of table.postgres.createIndexes) yield* db.unsafe(ddl)
+          }
           yield* db`CREATE TABLE app_migration_runs (n int)`
           yield* db`INSERT INTO app_migration_runs VALUES (1)`
         })

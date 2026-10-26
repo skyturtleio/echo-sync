@@ -29,6 +29,7 @@ const TableManifestSchema = Schema.Struct({
   name: Schema.String,
   columns: Schema.Array(Schema.Struct({ name: Schema.String, kind: ColumnKindSchema, nullable: Schema.Boolean })),
   indexes: Schema.Array(Schema.Struct({ name: Schema.String, columns: Schema.Array(Schema.String) })),
+  scopeWalkIndex: Schema.optionalKey(Schema.Literal(true)),
   unique: Schema.Array(Schema.Array(Schema.String)),
   dataHash: Schema.String,
   indexHash: Schema.String
@@ -181,6 +182,9 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
         ...was.indexes.map(
           (i) => `  ALTER INDEX ${quote(indexName(from, i.name))} RENAME TO ${quote(indexName(name, i.name))};`
         ),
+        ...(was.scopeWalkIndex === true
+          ? [`  ALTER INDEX ${quote(indexName(from, "echo-scope"))} RENAME TO ${quote(indexName(name, "echo-scope"))};`]
+          : []),
         `Re-run attach for ${name} at startup. The steps below for ${name} depend on this and are TODOs too;`,
         `they use the new index names.`
       )
@@ -299,6 +303,7 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
         fail(`no DDL for ${name}.${index}`)
       )
     }
+    if (was.scopeWalkIndex !== true) emit(createFor("echo-scope"), ["access_scope_id", "id"])
     for (const prior of was.indexes) {
       const next = newIndexes.get(prior.name)
       if (next !== undefined && sameList(next.columns, prior.columns)) continue

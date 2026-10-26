@@ -16,7 +16,67 @@ import {
 } from "../src/server/postgres/test-support.ts"
 import { countingClient } from "./sql-counter.ts"
 
+interface WalkPlan {
+  readonly "Node Type": string
+  readonly "Actual Rows": number
+  readonly "Index Cond"?: string
+  readonly "Rows Removed by Filter"?: number
+  readonly "Shared Hit Blocks": number
+  readonly Plans?: ReadonlyArray<WalkPlan>
+}
+
 describe.skipIf(!pgAvailable)("Postgres statement budgets", () => {
+  it.live(
+    "scope walks seek past the cursor without scanning earlier rows or another scope, even with generic plans",
+    () =>
+      Effect.gen(function* () {
+        const source = yield* SqlClient
+        yield* grant("alice", "s")
+        // Interleave an equally large unreadable scope: an id-only index is not sufficient.
+        yield* source`ALTER TABLE items DISABLE TRIGGER echo_sync_capture`
+        yield* source`INSERT INTO items (id, access_scope_id)
+        SELECT lpad(i::text, 6, '0') || suffix, scope
+        FROM generate_series(1, 100000) i,
+          (VALUES ('-a', 's'), ('-b', 'other')) scopes(suffix, scope)
+        ORDER BY scope DESC, i`
+        yield* source`ALTER TABLE items ENABLE TRIGGER echo_sync_capture`
+        yield* source`ANALYZE items`
+        const counter = yield* countingClient(source, PgClient.makeCompiler())
+        yield* counter.client`SET plan_cache_mode = force_generic_plan`
+        const replica = new Replica("alice", "seek")
+        yield* replica.sync(500).pipe(Effect.provideService(SqlClient, counter.client))
+        expect(replica.rows.size).toBe(100001) // items plus the readable grant
+        const walks = counter.statements.filter((s) => s.sql.includes('FROM "public"."items" t'))
+        expect(walks).toHaveLength(201)
+        // Explain the driver's actual cached statement, not EXPLAIN <parameterized SQL>, which
+        // Postgres custom-plans even under force_generic_plan. Check first and late pages.
+        for (const walk of [walks[0], walks.at(-2)]) {
+          if (walk === undefined) return yield* Effect.die("missing walk query")
+          const prepared = yield* counter.client<{ name: string; generic_plans: bigint }>`
+          SELECT name, generic_plans FROM pg_prepared_statements WHERE statement = ${walk.sql}`
+          const statement = prepared[0]
+          expect(statement?.generic_plans).toBeGreaterThan(0n)
+          if (statement === undefined) return yield* Effect.die("walk was not prepared")
+          const args = walk.params
+            .map((p) =>
+              typeof p === "number" ? String(p) : p === null ? "NULL" : `'${String(p).replaceAll("'", "''")}'`
+            )
+            .join(", ")
+          const explained = yield* counter.client.unsafe<{ "QUERY PLAN": ReadonlyArray<{ Plan: WalkPlan }> }>(
+            `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE "${statement.name}" (${args})`
+          )
+          const root = explained[0]?.["QUERY PLAN"][0]?.Plan
+          expect(root?.["Actual Rows"]).toBe(walk.rows)
+          const scan = root?.Plans?.[0]
+          expect(scan?.["Node Type"]).toBe("Index Scan")
+          expect(scan?.["Index Cond"]).toContain("access_scope_id = $1")
+          if (walk !== walks[0]) expect(scan?.["Index Cond"]).toMatch(/id > \(?\$2/)
+          expect(scan?.["Rows Removed by Filter"] ?? 0).toBe(0)
+          expect(root?.["Shared Hit Blocks"]).toBeLessThan(100)
+        }
+      }).pipe(Effect.scoped, Effect.provide(TestDatabase), Effect.provide(Reactivity.layer))
+  )
+
   it.live("a pushed mutation adds only its N reads and M writes to the fixed ledger cost", () =>
     Effect.gen(function* () {
       const source = yield* SqlClient

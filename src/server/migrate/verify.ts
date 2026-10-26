@@ -215,7 +215,13 @@ const checkRelation = Effect.fn("verify.checkRelation")(function* (
     )
   }
 
-  for (const index of Object.values(table.indexes)) {
+  for (const index of [
+    ...Object.values(table.indexes),
+    {
+      name: "echo-scope",
+      key: ["access_scope_id", "id"].flatMap((name) => table.columns.filter((c) => c.name === name))
+    }
+  ]) {
     const name = `${table.name}__${index.name}`
     const rows = byIndex.get(name)
     // SPEC §3: NULLS FIRST on declared fields, plain ASC (NULLS LAST) on the trailing id.

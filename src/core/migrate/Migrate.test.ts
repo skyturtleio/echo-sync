@@ -228,6 +228,7 @@ describe("DDL that depends on a TODO rename or kind change is a TODO too (SPEC Â
       'ALTER TABLE "docs" RENAME TO "articles";',
       'ALTER INDEX "docs__by_rank" RENAME TO "articles__by_rank";',
       'ALTER INDEX "docs__by_title" RENAME TO "articles__by_title";',
+      'ALTER INDEX "docs__echo-scope" RENAME TO "articles__echo-scope";',
       'ALTER TABLE "articles" ADD COLUMN "note" text COLLATE "C";',
       'DROP INDEX "articles__by_title";',
       'CREATE INDEX "articles__by_title" ON "articles" ("title" ASC NULLS FIRST, "rank" ASC NULLS FIRST, "id" ASC);'

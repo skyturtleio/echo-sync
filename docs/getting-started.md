@@ -174,6 +174,13 @@ migration.
 Keep `manifest.json` byte-identical to `g.snapshot`. Exclude it from your formatter: this repo's
 `.oxfmtrc.json` ignores `**/migrations/manifest.json`.
 
+When upgrading a pre-scope-index app, regenerate from that snapshot even if its declarations
+did not change: the generated migration adds `table__echo-scope` on `(access_scope_id, id)`
+for every synced app table. Commit and register that migration before starting the new server;
+otherwise startup reports missing-index `Drift`. The snapshot records `scopeWalkIndex: true`,
+but neither client hash changes and no replica rebuild is needed. Large tables may need a
+reviewed concurrent build outside the migration transaction; see SPEC §13.2.1.
+
 `generate` also preserves `history: [{ migration: "NNN_name", dataHash }]` and appends the
 current registry hash, including on index-only migrations (repeated hashes are intentional).
 The hash includes system tables such as `scope_grants`, exactly as the client's `Registry.make`

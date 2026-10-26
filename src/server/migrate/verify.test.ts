@@ -100,6 +100,64 @@ const second = Migrate.generate({
 })
 
 describe.skipIf(adminUrl === "")("generated migrations and the startup verifier (SPEC §13, real Postgres)", () => {
+  it.live(
+    "a legacy app gets only scope-walk indexes, reports missing-index Drift until migrated, and keeps client hashes",
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient
+        // Recreate the committed pre-index snapshot and DDL, not a second current declaration.
+        const legacy = Migrate.decodeSnapshot(
+          JSON.stringify({
+            version: 1,
+            tables: Migrate.snapshotOf(v1).tables.map((table) => ({ ...table, scopeWalkIndex: undefined }))
+          })
+        )
+        yield* migrate
+        for (const table of [DocsV1, Tags]) {
+          yield* sql.unsafe(table.postgres.createTable)
+          for (const ddl of table.postgres.createIndexes) {
+            if (!ddl.includes("__echo-scope")) yield* sql.unsafe(ddl)
+          }
+          yield* attach(table)
+        }
+        const missing = yield* driftOf(v1)
+        assert.strictEqual(missing.length, 2)
+        assert.isTrue(missing.every((m) => m.includes("__echo-scope") && m.includes("is missing")))
+        const upgrade = Migrate.generate({ previous: legacy, registry: v1, existing: ["001_init"], name: "scope_walk" })
+        assert.strictEqual(upgrade.steps.length, 2)
+        const migrations = yield* load([upgrade])
+        yield* migrateApp(migrations)
+        assert.deepStrictEqual(yield* driftOf(v1), [])
+        const current = Migrate.decodeSnapshot(upgrade.snapshot)
+        assert.deepStrictEqual(
+          current.tables.map((t) => [t.dataHash, t.indexHash]),
+          legacy.tables.map((t) => [t.dataHash, t.indexHash])
+        )
+        assert.deepStrictEqual(Migrate.plan(current, v1), [])
+        // Existing engine databases also need the grants index; 001 cannot be edited/replayed.
+        yield* sql`DROP INDEX echo_sync."scope_grants__echo-scope"`
+        yield* sql`DELETE FROM echo_sync.migrations WHERE migration_id = 5`
+        yield* migrate
+        assert.deepStrictEqual(yield* driftOf(v1), [])
+        // These names were already legal. The implicit index must not take either name.
+        const sibling = SyncTable.make("docs__echo_scope", base, { indexes: { echo_scope: ["accessScopeId"] } })
+        const expanded = Registry.make([DocsV1, Tags, sibling])
+        const addition = Migrate.generate({
+          previous: current,
+          registry: expanded,
+          existing: [upgrade.id],
+          name: "sibling"
+        })
+        yield* startUp(expanded, yield* load([addition]))
+        assert.deepStrictEqual(yield* driftOf(expanded), [])
+        // Baseline hashes pinned from the pre-change example's committed manifest, not computed
+        // by removing the marker from a new manifest (which could hide a hash regression).
+        const todos = SyncTable.make("todos", { ...base, title: Schema.String, note: Schema.NullOr(Schema.String) })
+        assert.strictEqual(todos.manifest.dataHash, "7b38fc8e9d381bf9")
+        assert.strictEqual(todos.manifest.indexHash, "cd0e6abb0225ca58")
+      }).pipe(Effect.scoped, Effect.provide(EmptyDatabase))
+  )
+
   it.layer(EmptyDatabase)((db) => {
     db.effect(
       "generated modules applied to an empty database pass the verifier, and the NOT NULL default is gone",
@@ -130,6 +188,11 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
   const FAILS = "!"
   const drifted: ReadonlyArray<[string, string, string]> = [
     ["a declared column dropped", "ALTER TABLE docs DROP COLUMN score", "docs: declared column score is missing"],
+    [
+      "a scope-walk index with its key columns reversed",
+      'DROP INDEX "docs__echo-scope";CREATE INDEX "docs__echo-scope" ON docs (id ASC, access_scope_id ASC NULLS FIRST)',
+      "docs: index docs__echo-scope is"
+    ],
     [
       "an index with its key columns reordered",
       "DROP INDEX docs__by_label;CREATE INDEX docs__by_label ON docs (rank ASC NULLS FIRST, label ASC NULLS FIRST, id ASC)",

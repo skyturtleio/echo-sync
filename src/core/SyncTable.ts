@@ -74,6 +74,8 @@ export interface TableManifest {
   readonly name: string
   readonly columns: ReadonlyArray<ColumnManifest>
   readonly indexes: ReadonlyArray<{ readonly name: string; readonly columns: ReadonlyArray<string> }>
+  /** Server-only scope/id seek index; absent in snapshots predating its introduction. Not hashed. */
+  readonly scopeWalkIndex?: true
   /** Declared unique column sets (column names, in declaration order). Part of `indexHash`. */
   readonly unique: ReadonlyArray<ReadonlyArray<string>>
   /**
@@ -546,6 +548,7 @@ export const make = <
     name,
     columns: sortedColumns,
     indexes: indexManifest,
+    scopeWalkIndex: true,
     unique: uniqueSets,
     dataHash: hash(
       canonicalJson({
@@ -573,7 +576,10 @@ export const make = <
     manifest,
     postgres: {
       createTable: `CREATE TABLE ${quote(name)} (\n${pgColumns.join(",\n")}\n)`,
-      createIndexes: indexDdl("pg"),
+      createIndexes: [
+        ...indexDdl("pg"),
+        `CREATE INDEX ${quote(`${name}__echo-scope`)} ON ${quote(name)} ("access_scope_id" ASC NULLS FIRST, "id" ASC)`
+      ],
       row: derived(Schema.Struct(pgFields))
     },
     sqlite: {

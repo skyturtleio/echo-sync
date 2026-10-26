@@ -265,7 +265,8 @@ synced table is `scope_grants` (§4).
 - INV-TBL-3: `dataHash` MUST change exactly when the storage shape changes (table name, column
   set, column kind, nullability) and MUST NOT change for indexes, unique sets, documentation
   annotations, field order, refinements, brands or nested JSON schema changes. `indexHash` covers
-  the index set and the unique sets, so a unique-set change does not rebuild the replica.
+  the declared index set and the unique sets, so a unique-set change does not rebuild the replica.
+  The server-only `scopeWalkIndex` manifest marker (§13) contributes to neither hash.
 - INV-TBL-4: A stored or pulled row MUST be the canonical wire re-encoding of the decoded value:
   excess keys dropped, values normalized; every store round-trips every leaf type at its
   boundaries, `null`, and the empty string unchanged.
@@ -342,6 +343,10 @@ the replica (§9.6).
 Postgres; the same without `NULLS FIRST` in SQLite, where NULL already sorts first. Declared
 `unique` sets become table-level `UNIQUE` constraints in both dialects. The startup verifier
 (§13) checks the live catalog against this.
+
+Postgres DDL also includes `table__echo-scope` on `(access_scope_id ASC NULLS FIRST, id ASC)`;
+both columns already have `COLLATE "C"`. This server-only seek index is recorded separately
+as `scopeWalkIndex: true`, not in declared query indexes or SQLite DDL (§13).
 
 **The comparator.** `Store.planOrder` and `Store.planMatches` are the reference semantics every
 `RowStore` must match; `Conformance.rowStore` checks `range` against them with seeded random
@@ -760,6 +765,14 @@ order starting at `after.table`, `SELECT … WHERE access_scope_id = scope AND i
 ORDER BY id COLLATE "C" LIMIT remaining + 1` (the extra row is the lookahead that decides
 whether the table is exhausted; at most `remaining` are delivered). When a walk completes its scope moves from `walking`
 to `scopes` (held). Only when `walking` is empty is the log read.
+
+The first page omits the id predicate entirely; resumed pages use a direct exclusive id
+comparison, never `after IS NULL OR id > after`. Both variants can seek in the scope/id index
+even when Postgres uses a generic prepared plan (INV-PERF-9).
+
+**Rationale (2026-10-26):** The nullable-cursor OR becomes a filter in generic plans, rescanning
+the prefix on each page. Separate query texts preserve a sargable seek; a scope-leading index
+also avoids depending on unrelated scopes' ids or heap layout for efficient reads.
 
 **Rationale (2026-10-21):** Newly granted scopes are walked before the log because a principal
 gaining a scope mid-stream needs its current rows, not only changes committed after the grant.
@@ -1550,13 +1563,23 @@ mismatch it refuses to serve. The client rebuilds its replica from a `dataHash` 
 - INV-SCH-8: Extra live columns are tolerated, so a server whose registry predates an additive
   migration MUST serve push and pull against the expanded database. A server whose registry
   declares a missing added column MUST fail startup with `Drift` until that migration runs.
+- INV-SCH-9: Every synced Postgres table MUST have the server-only `table__echo-scope` plain,
+  non-unique btree on `(access_scope_id ASC NULLS FIRST, id ASC)`, text keys collated `"C"`.
+  `Migrate.generate` MUST add it when the previous manifest lacks `scopeWalkIndex: true`;
+  `verify` MUST report a missing or malformed index as `Drift`. Neither client hash nor SQLite
+  DDL changes. The engine migration supplies it for `scope_grants`.
+
+**Rationale (2026-10-26):** Scope walks need a scope-leading keyset index, not just the id
+primary key. A separate manifest marker records this server-only requirement without rebuilding
+replica indexes or changing data hashes; silently adding app indexes at startup was rejected
+because app DDL remains reviewable migration work.
 
 ### Details
 
 #### 13.1 Startup order
 
 `Startup.prepare`: `migrate` (engine migrations `001_engine`, `002_grant_id_check`,
-`003_ledger_acked_at`, `004_engine_epoch` in `echo_sync.migrations`) → `migrateApp` (the app's record of
+`003_ledger_acked_at`, `004_engine_epoch`, `005_scope_walk_index` in `echo_sync.migrations`) → `migrateApp` (the app's record of
 `NNN_name` → Effect, in `echo_sync.app_migrations`) → for every registry table except
 `scope_grants` that exists (`to_regclass(quote_ident(name))`, i.e. resolved through
 `search_path`): `attach`, with `TableNameConflict` left for `verify` → `verify`. A table the app
@@ -1580,7 +1603,26 @@ Per registry table, from `pg_attribute`, `pg_index` (`indkey`, `indoption`, `ind
 - every declared unique set backed by a unique index on exactly those columns, `ASC NULLS LAST`,
   `NULLS DISTINCT`.
 
+The implicit `table__echo-scope` is checked like a declared index, with the same validity,
+collation, ordering and plain-btree checks (INV-SCH-9). Extra indexes remain allowed; an
+equivalent index under another name does not replace this named requirement.
+
 Extra live columns and indexes are allowed. The engine's own tables are not checked.
+
+#### 13.2.1 Existing apps: scope-walk index rollout
+
+Old version-1 snapshots lacking `scopeWalkIndex` still decode. Regenerate from the committed
+snapshot to emit one `CREATE INDEX` per existing app table and commit the new snapshot with
+`scopeWalkIndex: true`. New tables include the index in their Postgres DDL. Table-rename TODOs
+rename it too, or add it after a legacy table rename. The generator uses ordinary transactional
+`CREATE INDEX` (blocks writes while building); for large live tables, operators may instead
+build the exact index `CONCURRENTLY` outside the migration transaction before deploying the
+new server, then record that migration as a reviewed no-op. Do not run `CONCURRENTLY` inside
+the generated Migrator transaction. A missing index reports `declared index table__echo-scope
+(…) is missing` in `Drift` and startup refuses to serve until repaired. Migration
+`005_scope_walk_index` upgrades engine-owned grants on old and fresh databases. The quoted
+hyphenated index suffix cannot collide with any allowed app table or declared index name.
+No client update, resnapshot or client-policy floor change is required.
 
 #### 13.3 Migration 002 and 003 preconditions
 
@@ -1920,6 +1962,16 @@ batches, page limits and retention against them.
 - INV-PERF-8: Across a K-page pull, resume reads O(K) staged metadata rows, not O(K²) page
   payloads. Install reads the K staged payloads once. Reopening storage resumes from the durable
   tail; clearing or rolling back staging changes its progress atomically with the pages (§9.4).
+- INV-PERF-9: Scope-walk SQL MUST expose scope equality and, on resumed pages, an exclusive id
+  bound as indexable predicates, including generic prepared plans. On the real-Postgres fixture
+  (100k readable rows plus 100k unreadable rows with interleaved ids and scope-grouped heap),
+  first and late 500-row pages MUST use index conditions, discard no filtered rows, and touch
+  fewer than 100 shared-buffer blocks; wall time is not a test gate. Planner choice on arbitrary
+  distributions remains Postgres-owned, not a promise to force an index on every workload.
+
+**Rationale (2026-10-26):** Returned-row counts cannot detect prefix rescans. Check the driver's
+cached generic plan with `EXPLAIN ANALYZE EXECUTE`; explaining parameterized SQL directly
+replans it and can hide the failure. Retain the existing statement and lookahead budgets.
 
 **Rationale (2026-10-24):** Counters gate, timings inform. Separate client-issued statements
 from trigger-internal work instead of counting both as round trips; the old push shorthand
@@ -2227,6 +2279,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-SCH-6 | covered | `startup.test` "prepare run concurrently by several instances succeeds for all of them", "concurrent first starts on an empty database all succeed and run the app migration exactly once" |
 | INV-SCH-7 | covered | `capture.test` "attach inside a caller's REPEATABLE READ transaction is refused (its stale snapshot would admit a duplicate name)", "an attach that fails between its two triggers leaves the table neither captured nor half-guarded" |
 | INV-SCH-8 | covered | `startup.test` "an old server must serve push and pull on an expanded database, while a new server must refuse the unmigrated schema" |
+| INV-SCH-9 | covered | `verify.test` "a legacy app gets only scope-walk indexes, reports missing-index Drift until migrated, and keeps client hashes" |
 | INV-TEL-1 | covered | `startup.test` "startup's internal steps (verify, its per-table checks) must never hand the host a span other than echo.server.startup"; `observability.e2e` "sync propagates exported IDs and sampling through suppressed spans and preserves an explicit external parent", "engine spans across the e2e run never export an unregistered name or a raw failure cause"; `telemetry-entrypoints.test` "exported symbols cannot open named Effect.fn spans outside their boundary" |
 | INV-TEL-2 | covered | `observability.e2e` "SQLite sync never exports a typed failure, defect, result or dependency span containing secret inputs", "RPC request context cannot bypass sanitization for typed failures, defects, SQL spans or tracerLogger events", "direct server batches and maintenance cannot export returned identities or fail from a throwing tracer" |
 | INV-TEL-3 | covered | `observability.e2e` "throwing host sinks cannot change saved intent, retry deadlines, halt or successful installs", "closing a pulled subscription in the host context retains its own outcome and protects cleanup and the host parent", "engine spans across the e2e run never export an unregistered name or a raw failure cause" |
@@ -2245,6 +2298,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PERF-6 | partial | `rpc.test` "more open pokes streams than pool connections do not block push or pull, and the server holds one LISTEN" (fan-out and notify counts unmeasured) |
 | INV-PERF-7 | covered | `perf-postgres.test` both budget tests; `perf-install.test` "install undoes P entries, writes C changes and replays P handlers without hidden statements" (SELECT-returned rows, not physical scans) |
 | INV-PERF-8 | covered | `perf-install.test` "a resumed K-page pull reads only linear staged rows and installs the whole set once"; `Conformance` syncStorage durability and rollback checks include staged progress |
+| INV-PERF-9 | covered | `perf-postgres.test` "scope walks seek past the cursor without scanning earlier rows or another scope, even with generic plans" |
 | INV-SPEC-1 | covered | `registry.test` "a nonexistent cited test, duplicate invariant or unindexed question cannot pass the registry gate" |
 | INV-SPEC-2 | covered | `vectors.test` "wire messages cannot change their committed decoded values, JSON bytes or variant coverage" |
 
@@ -2263,6 +2317,7 @@ machine-verifiable literal test-title citations.
 | push batch size | `min(pushBatchSize ?? 50, 100)` | `Engine.ts` | `pushBatchSize` |
 | `PushRequest.mutations` | 1 … 100 | `Protocol.ts` | no |
 | `pageLimit` (upserts + tombstones per page) | 500; configured value must be a positive safe integer (INV-PULL-14) | `rpc.ts` | `pageLimit` |
+| server scope-walk index | one `table__echo-scope` per synced table; `(access_scope_id, id)`, `"C"` collation (INV-SCH-9) | `SyncTable.ts`, engine migration 005 | no |
 | staged resume read | at most 1 metadata row per request; full payload set read once at install (INV-PERF-8) | `SqliteSyncStorage.ts`, `Engine.ts` | no |
 | SQLite upsert batch | at most `floor(32766 / columnCount)` rows, never across page/table/delete/purge boundaries at install | `SqliteRowStore.ts`, `Engine.ts` | pinned wasm parameter limit, not a tuning option |
 | server `heartbeatInterval` (pokes and presence) | 15 s | `rpc.ts` | yes; must stay below clients' `idleTimeout` |
