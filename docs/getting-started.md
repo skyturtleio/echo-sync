@@ -202,6 +202,12 @@ Only after all four does it mount `Protocol.SyncRpcs` (HTTP POST + NDJSON) at `p
 `/sync`. Several instances may start concurrently, including against an empty database:
 migrations and attach are serialized, and verify only reads.
 
+Configure HTTP compression in the host stack rather than around `Startup.layer`. A host may use
+Effect's `HttpMiddleware.compression()` for finite pull responses when the client advertises
+`Accept-Encoding`; browsers and Effect's Fetch client decompress them before the RPC codec reads
+them. Never apply it indiscriminately to `/sync`: `pokes` and presence `room` are long-lived NDJSON
+streams whose heartbeat chunks must not wait for a compression flush.
+
 Build `Startup.layer` and check the result before you accept traffic. `HttpRouter.toWebHandler`
 starts building its layer immediately, but it gives you no result to await: a failed build only
 shows up as the rejection of each request. The example builds the layer into a shared `MemoMap`
