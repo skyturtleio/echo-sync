@@ -36,15 +36,17 @@ export const OutboxEntry = Schema.Struct({
 })
 export type OutboxEntry = typeof OutboxEntry.Type
 
+const StoredArgs = Schema.fromJsonString(Schema.Json)
 const EntryRow = Schema.Struct({
   seq: Schema.Number,
   client_id: Schema.String,
   mutation_id: Schema.String,
   name: Schema.String,
-  args: Schema.fromJsonString(Schema.Json),
+  args: StoredArgs,
   created_at: Schema.Number,
   released_at: Schema.NullOr(Schema.Number)
 })
+const encodeArgs = (args: Schema.Json) => Effect.orDie(Schema.encodeEffect(StoredArgs)(args))
 
 const toEntries = (rows: ReadonlyArray<unknown>): Effect.Effect<ReadonlyArray<OutboxEntry>> =>
   // A row that does not decode was written by a different engine version or corrupted: the `CorruptStorage`
@@ -147,8 +149,9 @@ export const append = (input: AppendInput): Effect.Effect<OutboxEntry, SqlError,
         const existing = yield* sql`SELECT * FROM echo_outbox WHERE mutation_id = ${input.mutationId}`
         if (existing.length === 0) {
           const now = yield* Clock.currentTimeMillis
+          const args = yield* encodeArgs(input.args)
           yield* sql`INSERT INTO echo_outbox (client_id, mutation_id, name, args, created_at)
-            VALUES (${input.clientId}, ${input.mutationId}, ${input.name}, ${JSON.stringify(input.args)}, ${now})`
+            VALUES (${input.clientId}, ${input.mutationId}, ${input.name}, ${args}, ${now})`
         }
         const rows = yield* sql`SELECT * FROM echo_outbox WHERE mutation_id = ${input.mutationId}`
         const [entry] = yield* toEntries(rows)
@@ -187,15 +190,17 @@ export const insert = (input: {
   readonly clientId: string
   readonly mutationId: string
   readonly name: string
-  readonly args: unknown
+  readonly args: Schema.Json
   readonly createdAt: number
   readonly undo: string
 }): Effect.Effect<void, SqlError, SqlClient.SqlClient> =>
-  Effect.flatMap(SqlClient.SqlClient, (sql) =>
-    Effect.asVoid(sql`INSERT INTO echo_outbox (seq, client_id, mutation_id, name, args, created_at, undo)
-      VALUES (${input.seq}, ${input.clientId}, ${input.mutationId}, ${input.name}, ${JSON.stringify(input.args)},
-        ${input.createdAt}, ${input.undo})`)
-  )
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const args = yield* encodeArgs(input.args)
+    yield* sql`INSERT INTO echo_outbox (seq, client_id, mutation_id, name, args, created_at, undo)
+      VALUES (${input.seq}, ${input.clientId}, ${input.mutationId}, ${input.name}, ${args}, ${input.createdAt},
+        ${input.undo})`
+  })
 
 /** The entry for `mutationId`, pending or released (until pruned). */
 export const lookup = (mutationId: string): Effect.Effect<Option.Option<OutboxEntry>, SqlError, SqlClient.SqlClient> =>
