@@ -1651,6 +1651,19 @@ primary key. A separate manifest marker records this server-only requirement wit
 replica indexes or changing data hashes; silently adding app indexes at startup was rejected
 because app DDL remains reviewable migration work.
 
+- INV-SCH-10: Snapshot decoding, snapshot encoding and migration generation MUST be lazy,
+  service-free Effects with typed `MigrationPlanError` failures for malformed snapshots and
+  invalid intent or names. Each execution MUST revalidate its inputs; construction MUST NOT
+  execute codecs or planning. `plan` and `nextId` MUST remain pure and return `Result` for
+  expected input refusals. Snapshot failures MUST preserve their original `SchemaError` cause
+  and identify decode versus encode; unexpected programmer exceptions remain defects. Snapshot
+  canonical bytes, history, numbering and DDL/TODO rules MUST remain unchanged.
+
+  **Rationale (2026-10-26):** Expected migration input errors belong in the recoverable typed
+  channel, while pure planning needs no runtime service. Calling an Effect-named schema parser
+  outside the generator was rejected because pinned parsers execute synchronous transforms
+  eagerly; adding parallel throwing APIs would retain two contracts for the same operation.
+
 ### Details
 
 #### 13.1 Startup order
@@ -1937,7 +1950,7 @@ rendered stack. Raw diagnostic representation is not the stable app-facing statu
 | `LedgerRetentionTooShort` | `retentionMillis, minimumMillis` | server GC | not applicable | —; maintenance call failure | — |
 | `Drift` | `mismatches: [{table, problem}]` | server verification | server does not start | —; startup failure | startup `server` |
 | `TableNameConflict` | `table, existingSchema` | server attach | server verification fails | —; attach failure | —; startup verification can fail as Drift |
-| `MigrationPlanError` (name) | `message` | core migration generator | not running | —; thrown Error | — |
+| `MigrationPlanError` | `stage: snapshot-decode \| snapshot-encode \| intent \| name, message, cause?: SchemaError` | core migration generator | not running | —; typed Effect failure or pure Result failure | — |
 | `CredentialsUnavailable` | `message` | client credential acquisition | no; retry | —; status(credentials) | `credentials` |
 | `PushIntegrityError` | `reason: invalidPayload \| serverDefect, message` | client transport | halt | —; Halted | `halted` |
 | `PullProtocolError` | `message` | client transport | no; retry | —; status(server) | `server` |
@@ -2363,6 +2376,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-SCH-7 | covered | `capture.test` "attach inside a caller's REPEATABLE READ transaction is refused (its stale snapshot would admit a duplicate name)", "an attach that fails between its two triggers leaves the table neither captured nor half-guarded" |
 | INV-SCH-8 | covered | `startup.test` "an old server must serve push and pull on an expanded database, while a new server must refuse the unmigrated schema" |
 | INV-SCH-9 | covered | `verify.test` "a legacy app gets only scope-walk indexes, reports missing-index Drift until migrated, and keeps client hashes" |
+| INV-SCH-10 | covered | `Migrate.test` "malformed snapshots are recoverable with their schema cause, and each execution decodes anew", "snapshot encoding is lazy, revalidates on execution and preserves canonical bytes and schema failures", "generation reads inputs only on execution and rechecks name and intent as recoverable failures", "an intent naming something the diff does not contain is refused, not ignored", "migrations are numbered after the highest existing one" |
 | INV-TEL-1 | covered | `startup.test` "startup's internal steps (verify, its per-table checks) must never hand the host a span other than echo.server.startup"; `observability.e2e` "sync propagates exported IDs and sampling through suppressed spans and preserves an explicit external parent", "engine spans across the e2e run never export an unregistered name or a raw failure cause"; `telemetry-entrypoints.test` "exported symbols cannot open named Effect.fn spans outside their boundary" |
 | INV-TEL-2 | covered | `observability.e2e` "SQLite sync never exports a typed failure, defect, result or dependency span containing secret inputs", "RPC request context cannot bypass sanitization for typed failures, defects, SQL spans or tracerLogger events", "direct server batches and maintenance cannot export returned identities or fail from a throwing tracer" |
 | INV-TEL-3 | covered | `observability.e2e` "throwing host sinks cannot change saved intent, retry deadlines, halt or successful installs", "closing a pulled subscription in the host context retains its own outcome and protects cleanup and the host parent", "engine spans across the e2e run never export an unregistered name or a raw failure cause" |
@@ -2696,7 +2710,7 @@ import { Effect } from "effect"
 import { Migrate, Protocol } from "echo-sync"
 import { Postgres } from "echo-sync/server"
 
-const manifest = Migrate.decodeSnapshot(await Bun.file("migrations/manifest.json").text())
+const manifest = await Effect.runPromise(Migrate.decodeSnapshot(await Bun.file("migrations/manifest.json").text()))
 const floor = 3 // accept every recorded manifest since 003, not only the latest hash
 const accepted = new Set((manifest.history ?? [])
   .filter((entry) => Number(entry.migration.split("_")[0]) >= floor)

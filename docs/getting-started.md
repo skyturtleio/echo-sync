@@ -155,11 +155,21 @@ registry or its manifest.
 
 ```ts
 import { Migrate } from "echo-sync"
-const previous = Migrate.decodeSnapshot(await Bun.file("migrations/manifest.json").text()) // or Migrate.emptySnapshot
-const g = Migrate.generate({ previous, registry, existing: ["001_create_todos"], name: "add_due_date" })
+import { Effect } from "effect"
+const text = await Bun.file("migrations/manifest.json").text()
+const g = await Effect.runPromise(Effect.gen(function* () {
+  const previous = yield* Migrate.decodeSnapshot(text) // or Migrate.emptySnapshot for the first migration
+  return yield* Migrate.generate({ previous, registry, existing: ["001_create_todos"], name: "add_due_date" })
+}))
 await Bun.write(`migrations/${g.id}.ts`, g.source) // review it, then commit both files together
 await Bun.write("migrations/manifest.json", g.snapshot)
 ```
+
+Snapshot decoding, encoding and generation are lazy Effects with recoverable `MigrationPlanError`
+failures. `stage` identifies `snapshot-decode`, `snapshot-encode`, `intent` or `name`; snapshot
+failures retain the original `SchemaError` in `cause`. The pure `plan` and `nextId` APIs return
+`Result` rather than throwing for invalid intent or names. No database or filesystem service is
+required; your script owns reading and writing the committed files.
 
 Pass them to the server as a record keyed by id. The example has one, at
 [examples/server/migrations/001_create_todos.ts](../examples/server/migrations/001_create_todos.ts):

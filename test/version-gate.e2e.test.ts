@@ -173,19 +173,19 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
       Effect.gen(function* () {
         const pg = yield* SqlClient
         yield* writableScope
-        const first = Migrate.generate({
+        const first = yield* Migrate.generate({
           previous: Migrate.emptySnapshot,
           registry: Registry.make([Items]),
           existing: [],
           name: "old"
         })
-        const second = Migrate.generate({
-          previous: Migrate.decodeSnapshot(first.snapshot),
+        const second = yield* Migrate.generate({
+          previous: yield* Migrate.decodeSnapshot(first.snapshot),
           registry: Registry.make([Notes, Items]),
           existing: [first.id],
           name: "current"
         })
-        const history = Migrate.decodeSnapshot(second.snapshot).history ?? []
+        const history = (yield* Migrate.decodeSnapshot(second.snapshot)).history ?? []
         const allowed = new Set(
           Arr.map(
             Arr.filter(history, (h) => Number(Str.split(h.migration, "_")[0]) >= 2),

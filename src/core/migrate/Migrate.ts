@@ -14,7 +14,7 @@
  *
  * `scope_grants` is the engine's table (created by `001_engine`) and is never planned here.
  */
-import { Array as Arr, Data, Option, pipe, Record as Rec, Schema, String as Str } from "effect"
+import { Array as Arr, Data, Effect, Option, pipe, Record as Rec, Result, Schema, String as Str } from "effect"
 import { ScopeGrants } from "../ScopeGrants.ts"
 import { canonicalJson, pgType, type AnySyncTable, type ColumnKind } from "../SyncTable.ts"
 import type { SyncRegistry } from "../Registry.ts"
@@ -60,20 +60,28 @@ export const snapshotOf = (registry: SyncRegistry): Snapshot => ({
   tables: Arr.map(appTables(registry), (t) => t.manifest)
 })
 
-/** Canonical JSON (sorted keys) with a trailing newline: the committed file's exact text. */
-export const encodeSnapshot = (snapshot: Snapshot): string =>
-  // oxlint-disable-next-line effecttsgo/schema-sync -- Public pure migration generator returns text synchronously, including validation failures.
-  `${canonicalJson(Schema.encodeSync(Snapshot)(snapshot))}\n`
+const encode = Schema.encodeEffect(Snapshot)
+const decode = Schema.decodeUnknownEffect(Schema.fromJsonString(Snapshot))
 
-/** Parses and validates a committed snapshot file. Throws `MigrationPlanError` if malformed. */
-export const decodeSnapshot = (text: string): Snapshot => {
-  try {
-    // oxlint-disable-next-line effecttsgo/schema-sync -- Public synchronous file codec preserves its MigrationPlanError throwing contract.
-    return Schema.decodeUnknownSync(Schema.fromJsonString(Snapshot))(text)
-  } catch (error) {
-    throw new MigrationPlanError(`manifest snapshot is malformed: ${String(error)}`)
-  }
-}
+/** Canonical JSON (sorted keys) with a trailing newline: the committed file's exact text. */
+export const encodeSnapshot = Effect.fnUntraced(function* (snapshot: Snapshot) {
+  const encoded = yield* encode(snapshot).pipe(
+    Effect.mapError(
+      (cause) =>
+        new MigrationPlanError({ stage: "snapshot-encode", message: "manifest snapshot cannot be encoded", cause })
+    )
+  )
+  return `${canonicalJson(encoded)}\n`
+})
+
+/** Lazily parses and validates a committed snapshot file, preserving the schema failure. */
+export const decodeSnapshot = Effect.fnUntraced(function* (text: string) {
+  return yield* decode(text).pipe(
+    Effect.mapError(
+      (cause) => new MigrationPlanError({ stage: "snapshot-decode", message: "manifest snapshot is malformed", cause })
+    )
+  )
+})
 
 // ---------------------------------------------------------------------------------------------
 // Intent and plan
@@ -96,20 +104,18 @@ export interface Intent {
   readonly acknowledgeDrops?: ReadonlyArray<string>
 }
 
-/** An intent that refers to something the diff does not contain; nothing is guessed. */
-export class MigrationPlanError extends Data.TaggedError("MigrationPlanError")<{ readonly message: string }> {
-  constructor(message: string) {
-    super({ message })
-  }
-}
+/** An expected migration input refusal; unexpected programmer exceptions remain defects. */
+export class MigrationPlanError extends Data.TaggedError("MigrationPlanError")<{
+  readonly stage: "snapshot-decode" | "snapshot-encode" | "intent" | "name"
+  readonly message: string
+  readonly cause?: Schema.SchemaError
+}> {}
 
 export type Step =
   | { readonly _tag: "Ddl"; readonly sql: string; readonly comment?: ReadonlyArray<string> }
   | { readonly _tag: "Todo"; readonly lines: ReadonlyArray<string> }
 
-const fail = (message: string): never => {
-  throw new MigrationPlanError(message)
-}
+const fail = (message: string) => Result.fail(new MigrationPlanError({ stage: "intent", message }))
 const setKey = (columns: ReadonlyArray<string>) => Arr.join(columns, "\u0000")
 const quote = (name: string) => `"${name}"`
 const indexName = (table: string, index: string) => `${table}__${index}`
@@ -128,10 +134,14 @@ const notNullSequence = (table: string, column: string): ReadonlyArray<string> =
 ]
 
 /**
- * The steps that take the database from `previous` to the registry's app tables. Throws
- * `MigrationPlanError` when the intent names a table or column the diff does not have.
+ * The steps that take the database from `previous` to the registry's app tables. Refuses
+ * intent naming a table or column the diff does not have with an explicit Result failure.
  */
-export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent = {}): ReadonlyArray<Step> => {
+export const plan = (
+  previous: Snapshot,
+  registry: SyncRegistry,
+  intent: Intent = {}
+): Result.Result<ReadonlyArray<Step>, MigrationPlanError> => {
   const steps: Array<Step> = []
   const todo = (...lines: ReadonlyArray<string>) => steps.push({ _tag: "Todo", lines })
   const ddl = (sql: string, ...comment: ReadonlyArray<string>) =>
@@ -147,8 +157,8 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
   const renamedFrom = new Set(tableRenames.values())
 
   for (const [to, from] of tableRenames) {
-    if (!after.has(to) || before.has(to)) fail(`renames.tables: "${to}" is not a newly declared table`)
-    if (!before.has(from) || after.has(from)) fail(`renames.tables: "${from}" is not a removed table`)
+    if (!after.has(to) || before.has(to)) return fail(`renames.tables: "${to}" is not a newly declared table`)
+    if (!before.has(from) || after.has(from)) return fail(`renames.tables: "${from}" is not a removed table`)
   }
   /** The previous manifest of a current table, resolved through a declared table rename. */
   const previousOf = (table: string) => before.get(table) ?? before.get(tableRenames.get(table) ?? "")
@@ -159,10 +169,10 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
       return fail(`renames.columns: "${table}" is not a table in both manifests`)
     for (const [to, from] of Rec.toEntries(columns)) {
       if (!Arr.some(now.manifest.columns, (c) => c.name === to) || Arr.some(was.columns, (c) => c.name === to)) {
-        fail(`renames.columns: "${table}.${to}" is not a newly declared column`)
+        return fail(`renames.columns: "${table}.${to}" is not a newly declared column`)
       }
       if (!Arr.some(was.columns, (c) => c.name === from) || Arr.some(now.manifest.columns, (c) => c.name === from)) {
-        fail(`renames.columns: "${table}.${from}" is not a removed column`)
+        return fail(`renames.columns: "${table}.${from}" is not a removed column`)
       }
     }
   }
@@ -313,7 +323,9 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
       const prefix = `CREATE INDEX ${quote(indexName(name, index))} `
       return Option.getOrElse(
         Arr.findFirst(table.postgres.createIndexes, (statement) => Str.startsWith(prefix)(statement)),
-        () => fail(`no DDL for ${name}.${index}`)
+        () => {
+          throw new Error(`no DDL for ${name}.${index}`)
+        }
       )
     }
     if (was.scopeWalkIndex !== true) emit(createFor("echo-scope"), ["access_scope_id", "id"])
@@ -375,7 +387,7 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
   }
 
   for (const k of defaults.keys())
-    if (!usedDefaults.has(k)) fail(`defaults: "${k}" is not a newly declared NOT NULL column`)
+    if (!usedDefaults.has(k)) return fail(`defaults: "${k}" is not a newly declared NOT NULL column`)
   for (const d of drops) {
     const [table, column] = Str.split(d, ".")
     const removed =
@@ -389,9 +401,9 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
             onNone: () => true,
             onSome: (currentTable) => Arr.some(currentTable.manifest.columns, (c) => c.name === column)
           })
-    if (!removed) fail(`acknowledgeDrops: "${d}" is not a removed table or column`)
+    if (!removed) return fail(`acknowledgeDrops: "${d}" is not a removed table or column`)
   }
-  return steps
+  return Result.succeed(steps)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -442,13 +454,16 @@ export const render = (id: string, steps: ReadonlyArray<Step>): string => {
 }
 
 /** `NNN_name` after the highest of `existing` (ids like `"002_add_notes"` or file names). */
-export const nextId = (existing: ReadonlyArray<string>, name: string): string => {
-  if (!/^[a-z0-9_]+$/.test(name)) throw new MigrationPlanError(`migration name "${name}" must match /^[a-z0-9_]+$/`)
+export const nextId = (existing: ReadonlyArray<string>, name: string): Result.Result<string, MigrationPlanError> => {
+  if (!/^[a-z0-9_]+$/.test(name))
+    return Result.fail(
+      new MigrationPlanError({ stage: "name", message: `migration name "${name}" must match /^[a-z0-9_]+$/` })
+    )
   const highest = Math.max(
     0,
     ...Arr.map(existing, (e) => Number(/^(\d+)_/.exec(Str.replace(/^.*\//, "")(e))?.[1] ?? 0))
   )
-  return `${Str.padStart(3, "0")(String(highest + 1))}_${name}`
+  return Result.succeed(`${Str.padStart(3, "0")(String(highest + 1))}_${name}`)
 }
 
 export interface Generated {
@@ -461,19 +476,19 @@ export interface Generated {
 }
 
 /** Plans and renders the next migration; commit `source` as `<id>.ts` together with `snapshot`. */
-export const generate = (options: {
+export const generate = Effect.fnUntraced(function* (options: {
   readonly previous: Snapshot
   readonly registry: SyncRegistry
   readonly intent?: Intent
   /** Existing migration ids or file names, to number the next one. */
   readonly existing: ReadonlyArray<string>
   readonly name: string
-}): Generated => {
-  const id = nextId(options.existing, options.name)
-  const steps = plan(options.previous, options.registry, options.intent)
+}): Effect.fn.Return<Generated, MigrationPlanError> {
+  const id = yield* Effect.fromResult(nextId(options.existing, options.name))
+  const steps = yield* Effect.fromResult(plan(options.previous, options.registry, options.intent))
   const snapshot: Snapshot = {
     ...snapshotOf(options.registry),
     history: [...(options.previous.history ?? []), { migration: id, dataHash: options.registry.dataHash }]
   }
-  return { id, source: render(id, steps), snapshot: encodeSnapshot(snapshot), steps }
-}
+  return { id, source: render(id, steps), snapshot: yield* encodeSnapshot(snapshot), steps }
+})

@@ -8,6 +8,7 @@ import {
   Random,
   Record as Rec,
   Redacted,
+  Result,
   Schema,
   String as Str
 } from "effect"
@@ -110,15 +111,6 @@ const driftOf = (registry: Registry.SyncRegistry) =>
     Effect.catchTag("Drift", (d: Drift) => Effect.succeed(Arr.map(d.mismatches, (m) => `${m.table}: ${m.problem}`)))
   )
 
-const first = Migrate.generate({ previous: Migrate.emptySnapshot, registry: v1, existing: [], name: "init" })
-const second = Migrate.generate({
-  previous: Migrate.decodeSnapshot(first.snapshot),
-  registry: v2,
-  intent: { defaults: { "docs.pinned": "false" } },
-  existing: [first.id],
-  name: "more"
-})
-
 describe.skipIf(adminUrl === "")("generated migrations and the startup verifier (SPEC §13, real Postgres)", () => {
   it.live(
     "a legacy app gets only scope-walk indexes, reports missing-index Drift until migrated, and keeps client hashes",
@@ -126,7 +118,7 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
       Effect.gen(function* () {
         const sql = yield* SqlClient
         // Recreate the committed pre-index snapshot and DDL, not a second current declaration.
-        const legacy = Migrate.decodeSnapshot(
+        const legacy = yield* Migrate.decodeSnapshot(
           yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({
             version: 1,
             tables: Arr.map(Migrate.snapshotOf(v1).tables, (table) => ({ ...table, scopeWalkIndex: undefined }))
@@ -143,17 +135,22 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
         const missing = yield* driftOf(v1)
         assert.strictEqual(missing.length, 2)
         assert.isTrue(Arr.every(missing, (m) => Str.includes("__echo-scope")(m) && Str.includes("is missing")(m)))
-        const upgrade = Migrate.generate({ previous: legacy, registry: v1, existing: ["001_init"], name: "scope_walk" })
+        const upgrade = yield* Migrate.generate({
+          previous: legacy,
+          registry: v1,
+          existing: ["001_init"],
+          name: "scope_walk"
+        })
         assert.strictEqual(upgrade.steps.length, 2)
         const migrations = yield* load([upgrade])
         yield* migrateApp(migrations)
         assert.deepStrictEqual(yield* driftOf(v1), [])
-        const current = Migrate.decodeSnapshot(upgrade.snapshot)
+        const current = yield* Migrate.decodeSnapshot(upgrade.snapshot)
         assert.deepStrictEqual(
           Arr.map(current.tables, (t) => [t.dataHash, t.indexHash]),
           Arr.map(legacy.tables, (t) => [t.dataHash, t.indexHash])
         )
-        assert.deepStrictEqual(Migrate.plan(current, v1), [])
+        assert.deepStrictEqual(Migrate.plan(current, v1), Result.succeed([]))
         // Existing engine databases also need the grants index; 001 cannot be edited/replayed.
         yield* sql`DROP INDEX echo_sync."scope_grants__echo-scope"`
         yield* sql`DELETE FROM echo_sync.migrations WHERE migration_id = 5`
@@ -162,7 +159,7 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
         // These names were already legal. The implicit index must not take either name.
         const sibling = SyncTable.make("docs__echo_scope", base, { indexes: { echo_scope: ["accessScopeId"] } })
         const expanded = Registry.make([DocsV1, Tags, sibling])
-        const addition = Migrate.generate({
+        const addition = yield* Migrate.generate({
           previous: current,
           registry: expanded,
           existing: [upgrade.id],
@@ -185,6 +182,19 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
       () =>
         Effect.gen(function* () {
           const sql = yield* SqlClient
+          const first = yield* Migrate.generate({
+            previous: Migrate.emptySnapshot,
+            registry: v1,
+            existing: [],
+            name: "init"
+          })
+          const second = yield* Migrate.generate({
+            previous: yield* Migrate.decodeSnapshot(first.snapshot),
+            registry: v2,
+            intent: { defaults: { "docs.pinned": "false" } },
+            existing: [first.id],
+            name: "more"
+          })
           const migrations = yield* load([first, second])
           yield* startUp(v1, { [first.id]: migrations[first.id] ?? Effect.die("missing") })
           assert.deepStrictEqual(yield* driftOf(v1), [])
@@ -306,6 +316,12 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
       db.effect(`the verifier refuses ${label}`, () =>
         Effect.gen(function* () {
           const sql = yield* SqlClient
+          const first = yield* Migrate.generate({
+            previous: Migrate.emptySnapshot,
+            registry: v1,
+            existing: [],
+            name: "init"
+          })
           yield* startUp(v1, yield* load([first]))
           assert.deepStrictEqual(yield* driftOf(v1), [])
           for (const statement of Str.split(sabotage, ";")) {
@@ -346,6 +362,12 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
       db.effect(`the verifier accepts ${label}`, () =>
         Effect.gen(function* () {
           const sql = yield* SqlClient
+          const first = yield* Migrate.generate({
+            previous: Migrate.emptySnapshot,
+            registry: v1,
+            existing: [],
+            name: "init"
+          })
           yield* startUp(v1, yield* load([first]))
           for (const statement of Str.split(change, ";")) yield* sql.unsafe(statement)
           assert.deepStrictEqual(yield* driftOf(v1), [])
@@ -379,26 +401,29 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
   )
   const renameV1 = Registry.make([NotesV1, CardsV1])
   const renameV2 = Registry.make([PapersV2, CardsV2])
-  const renameFirst = Migrate.generate({
-    previous: Migrate.emptySnapshot,
-    registry: renameV1,
-    existing: [],
-    name: "init"
-  })
-  const renameSecond = Migrate.generate({
-    previous: Migrate.decodeSnapshot(renameFirst.snapshot),
-    registry: renameV2,
-    intent: {
-      renames: { tables: { papers: "notes" }, columns: { papers: { heading: "title" }, cards: { heading: "title" } } },
-      acknowledgeDrops: ["papers.legacy"]
-    },
-    existing: [renameFirst.id],
-    name: "rename"
-  })
   it.layer(EmptyDatabase)((db) => {
     db.effect("the hand-carried TODO sequence for renames and drops passes the verifier", () =>
       Effect.gen(function* () {
         const sql = yield* SqlClient
+        const renameFirst = yield* Migrate.generate({
+          previous: Migrate.emptySnapshot,
+          registry: renameV1,
+          existing: [],
+          name: "init"
+        })
+        const renameSecond = yield* Migrate.generate({
+          previous: yield* Migrate.decodeSnapshot(renameFirst.snapshot),
+          registry: renameV2,
+          intent: {
+            renames: {
+              tables: { papers: "notes" },
+              columns: { papers: { heading: "title" }, cards: { heading: "title" } }
+            },
+            acknowledgeDrops: ["papers.legacy"]
+          },
+          existing: [renameFirst.id],
+          name: "rename"
+        })
         const migrations = yield* load([renameFirst, renameSecond])
         yield* startUp(renameV1, { [renameFirst.id]: migrations[renameFirst.id] ?? Effect.die("missing") })
         assert.deepStrictEqual(yield* driftOf(renameV1), [])
