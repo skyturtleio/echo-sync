@@ -29,6 +29,8 @@ const Continuation = Schema.Struct({
   cursor: Schema.NullOr(Schema.BigIntFromString),
   /** Log read through here (for an initial sync, starts at `head` of the first page). */
   position: Schema.BigIntFromString,
+  /** Acks can lag changes when their byte/count budget fills. Absent on pre-stream continuations. */
+  ackPosition: Schema.optionalKey(Schema.BigIntFromString),
   /** Scopes fully delivered in this set. */
   scopes: Schema.Array(Schema.String),
   /** Scopes whose current rows are being delivered, in order; `after` = last row delivered. */
@@ -57,6 +59,14 @@ export interface PullRequest {
 }
 
 const MutationOutcomeJson = Schema.toCodecJson(Mutation.MutationOutcome)
+
+/** Maximum UTF-8 bytes of the encoded PullResponse JSON (excluding transport framing). */
+export const maxPullPageBytes = 1_048_576
+// A configured row budget is an upper bound, not a target. Bound candidate construction even
+// for very large limits; this does not bound individual rows, acks or membership metadata.
+const maxPullPageRows = 500
+const encodeResponse = Schema.encodeSync(Schema.toCodecJson(Protocol.PullResponse))
+const utf8 = new TextEncoder()
 
 interface LogEntry {
   readonly position: bigint
@@ -123,7 +133,10 @@ export const pull = Effect.fnUntraced(function* (
     Effect.gen(function* () {
       yield* sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`
 
-      const stateRows = yield* sql<{ gc_horizon: bigint; head: bigint; expired_through: bigint }>`
+      let limit = Math.min(request.limit, maxPullPageRows)
+      let deferAcks = false
+      const candidate = Effect.gen(function* () {
+        const stateRows = yield* sql<{ gc_horizon: bigint; head: bigint; expired_through: bigint }>`
         SELECT gc_horizon,
                GREATEST(gc_horizon,
                         (SELECT max(position) FROM echo_sync.log),
@@ -133,156 +146,180 @@ export const pull = Effect.fnUntraced(function* (
                         (SELECT max(expired_position) FROM echo_sync.clients)) AS head,
                (SELECT expired_through FROM echo_sync.clients WHERE client_id = ${request.clientId}) AS expired_through
         FROM echo_sync.engine_state`
-      const state = stateRows[0]
-      if (state === undefined) return yield* Effect.die("echo_sync.engine_state is empty; run migrate")
-      if (request.cursor !== null && request.cursor > state.head) {
-        return yield* new Protocol.ResnapshotRequired({ reason: "unknownCursor", epoch })
-      }
-      // Resumed progress must lie in [originating cursor, head of this snapshot]. A position the
-      // server never reached would let PullDone record a nextCursor no snapshot produced.
-      if (
-        resumed !== undefined &&
-        (resumed.position < 0n ||
-          resumed.position > state.head ||
-          (request.cursor !== null && resumed.position < request.cursor))
-      ) {
-        return yield* stale
-      }
-      const base = resumed?.position ?? request.cursor
-      if (base !== null && base < state.gc_horizon) {
-        return yield* new Protocol.ResnapshotRequired({ reason: "gcHorizon" })
-      }
+        const state = stateRows[0]
+        if (state === undefined) return yield* Effect.die("echo_sync.engine_state is empty; run migrate")
+        if (request.cursor !== null && request.cursor > state.head) {
+          return yield* new Protocol.ResnapshotRequired({ reason: "unknownCursor", epoch })
+        }
+        // Resumed progress must lie in [originating cursor, head of this snapshot]. A position the
+        // server never reached would let PullDone record a nextCursor no snapshot produced.
+        if (
+          resumed !== undefined &&
+          (resumed.position < 0n ||
+            resumed.position > state.head ||
+            (resumed.ackPosition !== undefined &&
+              (resumed.ackPosition < (request.cursor ?? -1n) || resumed.ackPosition > resumed.position)) ||
+            (request.cursor !== null && resumed.position < request.cursor))
+        ) {
+          return yield* stale
+        }
+        const base = resumed?.position ?? request.cursor
+        if (base !== null && base < state.gc_horizon) {
+          return yield* new Protocol.ResnapshotRequired({ reason: "gcHorizon" })
+        }
 
-      // The originating cursor must be one the server completed a set at, resumed or not.
-      let held: ReadonlyArray<string> = []
-      if (request.cursor !== null) {
-        const recorded = yield* sql<{ scope_ids: ReadonlyArray<string> }>`
+        // The originating cursor must be one the server completed a set at, resumed or not.
+        let held: ReadonlyArray<string> = []
+        if (request.cursor !== null) {
+          const recorded = yield* sql<{ scope_ids: ReadonlyArray<string> }>`
           SELECT scope_ids FROM echo_sync.client_scopes
           WHERE client_id = ${request.clientId} AND position = ${request.cursor}`
-        const row = recorded[0]
-        if (row === undefined) return yield* new Protocol.ResnapshotRequired({ reason: "unknownCursor" })
-        held = row.scope_ids
-      }
-      // What the client holds at the start of this page.
-      let walking: Array<{ scopeId: string; after: typeof RowKey.Type | null }> = []
-      if (resumed !== undefined) {
-        held = resumed.scopes
-        walking = [...resumed.walking]
-      }
+          const row = recorded[0]
+          if (row === undefined) return yield* new Protocol.ResnapshotRequired({ reason: "unknownCursor" })
+          held = row.scope_ids
+        }
+        // What the client holds at the start of this page.
+        let walking: Array<{ scopeId: string; after: typeof RowKey.Type | null }> = []
+        if (resumed !== undefined) {
+          held = resumed.scopes
+          walking = [...resumed.walking]
+        }
 
-      const readable = new Set(
-        (yield* sql<{ access_scope_id: string }>`
+        const readable = new Set(
+          (yield* sql<{ access_scope_id: string }>`
           SELECT DISTINCT access_scope_id FROM echo_sync.scope_grants
           WHERE principal_id IN (${request.principalId}, '*')`).map((r) => r.access_scope_id)
-      )
-      const tables = yield* resolveTables(registry)
-      const position = base ?? state.head
-      const changes: Array<Protocol.Change> = []
+        )
+        const tables = yield* resolveTables(registry)
+        const position = base ?? state.head
+        const changes: Array<Protocol.Change> = []
 
-      // 1 + 2. Membership diff.
-      const scopes: Array<string> = []
-      for (const scopeId of held) {
-        if (readable.has(scopeId)) scopes.push(scopeId)
-        else changes.push(purged(scopeId))
-      }
-      walking = walking.filter((walk) => {
-        if (readable.has(walk.scopeId)) return true
-        changes.push(purged(walk.scopeId))
-        return false
-      })
-      const known = new Set([...scopes, ...walking.map((w) => w.scopeId)])
-      for (const scopeId of Arr.sort(readable, compare)) {
-        if (!known.has(scopeId)) walking.push({ scopeId, after: null })
-      }
+        // 1 + 2. Membership diff.
+        const scopes: Array<string> = []
+        for (const scopeId of held) {
+          if (readable.has(scopeId)) scopes.push(scopeId)
+          else changes.push(purged(scopeId))
+        }
+        walking = walking.filter((walk) => {
+          if (readable.has(walk.scopeId)) return true
+          changes.push(purged(walk.scopeId))
+          return false
+        })
+        const known = new Set([...scopes, ...walking.map((w) => w.scopeId)])
+        for (const scopeId of Arr.sort(readable, compare)) {
+          if (!known.has(scopeId)) walking.push({ scopeId, after: null })
+        }
 
-      // 3. Row walks.
-      let budget = request.limit
-      while (budget > 0) {
-        const walk = walking[0]
-        if (walk === undefined) break
-        const page = yield* walkPage(tables, walk.scopeId, walk.after, budget)
-        changes.push(...page.changes)
-        budget -= page.changes.length
-        if (page.after === null) {
-          walking.shift()
-          scopes.push(walk.scopeId)
-        } else walking[0] = { scopeId: walk.scopeId, after: page.after }
-      }
+        // 3. Row walks.
+        let budget = limit
+        while (budget > 0) {
+          const walk = walking[0]
+          if (walk === undefined) break
+          const page = yield* walkPage(tables, walk.scopeId, walk.after, budget)
+          changes.push(...page.changes)
+          budget -= page.changes.length
+          if (page.after === null) {
+            walking.shift()
+            scopes.push(walk.scopeId)
+          } else walking[0] = { scopeId: walk.scopeId, after: page.after }
+        }
 
-      // 4. The log, only once no walk is outstanding.
-      let nextPosition = position
-      let logDone = false
-      if (walking.length === 0 && budget > 0) {
-        const fetched = yield* sql<LogEntry>`
+        // 4. The log, only once no walk is outstanding.
+        let nextPosition = position
+        let logDone = false
+        if (walking.length === 0 && budget > 0) {
+          const fetched = yield* sql<LogEntry>`
           SELECT position, table_name, row_id, op FROM echo_sync.log
           WHERE position > ${position} AND access_scope_id = ANY(${[...readable]}::text[])
           ORDER BY position
           LIMIT ${budget + 1}`
-        logDone = fetched.length <= budget
-        const entries = logDone ? fetched : fetched.slice(0, budget)
-        const last = entries.at(-1)
-        // position ≤ head is enforced above, so a completed set ends exactly at this snapshot's head.
-        nextPosition = !logDone && last !== undefined ? last.position : state.head
+          logDone = fetched.length <= budget
+          const entries = logDone ? fetched : fetched.slice(0, budget)
+          const last = entries.at(-1)
+          // position ≤ head is enforced above, so a completed set ends exactly at this snapshot's head.
+          nextPosition = !logDone && last !== undefined ? last.position : state.head
 
-        const payloads = yield* fetchPayloads(tables, entries)
-        for (const entry of entries) {
-          const current = entry.op === "upsert" ? payloads.get(payloadKey(entry.table_name, entry.row_id)) : undefined
-          changes.push(
-            current !== undefined && readable.has(current.scopeId)
-              ? { _tag: "upsert", table: entry.table_name, row: current.row }
-              : // Deleted, or its current scope is not readable: never leak a payload.
-                { _tag: "tombstone", table: entry.table_name, id: entry.row_id }
-          )
+          const payloads = yield* fetchPayloads(tables, entries)
+          for (const entry of entries) {
+            const current = entry.op === "upsert" ? payloads.get(payloadKey(entry.table_name, entry.row_id)) : undefined
+            changes.push(
+              current !== undefined && readable.has(current.scopeId)
+                ? { _tag: "upsert", table: entry.table_name, row: current.row }
+                : // Deleted, or its current scope is not readable: never leak a payload.
+                  { _tag: "tombstone", table: entry.table_name, id: entry.row_id }
+            )
+          }
         }
-      }
 
-      // Acks: ledger rows in (cursor, nextCursor] across the set, each page covering the log
-      // range it advanced. An initial sync covers every committed mutation of this client.
-      const ackFloor = resumed?.position ?? request.cursor ?? -1n
-      const ackRows = yield* sql<{ mutation_id: string; position: bigint; outcome: unknown }>`
+        // Acks: ledger rows in (cursor, nextCursor] across the set, each page covering the log
+        // range it advanced. An initial sync covers every committed mutation of this client.
+        const ackFloor = resumed?.ackPosition ?? resumed?.position ?? request.cursor ?? -1n
+        const ackLimit = deferAcks ? 0 : limit
+        const ackRows = yield* sql<{ mutation_id: string; position: bigint; outcome: unknown }>`
         SELECT mutation_id, position, outcome FROM echo_sync.mutations
         WHERE client_id = ${request.clientId} AND position > ${ackFloor} AND position <= ${nextPosition}
           AND outcome IS NOT NULL
-        ORDER BY position`
-      const acks: Array<Protocol.Ack> = []
-      for (const row of ackRows) {
-        acks.push({
-          mutationId: Ids.MutationId.make(row.mutation_id),
-          position: Ids.Position.make(row.position),
-          outcome: yield* Store.decodeStored(MutationOutcomeJson, "echo_sync.mutations", row.outcome, row.mutation_id)
-        })
-      }
+        ORDER BY position LIMIT ${ackLimit + 1}`
+        const acksDone = ackRows.length <= ackLimit
+        const acks: Array<Protocol.Ack> = []
+        for (const row of ackRows.slice(0, ackLimit)) {
+          acks.push({
+            mutationId: Ids.MutationId.make(row.mutation_id),
+            position: Ids.Position.make(row.position),
+            outcome: yield* Store.decodeStored(MutationOutcomeJson, "echo_sync.mutations", row.outcome, row.mutation_id)
+          })
+        }
 
-      const result: Protocol.PullResponse = logDone
-        ? {
-            _tag: "PullDone",
-            epoch,
-            changes,
-            acks,
-            nextCursor: Ids.Position.make(nextPosition),
-            // Number() is exact only up to Number.MAX_SAFE_INTEGER; that matches SeqFloor being an
-            // Int (SPEC §11). Raised only by `expireLedger`.
-            expiredThrough: Ids.SeqFloor.make(Number(state.expired_through))
+        const result: Protocol.PullResponse =
+          logDone && acksDone
+            ? {
+                _tag: "PullDone",
+                epoch,
+                changes,
+                acks,
+                nextCursor: Ids.Position.make(nextPosition),
+                // Number() is exact only up to Number.MAX_SAFE_INTEGER; that matches SeqFloor being an
+                // Int (SPEC §11). Raised only by `expireLedger`.
+                expiredThrough: Ids.SeqFloor.make(Number(state.expired_through))
+              }
+            : {
+                _tag: "PullPage",
+                epoch,
+                changes,
+                acks,
+                continuation: Protocol.PullContinuation.make(
+                  encodeContinuation({
+                    clientId: request.clientId,
+                    principalId: request.principalId,
+                    cursor: request.cursor,
+                    position: nextPosition,
+                    ackPosition: acksDone ? nextPosition : (acks.at(-1)?.position ?? ackFloor),
+                    scopes,
+                    walking
+                  })
+                )
+              }
+        // At PullDone the delivered set is the readable set of this snapshot (every readable scope
+        // was kept or walked, every other purged). Record that directly, not what the request claimed.
+        return { result, held: Arr.sort(readable, compare) }
+      })
+      // Rebuild from the original continuation in the SAME snapshot. Truncating changes alone
+      // would skip rows/acks because its continuation has already advanced past them. No cursor
+      // bookkeeping happens until an entire encoded candidate fits.
+      while (true) {
+        const page = yield* candidate
+        if (utf8.encode(JSON.stringify(encodeResponse(page.result))).byteLength <= maxPullPageBytes) return page
+        if (limit <= 1) {
+          // A row and an ack may each fit separately but not together. Preserve ack progress
+          // in the continuation and deliver it on a later page rather than refusing the pair.
+          if (!deferAcks && page.result.changes.length > 0 && page.result.acks.length > 0) {
+            deferAcks = true
+            continue
           }
-        : {
-            _tag: "PullPage",
-            epoch,
-            changes,
-            acks,
-            continuation: Protocol.PullContinuation.make(
-              encodeContinuation({
-                clientId: request.clientId,
-                principalId: request.principalId,
-                cursor: request.cursor,
-                position: nextPosition,
-                scopes,
-                walking
-              })
-            )
-          }
-      // At PullDone the delivered set is the readable set of this snapshot (every readable scope
-      // was kept or walked, every other purged). Record that directly, not what the request claimed.
-      return { result, held: Arr.sort(readable, compare) }
+          return yield* new Protocol.ServerUnavailable({ message: "Pull page exceeds the byte limit" })
+        }
+        limit = Math.max(1, Math.floor(limit / 2))
+      }
     })
   )
 

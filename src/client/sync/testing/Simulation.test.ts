@@ -17,6 +17,7 @@ import {
   scope
 } from "../../../core/testing/SimApp.ts"
 import * as Simulation from "./Simulation.ts"
+import { paginate } from "./Pull.ts"
 
 // Reproduce a failure with SIM_SEED=<seed>; widen the sweep with SIM_SEEDS=<n>.
 const only = Number(process.env["SIM_SEED"] ?? 0)
@@ -58,10 +59,10 @@ const scriptedPulls = (disk: MemorySyncStorage.Disk, responses: Array<Protocol.P
     storage: MemorySyncStorage.make(disk),
     transport: {
       push: () => Effect.die("unused"),
-      pull: () => {
+      pull: paginate(() => {
         const next = responses.shift()
         return next === undefined ? Effect.fail(Simulation.pullLost("pull")) : Effect.succeed(next)
-      }
+      })
     }
   })
 
@@ -103,7 +104,7 @@ const transientScenario = (scenario: {
             }
             return server.push(request, Option.none())
           }),
-        pull: server.pull
+        pull: paginate(server.pull)
       }
     }
     let engine = yield* Engine.make(options)
@@ -213,7 +214,7 @@ describe("reconciliation simulation", () => {
                     ]
                   : []
             }),
-          pull: () => Effect.die("unused")
+          pull: paginate(() => Effect.die("unused"))
         }
       })
       yield* engine.mutate(id("prefix"), "increment", { id: "x", by: 2 })
@@ -285,7 +286,7 @@ describe("reconciliation simulation", () => {
                   }
                   return response
                 }),
-              pull: server.pull
+              pull: paginate(server.pull)
             }
           })
           yield* engine.pull
@@ -355,7 +356,7 @@ describe("reconciliation simulation", () => {
                   }
                   return response
                 }),
-              pull: (request) =>
+              pull: paginate((request) =>
                 Effect.gen(function* () {
                   const response = yield* server.pull(request)
                   if (hold && delayed === "pull") {
@@ -365,6 +366,7 @@ describe("reconciliation simulation", () => {
                   }
                   return response
                 })
+              )
             }
           })
           yield* engine.pull
@@ -514,7 +516,7 @@ describe("reconciliation simulation", () => {
                 position: position(5n)
               }))
             }),
-          pull: () =>
+          pull: paginate(() =>
             Effect.gen(function* () {
               pulls++
               if (pulls > 1) return yield* Simulation.pullLost("replacement snapshot")
@@ -522,6 +524,7 @@ describe("reconciliation simulation", () => {
               yield* Deferred.await(release)
               return yield* new Protocol.ResnapshotRequired({ reason: "gcHorizon" })
             })
+          )
         }
       })
       const pulling = yield* Effect.forkChild(Effect.exit(engine.pull))
@@ -553,7 +556,7 @@ describe("reconciliation simulation", () => {
         storage: MemorySyncStorage.make(disk),
         transport: {
           push: (request: Protocol.PushRequest) => server.push(request, Option.none()),
-          pull: server.pull
+          pull: paginate(server.pull)
         }
       }
       let engine = yield* Engine.make(options)
@@ -732,10 +735,10 @@ describe("reconciliation simulation", () => {
         storage: MemorySyncStorage.make(disk),
         transport: {
           push: () => Effect.die("unused"),
-          pull: () => {
+          pull: paginate(() => {
             const next = responses.shift() ?? Option.none()
             return Option.isSome(next) ? Effect.succeed(next.value) : Effect.fail(Simulation.pullLost("pull"))
-          }
+          })
         }
       })
 
@@ -795,7 +798,7 @@ describe("reconciliation simulation", () => {
           transport: {
             // An expired identity answers m1 at position 5, above the cursor; no pull will ever ack it.
             push: () => Effect.succeed(response),
-            pull: () =>
+            pull: paginate(() =>
               Effect.succeed<Protocol.PullResponse>({
                 _tag: "PullDone",
                 changes: [{ _tag: "upsert", table: Counters.name, row: counterRow("x", Number(base) + 10) }],
@@ -803,6 +806,7 @@ describe("reconciliation simulation", () => {
                 nextCursor: position(8n),
                 expiredThrough: Ids.SeqFloor.make(0)
               })
+            )
           }
         })
         yield* engine.mutate(id("m1"), "increment", { id: "x", by: 1 })

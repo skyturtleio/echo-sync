@@ -136,9 +136,13 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
 
     // The request is built by the engine from core types; the response is decoded by the RPC client.
     pull: (request) =>
-      client.pull(request).pipe(
-        defectsAs((message) => new PullProtocolError({ message })),
-        Effect.mapError(lift)
+      client.pull(request, { streamBufferSize: 1 }).pipe(
+        Stream.catchCause((cause): Stream.Stream<never, PullReason> =>
+          Cause.hasInterrupts(cause) || !Cause.hasDies(cause)
+            ? Stream.failCause(cause)
+            : Stream.fail(new PullProtocolError({ message: Cause.pretty(cause) }))
+        ),
+        Stream.mapError(lift)
       ),
 
     // Any end of this stream (failure, defect, completion) is handled by reconnecting (followPokes).

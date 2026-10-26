@@ -41,7 +41,7 @@ export interface SyncServerOptions {
    * Body-supplied RPC message headers are never exposed. Runs for every call / stream open.
    */
   readonly principalFor: (headers: Headers) => Effect.Effect<AccessScope.PrincipalId, Protocol.Unauthorized>
-  /** After authentication, before any sync work. Omitted = serve, including legacy clients. */
+  /** App compatibility policy, in addition to pull's mandatory streaming wire-version floor. */
   readonly clientPolicy?: ClientPolicy | undefined
   /** Upserts and tombstones per pull page. Default 500. */
   readonly pageLimit?: number | undefined
@@ -464,34 +464,58 @@ export const handlers = (options: SyncServerOptions) =>
                 (work) => Telemetry.observe(work, "echo.server.push", protocolOutcome)
               ),
             pull: (request) =>
-              Effect.gen(function* () {
-                const principalId = yield* authenticate(options.principalFor)
-                return yield* pull(
-                  options.registry,
-                  {
-                    principalId,
-                    clientId: request.clientId,
-                    epoch: request.epoch,
-                    clientVersion: request.clientVersion,
-                    principal: request.principal,
-                    cursor: request.cursor,
-                    continuation: request.continuation,
-                    limit: options.pageLimit ?? 500
-                  },
-                  options.clientPolicy
+              Stream.suspend(() => {
+                let principalId: AccessScope.PrincipalId | undefined
+                return Stream.paginate(request, (next) =>
+                  Effect.gen(function* () {
+                    if (principalId === undefined) {
+                      principalId = yield* authenticate(options.principalFor)
+                      yield* assertPrincipal(principalId, request.principal)
+                      // A unary client can decode this shared error Exit, but not streamed success.
+                      if ((request.clientVersion?.wireVersion ?? 0) < 2) {
+                        return yield* new Protocol.ClientOutdated({ message: "streamed pull requires wire version 2" })
+                      }
+                    }
+                    return yield* pull(
+                      options.registry,
+                      {
+                        principalId,
+                        clientId: next.clientId,
+                        epoch: next.epoch,
+                        clientVersion: next.clientVersion,
+                        principal: next.principal,
+                        cursor: next.cursor,
+                        continuation: next.continuation,
+                        limit: options.pageLimit ?? 500
+                      },
+                      options.clientPolicy
+                    )
+                  }).pipe(
+                    serverFailures,
+                    Effect.tap((response) =>
+                      Telemetry.annotate({
+                        "echo.result": response._tag === "PullDone" ? "done" : "page",
+                        "echo.changes": response.changes.length,
+                        "echo.acks": response.acks.length
+                      })
+                    ),
+                    (work) => Telemetry.observe(work, "echo.server.pull", protocolOutcome),
+                    Effect.map(
+                      (response) =>
+                        [
+                          [response],
+                          response._tag === "PullDone"
+                            ? Option.none<Protocol.PullRequest>()
+                            : Option.some({
+                                ...next,
+                                ...(response.epoch === undefined ? {} : { epoch: response.epoch }),
+                                continuation: Option.some(response.continuation)
+                              })
+                        ] as const
+                    )
+                  )
                 )
-              }).pipe(
-                serverFailures,
-                Effect.tap((response) =>
-                  Telemetry.annotate({
-                    "echo.result": response._tag === "PullDone" ? "done" : "page",
-                    "echo.changes": response.changes.length,
-                    "echo.acks": response.acks.length
-                  })
-                ),
-                Effect.provideService(SqlClient, sql),
-                (work) => Telemetry.observe(work, "echo.server.pull", protocolOutcome)
-              ),
+              }).pipe(Stream.provideService(SqlClient, sql)),
             pokes: ({ clientId, principal, epoch }) =>
               Stream.unwrap(
                 Effect.gen(function* () {
@@ -605,7 +629,8 @@ export const layerHttp = (options: SyncServerOptions & { readonly path?: HttpRou
   RpcServer.layerHttp({
     group: Protocol.SyncRpcs.merge(Protocol.PresenceRpcs),
     path: options.path ?? "/sync",
-    protocol: "http"
+    protocol: "http",
+    streamBufferSize: 1
   }).pipe(
     // Route-scoped, before RpcServer constructs its automatic span and handler context.
     Layer.provide(HttpRouter.middleware((work) => Telemetry.boundary(work)).layer),

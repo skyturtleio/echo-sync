@@ -4,6 +4,7 @@ import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import type * as PgClient from "@effect/sql-pg/PgClient"
 import { describe, expect, it } from "@effect/vitest"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Metric, Schema, Scope, Stream, Tracer } from "effect"
+import { paginate } from "../src/client/sync/testing/Pull.ts"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import { FetchHttpClient, Headers, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
 import { Rpc } from "effect/rpc"
@@ -87,7 +88,7 @@ it.effect("request failures append no notices and ledgered rejections keep succe
         }))
         return Effect.succeed({ results })
       },
-      pull: () => Effect.succeed({ ...done, acks: results })
+      pull: () => Stream.succeed({ ...done, acks: results })
     })
     const local = yield* Effect.flip(engine.mutate(Ids.MutationId.make("local"), "missing", {}))
     expect(local).toBeInstanceOf(Engine.LocallyRejected)
@@ -128,7 +129,7 @@ it.live(
       const { engine } = yield* device({
         push: () => Effect.succeed({ results: [] }),
         // The nested enqueues are expected to succeed; a failure of one is the test's defect.
-        pull: (): Effect.Effect<Protocol.PullResponse> =>
+        pull: paginate((): Effect.Effect<Protocol.PullResponse> =>
           Effect.orDie(
             Effect.gen(function* () {
               yield* capture
@@ -145,6 +146,7 @@ it.live(
               return done
             })
           )
+        )
       })
       yield* engine.pull.pipe(Effect.withSpan("host.parent"))
       const pull = recording.spans.find((span) => span.name === "echo.pull")
@@ -193,7 +195,7 @@ it.effect("batch telemetry agrees with the loop's whole-cause decision, not the 
               pushes++
               return Effect.failCause(cause)
             }),
-          pull: () => Effect.succeed(done)
+          pull: () => Stream.succeed(done)
         })
         yield* engine.mutate(Ids.MutationId.make("intent"), "accept", {})
         const loop = yield* SyncLoop.make({ engine, pendingMutations: storage.pendingCount })
@@ -232,7 +234,7 @@ it.effect("the whole final push cause remains authoritative, including typed cle
         const { engine, storage } = yield* device({
           push: () => Effect.fail(new Protocol.Unauthorized({ reason: "authenticationRefused", message: secret })),
           pull: () =>
-            Effect.sync(() => {
+            Stream.sync(() => {
               pulls++
               return done
             })
@@ -302,7 +304,7 @@ it.effect("throwing host sinks cannot change saved intent, retry deadlines, halt
                   : malformedEnvelope()
               )
             }),
-          pull: () => Effect.succeed(done)
+          pull: () => Stream.succeed(done)
         })
         const saved = yield* engine.mutate(Ids.MutationId.make("intent"), "accept", { secret })
         expect((yield* engine.mutate(Ids.MutationId.make("intent"), "accept", { other: true })).seq).toBe(saved.seq)
@@ -349,7 +351,7 @@ it.live("SQLite sync never exports a typed failure, defect, result or dependency
     let failing = false
     const { engine, storage } = yield* device({
       push: () => Effect.fail(new Protocol.Unauthorized({ reason: "authenticationRefused", message: secret })),
-      pull: () => (failing ? Effect.die(new Error(secret)) : Effect.succeed(done))
+      pull: () => (failing ? Stream.die(new Error(secret)) : Stream.succeed(done))
     })
     yield* engine.mutate(Ids.MutationId.make("intent"), "accept", { secret })
     yield* Effect.exit(engine.push)
@@ -536,7 +538,7 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
         )
         const transport: Engine.Transport = {
           push: (request) => rpc.push(request).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)),
-          pull: (request) => rpc.pull(request).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+          pull: (request) => rpc.pull(request).pipe(Stream.provideService(FetchHttpClient.Fetch, fetch))
         }
         const { engine } = yield* device(transport)
         recording.spans.length = 0

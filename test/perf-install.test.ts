@@ -10,6 +10,7 @@ import * as Engine from "../src/client/sync/Engine.ts"
 import * as SqliteSyncStorage from "../src/client/sync/SqliteSyncStorage.ts"
 import { countingClient } from "./sql-counter.ts"
 import { installFixture } from "./perf-install.ts"
+import { paginate } from "../src/client/sync/testing/Pull.ts"
 
 const upsert = (id: string, value: number): Protocol.Change => ({
   _tag: "upsert",
@@ -118,7 +119,7 @@ it.live("a resumed K-page pull reads only linear staged rows and installs the wh
             clientId: Ids.ClientId.make("linear"),
             transport: {
               push: () => Effect.succeed({ results: [] }),
-              pull: (request) =>
+              pull: paginate((request) =>
                 Effect.sync(() => {
                   const index = Option.isNone(request.continuation) ? 0 : Number(request.continuation.value)
                   if (requests++ === k / 2) throw new Error("reload")
@@ -144,6 +145,7 @@ it.live("a resumed K-page pull reads only linear staged rows and installs the wh
                         continuation: Protocol.PullContinuation.make(String(index + 1))
                       }
                 })
+              )
             }
           }),
           (engine) => ({ engine, storage })
@@ -160,9 +162,10 @@ it.live("a resumed K-page pull reads only linear staged rows and installs the wh
       })
       yield* resumed.engine.pull
       const stagedReads = counter.statements.filter((s) => /^\s*SELECT\b/i.test(s.sql) && s.sql.includes("echo_staged"))
-      // K tail reads + one repeated after failure + our progress check + K rows at install.
+      // One resumed tail read + our progress check + K rows at install. The initial empty
+      // tail read returns no row; streaming no longer re-reads progress before each page.
       // A second full-set read would exceed this budget, even though it is still linear.
-      expect(stagedReads.reduce((n, s) => n + s.rows, 0)).toBeLessThanOrEqual(2 * k + 2)
+      expect(stagedReads.reduce((n, s) => n + s.rows, 0)).toBeLessThanOrEqual(k + 2)
       expect(
         (yield* resumed.storage.transaction(resumed.storage.rows.scan(Counters)))
           .map((r) => r["value"])

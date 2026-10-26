@@ -8,6 +8,7 @@ import * as MemorySyncStorage from "./testing/MemorySyncStorage.ts"
 import * as SyncFailure from "./SyncFailure.ts"
 import * as SyncLoop from "./SyncLoop.ts"
 import * as Transport from "./Transport.ts"
+import { paginate, last } from "./testing/Pull.ts"
 
 interface Handlers {
   readonly pokes?: (request: {
@@ -59,7 +60,7 @@ const serve = (handlers: Handlers) =>
     Layer.provide([
       Protocol.SyncRpcs.toLayer({
         push: handlers.push ?? (() => Effect.die("push not expected")),
-        pull: handlers.pull ?? (() => Effect.die("pull not expected")),
+        pull: paginate(handlers.pull ?? (() => Effect.die("pull not expected"))),
         pokes: handlers.pokes ?? (() => Stream.never)
       }),
       RpcSerialization.layerNdjson
@@ -99,11 +100,15 @@ const batch = (n: number): Protocol.PushRequest => {
 /** A server on another protocol version whose pull response this client cannot decode. */
 const skewedPull = (() => {
   const group = RpcGroup.make(
-    Rpc.make("pull", { payload: Schema.Unknown, success: Schema.Struct({ _tag: Schema.Literal("Weird") }) })
+    Rpc.make("pull", {
+      payload: Schema.Unknown,
+      success: Schema.Struct({ _tag: Schema.Literal("Weird") }),
+      stream: true
+    })
   )
   return RpcServer.layerHttp({ group, path: "/rpc", protocol: "http" }).pipe(
     Layer.provide([
-      group.toLayer({ pull: () => Effect.succeed({ _tag: "Weird" as const }) }),
+      group.toLayer({ pull: () => Stream.succeed({ _tag: "Weird" as const }) }),
       RpcSerialization.layerNdjson
     ])
   )
@@ -270,7 +275,7 @@ it.effect(
       }
       const resnapshot = yield* harness(
         serve({ pull: () => Effect.fail(new Protocol.ResnapshotRequired({ reason: "gcHorizon" })) }),
-        (t) => t.pull(request)
+        (t) => last(t.pull(request))
       )
       const error = failureOf(resnapshot.exit)
       expect(error).toEqual(new Protocol.ResnapshotRequired({ reason: "gcHorizon" }))
@@ -278,13 +283,13 @@ it.effect(
       // The server's store is down: the engine sees core's typed ServerUnavailable, a transient pull failure.
       const down = yield* harness(
         serve({ pull: () => Effect.fail(new Protocol.ServerUnavailable({ message: "db down" })) }),
-        (t) => t.pull(request)
+        (t) => last(t.pull(request))
       )
       const unavailable = failureOf(down.exit)
       expect(unavailable).toEqual(new Protocol.ServerUnavailable({ message: "db down" }))
 
-      const noId = yield* harness(skewedPull, (t) => t.pull(request))
-      const dies = yield* harness(serve({ pull: () => Effect.die(new Error("bug")) }), (t) => t.pull(request))
+      const noId = yield* harness(skewedPull, (t) => last(t.pull(request)))
+      const dies = yield* harness(serve({ pull: () => Effect.die(new Error("bug")) }), (t) => last(t.pull(request)))
       for (const exit of [noId.exit, dies.exit]) {
         const failure = failureOf(exit)
         expect(failure).toBeInstanceOf(SyncFailure.PullProtocolError)
@@ -312,7 +317,7 @@ it.effect("a transport built with headers sends them on push, pull and the pokes
               }
             }),
           pull: (_, { headers }) =>
-            Effect.sync(() => {
+            Stream.sync(() => {
               seen["pull"] = headers["x-echo-principal"]
               return Schema.decodeUnknownSync(Protocol.PullDone)({
                 _tag: "PullDone",
@@ -346,7 +351,7 @@ it.effect("a transport built with headers sends them on push, pull and the pokes
         )
       )
       yield* t.push(batch(1))
-      yield* t.pull({ clientId: Ids.ClientId.make("c"), cursor: null, continuation: Option.none() })
+      yield* last(t.pull({ clientId: Ids.ClientId.make("c"), cursor: null, continuation: Option.none() }))
       yield* Stream.runHead(Stream.unwrap(t.pokes(Ids.ClientId.make("c"), AccessScope.PrincipalId.make("alice"))))
     }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
     expect(seen).toEqual({ push: "alice", pull: "alice", pokes: "alice" })
@@ -398,7 +403,7 @@ const PreviousRpcs = RpcGroup.make(
   })
 )
 
-it.effect("an older server serves push, pull, pokes, room and track that assert the replica principal", () =>
+it.effect("an older server serves principal-asserting RPCs but its unary pull fails the streaming protocol", () =>
   Effect.gen(function* () {
     const alice = AccessScope.PrincipalId.make("alice")
     const room = AccessScope.AccessScopeId.make("r")
@@ -453,9 +458,12 @@ it.effect("an older server serves push, pull, pokes, room and track that assert 
       const t = yield* Transport.make.pipe(Effect.provide(Transport.layerProtocolHttp("http://echo.test/rpc")))
       const join = { room, tabId: Protocol.TabId.make("tab"), state: null, revision: 0 }
       expect((yield* t.push({ ...batch(1), principal: alice })).results).toHaveLength(1)
-      expect((yield* t.pull({ clientId, principal: alice, cursor: null, continuation: Option.none() }))._tag).toBe(
-        "PullDone"
-      )
+      // A unary PullDone is not a valid streaming RPC success Exit (which must carry null).
+      expect(
+        yield* Effect.flip(
+          Stream.runCollect(t.pull({ clientId, principal: alice, cursor: null, continuation: Option.none() }))
+        )
+      ).toBeInstanceOf(SyncFailure.PullProtocolError)
       expect(Option.isSome(yield* Stream.runHead(Stream.unwrap(t.pokes(clientId, alice))))).toBe(true)
       const presence = t.presence(clientId, alice)
       expect(Option.isSome(yield* Stream.runHead(Stream.unwrap(presence.room(join))))).toBe(true)
@@ -548,24 +556,26 @@ const credentials = Effect.gen(function* () {
             }
           ),
         pull: (_, { headers }) =>
-          Effect.as(
-            Effect.andThen(
-              authenticate("pull", headers),
-              Effect.suspend(() =>
-                state.pullDefect !== undefined
-                  ? Effect.die(state.pullDefect)
-                  : state.pullUnavailable
-                    ? Effect.fail(new Protocol.ServerUnavailable({ message: "database is restarting" }))
-                    : Effect.void
-              )
-            ),
-            Schema.decodeUnknownSync(Protocol.PullDone)({
-              _tag: "PullDone",
-              changes: [],
-              acks: [],
-              nextCursor: "1",
-              expiredThrough: 0
-            })
+          Stream.fromEffect(
+            Effect.as(
+              Effect.andThen(
+                authenticate("pull", headers),
+                Effect.suspend(() =>
+                  state.pullDefect !== undefined
+                    ? Effect.die(state.pullDefect)
+                    : state.pullUnavailable
+                      ? Effect.fail(new Protocol.ServerUnavailable({ message: "database is restarting" }))
+                      : Effect.void
+                )
+              ),
+              Schema.decodeUnknownSync(Protocol.PullDone)({
+                _tag: "PullDone",
+                changes: [],
+                acks: [],
+                nextCursor: "1",
+                expiredThrough: 0
+              })
+            )
           ),
         pokes: (_, { headers }) =>
           // The initial poke, then silence (no heartbeat): only the client's idleTimeout ends it.
@@ -612,15 +622,15 @@ it.effect(
         // Built once, like the leader's `connect`; each run is one (re)connect.
         const pokes = Stream.unwrap(t.pokes(Ids.ClientId.make("c"), AccessScope.PrincipalId.make("alice")))
         yield* t.push(batch(1))
-        yield* t.pull(pullRequest)
+        yield* last(t.pull(pullRequest))
         yield* Stream.runHead(pokes)
         // The app renews: the old token is no longer accepted, and the client now returns the new one.
         state.valid = "t2"
         state.client = "t2"
         yield* t.push(batch(1))
-        yield* t.pull(pullRequest)
+        yield* last(t.pull(pullRequest))
         yield* Stream.runHead(pokes)
-        yield* t.pull(pullRequest)
+        yield* last(t.pull(pullRequest))
       }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
       expect(seen).toEqual(["push(m1#1):t1", "pull:t1", "pokes:t1", "push(m1#1):t2", "pull:t2", "pokes:t2", "pull:t2"])
       // Seven requests, seven evaluations: never cached for the leader's lifetime, never twice per request.
@@ -847,7 +857,7 @@ it.live(
             Layer.provide([
               Protocol.SyncRpcs.toLayer({
                 push: () => Effect.die("middleware must refuse before RPC"),
-                pull: () => Effect.die("middleware must refuse before RPC"),
+                pull: () => Stream.die("middleware must refuse before RPC"),
                 pokes: () => Stream.die("middleware must refuse before RPC")
               }),
               RpcSerialization.layerNdjson,

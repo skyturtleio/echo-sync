@@ -3,7 +3,7 @@ import "../src/client/testing/nodeWasm.ts"
 import { strict as assert } from "node:assert"
 import { execFileSync } from "node:child_process"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
-import { Effect, Option } from "effect"
+import { Effect, Option, Stream } from "effect"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import { AccessScope, Ids, Protocol, ScopeGrants } from "echo-sync"
 import { clientRegistry, Counters, grantRow, mutations, principal } from "../src/core/testing/SimApp.ts"
@@ -28,7 +28,7 @@ export const installFixture = Effect.fnUntraced(function* (p: number, c: number,
   const engine = yield* Engine.make({
     ...context,
     clientId: Ids.ClientId.make("device"),
-    transport: { push: () => Effect.succeed({ results: [] }), pull: () => Effect.die("unused") }
+    transport: { push: () => Effect.succeed({ results: [] }), pull: () => Stream.die("unused") }
   })
   yield* storage.transaction(
     Effect.gen(function* () {

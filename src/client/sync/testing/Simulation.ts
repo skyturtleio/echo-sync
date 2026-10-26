@@ -22,7 +22,7 @@
  * unexecuted with exactly one notice; outboxes empty, replicas equal the server restricted
  * to readable scopes, and each server rejection surfaced as exactly one notice.
  */
-import { Array as Arr, Clock, Deferred, Effect, Fiber, Option, Order, Schema } from "effect"
+import { Array as Arr, Clock, Deferred, Effect, Fiber, Option, Order, Schema, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { RpcClientError } from "effect/rpc"
 import * as Engine from "../Engine.ts"
@@ -31,6 +31,7 @@ import { Ids, ScopeGrants } from "../../../core/index.ts"
 import type { AccessScope, Mutation, Protocol, SyncTable } from "../../../core/index.ts"
 import * as MemoryStore from "../../../core/testing/MemoryStore.ts"
 import * as MemorySyncStorage from "./MemorySyncStorage.ts"
+import { paginate, last } from "./Pull.ts"
 import * as RefServer from "../../../core/testing/RefServer.ts"
 import {
   ANYONE,
@@ -284,7 +285,7 @@ export const run = (options: Options) =>
               }
               return response
             }),
-          pull: (request) =>
+          pull: paginate((request) =>
             Effect.gen(function* () {
               if (Option.isSome(ctl.gate)) {
                 const { arrived, release } = ctl.gate.value
@@ -303,6 +304,7 @@ export const run = (options: Options) =>
               if (faults && rng.chance(0.1)) return yield* pullLost("pull response")
               return response
             })
+          )
         }
         const client = {
           clientId,
@@ -345,6 +347,8 @@ export const run = (options: Options) =>
           const from = meta.resnapshot ? null : meta.cursor
           const continuation = Option.fromNullishOr(client.disk.staged.at(-1)?.continuation)
           const response = yield* transport.pull({ clientId: client.clientId, cursor: from, continuation }).pipe(
+            Stream.take(1),
+            last,
             Effect.map(Option.some<PullResponse>),
             Effect.catchTag("ResnapshotRequired", () =>
               storage

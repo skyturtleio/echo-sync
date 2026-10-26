@@ -6,7 +6,7 @@ import { MutationOutcome } from "./Mutation.ts"
 import { EncodedRow } from "./SyncTable.ts"
 
 /** Engine wire contract, independent of the app's registry hash. Not an equality gate. */
-export const wireVersion = 1
+export const wireVersion = 2
 export const ClientVersion = Schema.Struct({
   dataHash: Schema.String,
   wireVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
@@ -183,7 +183,8 @@ export const SyncRpcs = RpcGroup.make(
   Rpc.make("pull", {
     payload: PullRequest,
     success: PullResponse,
-    error: Schema.Union([ResnapshotRequired, ServerUnavailable, Unauthorized, ClientOutdated])
+    error: Schema.Union([ResnapshotRequired, ServerUnavailable, Unauthorized, ClientOutdated]),
+    stream: true
   }),
   Rpc.make("pokes", {
     /** `principal` as on `PushRequest` (SPEC §5). */

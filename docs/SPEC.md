@@ -51,10 +51,11 @@ together. Unsupported schema shapes or invalid branch samples fail rather than l
 
 ### 0.2 Versioning
 
-- **Wire version.** `Protocol.wireVersion` is `1`. Every `push` and `pull` request carries
+- **Wire version.** `Protocol.wireVersion` is `2`. Every `push` and `pull` request carries
   `clientVersion: { dataHash, wireVersion }` (optional on the wire only for clients that predate
   the field). The server MUST NOT infer compatibility from the field's absence. Compatibility is
-  decided by the app-supplied `clientPolicy`; the engine's default is to serve every client.
+  decided by the app-supplied `clientPolicy`, in addition to HTTP pull's mandatory wire-version
+  floor of 2. Push remains compatible with older wire versions unless the app policy refuses them.
 - **Consumers pin a commit.** The package is consumed as a git dependency and ships TypeScript
   source; there is no npm release. A consumer picks up a change only by bumping its pinned
   commit SHA. There is therefore no semantic version; the unit of compatibility is the pair
@@ -73,6 +74,13 @@ together. Unsupported schema shapes or invalid branch samples fail rather than l
   (`ResnapshotRequired.reason`, `SyncErrorKind`, `LeaderUnavailable.reason`, telemetry names and
   outcomes) are part of the contract; adding a member is a design change recorded in a dated
   rationale note next to the affected rule.
+
+**Rationale (2026-10-26):** Pull now streams on the existing RPC tag, so unary success framing is
+incompatible. Deploy the server first: it refuses absent/v1 pull versions with the shared
+`ClientOutdated` error before serving or registering; gate-aware old clients stop without losing
+pending intent and must reload to sync again. A v2 client against a unary server reports transient
+`PullProtocolError` on incompatible success framing, never a successful empty install. No automatic
+fallback or parallel legacy endpoint is provided; app `clientPolicy` may impose stricter floors.
 
 **Rationale (2026-10-22):** Two-direction compatibility gates were chosen because an old PWA
 can keep running indefinitely after dismissing reload, while a newer client can corrupt its
@@ -702,16 +710,18 @@ rest. Payloads are always the current row.
   tables by name, rows by `id COLLATE "C"`, keyset-continued by `after = (table, rowId)`) complete
   before any log entry is read; log entries are read in position order, `> position` and in
   readable scopes, with `LIMIT budget + 1` to detect the end.
-- INV-PULL-8: The page budget (`limit`, default `pageLimit` 500) counts upserts and
+- INV-PULL-8: The page budget (`min(limit, 500)`, default `pageLimit` 500) counts upserts and
   tombstones only; `scopePurged` entries are free. A walk page never exceeds the remaining
-  budget.
+  budget. The byte bound may reduce this budget further (INV-PULL-18).
 - INV-PULL-9: Payloads MUST be read from the current row through the table's codec, restricted to
   declared columns; a log entry whose row is gone, whose current `access_scope_id` is not
   readable, or whose table is no longer attached and registered (`resolveTables`), MUST be
   delivered as a tombstone, never as a payload.
 - INV-PULL-10: Acks delivered by a page are the client's ledger rows with
-  `position ∈ (ackFloor, nextPosition]` and `outcome IS NOT NULL`, where `ackFloor` is the
-  resumed position, else the cursor, else −1. An expired row (outcome `NULL`) is never acked.
+  `position ∈ (ackFloor, nextPosition]` and `outcome IS NOT NULL`, in position order up to the
+  candidate's row budget. `ackFloor` is the resumed `ackPosition`, else the resumed position,
+  else the cursor, else −1. An expired row (outcome `NULL`) is never acked. `ackPosition` may
+  lag change progress; `PullDone` requires both log and ack exhaustion.
 - INV-PULL-11: After the read snapshot, in this order and each idempotent: delete
   `client_scopes` rows with `position < cursor`; set `clients.cursor = cursor`; stamp
   `acked_at = now()` on ledger rows with `position ≤ cursor`, `acked_at IS NULL` and an outcome;
@@ -735,6 +745,36 @@ rest. Payloads are always the current row.
 - INV-PULL-16: An absent epoch MAY be served only while `engine_state.require_epoch = false`
   (the migration's rollout default); once true, every sync entry point MUST refuse absence
   `ClientOutdated` before any write. `null` is an epoch-aware bootstrap, never a legacy exemption.
+- INV-PULL-17: One HTTP pull MUST stream a page set as `PullPage*`, then `PullDone`, with one
+  independently committed `REPEATABLE READ` snapshot per page and no transaction held across
+  stream backpressure. The producer is lazy, emits one page per RPC chunk, and both server and
+  client RPC queues have capacity one. HTTP pull MUST refuse absent/v1 wire versions with
+  `ClientOutdated` before client registration or page production.
+- INV-PULL-18: Encoded `PullResponse` JSON MUST be at most 1,048,576 UTF-8 bytes, excluding RPC
+  framing. An oversized candidate is rebuilt with a halved row budget in the same snapshot,
+  from its original continuation. Nothing may be truncated or skipped to fit. A minimum mixed
+  candidate may defer all acks without advancing their position; it cannot complete until those
+  acks are delivered. If the resulting candidate still exceeds the cap (individual row, individual
+  ack or metadata), fail `ServerUnavailable` without cursor
+  bookkeeping; registration/last-seen may already have occurred.
+
+**Rationale (2026-10-26):** A streamed page set removes the HTTP round trip per 500 rows while
+retaining per-page authorization, snapshots and durable continuations. Capacity-one RPC queues
+already overlap network and staging; another `Stream.buffer` would add redundant buffering.
+The 1 MiB wire bound is a safety limit, not a localhost throughput tuning result. Candidate
+construction caps counted changes at the existing 500-row default even for larger configured
+limits; halving avoids complex continuation surgery. Oversized atomic data fails closed rather
+than silently losing rows or acknowledgments. Applications must keep individual rows, individual acks
+and membership metadata within this limit.
+
+**Rationale (2026-10-26):** A long-offline client's many small outcomes must not become an
+indivisible oversized page. Track acknowledgment progress separately from change progress and
+page the ordered ack query too; reducing only the change budget cannot handle an ack-only backlog.
+Older saved continuations omit `ackPosition` and retain their original meaning (acks through
+`position` were delivered). A supplied ack position must lie between the original cursor (−1
+for a null cursor) and the continuation's change position.
+Servers that ignore `ackPosition` cannot safely resume new continuations with deferred acks;
+do not mix those server versions or roll back while such continuations remain live.
 
 ### Details
 
@@ -742,9 +782,19 @@ rest. Payloads are always the current row.
 
 `PullRequest{clientId, clientVersion?, principal?, epoch?, cursor, continuation?}`. At server
 construction, configured `pageLimit` is checked by INV-PULL-14. At the request boundary the
-server refuses authenticated `*` (INV-ACL-8), then runs `assertPrincipal` (INV-PULL-1), the app's
+server refuses authenticated `*` (INV-ACL-8), then runs `assertPrincipal` (INV-PULL-1), the streaming
+wire-version floor, and the app's
 `clientPolicy` (`ClientOutdated`), the epoch fence, `registerClient`, then decodes the continuation (failure →
 `staleContinuation`; identity mismatch → `staleContinuation`).
+
+Authentication runs once at stream open; app policy, epoch and membership checks run per page.
+The next page uses the preceding page's continuation and epoch. On disconnect the client reconnects
+with its last durably staged continuation, not any prefetched page. The transport-neutral
+`Postgres.pull` still returns one page; the HTTP handler composes it with `Stream.paginate`.
+NDJSON framing is required. Capacity-one queues bound engine prefetch, not browser/socket buffers
+or all frames already parsed from the current HTTP chunk. Page construction still materializes
+candidate rows/acks/metadata before measuring bytes; neither the cap nor streaming is a claim of
+bounded total process memory. Installation still reads the complete staged set (§9.4).
 
 #### 7.2 The snapshot
 
@@ -815,7 +865,7 @@ The persisted restore gate permits that rollout and refuses unprotected clients 
 
 #### 7.5 The continuation
 
-`{clientId, principalId, cursor, position, scopes, walking: [{scopeId, after: {table, rowId} |
+`{clientId, principalId, cursor, position, ackPosition?, scopes, walking: [{scopeId, after: {table, rowId} |
 null}]}` as a JSON string, unsigned. The server trusts from it only what it re-validates
 (identity, position bounds, readability of every scope); the rest (`scopes`, `walking.after`,
 `position`) is progress the client may corrupt only to its own detriment.
@@ -865,8 +915,9 @@ readable grants; catalog (`resolveTables`); one `SELECT` per table per walk page
 `SELECT` (only when no walk is in progress and budget remains); one `SELECT` per table that has
 upsert entries, for payloads; one ack `SELECT`; `COMMIT`; after the transaction, three writes when
 `cursor` is non-null (`DELETE client_scopes`, `UPDATE clients`, `UPDATE mutations`) and one
-`INSERT client_scopes` on `PullDone`. Plus, per request, the principal lookup, `clientPolicy` and
-`registerClient` and one epoch read.
+`INSERT client_scopes` on `PullDone`. Plus, per page, `clientPolicy`, `registerClient` and one
+epoch read; the principal lookup runs once per HTTP stream. Byte retries repeat candidate reads
+inside the same snapshot. Ack queries fetch at most `budget + 1` rows for lookahead.
 
 ## 8. Push
 
@@ -963,8 +1014,8 @@ replay set goes through one function, `rebase`.
   is `ServerOutdated{table}` (back off, keep prior staging and its continuation, never rebuild),
   any other failure is `MalformedChange{table}` (transient). Changes of unknown tables are
   skipped at install with a debug log.
-- INV-CLI-10: `ResnapshotRequired` on a request that was not the initial one (non-null cursor
-  or a continuation) clears staging, sets `meta.resnapshot`, and continues the loop from a null
+- INV-CLI-10: `ResnapshotRequired` after any received page, or on a request that was not the
+  initial one (non-null cursor or a continuation), clears staging, sets `meta.resnapshot`, and continues the loop from a null
   cursor; the replica and its cursor keep serving reads until the snapshot installs. On an
   initial request it is a pull failure, except for a history fence carrying `epoch` (INV-CLI-14).
 - INV-CLI-11: A stored row that no longer decodes, or stored engine data that does not decode,
@@ -1002,6 +1053,11 @@ replay set goes through one function, `rebase`.
   without splitting query snapshots or installs; it does not bound running-query time or
   establish a measured latency improvement.
 
+- INV-CLI-16: A streamed pull MUST await registry validation and durable staging of each page
+  before processing the next. Failure, cancellation or EOF before `PullDone` MUST NOT install
+  the set or advance the cursor. Reopening storage resumes from the last durable continuation;
+  clean premature EOF is `PullProtocolError`, not success.
+
 ### Details
 
 #### 9.1 Storage
@@ -1024,6 +1080,15 @@ reentrant: storage methods inside an admitted operation use its existing admissi
 `{cursor: Cursor, pushedThrough: number, resnapshot: boolean, epoch?: string | null}`. Missing
 epoch in pre-upgrade storage means unnegotiated, like `null`. The pull request's cursor is
 `null` when `resnapshot` is set, else `cursor`; its continuation is the last staged page's.
+
+Each streamed `PullPage` is validated then durably staged before processing the next element.
+EOF before `PullDone` MUST fail `PullProtocolError`, leaving valid staging, cursor and pending
+intent unchanged. A stream failure or cancellation drops volatile prefetched pages only; the
+next attempt reads durable progress again. `PullDone` alone enters the existing atomic install.
+
+**Rationale (2026-10-26):** Network receipt is not durable progress. Waiting for staging before
+consuming another page preserves reload/disconnect recovery, and requiring `PullDone` prevents
+a truncated stream or unary/stream schema mismatch from certifying incomplete data.
 
 #### 9.3 Install
 
@@ -1063,9 +1128,15 @@ Before each request, `stagedProgress` returns only the last continuation and pag
 the accumulated payloads. SQLite extracts the continuation from the tail JSON; two primary-key
 end seeks derive count as `last ord - first ord + 1`. Staging only appends and clears whole sets,
 so ords are contiguous within a set, even after rollback; their absolute values need not start at 1.
-Memory storage reads the array tail and length. Across K pages, resume returns O(K) metadata rows
-and SQLite parses O(C) tail payload bytes for fixed-size rows, rather than repeatedly decoding
-all preceding pages. Install still reads the full set exactly once, atomically (INV-PERF-8).
+Memory storage reads the array tail and length. An uninterrupted K-page stream reads progress
+once at open; R reconnects add O(R) tail metadata reads. Across at most one reconnect per page
+this remains O(K) metadata rows and O(C) tail payload bytes for fixed-size rows, rather than
+repeatedly decoding all preceding pages. Install still reads the full set exactly once,
+atomically (INV-PERF-8).
+
+**Rationale (2026-10-26):** The streaming loop carries only its received-page count during an
+attempt; durable resume metadata is needed at connection boundaries, not for each emitted page.
+Page staging, registry validation, atomic install and its codec/write costs remain unchanged.
 
 **Rationale (2026-10-25):** Reading all staged pages merely to resume made a K-page pull perform
 K(K+1)/2 page reads before install; the previous cost model omitted that quadratic work and the
@@ -1933,11 +2004,13 @@ batches, page limits and retention against them.
   `patch`es: `9 + 2N + 3M`. `executeBatch` adds one epoch and one catalog query per request. App principal
   lookup/policy SQL is outside this engine budget. Trigger-side `next_position()` and log
   inserts are additional server work, not connection statements. Retries repeat the transaction.
-- INV-PERF-3: Per pull request (§7.7): `9 + h + w + l + t + 3h + d` connection statements,
+- INV-PERF-3: Per pull page without byte-budget retries (§7.7): `9 + h + w + l + t + 3h + d` connection statements,
   including registration and controls. The fixed 9 are epoch, register, BEGIN, SET, state, readable
   grants, catalog, acks, COMMIT; `h = 1` for non-null cursor (held lookup and three cursor
   writes), `w` is walk SELECTs, `l = 1` if the log is read, `t` is payload-table SELECTs,
   `d = 1` on PullDone (held insert). App principal lookup/policy SQL is excluded.
+  Byte-budget retries repeat candidate reads inside the same snapshot; one HTTP request now
+  carries multiple pages, not one database snapshot.
 - INV-PERF-4: Per install (§9.4, Q3): one SQLite transaction holding the storage's single permit
   for `U` undo writes + batched `C` change writes + `Σ H(m)` replay operations + `|P∖R|` outbox undo
   updates; one `clearAll` statement per replica table when the set started from null. For the
@@ -2221,6 +2294,8 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PULL-14 | covered | `rpc.test` "a server with an invalid pageLimit dies at construction instead of producing an endless PullPage" |
 | INV-PULL-15 | covered | `rpc.test` "a stale epoch reaches no ledger, cursor, client registration or presence write on any sync entry point", "a cursor above head is resnapshotted even when its held-scope record survived" |
 | INV-PULL-16 | covered | `rpc.test` "an omitted epoch works during rollout but is refused ClientOutdated after restore fencing" |
+| INV-PULL-17 | covered | `streamed-pull.e2e` "one HTTP pull stages incrementally, reads a fresh snapshot per page, and exposes nothing before done", "a legacy unary client receives ClientOutdated before a streaming server registers or serves it" |
+| INV-PULL-18 | covered | `pull-size.test` "UTF-8 oversized walks split without losing or duplicating rows or recording an unfinished cursor", "byte-split log pages deliver every change and intervening ack exactly once (INV-PULL-7/10/11)", "an oversized single row fails before cursor pruning, cursor advancement or ack stamping", "ack-only backlogs split within the byte cap and resume without dropping or repeating outcomes", "oversized continuation metadata fails without recording or advancing the cursor", "a huge configured row budget still constructs at most 500 changes per candidate" |
 | INV-PUSH-1 | partial | `Transport.test` "push failures are fatal exactly when SPEC §10 says so, classified by real tags over a real RPC server" (includes the cap); the 50 default and the `min(…, 100)` clamp have no test |
 | INV-PUSH-2 | covered | `ledger.test` "a batch stops at a transient failure without recording it, and its resubmission continues in order"; `Transport.test` "a push batch the server stopped is reported as kind server" |
 | INV-PUSH-3 | covered | `rpc.test` "a connection lost mid-batch is a short results list, never a defect the client would halt on", "an infrastructure defect in principalFor is a transient stop (empty results), not a push failure" |
@@ -2242,6 +2317,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-CLI-13 | covered | `version-gate.e2e` "unknown-table changes must not stall an old client or be lost after its registry update" |
 | INV-CLI-14 | covered | `expiry.e2e` "an epoch rotation resnapshots without losing pushed or unpushed pending mutations; released intent stays lost with the backup"; `Simulation.test` "restoring an earlier log and ledger cannot strand pending intent or mix replicas across epochs", "late push and pull responses from a restored epoch cannot release pending intent or install old rows"; `SyncLoop.test` "a discovered or resumed epoch resnapshot delivers pending intent without an external wake"; `Transport.test` "an epoch-refused pokes connection wakes pull even when the restored server has no new writes" |
 | INV-CLI-15 | covered | `SqliteSyncStorage.test` "queued transactions, reads and pending counts progress before a releasing caller can reenter", "cancelling queued head, middle and tail work never runs it or releases the active transaction", "interruption at every admission handoff boundary leaves transactions atomic and admission usable" |
+| INV-CLI-16 | covered | `streamed-pull.e2e` "a truncated stream resumes after the last durable page when the engine is reconstructed", "an old unary server cannot make a streaming client certify completion or discard durable staging", "a stalled pull consumer backpressures page production and cancellation releases the server stream"; additionally `stream-resume.sh` checks real HTTP abort, offline OPFS reload and complete resumed data |
 | INV-LOOP-1 | covered | `SyncLoop.test` "a transient push failure is retried with backoff and clears once a cycle succeeds"; `Leader.test` "requestSync during backoff runs the next cycle at once and leaves a halted push halted" |
 | INV-LOOP-2 | covered | `SyncLoop.test` "lastSyncedAt stays null after a cycle whose pull failed, and is set by the first cycle that installs", "a stopped push that processed later entries cannot advance lastSyncedAt or halt push"; `Leader.test` "a push whose response is lost keeps the entry pending until the pull installs its ack, and that cycle sets no lastSyncedAt" |
 | INV-LOOP-3 | covered | `SyncLoop.test` "an integrity error halts push for good while pull keeps running"; supplementary browser scenarios cover handover and pending export |
@@ -2310,14 +2386,16 @@ machine-verifiable literal test-title citations.
 
 | name | value | where | tunable |
 |---|---|---|---|
-| `wireVersion` | 1 | `Protocol.ts` | no |
+| `wireVersion` | 2; HTTP pull requires ≥ 2 | `Protocol.ts`, `rpc.ts` | no; app policy may be stricter |
 | mutation future-clock skew bound | 30,000 ms (strictly greater rejects) | `Protocol.maxMutationFutureSkewMillis`, `rpc.ts` | no |
 | mutation args excess keys | reject, including nested keys | `Mutation.make`, `LeaderClient.ts` | `onExcessProperty: "ignore"` opts into stripping |
 | `engine_state.require_epoch` | false on migration; true after restore | migration 004, §11.1 | operator, never disable after restore |
 | push batch size | `min(pushBatchSize ?? 50, 100)` | `Engine.ts` | `pushBatchSize` |
 | `PushRequest.mutations` | 1 … 100 | `Protocol.ts` | no |
-| `pageLimit` (upserts + tombstones per page) | 500; configured value must be a positive safe integer (INV-PULL-14) | `rpc.ts` | `pageLimit` |
+| `pageLimit` (upserts + tombstones per page) | default 500; positive safe-integer configuration; effective candidate ceiling 500 (INV-PULL-8/14) | `rpc.ts`, `pull.ts` | `pageLimit` may lower it |
 | server scope-walk index | one `table__echo-scope` per synced table; `(access_scope_id, id)`, `"C"` collation (INV-SCH-9) | `SyncTable.ts`, engine migration 005 | no |
+| pull page JSON | ≤ 1,048,576 UTF-8 bytes, excluding RPC framing; oversized atomic data fails (INV-PULL-18) | `pull.ts` | no |
+| streaming RPC queues | server: 1 encoded message; pull client: 1 decoded page; one page per chunk; excludes HTTP/runtime/parser buffers | `rpc.ts`, `Transport.ts` | no |
 | staged resume read | at most 1 metadata row per request; full payload set read once at install (INV-PERF-8) | `SqliteSyncStorage.ts`, `Engine.ts` | no |
 | SQLite upsert batch | at most `floor(32766 / columnCount)` rows, never across page/table/delete/purge boundaries at install | `SqliteRowStore.ts`, `Engine.ts` | pinned wasm parameter limit, not a tuning option |
 | server `heartbeatInterval` (pokes and presence) | 15 s | `rpc.ts` | yes; must stay below clients' `idleTimeout` |

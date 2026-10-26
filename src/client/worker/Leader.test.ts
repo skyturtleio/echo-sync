@@ -29,6 +29,7 @@ import * as Provenance from "../Provenance.ts"
 import { enqueueAndWake, makeHandlers } from "./Leader.ts"
 import { type LeaderCalls, tabApi } from "./LeaderClient.ts"
 import { LeaderRpcs, LeaderUnavailable } from "./LeaderRpcs.ts"
+import { paginate } from "../sync/testing/Pull.ts"
 
 const T = SyncTable.make("t", { id: Schema.String.pipe(Schema.brand("TId")), accessScopeId: AccessScope.AccessScopeId })
 const registry = Registry.make([T])
@@ -72,7 +73,7 @@ it.live("an enqueue cancelled while its COMMIT runs still wakes the loop: the en
           })
         ),
       pull: () =>
-        Effect.succeed(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "1", expiredThrough: 0 }))
+        Stream.succeed(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "1", expiredThrough: 0 }))
     }
     const engine = yield* Engine.make({
       clientId: Ids.ClientId.make("c"),
@@ -235,7 +236,7 @@ const leaderRpc = (options: { readonly allowRawExec: boolean; readonly transport
       transport: options.transport ?? {
         push: () => Effect.die(new Error("no transport")),
         pull: () =>
-          Effect.succeed(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "2", expiredThrough: 0 }))
+          Stream.succeed(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "2", expiredThrough: 0 }))
       }
     })
     const handlers = yield* makeHandlers({
@@ -544,7 +545,7 @@ it.live(
           push: () => Effect.die("unused"),
           pull: () =>
             online
-              ? Effect.succeed(
+              ? Stream.succeed(
                   decodeDone({
                     _tag: "PullDone",
                     changes:
@@ -568,7 +569,7 @@ it.live(
                     expiredThrough: 0
                   })
                 )
-              : Effect.fail(pullOffline())
+              : Stream.fail(pullOffline())
         }
       })
       // A previously installed replica; a reconnect is incremental, not a new scope snapshot.
@@ -891,7 +892,7 @@ it.live(
               })
             })
           ),
-        pull: () =>
+        pull: paginate(() =>
           Effect.map(Queue.take(pulls), (acked) => {
             const acks = acked.map((id) => ({
               mutationId: id,
@@ -901,6 +902,7 @@ it.live(
             cursor = Math.max(cursor, ...acked.map((id) => positions.get(id) ?? 0))
             return decodeDone({ _tag: "PullDone", changes: [], acks, nextCursor: String(cursor), expiredThrough: 0 })
           })
+        )
       }
       const first = yield* Scope.make()
       const leader1 = yield* syncLeader(db, transport).pipe(Scope.provide(first))
@@ -977,7 +979,7 @@ it.live("requestSync during backoff runs the next cycle at once and leaves a hal
     const calls = { push: 0, pull: 0 }
     const transport: Engine.Transport = {
       push: () => Effect.suspend(() => (calls.push++, Effect.fail(integrity()))),
-      pull: () => Effect.suspend(() => (calls.pull++, Effect.fail(pullOffline())))
+      pull: paginate(() => Effect.suspend(() => (calls.pull++, Effect.fail(pullOffline()))))
     }
     // An hour of backoff: only a wake can bring the next cycle within the test's budget.
     const client = yield* syncLeader(db, transport, "1 hour")
@@ -1027,7 +1029,7 @@ it.live(
             // The first push that carries a mutation commits on the server, then its response is lost.
             return pushes === 1 ? Effect.fail(pushOffline()) : Effect.succeed(decodePush({ results }))
           }),
-        pull: () =>
+        pull: paginate(() =>
           Effect.map(Queue.take(pulls), (acked) => {
             const acks = acked.map((id) => ({
               mutationId: id,
@@ -1037,6 +1039,7 @@ it.live(
             cursor = Math.max(cursor, ...acked.map((id) => recorded.get(id) ?? 0))
             return decodeDone({ _tag: "PullDone", changes: [], acks, nextCursor: String(cursor), expiredThrough: 0 })
           })
+        )
       }
       const client = yield* syncLeader(db, transport)
       const api = tabApi(passThrough(client))

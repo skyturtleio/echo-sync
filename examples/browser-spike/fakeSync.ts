@@ -37,7 +37,7 @@ const handlers = Protocol.SyncRpcs.toLayer({
   },
   pull: (request) => {
     statsFor(request.clientId).pulls++
-    return Effect.succeed({
+    return Stream.succeed({
       _tag: "PullDone" as const,
       changes: [],
       acks: [],

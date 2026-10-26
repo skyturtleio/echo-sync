@@ -662,7 +662,7 @@ it.live("a mutate queued behind a long pull install can be interrupted while it 
     const transport: Engine.Transport = {
       push: () => Effect.die("unused"),
       pull: () =>
-        Effect.succeed(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "5", expiredThrough: 0 }))
+        Stream.succeed(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "5", expiredThrough: 0 }))
     }
     const engine = yield* Engine.make({
       clientId: Ids.ClientId.make("c"),

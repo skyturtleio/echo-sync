@@ -10,6 +10,7 @@ import * as SimApp from "../../core/testing/SimApp.ts"
 import * as SyncFailure from "./SyncFailure.ts"
 import * as SyncLoop from "./SyncLoop.ts"
 import { recorder } from "../../../test/telemetry-recorder.ts"
+import { paginate } from "./testing/Pull.ts"
 
 const rpcFailure = () =>
   new RpcClientError.RpcClientError({
@@ -64,11 +65,12 @@ it.effect("a discovered or resumed epoch resnapshot delivers pending intent with
         mutations: SimApp.mutations,
         transport: {
           push: (request: Protocol.PushRequest) => server.push(request, Option.none()),
-          pull: (request: Protocol.PullRequest) =>
+          pull: paginate((request: Protocol.PullRequest) =>
             Effect.gen(function* () {
               if (failSnapshot && request.epoch === server.epoch()) return yield* pullOffline()
               return yield* server.pull(request)
             })
+          )
         }
       }
       const engine = yield* Engine.make(options)

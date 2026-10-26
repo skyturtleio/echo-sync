@@ -15,6 +15,7 @@ import * as Transport from "../src/client/sync/Transport.ts"
 import { type ClientPolicy } from "../src/server/postgres/pull.ts"
 import { layerHttp } from "../src/server/postgres/rpc.ts"
 import { grant, Items, Notes, pgAvailable, registry, RowId, TestDatabase } from "../src/server/postgres/test-support.ts"
+import { last } from "../src/client/sync/testing/Pull.ts"
 
 const actor = AccessScope.PrincipalId.make("p")
 const clientId = Ids.ClientId.make("version-client")
@@ -71,7 +72,7 @@ const serve = Effect.fnUntraced(function* (tables: Registry.SyncRegistry, client
   const rpc = yield* Transport.make.pipe(Effect.provide(Transport.layerProtocolHttp("http://echo.test/sync")))
   const transport: Engine.Transport = {
     push: (request) => rpc.push(request).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)),
-    pull: (request) => rpc.pull(request).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+    pull: (request) => rpc.pull(request).pipe(Stream.provideService(FetchHttpClient.Fetch, fetch))
   }
   return { transport, sent }
 })
@@ -133,12 +134,15 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
           { id: "old-write", extra_note: null }
         ])
         expect(oldRegistry.dataHash).not.toBe(newRegistry.dataHash)
-        expect(sent.length).toBeGreaterThan(4) // metadata is carried on continuations too
-        // Absence is accepted as legacy, not decoded as a malformed request.
-        expect(
-          (yield* transport.pull({ clientId: Ids.ClientId.make("legacy"), cursor: null, continuation: Option.none() }))
-            ._tag
-        ).toBe("PullPage")
+        // First discover the server epoch, then stream the snapshot; the later pull is incremental.
+        expect(sent.map(({ tag }) => tag)).toEqual(["pull", "pull", "push", "pull"])
+        expect(sent.every(({ payload }) => payload.clientVersion?.wireVersion === Protocol.wireVersion)).toBe(true)
+        // The streaming wire floor refuses a missing version before registering a legacy pull.
+        const legacy = yield* Effect.flip(
+          last(transport.pull({ clientId: Ids.ClientId.make("legacy"), cursor: null, continuation: Option.none() }))
+        )
+        expect(legacy).toBeInstanceOf(Protocol.ClientOutdated)
+        expect(yield* pg`SELECT client_id FROM echo_sync.clients WHERE client_id = 'legacy'`).toEqual([])
         // Updating the registry changes the data hash, resetting the old cursor before the new
         // engine pulls the snapshot that contains the previously skipped table.
         const updated = yield* device(newRegistry, transport, sqlite)
@@ -194,12 +198,14 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
         enforce = true
         // Both directions fail typed, before registration, replay/ledger lookup or cursor validation.
         const refused = yield* Effect.exit(
-          transport.pull({
-            clientId: Ids.ClientId.make("never-registered"),
-            clientVersion: { dataHash: oldRegistry.dataHash, wireVersion: 99 },
-            cursor: Ids.Position.make(99999n),
-            continuation: Option.none()
-          })
+          last(
+            transport.pull({
+              clientId: Ids.ClientId.make("never-registered"),
+              clientVersion: { dataHash: oldRegistry.dataHash, wireVersion: 99 },
+              cursor: Ids.Position.make(99999n),
+              continuation: Option.none()
+            })
+          )
         )
         expect(refused._tag).toBe("Failure")
         const refusal = Option.getOrNull(Exit.findErrorOption(refused))
@@ -394,7 +400,7 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
           transport: {
             push: transport.push,
             pull: () =>
-              Effect.succeed(done({ id: "null-is-present", access_scope_id: "s1", body: 42, extra_note: null }))
+              Stream.succeed(done({ id: "null-is-present", access_scope_id: "s1", body: 42, extra_note: null }))
           }
         })
         const malformed = yield* Effect.exit(probe.pull)
@@ -410,7 +416,7 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
           transport: {
             push: transport.push,
             pull: () =>
-              Effect.succeed(
+              Stream.succeed(
                 done({
                   id: "null-is-present",
                   access_scope_id: "s1",

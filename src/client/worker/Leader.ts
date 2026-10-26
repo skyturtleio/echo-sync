@@ -102,7 +102,7 @@ const openDatabase = Effect.fn("Leader.openDatabase")(function* (
 /** A replica without `syncUrl`: the engine never calls its transport, because no loop runs. */
 const localOnly: Engine.Transport = {
   push: () => Effect.die(new Error("echo-sync: local-only replica has no transport")),
-  pull: () => Effect.die(new Error("echo-sync: local-only replica has no transport"))
+  pull: () => Stream.die(new Error("echo-sync: local-only replica has no transport"))
 }
 
 /**

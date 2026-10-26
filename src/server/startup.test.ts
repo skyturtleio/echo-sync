@@ -18,6 +18,7 @@ import {
 } from "./postgres/test-support.ts"
 import * as Startup from "./startup.ts"
 import { recorder } from "../../test/telemetry-recorder.ts"
+import { last } from "../client/sync/testing/Pull.ts"
 
 const options: Startup.StartupOptions = {
   registry,
@@ -53,7 +54,14 @@ const pullOnce = (startupOptions: Startup.StartupOptions = options) =>
       )
     )
     return yield* Effect.exit(
-      client.pull({ clientId: Ids.ClientId.make("d"), cursor: null, continuation: Option.none() })
+      last(
+        client.pull({
+          clientId: Ids.ClientId.make("d"),
+          cursor: null,
+          continuation: Option.none(),
+          clientVersion: { dataHash: startupOptions.registry.dataHash, wireVersion: Protocol.wireVersion }
+        })
+      )
     )
   }).pipe(Effect.scoped)
 

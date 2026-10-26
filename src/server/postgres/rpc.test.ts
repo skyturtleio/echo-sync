@@ -29,6 +29,7 @@ import * as SyncLoop from "../../client/sync/SyncLoop.ts"
 import type { ClientPolicy } from "./pull.ts"
 import { executeBatch, handlers, layerHttp, Notifications, sharedPokes } from "./rpc.ts"
 import { grant, Items, pgAvailable, registry, RowId, TestDatabase } from "./test-support.ts"
+import { last } from "../../client/sync/testing/Pull.ts"
 
 const addItem = Mutation.make("items.add", {
   args: Schema.Struct({ id: Schema.String, body: Schema.String }),
@@ -74,7 +75,7 @@ const connectTo = (
       (input: RequestInfo | URL, init?: RequestInit) => web.handler(new Request(input, init)),
       { preconnect: globalThis.fetch.preconnect }
     )
-    return yield* RpcClient.make(Protocol.SyncRpcs.merge(Protocol.PresenceRpcs)).pipe(
+    const client = yield* RpcClient.make(Protocol.SyncRpcs.merge(Protocol.PresenceRpcs)).pipe(
       Effect.provide(
         RpcClient.layerProtocolHttp({ url: "http://echo.test/sync" }).pipe(
           Layer.provide([
@@ -84,6 +85,16 @@ const connectTo = (
         )
       )
     )
+    return {
+      ...client,
+      pull: (request: Protocol.PullRequest) =>
+        last(
+          client.pull({
+            ...request,
+            clientVersion: request.clientVersion ?? { dataHash: registry.dataHash, wireVersion: Protocol.wireVersion }
+          })
+        )
+    }
   })
 
 const connect = connectWith((sql) => sql)

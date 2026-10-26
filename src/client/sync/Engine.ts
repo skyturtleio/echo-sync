@@ -15,7 +15,7 @@
  * would either expose a torn transaction or replay a pending mutation over a server row that
  * already contains it.
  */
-import { Array as Arr, Clock, Effect, Match, Option, Schema, Semaphore } from "effect"
+import { Array as Arr, Clock, Effect, Match, Option, Schema, Semaphore, Stream } from "effect"
 import { Mutation, Protocol, Store } from "../../core/index.ts"
 import type { AccessScope, Errors, Ids, Registry, SyncTable } from "../../core/index.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
@@ -115,7 +115,7 @@ export interface SyncStorage {
 /** The network port. Every failure is classified once, by the transport (see `SyncFailure`). */
 export interface Transport {
   readonly push: (request: Protocol.PushRequest) => Effect.Effect<Protocol.PushResponse, PushReason>
-  readonly pull: (request: Protocol.PullRequest) => Effect.Effect<Protocol.PullResponse, PullReason>
+  readonly pull: (request: Protocol.PullRequest) => Stream.Stream<Protocol.PullResponse, PullReason>
 }
 
 /** The handler rejected the mutation against the local replica; nothing was saved. */
@@ -560,16 +560,70 @@ export const make = (options: {
               cursor: pullFrom(meta),
               continuation
             }
-            const page = yield* transport.pull(request).pipe(
-              Effect.map(Option.some<Protocol.PullResponse>),
+            let receivedPages = 0
+            let result: { readonly retryPush: boolean } | undefined
+            const completed = yield* transport.pull(request).pipe(
+              Stream.takeUntil((response) => response._tag === "PullDone"),
+              Stream.runForEach((response) =>
+                Effect.gen(function* () {
+                  receivedPages++
+                  yield* Telemetry.annotate({
+                    "echo.pages": staged.count + receivedPages,
+                    "echo.resnapshot": pullFrom(meta) === null
+                  })
+                  if (response._tag === "PullPage") {
+                    // A page becomes resumable only after registry validation and durable commit.
+                    for (const change of response.changes) {
+                      if (change._tag !== "upsert") continue
+                      const table = options.registry.get(change.table)
+                      if (Option.isSome(table)) yield* decodeRow(table.value, change.row)
+                    }
+                    yield* storage.transaction(
+                      Effect.gen(function* () {
+                        const current = yield* storage.meta
+                        if ((current.epoch ?? null) === (meta.epoch ?? null)) yield* storage.stage(response)
+                      })
+                    )
+                    return
+                  }
+                  const installedSet = yield* Telemetry.observe(
+                    storage.transaction(
+                      Effect.gen(function* () {
+                        const set = yield* storage.staged
+                        const current = yield* storage.meta
+                        if ((current.epoch ?? null) !== (meta.epoch ?? null)) return undefined
+                        yield* applyPageSet(context, set, response)
+                        const installed = yield* storage.meta
+                        const retryPush = (yield* storage.pending).some(
+                          (entry) => entry.envelope.seq > installed.pushedThrough
+                        )
+                        return { retryPush, set }
+                      })
+                    ),
+                    "echo.install",
+                    (cause) => SyncFailure.classifyPull(cause).outcome
+                  )
+                  if (installedSet === undefined) return
+                  for (const installed of [...installedSet.set, response]) {
+                    for (const ack of installed.acks) transientAnswers.delete(ack.mutationId)
+                  }
+                  yield* Telemetry.histogram("echo.pull.pages", installedSet.set.length + 1)
+                  yield* Telemetry.annotate({
+                    "echo.pages": installedSet.set.length + 1,
+                    "echo.result": resnapshots > 0 ? "resnapshot" : "ok"
+                  })
+                  result = { retryPush: installedSet.retryPush }
+                })
+              ),
+              Effect.as(true),
               Effect.catchTag("ResnapshotRequired", (error) =>
                 Effect.gen(function* () {
                   if (error.epoch !== undefined) {
                     yield* resetEpoch(error.epoch, meta.epoch)
                     resnapshots++
-                    return Option.none<Protocol.PullResponse>()
+                    return false
                   }
-                  if (request.cursor === null && Option.isNone(continuation)) return yield* error
+                  if (request.cursor === null && Option.isNone(continuation) && receivedPages === 0) return yield* error
                   // Never apply a partial set: drop it and start a snapshot from null. The
                   // replica (and its cursor) keeps serving reads until that snapshot is installed.
                   // Re-read meta: the request was built before the network wait, and push responses
@@ -583,56 +637,16 @@ export const make = (options: {
                   )
                   resnapshots++
                   yield* Telemetry.annotate({ "echo.resnapshot_count": resnapshots })
-                  return Option.none<Protocol.PullResponse>()
+                  return false
                 })
               )
             )
-            if (Option.isNone(page)) continue
-            const response = page.value
-            yield* Telemetry.annotate({ "echo.pages": staged.count + 1, "echo.resnapshot": pullFrom(meta) === null })
-            if (response._tag === "PullPage") {
-              // Keep only valid pages: retry the incompatible page from the last valid continuation,
-              // rather than persisting its stale payload and resuming after it forever.
-              for (const change of response.changes) {
-                if (change._tag !== "upsert") continue
-                const table = options.registry.get(change.table)
-                if (Option.isSome(table)) yield* decodeRow(table.value, change.row)
-              }
-              yield* storage.transaction(
-                Effect.gen(function* () {
-                  const current = yield* storage.meta
-                  if ((current.epoch ?? null) === (meta.epoch ?? null)) yield* storage.stage(response)
-                })
-              )
-              continue
-            }
-            const installedSet = yield* Telemetry.observe(
-              storage.transaction(
-                Effect.gen(function* () {
-                  const set = yield* storage.staged
-                  const current = yield* storage.meta
-                  if ((current.epoch ?? null) !== (meta.epoch ?? null)) return undefined
-                  yield* applyPageSet(context, set, response)
-                  const installed = yield* storage.meta
-                  const retryPush = (yield* storage.pending).some(
-                    (entry) => entry.envelope.seq > installed.pushedThrough
-                  )
-                  return { retryPush, set }
-                })
-              ),
-              "echo.install",
-              (cause) => SyncFailure.classifyPull(cause).outcome
-            )
-            if (installedSet === undefined) continue
-            for (const installed of [...installedSet.set, response]) {
-              for (const ack of installed.acks) transientAnswers.delete(ack.mutationId)
-            }
-            yield* Telemetry.histogram("echo.pull.pages", installedSet.set.length + 1)
-            yield* Telemetry.annotate({
-              "echo.pages": installedSet.set.length + 1,
-              "echo.result": resnapshots > 0 ? "resnapshot" : "ok"
-            })
-            return { retryPush: installedSet.retryPush }
+            if (!completed) continue
+            if (result !== undefined) return result
+            const current = yield* storage.transaction(storage.meta)
+            if ((current.epoch ?? null) !== (meta.epoch ?? null)) continue
+            // A clean RPC end alone cannot certify a complete page set.
+            return yield* new SyncFailure.PullProtocolError({ message: "pull stream ended before PullDone" })
           }
         }),
         "echo.pull",
