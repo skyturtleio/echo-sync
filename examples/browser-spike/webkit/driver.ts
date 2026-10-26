@@ -13,11 +13,14 @@
  * ~/.cache/echo-webkit, where `bun add playwright` and `bunx playwright install --with-deps webkit` put it).
  * Dev harness only.
  */
+import { Array as Arr, Clock, Config, Console, Effect, Schema, String as Str } from "effect"
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- External Playwright daemon creates its native persistent-profile directory before browser startup.
 import { mkdtemp } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Resolve the separately installed Playwright entrypoint and native profile path.
 import { join } from "node:path"
 
-const port = Number(process.env["ECHO_WEBKIT_PORT"] ?? "5299")
+const port = Number(Effect.runSync(Config.String("ECHO_WEBKIT_PORT").pipe(Config.withDefault("5299"))))
 const command = process.argv.slice(2)
 
 /** The slice of Playwright's API this driver uses (Playwright is loaded at runtime, untyped). */
@@ -48,12 +51,18 @@ interface Playwright {
 const isPlaywright = (value: unknown): value is Playwright =>
   typeof value === "object" && value !== null && "webkit" in value
 
+// oxlint-disable-next-line effecttsgo/async-function -- External Playwright's Promise API owns this driver lifecycle, outside the engine.
 const serve = async () => {
-  const dir = process.env["ECHO_PLAYWRIGHT_DIR"] ?? join(homedir(), ".cache", "echo-webkit")
+  const dir = Effect.runSync(
+    Config.String("ECHO_PLAYWRIGHT_DIR").pipe(Config.withDefault(join(homedir(), ".cache", "echo-webkit")))
+  )
   const loaded: unknown = await import(join(dir, "node_modules", "playwright", "index.mjs"))
   if (!isPlaywright(loaded)) throw new Error(`no Playwright in ${dir}`)
   // Extra MiniBrowser arguments (space-separated), e.g. `--features=+StorageAPI`.
-  const browserArgs = (process.env["ECHO_WEBKIT_ARGS"] ?? "").split(" ").filter((a) => a !== "")
+  const browserArgs = Arr.filter(
+    Str.split(Effect.runSync(Config.String("ECHO_WEBKIT_ARGS").pipe(Config.withDefault(""))), " "),
+    (a) => a !== ""
+  )
   // A persistent context, like a normal (non-private) Safari window: WebKit's ephemeral contexts behave as
   // private browsing, where OPFS is unavailable (microsoft/playwright#18235). A fresh profile per daemon.
   const profile = await mkdtemp(join(tmpdir(), "echo-webkit-"))
@@ -62,18 +71,19 @@ const serve = async () => {
   let next = 1
   let active: string | undefined
   // Page console output and uncaught errors go to the daemon's stderr (ECHO_WEBKIT_LOG=1).
-  const log = process.env["ECHO_WEBKIT_LOG"] === "1"
+  const log = Effect.runSync(Config.String("ECHO_WEBKIT_LOG").pipe(Config.withDefault("0"))) === "1"
+  // oxlint-disable-next-line effecttsgo/async-function -- Tab creation and navigation implement Playwright's external Promise contract.
   const open = async (url: string) => {
     const page = await context.newPage()
     const id = `t${next++}`
     if (log) {
-      page.on("console", (m) => console.error(`${id} console.${m.type()} ${m.text()}`))
-      page.on("pageerror", (e) => console.error(`${id} pageerror ${e.message}`))
+      page.on("console", (m) => Effect.runSync(Console.error(`${id} console.${m.type()} ${m.text()}`)))
+      page.on("pageerror", (e) => Effect.runSync(Console.error(`${id} pageerror ${e.message}`)))
       page.on("worker", (worker) => {
         const name = `${id} worker ${new URL(worker.url()).pathname}`
-        console.error(`${name} started`)
-        worker.on("console", (m) => console.error(`${name} console.${m.type()} ${m.text()}`))
-        worker.on("close", () => console.error(`${name} closed`))
+        Effect.runSync(Console.error(`${name} started`))
+        worker.on("console", (m) => Effect.runSync(Console.error(`${name} console.${m.type()} ${m.text()}`)))
+        worker.on("close", () => Effect.runSync(Console.error(`${name} closed`)))
       })
     }
     tabs.set(id, page)
@@ -86,6 +96,7 @@ const serve = async () => {
     if (page === undefined) throw new Error("no active tab")
     return page
   }
+  // oxlint-disable-next-line effecttsgo/async-function -- Command dispatch adapts the external Playwright Promise methods without adding sync semantics.
   const run = async (args: ReadonlyArray<string>, stdin: string): Promise<unknown> => {
     const [verb, a1, a2] = args
     switch (verb) {
@@ -94,7 +105,7 @@ const serve = async () => {
       case "tab":
         if (a1 === "new") return { data: { tabId: await open(a2 ?? "about:blank") } }
         if (a1 === "--json")
-          return { data: { tabs: [...tabs.keys()].map((tabId) => ({ tabId, active: tabId === active })) } }
+          return { data: { tabs: Arr.map([...tabs.keys()], (tabId) => ({ tabId, active: tabId === active })) } }
         if (a1 === "close") {
           const id = a2 ?? active
           const page = id === undefined ? undefined : tabs.get(id)
@@ -114,13 +125,17 @@ const serve = async () => {
         // JSON-encoded in the page, as CDP's returnByValue does: Playwright's own serializer would turn an
         // Error subclass (a Schema.TaggedError notice) into { name, message, stack } and drop its fields.
         const encoded = await current().evaluate(`(async () => JSON.stringify(await (${stdin})) ?? "null")()`)
-        const result: unknown = typeof encoded === "string" ? JSON.parse(encoded) : null
+        const result: unknown =
+          typeof encoded === "string"
+            ? await Effect.runPromise(Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))(encoded))
+            : null
         return { data: { result } }
       }
       case "reload":
         await current().reload()
         return { data: {} }
       case "close":
+        // oxlint-disable-next-line effecttsgo/global-timers -- Let Bun flush the command response before the browser daemon exits.
         setTimeout(() => void context.close().finally(() => process.exit(0)), 10)
         return { data: {} }
       default:
@@ -133,21 +148,23 @@ const serve = async () => {
     port,
     hostname: "127.0.0.1",
     idleTimeout: 0,
+    // oxlint-disable-next-line effecttsgo/async-function -- Bun's HTTP callback serializes commands against external Playwright Promises.
     fetch: async (request) => {
       if (request.method !== "POST") return new Response("webkit driver")
       // oxlint-disable-next-line typescript/no-unsafe-assignment -- loopback-only driver receives its own CLI's JSON
       const { args, stdin }: { args: Array<string>; stdin: string } = await request.json()
       // A command that never settles (a hung page) fails after this long instead of stalling the run.
-      const limit = Number(process.env["ECHO_WEBKIT_COMMAND_TIMEOUT_MS"] ?? "180000")
+      const limit = Number(
+        Effect.runSync(Config.String("ECHO_WEBKIT_COMMAND_TIMEOUT_MS").pipe(Config.withDefault("180000")))
+      )
       const result = queue.then(() => {
-        const started = Date.now()
-        console.error(`> ${args.join(" ")}`)
-        return Promise.race([
-          run(args, stdin),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error(`webkit driver: '${args.join(" ")}' timed out`)), limit)
+        const started = Effect.runSync(Clock.currentTimeMillis)
+        Effect.runSync(Console.error(`> ${Arr.join(args, " ")}`))
+        return Effect.runPromise(Effect.tryPromise(() => run(args, stdin)).pipe(Effect.timeout(limit))).finally(() =>
+          Effect.runSync(
+            Console.error(`< ${Arr.join(args, " ")} ${Effect.runSync(Clock.currentTimeMillis) - started} ms`)
           )
-        ]).finally(() => console.error(`< ${args.join(" ")} ${Date.now() - started} ms`))
+        )
       })
       queue = result.catch(() => undefined)
       return result.then(
@@ -156,11 +173,13 @@ const serve = async () => {
       )
     }
   })
-  console.log(`webkit driver on ${port}`)
+  Effect.runSync(Console.log(`webkit driver on ${port}`))
 }
 
+// oxlint-disable-next-line effecttsgo/async-function -- CLI entrypoint sends commands through Bun's native HTTP/stdio Promise APIs.
 const client = async () => {
   const stdin = command.includes("--stdin") ? await Bun.stdin.text() : ""
+  // oxlint-disable-next-line effecttsgo/global-fetch -- This loopback-only browser driver checks native HTTP status and writes the daemon's response verbatim.
   const response = await fetch(`http://127.0.0.1:${port}/`, {
     method: "POST",
     body: JSON.stringify({ args: command, stdin })

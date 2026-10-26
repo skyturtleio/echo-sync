@@ -1,16 +1,29 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Layer, Redacted, Schema } from "effect"
+import {
+  Array as Arr,
+  Clock,
+  Config,
+  Effect,
+  Layer,
+  Random,
+  Record as Rec,
+  Redacted,
+  Schema,
+  String as Str
+} from "effect"
 import * as PgClient from "@effect/sql-pg/PgClient"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- This generated-module fixture writes real TypeScript beside the test so module resolution matches a consumer's migrations.
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Resolve generated module filenames at the host import boundary.
 import { join } from "node:path"
 import { AccessScope, Migrate, Registry, SyncTable } from "echo-sync"
 import { attach, migrate } from "../postgres/schema.ts"
 import { migrateApp, verify } from "./index.ts"
 import type { Drift } from "./index.ts"
 
-const adminUrl = process.env["ECHO_PG_URL"] ?? ""
+const adminUrl = Effect.runSync(Config.String("ECHO_PG_URL").pipe(Config.withDefault("")))
 
 /** A fresh, empty database (engine schema not yet migrated), dropped afterwards. */
 const EmptyDatabase = Layer.unwrap(
@@ -21,7 +34,9 @@ const EmptyDatabase = Layer.unwrap(
         yield* sql.unsafe(statement)
         // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Administrative fixture runner owns a short-lived pool separate from the database it creates or drops.
       }).pipe(Effect.provide(PgClient.layer({ url: Redacted.make(adminUrl), maxConnections: 1 })))
-    const name = `echo_migrate_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+    const now = yield* Clock.currentTimeMillis
+    const random = yield* Random.next
+    const name = `echo_migrate_${now.toString(36)}_${Str.slice(2, 8)(random.toString(36))}`
     yield* admin(`CREATE DATABASE ${name}`)
     yield* Effect.addFinalizer(() => Effect.orDie(admin(`DROP DATABASE ${name} WITH (FORCE)`)))
     const url = new URL(adminUrl)
@@ -64,16 +79,18 @@ const load = (generated: ReadonlyArray<Migrate.Generated>) =>
   ).pipe(
     Effect.flatMap((dir) =>
       Effect.forEach(generated, (g) =>
-        Effect.promise(async () => {
+        Effect.gen(function* () {
           const file = join(dir, `${g.id}.ts`)
           writeFileSync(file, g.source)
           // oxlint-disable-next-line typescript/no-unsafe-assignment -- generated migration source has this module contract
-          const module: { readonly default: Effect.Effect<void, SqlError, SqlClient> } = await import(file)
+          const module: { readonly default: Effect.Effect<void, SqlError, SqlClient> } = yield* Effect.promise(
+            () => import(file)
+          )
           return [g.id, module.default] as const
         })
       )
     ),
-    Effect.map((entries) => Object.fromEntries(entries))
+    Effect.map((entries) => Rec.fromEntries(entries))
   )
 
 /** Engine migrate, the app migrations, attach every table, as server startup does. */
@@ -90,7 +107,7 @@ const startUp = (
 const driftOf = (registry: Registry.SyncRegistry) =>
   verify(registry).pipe(
     Effect.as<ReadonlyArray<string>>([]),
-    Effect.catchTag("Drift", (d: Drift) => Effect.succeed(d.mismatches.map((m) => `${m.table}: ${m.problem}`)))
+    Effect.catchTag("Drift", (d: Drift) => Effect.succeed(Arr.map(d.mismatches, (m) => `${m.table}: ${m.problem}`)))
   )
 
 const first = Migrate.generate({ previous: Migrate.emptySnapshot, registry: v1, existing: [], name: "init" })
@@ -110,22 +127,22 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
         const sql = yield* SqlClient
         // Recreate the committed pre-index snapshot and DDL, not a second current declaration.
         const legacy = Migrate.decodeSnapshot(
-          JSON.stringify({
+          yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({
             version: 1,
-            tables: Migrate.snapshotOf(v1).tables.map((table) => ({ ...table, scopeWalkIndex: undefined }))
+            tables: Arr.map(Migrate.snapshotOf(v1).tables, (table) => ({ ...table, scopeWalkIndex: undefined }))
           })
         )
         yield* migrate
         for (const table of [DocsV1, Tags]) {
           yield* sql.unsafe(table.postgres.createTable)
           for (const ddl of table.postgres.createIndexes) {
-            if (!ddl.includes("__echo-scope")) yield* sql.unsafe(ddl)
+            if (!Str.includes("__echo-scope")(ddl)) yield* sql.unsafe(ddl)
           }
           yield* attach(table)
         }
         const missing = yield* driftOf(v1)
         assert.strictEqual(missing.length, 2)
-        assert.isTrue(missing.every((m) => m.includes("__echo-scope") && m.includes("is missing")))
+        assert.isTrue(Arr.every(missing, (m) => Str.includes("__echo-scope")(m) && Str.includes("is missing")(m)))
         const upgrade = Migrate.generate({ previous: legacy, registry: v1, existing: ["001_init"], name: "scope_walk" })
         assert.strictEqual(upgrade.steps.length, 2)
         const migrations = yield* load([upgrade])
@@ -133,8 +150,8 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
         assert.deepStrictEqual(yield* driftOf(v1), [])
         const current = Migrate.decodeSnapshot(upgrade.snapshot)
         assert.deepStrictEqual(
-          current.tables.map((t) => [t.dataHash, t.indexHash]),
-          legacy.tables.map((t) => [t.dataHash, t.indexHash])
+          Arr.map(current.tables, (t) => [t.dataHash, t.indexHash]),
+          Arr.map(legacy.tables, (t) => [t.dataHash, t.indexHash])
         )
         assert.deepStrictEqual(Migrate.plan(current, v1), [])
         // Existing engine databases also need the grants index; 001 cannot be edited/replayed.
@@ -291,19 +308,19 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
           const sql = yield* SqlClient
           yield* startUp(v1, yield* load([first]))
           assert.deepStrictEqual(yield* driftOf(v1), [])
-          for (const statement of sabotage.split(";")) {
-            if (!statement.startsWith(FAILS)) {
+          for (const statement of Str.split(sabotage, ";")) {
+            if (!Str.startsWith(FAILS)(statement)) {
               yield* sql.unsafe(statement)
               continue
             }
             // The sabotage itself must fail (leaving its debris behind), or the case tests nothing.
-            const exit = yield* Effect.exit(sql.unsafe(statement.slice(FAILS.length)))
+            const exit = yield* Effect.exit(sql.unsafe(Str.slice(FAILS.length)(statement)))
             assert.isTrue(exit._tag === "Failure", `expected "${statement}" to fail`)
           }
           const mismatches = yield* driftOf(v1)
           assert.isTrue(
-            mismatches.some((m) => m.startsWith(expected)),
-            `expected a mismatch starting "${expected}", got ${JSON.stringify(mismatches)}`
+            Arr.some(mismatches, (m) => Str.startsWith(expected)(m)),
+            `expected a mismatch starting "${expected}", got ${yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(mismatches)}`
           )
         })
       )
@@ -330,7 +347,7 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
         Effect.gen(function* () {
           const sql = yield* SqlClient
           yield* startUp(v1, yield* load([first]))
-          for (const statement of change.split(";")) yield* sql.unsafe(statement)
+          for (const statement of Str.split(change, ";")) yield* sql.unsafe(statement)
           assert.deepStrictEqual(yield* driftOf(v1), [])
         })
       )
@@ -386,13 +403,16 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
         yield* startUp(renameV1, { [renameFirst.id]: migrations[renameFirst.id] ?? Effect.die("missing") })
         assert.deepStrictEqual(yield* driftOf(renameV1), [])
         yield* sql`INSERT INTO notes (id, access_scope_id, title, legacy, rank) VALUES ('n1', 's', 't', 'x', 1)`
-        const hand = renameSecond.steps.flatMap((s) =>
+        const hand = Arr.flatMap(renameSecond.steps, (s) =>
           s._tag === "Todo"
-            ? s.lines.filter((l) => /^ {2}[A-Z]+ [^<]*;$/.test(l)).map((l) => l.trim().slice(0, -1))
+            ? Arr.map(
+                Arr.filter(s.lines, (l) => /^ {2}[A-Z]+ [^<]*;$/.test(l)),
+                (l) => Str.slice(0, -1)(Str.trim(l))
+              )
             : []
         )
         assert.isTrue(hand.length > 0)
-        assert.isFalse(renameSecond.steps.some((s) => s._tag === "Ddl"))
+        assert.isFalse(Arr.some(renameSecond.steps, (s) => s._tag === "Ddl"))
         for (const statement of hand) yield* sql.unsafe(statement)
         yield* startUp(renameV2, migrations)
         assert.deepStrictEqual(yield* driftOf(renameV2), [])

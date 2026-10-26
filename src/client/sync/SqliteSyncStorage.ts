@@ -13,7 +13,7 @@
  * `Mutation.MutationRejection`, and undo images store their table by sync name, resolved through the
  * registry when read (a rebuild empties them, so a name is always registered).
  */
-import { Deferred, Effect, Option, Schema, type Stream } from "effect"
+import { Array as Arr, Deferred, Effect, Option, Schema, String as Str, type Stream } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
 import { type Errors, Ids, Mutation, Protocol, type Registry, Store, SyncTable } from "echo-sync"
@@ -68,7 +68,7 @@ const initialMeta: Engine.SyncMeta = { cursor: null, pushedThrough: 0, resnapsho
 const StoredTables = Schema.fromJsonString(Schema.Array(Schema.String))
 const decodeTables = decode(StoredTables, "echo_meta")
 const encodeTables = encode(StoredTables)
-const q = (name: string) => `"${name.replaceAll('"', '""')}"`
+const q = (name: string) => `"${Str.replaceAll('"', '""')(name)}"`
 
 /**
  * Brings the leader's database in line with `registry` (SPEC §9.6, §13.4) in ONE SQLite transaction:
@@ -96,22 +96,28 @@ export const migrate = (
         // Engine tables first (versioned forward steps), in this same transaction.
         yield* Outbox.migrate
         const meta = new Map(
-          (yield* sql<{ readonly key: string; readonly value: string }>`
-            SELECT key, value FROM echo_meta WHERE key IN ('replica_tables', 'replica_data_hash', 'replica_index_hash', 'replica_table_ddl')`).map(
-            (r) => [r.key, r.value]
+          Arr.map(
+            yield* sql<{ readonly key: string; readonly value: string }>`
+            SELECT key, value FROM echo_meta WHERE key IN ('replica_tables', 'replica_data_hash', 'replica_index_hash', 'replica_table_ddl')`,
+            (r) => [r.key, r.value] as const
           )
         )
         const put = (key: string, value: string) =>
           sql`INSERT INTO echo_meta (key, value) VALUES (${key}, ${value})
             ON CONFLICT (key) DO UPDATE SET value = excluded.value`
         const createIndexes = Effect.forEach(
-          registry.tables.flatMap((t) => t.sqlite.createIndexes),
+          Arr.flatMap(registry.tables, (t) => t.sqlite.createIndexes),
           (ddl) => sql.unsafe(ddl)
         )
         const previous = meta.get("replica_tables")
         // Table DDL also carries constraints the manifest hashes as index shape (`unique`); SQLite
         // cannot alter a table's constraints, so any change to the CREATE TABLE text rebuilds too.
-        const tableDdl = SyncTable.hash(registry.tables.map((t) => t.sqlite.createTable).join(";\n"))
+        const tableDdl = SyncTable.hash(
+          Arr.join(
+            Arr.map(registry.tables, (t) => t.sqlite.createTable),
+            ";\n"
+          )
+        )
         const rebuilt =
           previous !== undefined &&
           (meta.get("replica_data_hash") !== registry.dataHash || meta.get("replica_table_ddl") !== tableDdl)
@@ -129,15 +135,18 @@ export const migrate = (
           yield* sql`DELETE FROM echo_staged`
           yield* sql`UPDATE echo_outbox SET undo = '[]' WHERE released_at IS NULL`
         } else if (meta.get("replica_index_hash") !== registry.indexHash) {
-          const names = registry.tables.map((t) => t.name)
+          const names = Arr.map(registry.tables, (t) => t.name)
           const indexes = yield* sql.unsafe<{ readonly name: string }>(
-            `SELECT name FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL AND tbl_name IN (${names.map(() => "?").join(", ")})`,
+            `SELECT name FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL AND tbl_name IN (${Arr.join(
+              Arr.map(names, () => "?"),
+              ", "
+            )})`,
             names
           )
           for (const { name } of indexes) yield* sql.unsafe(`DROP INDEX ${q(name)}`)
           yield* createIndexes
         }
-        yield* put("replica_tables", yield* encodeTables(registry.tables.map((t) => t.name)))
+        yield* put("replica_tables", yield* encodeTables(Arr.map(registry.tables, (t) => t.name)))
         yield* put("replica_data_hash", registry.dataHash)
         yield* put("replica_table_ddl", tableDdl)
         yield* put("replica_index_hash", registry.indexHash)
@@ -147,7 +156,7 @@ export const migrate = (
   })
 
 const encodeUndoImages = (undo: ReadonlyArray<Store.UndoImage>) =>
-  encodeUndo(undo.map((image) => ({ table: image.table.name, id: image.id, before: image.before })))
+  encodeUndo(Arr.map(undo, (image) => ({ table: image.table.name, id: image.id, before: image.before })))
 
 const toEnvelope = (entry: Outbox.OutboxEntry): Effect.Effect<Mutation.MutationEnvelope> =>
   Store.decodeStored(
@@ -255,7 +264,7 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
       const result: Array<Engine.PendingMutation> = []
       const undo = yield* run(sql<{ readonly seq: number; readonly undo: string }>`
       SELECT seq, undo FROM echo_outbox WHERE released_at IS NULL ORDER BY seq`)
-      const undoBySeq = new Map(undo.map((r) => [r.seq, r.undo]))
+      const undoBySeq = new Map(Arr.map(undo, (r) => [r.seq, r.undo] as const))
       for (const entry of yield* run(Outbox.pending)) {
         result.push({
           envelope: yield* toEnvelope(entry),

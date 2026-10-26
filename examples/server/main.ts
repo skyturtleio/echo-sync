@@ -13,7 +13,21 @@
  * scenarios grant, revoke and inspect the ledger.
  */
 import * as PgClient from "@effect/sql-pg/PgClient"
-import { Cause, Effect, Exit, Layer, ManagedRuntime, Redacted, Schedule, Scope } from "effect"
+import * as BunCrypto from "@effect/platform-bun/BunCrypto"
+import {
+  Cause,
+  Config,
+  Console,
+  Crypto,
+  Effect,
+  Exit,
+  Layer,
+  ManagedRuntime,
+  Redacted,
+  Schedule,
+  Scope,
+  String as Str
+} from "effect"
 import * as HttpRouter from "effect/http/HttpRouter"
 import { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, Protocol, ScopeGrants } from "../../src/core/index.ts"
@@ -23,9 +37,13 @@ import addTodoNote from "./migrations/002_add_todo_note.ts"
 import scopeWalkIndex from "./migrations/003_scope_walk_index.ts"
 import { principalHeader, registry, serverHooks, serverMutations, Todos } from "../browser-spike/app.ts"
 
-const port = Number(process.env["ECHO_SLICE_PORT"] ?? "5200")
-const adminUrl = new URL(process.env["ECHO_PG_URL"] ?? "postgres://postgres:echo@localhost:5432/postgres")
-const dbName = process.env["ECHO_SLICE_DB"] ?? "echo_slice"
+const port = Number(Effect.runSync(Config.String("ECHO_SLICE_PORT").pipe(Config.withDefault("5200"))))
+const adminUrl = new URL(
+  Effect.runSync(
+    Config.String("ECHO_PG_URL").pipe(Config.withDefault("postgres://postgres:echo@localhost:5432/postgres"))
+  )
+)
+const dbName = Effect.runSync(Config.String("ECHO_SLICE_DB").pipe(Config.withDefault("echo_slice")))
 const dbUrl = new URL(adminUrl)
 dbUrl.pathname = `/${dbName}`
 
@@ -36,7 +54,7 @@ const ensureDatabase = Effect.gen(function* () {
   // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Startup administrative runner owns a short-lived pool before the application database runtime exists.
 }).pipe(Effect.provide(PgClient.layer({ url: Redacted.make(adminUrl.toString()), maxConnections: 1 })))
 
-const Db = PgClient.layer({ url: Redacted.make(dbUrl.toString()), maxConnections: 40 })
+const Db = Layer.merge(PgClient.layer({ url: Redacted.make(dbUrl.toString()), maxConnections: 40 }), BunCrypto.layer)
 
 /**
  * The app's migrations (SPEC §13), run by `Startup` in `echo_sync.app_migrations` after the engine's.
@@ -80,8 +98,8 @@ const admin = ManagedRuntime.make(Db)
 /** Per client id, how many requests of each RPC tag reached this process (read from the NDJSON body). */
 const rpcCounts = new Map<string, Record<string, number>>()
 const countRpcs = (body: string) => {
-  for (const line of body.split("\n")) {
-    if (line.trim() === "") continue
+  for (const line of Str.split(body, "\n")) {
+    if (Str.trim(line) === "") continue
     const message: unknown = JSON.parse(line)
     if (typeof message !== "object" || message === null) continue
     const tag = "tag" in message && typeof message.tag === "string" ? message.tag : undefined
@@ -116,8 +134,9 @@ const adminRoute = (url: URL) =>
           return new Response("count must be 1..100000", { status: 400 })
         }
         // Server-minted identities: no previous run's rows or grants can enter this snapshot.
-        const scope = AccessScope.AccessScopeId.make(`bootstrap-${crypto.randomUUID()}`)
-        const principal = AccessScope.PrincipalId.make(`bootstrap-${crypto.randomUUID()}`)
+        const crypto = yield* Crypto.Crypto
+        const scope = AccessScope.AccessScopeId.make(`bootstrap-${yield* crypto.randomUUIDv4()}`)
+        const principal = AccessScope.PrincipalId.make(`bootstrap-${yield* crypto.randomUUIDv4()}`)
         yield* sql.withTransaction(
           Effect.gen(function* () {
             yield* sql`INSERT INTO echo_sync.access_scopes (id) VALUES (${scope})`
@@ -181,7 +200,7 @@ const started = await Effect.runPromiseExit(
   Layer.buildWithMemoMap(Layer.provideMerge(sync, HttpRouter.layer), memoMap, startupScope)
 )
 if (Exit.isFailure(started)) {
-  console.error(Cause.pretty(started.cause))
+  Effect.runSync(Console.error(Cause.pretty(started.cause)))
   process.exit(1)
 }
 const web = HttpRouter.toWebHandler(sync, { disableLogger: true, memoMap })
@@ -191,14 +210,20 @@ const server = Bun.serve({
   hostname: "127.0.0.1",
   // The pokes stream is a long-lived response that may stay quiet for minutes.
   idleTimeout: 0,
-  fetch: async (request) => {
-    const url = new URL(request.url)
-    if (url.pathname.startsWith("/admin/")) {
-      return admin.runPromise(adminRoute(url)).catch((error: unknown) => new Response(String(error), { status: 500 }))
-    }
-    if (url.pathname === "/sync" || url.pathname === "/sync/") countRpcs(await request.clone().text())
-    return web.handler(request)
-  }
+  fetch: (request) =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        const url = new URL(request.url)
+        if (Str.startsWith("/admin/")(url.pathname)) {
+          return yield* Effect.promise(() =>
+            admin.runPromise(adminRoute(url)).catch((error: unknown) => new Response(String(error), { status: 500 }))
+          )
+        }
+        if (url.pathname === "/sync" || url.pathname === "/sync/")
+          countRpcs(yield* Effect.promise(() => request.clone().text()))
+        return yield* Effect.promise(() => web.handler(request))
+      })
+    )
 })
 // Ledger expiry (SPEC §11): the app's server schedules it. Hourly, default 7-day retention;
 // a failed run is logged and the next one retries.
@@ -208,7 +233,7 @@ admin.runFork(
     Schedule.spaced("1 hour")
   )
 )
-console.log(`echo-sync slice server on http://127.0.0.1:${server.port}/sync (database ${dbName})`)
+Effect.runSync(Console.log(`echo-sync slice server on http://127.0.0.1:${server.port}/sync (database ${dbName})`))
 
 const shutdown = () => {
   void server.stop(true)

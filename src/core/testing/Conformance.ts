@@ -28,9 +28,11 @@ import {
   Exit,
   Fiber,
   Option,
+  Record as Rec,
   Schema,
   SchemaGetter,
-  Scheduler
+  Scheduler,
+  String as Str
 } from "effect"
 import type { Scope } from "effect"
 import type * as Engine from "../../client/sync/Engine.ts"
@@ -155,6 +157,7 @@ const grant = (
   role: AccessScope.Role,
   id = ScopeGrants.grantId(scope, principal)
 ) => {
+  // oxlint-disable-next-line effecttsgo/schema-sync -- Pure fixture constructor used by synchronous model/oracle calculations.
   const row = Schema.encodeSync(ScopeGrants.ScopeGrants.wire)({
     id,
     accessScopeId: scope,
@@ -171,6 +174,7 @@ const GRANTS = [
   grant(open, AccessScope.Everyone, "writer"),
   grant(theirs, AccessScope.PrincipalId.make("u2"), "owner")
 ]
+// oxlint-disable-next-line effecttsgo/schema-sync -- Fixture generation is deliberately synchronous and service-free.
 const encodeItem = Schema.encodeSync(Items.wire)
 const item = (id: string, fields: Partial<Omit<Item, "id">> = {}) =>
   encodeItem({
@@ -185,6 +189,7 @@ const item = (id: string, fields: Partial<Omit<Item, "id">> = {}) =>
     ...fields
   })
 const tag = (id: string, scope: AccessScope.AccessScopeId, name: string) =>
+  // oxlint-disable-next-line effecttsgo/schema-sync -- Pure fixture constructor, also used outside Effect execution.
   Schema.encodeSync(Tags.wire)({ id: TagId.make(id), accessScopeId: scope, name })
 
 // ---------------------------------------------------------------------------------------------
@@ -218,8 +223,15 @@ const canonical = (value: unknown): string =>
   JSON.stringify(value, (_, v: unknown) => {
     if (typeof v === "bigint") return `${v}n`
     if (isTable(v)) return { table: v.name }
-    if (typeof v !== "object" || v === null || Array.isArray(v)) return v
-    return Object.fromEntries(Object.entries(v).toSorted(([a], [b]) => Store.compareText(a, b)))
+    if (typeof v !== "object" || v === null || Arr.isArray(v)) return v
+    // oxlint-disable-next-line effecttsgo/prefer-effect-record -- Inspect arbitrary objects (including Error instances), not only string-keyed records.
+    const entries: Array<[string, unknown]> = Object.entries(v)
+    return Rec.fromEntries(
+      Arr.sort(entries, ([a]: [string, unknown], [b]: [string, unknown]) => {
+        const result = Store.compareText(a, b)
+        return result < 0 ? -1 : result > 0 ? 1 : 0
+      })
+    )
   })
 /** A table object (inside undo images) is identified by its sync name. */
 const isTable = (v: unknown): v is { readonly name: string } =>
@@ -294,7 +306,7 @@ const interruptSweep = <S, R, E, E2>(options: TransactionCase<S, R, E, E2>) =>
             options.within(subject, options.body(subject)).pipe(Effect.provideService(Scheduler.Scheduler, scheduler))
           )
           const exit = yield* Fiber.await(fiber)
-          if (exit._tag === "Failure" && !exit.cause.reasons.every((r) => r._tag === "Interrupt")) {
+          if (exit._tag === "Failure" && !Arr.every(exit.cause.reasons, (r) => r._tag === "Interrupt")) {
             return yield* fail(`boundary ${k}: the transaction failed instead of committing or being interrupted`)
           }
           return { completed: !state.fired, observed: yield* options.observe(subject) }
@@ -332,7 +344,7 @@ const atomicity = <S, R, E, E2>(options: TransactionCase<S, R, E, E2>) =>
           const intended =
             exit._tag === "Failure" &&
             exit.cause.reasons.length === 1 &&
-            exit.cause.reasons.every((r) =>
+            Arr.every(exit.cause.reasons, (r) =>
               ending === "fail" ? r._tag === "Fail" && r.error === "abort" : r._tag === "Die" && r.defect === "crash"
             )
           if (!intended) return yield* fail(`a body ending in ${ending} did not end that way: ${String(exit)}`)
@@ -370,11 +382,15 @@ const randomItem = (rng: ReturnType<typeof prng>, id: string) =>
     rank: rng.chance(0.2) ? null : rng.chance(0.5) ? rng.int(7) - 3 : rng.pick(WIDE_INTS),
     score: rng.pick([-1.5, -1, 0, 0.25, 1, 2.5, 1e300]),
     flag: rng.chance(0.5),
+    // oxlint-disable-next-line effecttsgo/global-date -- Native Date is the declared field type whose dialect round-trip this checks.
     at: rng.chance(0.2) ? null : new Date(rng.pick([-86_400_000, -1, 0, 1, 1_700_000_000_000])),
     data: rng.chance(0.5) ? null : { tags: [rng.pick(TEXT)], n: rng.int(3) }
   })
 
-const byId = (a: SyncTable.EncodedRow, b: SyncTable.EncodedRow) => Store.compareText(String(a["id"]), String(b["id"]))
+const byId = (a: SyncTable.EncodedRow, b: SyncTable.EncodedRow) => {
+  const result = Store.compareText(String(a["id"]), String(b["id"]))
+  return result < 0 ? -1 : result > 0 ? 1 : 0
+}
 
 const EMPTY_ROWS = canonical({ items: [], tags: [] })
 
@@ -430,8 +446,8 @@ const randomPlan = (rng: ReturnType<typeof prng>, rows: ReadonlyArray<SyncTable.
   }
   return {
     index,
-    ...(rng.chance(0.6) ? { after: index.key.map((c) => valueOf(c, true)) } : {}),
-    ...(rng.chance(0.4) ? { before: index.key.map((c) => valueOf(c, true)) } : {}),
+    ...(rng.chance(0.6) ? { after: Arr.map(index.key, (c) => valueOf(c, true)) } : {}),
+    ...(rng.chance(0.4) ? { before: Arr.map(index.key, (c) => valueOf(c, true)) } : {}),
     eq,
     lower: bound(),
     upper: bound(),
@@ -471,9 +487,9 @@ export const search = <R, E>(make: Effect.Effect<RowStoreSubject, E, R>) =>
           claimScope: Store.claimFromGrants(rows)
         })
         const assertIds = (actual: ReadonlyArray<Item>, expected: ReadonlyArray<string>) =>
-          canonical(actual.map((r) => r.id)) === canonical(expected)
+          canonical(Arr.map(actual, (r) => r.id)) === canonical(expected)
             ? Effect.void
-            : fail(`got ${canonical(actual.map((r) => r.id))}, expected ${canonical(expected)}`)
+            : fail(`got ${canonical(Arr.map(actual, (r) => r.id))}, expected ${canonical(expected)}`)
         const query = store.query(Items).withIndex("by_score").contains("label", "%_\\'")
         yield* assertIds(yield* query.take(1), ["c"])
         yield* assertIds(yield* query.order("desc").take(1), ["d"])
@@ -504,11 +520,11 @@ export const search = <R, E>(make: Effect.Effect<RowStoreSubject, E, R>) =>
         )
         for (const invalid of ["\0", "\ud800"]) {
           const result = yield* Effect.flip(query.contains("label", invalid).collect)
-          if (!(result instanceof Errors.InvalidRow)) return yield* fail("invalid Unicode was accepted")
+          if (!Schema.is(Errors.InvalidRow)(result)) return yield* fail("invalid Unicode was accepted")
           const prefixResult = yield* Effect.flip(
             store.query(Items).withIndex("by_label_rank", (q) => q.prefix("label", invalid)).collect
           )
-          if (!(prefixResult instanceof Errors.InvalidRow)) return yield* fail("invalid prefix was accepted")
+          if (!Schema.is(Errors.InvalidRow)(prefixResult)) return yield* fail("invalid prefix was accepted")
         }
         const Refined = SyncTable.make(
           Items.name,
@@ -540,7 +556,7 @@ export const search = <R, E>(make: Effect.Effect<RowStoreSubject, E, R>) =>
             label: Schema.String.pipe(
               Schema.decodeTo(Schema.String, {
                 decode: SchemaGetter.transform((s: string) => `decoded:${s}`),
-                encode: SchemaGetter.transform((s: string) => s.slice("decoded:".length))
+                encode: SchemaGetter.transform((s: string) => Str.slice("decoded:".length)(s))
               })
             )
           },
@@ -593,6 +609,7 @@ export const rowStore = <R, E>(
                     score: 10,
                     label: "tie",
                     rank: 3,
+                    // oxlint-disable-next-line effecttsgo/global-date-in-effect -- This fixture must exercise native Date cursor codecs, not DateTime.
                     at: new Date(1234)
                   })
                 )
@@ -609,9 +626,9 @@ export const rowStore = <R, E>(
           claimScope: Store.claimFromGrants(rows)
         })
         const assertIds = (actual: ReadonlyArray<Item>, expected: ReadonlyArray<string>) =>
-          canonical(actual.map((r) => r.id)) === canonical(expected)
+          canonical(Arr.map(actual, (r) => r.id)) === canonical(expected)
             ? Effect.void
-            : fail(`got ${canonical(actual.map((r) => r.id))}, expected ${canonical(expected)}`)
+            : fail(`got ${canonical(Arr.map(actual, (r) => r.id))}, expected ${canonical(expected)}`)
         const query = store.query(Items).withIndex("by_score", (q) => q.eq("score", 10))
         for (const order of ["asc", "desc"] as const) {
           const expected =
@@ -668,6 +685,7 @@ export const rowStore = <R, E>(
         yield* assertIds(yield* transaction(query.order("desc").after(cursor).take(3)), ["e1", "e", "d"])
         yield* assertIds(yield* transaction(query.after(cursor).take(3)), ["f1", "g", "h"])
         const dated = store.query(Items).withIndex("by_flag_at", (q) => q.eq("flag", false))
+        // oxlint-disable-next-line effecttsgo/global-date-in-effect -- Native Date is the decoded cursor type under test.
         const dateCursor = { flag: false, at: new Date(1234), id: ItemId.make("d") }
         yield* assertIds(yield* transaction(dated.after(dateCursor).order("desc").take(4)), ["c", "b", "a", "null"])
         yield* assertIds(yield* transaction(dated.before({ flag: false, at: null, id: ItemId.make("null") }).collect), [
@@ -701,7 +719,7 @@ export const rowStore = <R, E>(
           return yield* fail("empty page lost dependencies")
         for (const id of ["\0", "\ud800"]) {
           const error = yield* Effect.flip(transaction(query.after({ score: 10, id: ItemId.make(id) }).collect))
-          if (!(error instanceof Errors.InvalidRow)) return yield* fail("nonportable cursor accepted")
+          if (!Schema.is(Errors.InvalidRow)(error)) return yield* fail("nonportable cursor accepted")
         }
         for (const invalid of [
           // @ts-expect-error untyped caller omits the implicit id
@@ -712,7 +730,7 @@ export const rowStore = <R, E>(
           query.after(undefined)
         ]) {
           const error = yield* Effect.flip(transaction(invalid.collect))
-          if (!(error instanceof Errors.InvalidRow)) return yield* fail("invalid cursor accepted")
+          if (!Schema.is(Errors.InvalidRow)(error)) return yield* fail("invalid cursor accepted")
         }
         yield* transaction(
           Effect.gen(function* () {
@@ -748,7 +766,13 @@ export const rowStore = <R, E>(
             for (let p = 0; p < 40; p++) {
               const plan = randomPlan(rng, data)
               const expected = canonical(
-                data.filter((row) => Store.planMatches(plan, row)).toSorted(Store.planOrder(plan))
+                Arr.sort(
+                  Arr.filter(data, (row) => Store.planMatches(plan, row)),
+                  (a: SyncTable.EncodedRow, b: SyncTable.EncodedRow) => {
+                    const result = Store.planOrder(plan)(a, b)
+                    return result < 0 ? -1 : result > 0 ? 1 : 0
+                  }
+                )
               )
               const actual = canonical(yield* transaction(rows.range(Items, plan)))
               if (actual !== expected) {
@@ -756,7 +780,7 @@ export const rowStore = <R, E>(
               }
             }
             const scanned = canonical(yield* transaction(rows.scan(Items)))
-            if (scanned !== canonical(data.toSorted(byId))) {
+            if (scanned !== canonical(Arr.sort(data, byId))) {
               return yield* fail(`seed ${seed}: scan is not ordered by id code point: ${scanned}`)
             }
             return 40
@@ -780,8 +804,8 @@ export const rowStore = <R, E>(
             const scopes = Array.from({ length: 40 }, (_, i) =>
               i < 5 || i >= 35 ? rng.pick(UNREADABLE) : rng.chance(0.3) ? rng.pick(READABLE) : rng.pick(UNREADABLE)
             )
-            const data = scopes.map((scope, i) => ({
-              ...randomItem(rng, `r${String(i).padStart(2, "0")}`),
+            const data = Arr.map(scopes, (scope, i) => ({
+              ...randomItem(rng, `r${Str.padStart(2, "0")(String(i))}`),
               access_scope_id: scope,
               score: i
             }))
@@ -791,10 +815,13 @@ export const rowStore = <R, E>(
                 Effect.forEach(data, (row) => rows.write(Items, String(row["id"]), Option.some(row)))
               ])
             )
-            const readableIds = data.filter((_, i) => READABLE.includes(scopes[i] ?? s2)).map((r) => r["id"])
+            const readableIds = Arr.map(
+              Arr.filter(data, (_, i) => Arr.contains(READABLE, scopes[i] ?? s2)),
+              (r) => r["id"]
+            )
             let n = 0
             for (const order of ["asc", "desc"] as const) {
-              const inOrder = order === "asc" ? readableIds : readableIds.toReversed()
+              const inOrder = order === "asc" ? readableIds : Arr.reverse(readableIds)
               for (const limit of [0, 1, 2, 3, 7, inOrder.length, inOrder.length + 5]) {
                 const plan: Store.IndexRangePlan = {
                   index: Items.indexes.by_score,
@@ -805,7 +832,7 @@ export const rowStore = <R, E>(
                   readableBy: Option.some(READERS),
                   limit: Option.some(limit)
                 }
-                const got = (yield* transaction(rows.range(Items, plan))).map((r) => r["id"])
+                const got = Arr.map(yield* transaction(rows.range(Items, plan)), (r) => r["id"])
                 const want = inOrder.slice(0, limit)
                 if (canonical(got) !== canonical(want)) {
                   return yield* fail(
@@ -827,7 +854,7 @@ export const rowStore = <R, E>(
                 Store.planResult(
                   plan,
                   data,
-                  GRANTS.map(([, row]) => row)
+                  Arr.map(GRANTS, ([, row]) => row)
                 )
               )
               const got = canonical(yield* transaction(rows.range(Items, plan)))
@@ -849,7 +876,7 @@ export const rowStore = <R, E>(
         const fail = violation("take(n) limits")
         // 120 readable rows: more than any default page or limit a store might impose.
         const data = Array.from({ length: 120 }, (_, i) =>
-          item(`t${String(i).padStart(3, "0")}`, { accessScopeId: mine, score: i })
+          item(`t${Str.padStart(3, "0")(String(i))}`, { accessScopeId: mine, score: i })
         )
         yield* transaction(
           Effect.all([
@@ -865,7 +892,7 @@ export const rowStore = <R, E>(
         })
         const query = store.query(Items).withIndex("by_score")
         const all = yield* transaction(query.collect)
-        if (canonical(all.map((r) => r.id)) !== canonical(data.map((r) => r["id"]))) {
+        if (canonical(Arr.map(all, (r) => r.id)) !== canonical(Arr.map(data, (r) => r["id"]))) {
           return yield* fail(`collect returned ${all.length} rows, want all 120 in score order`)
         }
         const none = yield* transaction(query.take(0))
@@ -896,8 +923,8 @@ export const rowStore = <R, E>(
           ] as const) {
             const defects = Exit.isSuccess(exit)
               ? []
-              : exit.cause.reasons.flatMap((r) => (Cause.isDieReason(r) ? [r.defect] : []))
-            const ok = defects.some((d) => d instanceof RangeError && d.message === want)
+              : Arr.flatMap(exit.cause.reasons, (r) => (Cause.isDieReason(r) ? [r.defect] : []))
+            const ok = Arr.some(defects, (d) => d instanceof RangeError && d.message === want)
             if (!ok) {
               return yield* fail(
                 `${label} with limit ${n}: want a defect "${want}", got ${Exit.isSuccess(exit) ? `success (${exit.value} rows)` : String(exit.cause)}`
@@ -920,6 +947,7 @@ export const rowStore = <R, E>(
           rank: -3,
           score: 1e300,
           flag: true,
+          // oxlint-disable-next-line effecttsgo/global-date-in-effect -- Native Date leaf serialization is part of the table contract.
           at: new Date(-1),
           data: { tags: ["", "\u00E9"], n: 0.5 }
         })
@@ -1015,7 +1043,12 @@ export const rowStore = <R, E>(
         )
         const grants = Effect.map(transaction(rows.scan(ScopeGrants.ScopeGrants)), canonical)
         // The fixture's grants in scan order (id, code point), derived from GRANTS, not from a read.
-        const seeded = canonical(GRANTS.map(([, row]) => row).toSorted(byId))
+        const seeded = canonical(
+          Arr.sort(
+            Arr.map(GRANTS, ([, row]) => row),
+            byId
+          )
+        )
         const initial = yield* grants
         if (initial !== seeded) return yield* fail(`seeded scope_grants:\n got ${initial}\nwant ${seeded}`)
         const fresh = AccessScope.AccessScopeId.make("created")
@@ -1044,7 +1077,7 @@ export const rowStore = <R, E>(
         const created = instance(u1)
         yield* transaction(created.store.createScope(fresh))
         const [newId, newRow] = grant(fresh, u1, "owner")
-        const want = canonical([...GRANTS.map(([, row]) => row), newRow].toSorted(byId))
+        const want = canonical(Arr.sort([...Arr.map(GRANTS, ([, row]) => row), newRow], byId))
         const got = yield* grants
         if (got !== want) return yield* fail(`after creating ${fresh}:\n got ${got}\nwant ${want}`)
         const images = canonical(yield* created.touched)
@@ -1378,7 +1411,7 @@ export const syncStorage = <R, E, E2>(
         )
         // First-touch pre-images in first-write order, one per row (Store.make's contract).
         const expected: ReadonlyArray<Store.UndoImage> = [
-          ...seedItems.map((row) => ({ table: Items, id: String(row["id"]), before: Option.some(row) })),
+          ...Arr.map(seedItems, (row) => ({ table: Items, id: String(row["id"]), before: Option.some(row) })),
           { table: Tags, id: "n", before: Option.none() },
           { table: Tags, id: "t", before: Option.some(oldTag) }
         ]

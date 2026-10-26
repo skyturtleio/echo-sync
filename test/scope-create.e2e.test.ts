@@ -3,7 +3,7 @@ import "../src/client/testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { assert, describe, it } from "@effect/vitest"
 import type * as PgClient from "@effect/sql-pg/PgClient"
-import { Clock, Context, Effect, Layer, Schema } from "effect"
+import { Array as Arr, Clock, Context, Effect, Layer, Schema } from "effect"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
 import { SqlClient } from "effect/sql/SqlClient"
@@ -72,19 +72,19 @@ const setup = Effect.gen(function* () {
     })
   ).pipe(
     Effect.map(({ grants, items }) => ({
-      grants: grants.map((g) => `${g.access_scope_id}:${g.principal_id}:${g.role}`),
-      items: items.map((i) => i.id)
+      grants: Arr.map(grants, (g) => `${g.access_scope_id}:${g.principal_id}:${g.role}`),
+      items: Arr.map(items, (i) => i.id)
     }))
   )
   const notices = Effect.map(SqliteSyncStorage.notices(sqlite), (all) =>
-    all.map(({ notice }): ReadonlyArray<string | null> => [
+    Arr.map(all, ({ notice }): ReadonlyArray<string | null> => [
       notice.envelope.mutationId,
       notice._tag === "Rejected" ? notice.error._tag : notice._tag,
       notice._tag === "Rejected" && notice.error._tag === "ScopeForbidden" ? notice.error.required : null
     ])
   )
   const pending = Effect.map(storage.transaction(storage.pending), (entries) =>
-    entries.map((e) => ({ mutationId: e.envelope.mutationId, undo: e.undo.length }))
+    Arr.map(entries, (e) => ({ mutationId: e.envelope.mutationId, undo: e.undo.length }))
   )
   return { pg: Context.get(db, SqlClient), sqlite, engine, replica, notices, pending, fetch }
 })

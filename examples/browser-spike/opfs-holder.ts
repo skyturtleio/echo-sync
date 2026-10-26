@@ -7,10 +7,12 @@ let releaseLeader: (() => void) | undefined
 let poolWorker: Worker | undefined
 
 const holdLeader = () =>
+  // oxlint-disable-next-line effecttsgo/new-promise -- Driver needs notification once the browser grants the raw leader lock, independently of engine execution.
   new Promise<void>((resolve) => {
     void navigator.locks.request(
       leaderLock,
       () =>
+        // oxlint-disable-next-line effecttsgo/new-promise -- The lock callback's Promise intentionally lives until the driver calls releaseLeader.
         new Promise<void>((release) => {
           releaseLeader = release
           resolve()
@@ -19,6 +21,7 @@ const holdLeader = () =>
   })
 
 const holdPool = () =>
+  // oxlint-disable-next-line effecttsgo/new-promise -- Browser driver waits for the separate holder worker's actual OPFS acquisition report.
   new Promise<{ readonly count: number }>((resolve, reject) => {
     poolWorker = new Worker(new URL("./opfs-holder.worker.ts", import.meta.url), { type: "module" })
     poolWorker.addEventListener(

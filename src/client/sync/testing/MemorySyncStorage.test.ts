@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Exit, Option } from "effect"
+import { Array as Arr, Effect, Exit, Option, String as Str } from "effect"
 import { Ids } from "../../../core/index.ts"
 import type { Store } from "../../../core/index.ts"
 import * as Conformance from "../../../core/testing/Conformance.ts"
@@ -48,7 +48,7 @@ it.effect("conformance retains typed reopen and pruning failures rather than dis
           pruneReleased: operation === "pruneReleased" ? Effect.fail(failure) : subject.pruneReleased
         }))
       )
-      const check = checks.find((c) => c.name.startsWith("seq is never reused:"))
+      const check = Option.getOrUndefined(Arr.findFirst(checks, (c) => Str.startsWith("seq is never reused:")(c.name)))
       if (check === undefined) return assert.fail("missing seq durability check")
       assert.deepStrictEqual(yield* Effect.exit(check.run), Exit.fail(failure))
     }
@@ -148,8 +148,10 @@ describe("the suite's expectations come from fixtures, not from the subject (SPE
   })
   mustCatch(
     "a storage that drops meta and staging writes",
-    Conformance.syncStorage(dropsMetaAndStaging).filter((check) =>
-      ["nextSeq allocates", "clearAll", "a storage transaction"].some((prefix) => check.name.startsWith(prefix))
+    Arr.filter(Conformance.syncStorage(dropsMetaAndStaging), (check) =>
+      Arr.some(["nextSeq allocates", "clearAll", "a storage transaction"], (prefix) =>
+        Str.startsWith(prefix)(check.name)
+      )
     )
   )
 })

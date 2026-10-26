@@ -1,4 +1,4 @@
-import { Effect, Option, Schema } from "effect"
+import { Array as Arr, Effect, Option, Schema } from "effect"
 import * as PgMigrator from "@effect/sql-pg/PgMigrator"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { Registry, SyncTable } from "echo-sync"
@@ -89,7 +89,9 @@ export const attach = (table: SyncTable.AnySyncTable, options?: { readonly schem
         const resolved = target[0]
         if (resolved === undefined) return yield* Effect.die(`attach: ${table.name} did not resolve`)
         const relation = sql`${sql(resolved.schema)}.${sql(resolved.name)}`
-        const clash = (yield* syncedTables).find((t) => t.name === resolved.name && t.schema !== resolved.schema)
+        const clash = Option.getOrUndefined(
+          Arr.findFirst(yield* syncedTables, (t) => t.name === resolved.name && t.schema !== resolved.schema)
+        )
         if (clash !== undefined) {
           return yield* new TableNameConflict({ table: clash.name, existingSchema: clash.schema })
         }
@@ -136,11 +138,12 @@ export interface Resolved {
  */
 export const resolveTables = (registry: Registry.SyncRegistry) =>
   Effect.map(syncedTables, (captured) => {
-    const schemaOf = new Map(captured.map((t) => [t.name, t.schema]))
-    return registry.tables
-      .flatMap((table): ReadonlyArray<Resolved> => {
+    const schemaOf = new Map(Arr.map(captured, (t) => [t.name, t.schema]))
+    return Arr.sort(
+      Arr.flatMap(registry.tables, (table): ReadonlyArray<Resolved> => {
         const schema = schemaOf.get(table.name)
         return schema === undefined ? [] : [{ table, schema }]
-      })
-      .toSorted((a, b) => (a.table.name < b.table.name ? -1 : a.table.name > b.table.name ? 1 : 0))
+      }),
+      (a: Resolved, b: Resolved) => (a.table.name < b.table.name ? -1 : a.table.name > b.table.name ? 1 : 0)
+    )
   })

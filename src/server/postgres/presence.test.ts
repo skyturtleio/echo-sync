@@ -1,6 +1,21 @@
 import { assert, describe, it } from "@effect/vitest"
 import type * as PgClient from "@effect/sql-pg/PgClient"
-import { Clock, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Scheduler, Stream } from "effect"
+import {
+  Array as Arr,
+  Clock,
+  Deferred,
+  Effect,
+  Equivalence,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Queue,
+  Scheduler,
+  Schema,
+  Stream,
+  String as Str
+} from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
@@ -88,7 +103,7 @@ const open = (client: PresenceClient, p: ReturnType<typeof payload>) =>
 const show = (element: Protocol.RoomElement) =>
   element._tag === "heartbeat"
     ? ["(heartbeat)"]
-    : element.entries.map((e) => `${e.principalId}/${e.clientId}/${e.tabId}=${JSON.stringify(e.state)}`)
+    : Arr.map(element.entries, (e) => `${e.principalId}/${e.clientId}/${e.tabId}=${JSON.stringify(e.state)}`)
 
 /** A stream's typed failure as JSON; `expected` is the one a revoked or ungranted stream ends with. */
 const forbidden = (exit: Exit.Exit<unknown, unknown>) =>
@@ -106,13 +121,14 @@ const until = (snapshots: Queue.Queue<Protocol.RoomSnapshot>, want: ReadonlyArra
       Effect.gen(function* () {
         while (true) {
           last = show(yield* Queue.take(snapshots))
-          if (JSON.stringify(last) === JSON.stringify(want)) return
+          if (Equivalence.Array(Equivalence.String)(last, want)) return
         }
       }),
       "5 seconds"
     )
     if (Option.isNone(found)) {
-      return assert.fail(`wanted ${JSON.stringify(want)}, last snapshot ${JSON.stringify(last)}`)
+      const encode = Schema.encodeEffect(Schema.fromJsonString(Schema.Array(Schema.String)))
+      return assert.fail(`wanted ${yield* encode(want)}, last snapshot ${yield* encode(last)}`)
     }
   })
 
@@ -190,7 +206,7 @@ describe("presence state (SPEC §10)", () => {
         yield* Effect.forkChild(
           Stream.runForEach(presence.join(entry("idle")), (element) =>
             Effect.flatMap(Clock.currentTimeMillis, (at) =>
-              Effect.sync(() => void seen.push(`${at} ${show(element).join(",")}`))
+              Effect.sync(() => void seen.push(`${at} ${Arr.join(show(element), ",")}`))
             )
           )
         )
@@ -227,7 +243,10 @@ describe("presence state (SPEC §10)", () => {
         assert.strictEqual(
           first[0]?._tag,
           "snapshot",
-          `MaxOpsBeforeYield ${ops}: ${first.map((e) => e._tag).join(",")}`
+          `MaxOpsBeforeYield ${ops}: ${Arr.join(
+            Arr.map(first, (e) => e._tag),
+            ","
+          )}`
         )
       }
     })
@@ -246,7 +265,7 @@ describe("presence state (SPEC §10)", () => {
           yield* Effect.forkChild(
             Stream.runForEach(presence.join(entry("slow")), (element) =>
               Effect.andThen(
-                Effect.sync(() => void seen.push(show(element).join(","))),
+                Effect.sync(() => void seen.push(Arr.join(show(element), ","))),
                 Effect.suspend(() => (seen.length === 1 ? Deferred.await(release) : Effect.void))
               )
             )
@@ -256,7 +275,7 @@ describe("presence state (SPEC §10)", () => {
             assert.deepStrictEqual(seen, ["p/c1/slow=null"], "the consumer is still blocked")
             yield* Deferred.succeed(release, undefined)
             yield* settle
-            return seen.filter((e) => e !== "(heartbeat)").at(-1)
+            return Arr.filter(seen, (e) => e !== "(heartbeat)").at(-1)
           })
           return { presence, seen, lastSnapshot }
         })
@@ -647,7 +666,9 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (SPEC §10)", () => 
 
       const observer = yield* open(yield* connect("p"), payload("c0", "watch"))
       yield* until(observer.snapshots, ["p/c0/watch=null"])
-      assert.isFalse(observer.seen.flat().some((value) => value.includes("wildcard") || value.includes("unseen")))
+      assert.isFalse(
+        Arr.some(observer.seen.flat(), (value) => Str.includes("wildcard")(value) || Str.includes("unseen")(value))
+      )
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped presence clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
@@ -691,7 +712,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (SPEC §10)", () => 
       yield* (yield* connect("p")).track(payload("c0", "watch", "changed", 1))
       yield* until(observer.snapshots, ['p/c0/watch="changed"'])
       assert.deepStrictEqual(
-        observer.seen.flat().filter((e) => !e.startsWith("p/")),
+        Arr.filter(observer.seen.flat(), (e) => !Str.startsWith("p/")(e)),
         []
       )
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped presence clients close.
@@ -726,7 +747,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (SPEC §10)", () => 
         assert.deepStrictEqual(tagOf(tracked), Option.some("Unauthorized"))
         yield* (yield* connect("p")).track(payload("c0", "watch", "changed", 1))
         yield* until(observer.snapshots, ['p/c0/watch="changed"', "q/cq/t2=null"])
-        assert.isFalse(observer.seen.flat().some((e) => e.includes("switched") || e.includes("/t1=")))
+        assert.isFalse(Arr.some(observer.seen.flat(), (e) => Str.includes("switched")(e) || Str.includes("/t1=")(e)))
         yield* Fiber.interrupt(own.fiber)
         // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped presence clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase))
@@ -753,12 +774,15 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (SPEC §10)", () => 
           const exit = yield* Fiber.join(tab.fiber).pipe(Effect.timeout("5 seconds"))
           assert.deepStrictEqual(forbidden(exit), expected)
           // It never saw the room without itself: nothing of the room reached it after removal.
-          assert.isTrue(tab.seen.every((snapshot) => snapshot.some((e) => e.startsWith("q/"))))
+          assert.isTrue(Arr.every(tab.seen, (snapshot) => Arr.some(snapshot, (e) => Str.startsWith("q/")(e))))
         }
         yield* until(observer.snapshots, ["p/c0/watch=null"])
         // Both entries left in one step: no snapshot showed one of them gone and the other still there.
         assert.deepStrictEqual(
-          observer.seen.slice(before).filter((snapshot) => snapshot.filter((e) => e.startsWith("q/")).length === 1),
+          Arr.filter(
+            observer.seen.slice(before),
+            (snapshot) => Arr.filter(snapshot, (e) => Str.startsWith("q/")(e)).length === 1
+          ),
           []
         )
         // A track for a removed entry is the existing no-op.

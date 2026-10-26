@@ -1,5 +1,6 @@
 /** Driven by observability.sh, separate from the unchanged substrate/slice suites. */
-import { Effect, Exit, Fiber, Layer } from "effect"
+import { Array as Arr, Effect, Exit, Fiber, Layer } from "effect"
+import { randomUUIDv4 } from "../../src/client/Crypto.ts"
 import * as BrowserWorker from "@effect/platform-browser/BrowserWorker"
 import { RpcClient } from "effect/rpc"
 import { Ids } from "../../src/core/index.ts"
@@ -14,7 +15,7 @@ const noop = () => {}
 const routerTeardown = () =>
   Effect.runPromise(
     Effect.gen(function* () {
-      const identity = { appId: `router-telemetry-${crypto.randomUUID()}`, profile: "scope" }
+      const identity = { appId: `router-telemetry-${yield* randomUUIDv4}`, profile: "scope" }
       const epoch = Platform.leaderEpochLockName(identity, "epoch")
       const tab = Platform.tabLockName(identity, "tab")
       yield* Platform.holdLock(epoch)
@@ -48,7 +49,7 @@ const routerTeardown = () =>
       channel.port2.postMessage({ _tag: "Hello", ...identity, tabId: "tab", connectedTo: null }, { transfer: [] })
       channel.port2.postMessage({ _tag: "Leader", leaderId: "epoch", port: leader.port1 }, [leader.port1])
       let before = yield* Effect.promise(() => navigator.locks.query())
-      for (let i = 0; i < 100 && !before.pending?.some((lock) => lock.name === epoch); i++) {
+      for (let i = 0; i < 100 && !Arr.some(before.pending ?? [], (lock) => lock.name === epoch); i++) {
         yield* Effect.sleep("20 millis")
         before = yield* Effect.promise(() => navigator.locks.query())
       }
@@ -59,17 +60,19 @@ const routerTeardown = () =>
       yield* Effect.sleep("50 millis")
       const after = yield* Effect.promise(() => navigator.locks.query())
       return {
-        watched: before.pending?.some((lock) => lock.name === epoch) === true,
+        watched: Arr.some(before.pending ?? [], (lock) => lock.name === epoch),
         removed,
-        stopped: !after.pending?.some((lock) => lock.name === epoch || lock.name === tab)
+        stopped: !Arr.some(after.pending ?? [], (lock) => lock.name === epoch || lock.name === tab)
       }
     }).pipe(Effect.scoped)
   )
 
+// oxlint-disable-next-line effecttsgo/async-function -- Browser automation host owns the worker, tab lock and Promise-based report boundary around the actual Effect program.
 export const run = async () => {
   const secret = "native-secret-arg-principal-defect-916582"
-  const appId = `observability-${crypto.randomUUID()}`
+  const appId = `observability-${await Effect.runPromise(randomUUIDv4)}`
   const worker = new Worker(new URL("./observability.worker.ts", import.meta.url), { type: "module" })
+  // oxlint-disable-next-line effecttsgo/new-promise -- Worker startup report is an external MessageEvent rendezvous, armed before Init.
   const elected = new Promise<void>((resolve, reject) =>
     worker.addEventListener("message", (event: MessageEvent<FromLeader>) => {
       if (event.data._tag === "Elected") resolve()
@@ -81,7 +84,8 @@ export const run = async () => {
   let release = noop
   try {
     await elected
-    const tabId = crypto.randomUUID()
+    const tabId = await Effect.runPromise(randomUUIDv4)
+    // oxlint-disable-next-line effecttsgo/new-promise -- The real tab Web Lock must stay held until the host explicitly releases it after engine teardown.
     const held = new Promise<void>((resolve) => {
       release = resolve
     })
@@ -110,6 +114,7 @@ export const run = async () => {
       }).pipe(Effect.provide(protocol), Effect.scoped)
     )
     const report = () =>
+      // oxlint-disable-next-line effecttsgo/new-promise -- Host requests a worker report only after its engine fiber has closed; no engine runtime owns this message wait.
       new Promise<unknown>((resolve) => {
         const listener = (event: MessageEvent<unknown>) => {
           if (typeof event.data === "object" && event.data !== null && "telemetry" in event.data) {

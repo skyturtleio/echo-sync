@@ -1,4 +1,6 @@
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- This ordinary Vitest contract gate synchronously inspects committed source declarations.
 import { globSync, readFileSync } from "node:fs"
+import { Array as Arr, String as Str } from "effect"
 import { parseSync, Visitor } from "oxc-parser"
 import { expect, it } from "vitest"
 import { RpcClientError } from "effect/rpc"
@@ -24,14 +26,14 @@ const declaration = (text: string, name: string): string => {
   new Visitor({
     VariableDeclarator(node) {
       if (node.id.type === "Identifier" && node.id.name === name && node.init)
-        result = text.slice(node.init.start, node.init.end)
+        result = Str.slice(node.init.start, node.init.end)(text)
     },
     TSTypeAliasDeclaration(node) {
       if (node.id.name === name && result === undefined)
-        result = text.slice(node.typeAnnotation.start, node.typeAnnotation.end)
+        result = Str.slice(node.typeAnnotation.start, node.typeAnnotation.end)(text)
     },
     ClassDeclaration(node) {
-      if (node.id?.name === name) result = text.slice(node.start, node.end)
+      if (node.id?.name === name) result = Str.slice(node.start, node.end)(text)
     }
   }).visit(parseSync("v.ts", text).program)
   if (result === undefined) throw new Error(`Missing declaration ${name}`)
@@ -43,7 +45,7 @@ const errors = (text: string): string[] => {
     ClassDeclaration(node) {
       if (
         node.superClass?.type === "CallExpression" &&
-        /TaggedError/.test(text.slice(node.superClass.start, node.superClass.end))
+        /TaggedError/.test(Str.slice(node.superClass.start, node.superClass.end)(text))
       ) {
         const tag = node.superClass.arguments[0]
         if (tag?.type !== "Literal" || typeof tag.value !== "string") throw new Error("Nonliteral error tag")
@@ -54,7 +56,7 @@ const errors = (text: string): string[] => {
   return tags
 }
 const same = (actual: readonly string[], expected: readonly string[]) =>
-  expect([...new Set(actual)].toSorted()).toEqual([...expected].toSorted())
+  expect(Arr.sort(new Set(actual), Str.Order)).toEqual(Arr.sort(expected, Str.Order))
 
 it("telemetry, wire errors and client failure or notice vocabularies cannot drift from SPEC §14–15", () => {
   const telemetry = source("internal/Telemetry")
@@ -66,7 +68,7 @@ it("telemetry, wire errors and client failure or notice vocabularies cannot drif
   new Visitor({
     MethodDefinition(node) {
       if (node.key.type === "Identifier" && node.key.name === "event")
-        eventBodies.push(telemetry.slice(node.value.body?.start, node.value.body?.end))
+        eventBodies.push(Str.slice(node.value.body?.start, node.value.body?.end)(telemetry))
     }
   }).visit(parseSync("v.ts", telemetry).program)
   expect(eventBodies).toEqual(["{}"])
@@ -81,10 +83,12 @@ it("telemetry, wire errors and client failure or notice vocabularies cannot drif
     [failure, "SyncErrorKind"]
   ] as const) {
     const values = literals(
-      declaration(text, key).startsWith("export class") ? declaration(text, key) : `const x = ${declaration(text, key)}`
+      Str.startsWith("export class")(declaration(text, key))
+        ? declaration(text, key)
+        : `const x = ${declaration(text, key)}`
     )
     same(
-      values.filter((value) => value !== key),
+      Arr.filter(values, (value) => value !== key),
       vocabulary[key]
     )
   }
@@ -96,7 +100,7 @@ it("telemetry, wire errors and client failure or notice vocabularies cannot drif
     for (const statement of parseSync(file, text).program.body) {
       if (statement.type !== "ExportNamedDeclaration" || statement.declaration?.type !== "ClassDeclaration") continue
       const node = statement.declaration
-      const body = text.slice(node.start, node.end)
+      const body = Str.slice(node.start, node.end)(text)
       codes.push(...errors(body))
       if (node.superClass?.type === "Identifier" && node.superClass.name === "Error") {
         for (const field of node.body.body) {
@@ -118,8 +122,8 @@ it("telemetry, wire errors and client failure or notice vocabularies cannot drif
     })._tag
   )
   const spec = readFileSync(new URL("../docs/SPEC.md", import.meta.url), "utf8")
-  const catalog = spec.split("#### 15.1 Observable error catalog\n")[1]?.split("#### 15.2")[0] ?? ""
-  const documented = [...catalog.matchAll(/^\| `([^`]+)`/gm)].map((match) => match[1] ?? "")
+  const catalog = Str.split(Str.split(spec, "#### 15.1 Observable error catalog\n")[1] ?? "", "#### 15.2")[0] ?? ""
+  const documented = Arr.map([...Str.matchAll(/^\| `([^`]+)`/gm)(catalog)], (match) => match[1] ?? "")
   expect(documented.length).toBeGreaterThan(0)
   expect(new Set(documented).size).toBe(documented.length)
   same(codes, documented)

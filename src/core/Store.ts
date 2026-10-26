@@ -1,4 +1,4 @@
-import { Array as Arr, type DateTime, Effect, Option, Schema } from "effect"
+import { Array as Arr, type DateTime, Effect, Option, Schema, String as Str } from "effect"
 import {
   type AccessScopeId,
   AccessScopeId as AccessScopeIdSchema,
@@ -34,8 +34,8 @@ export const compareText = (a: string, b: string): number => {
   let i = 0
   let j = 0
   while (i < a.length && j < b.length) {
-    const ca = a.codePointAt(i) ?? 0
-    const cb = b.codePointAt(j) ?? 0
+    const ca = Option.getOrElse(Str.codePointAt(a, i), () => 0)
+    const cb = Option.getOrElse(Str.codePointAt(b, j), () => 0)
     if (ca !== cb) return ca < cb ? -1 : 1
     i += ca > 0xffff ? 2 : 1
     j += cb > 0xffff ? 2 : 1
@@ -123,7 +123,7 @@ export const planMatches = (plan: IndexRangePlan, row: EncodedRow): boolean => {
   }
   if (plan.text !== undefined) {
     const value = row[plan.text.column.name]
-    if (typeof value !== "string" || !value.includes(plan.text.needle)) return false
+    if (typeof value !== "string" || !Str.includes(plan.text.needle)(value)) return false
   }
   for (const [i, value] of plan.eq.entries()) {
     const c = plan.index.key[i]
@@ -159,6 +159,7 @@ export const checkLimit = (limit: Option.Option<number>): Effect.Effect<void> =>
     ? Effect.die(new RangeError(`take(n) requires a non-negative safe integer, got ${limit.value}`))
     : Effect.void
 
+// oxlint-disable-next-line effecttsgo/prefer-schema-over-json -- Internal identity key also represents missing values as null; this is not a wire codec.
 const grantPair = (scope: unknown, principal: unknown) => JSON.stringify([scope, principal])
 
 /**
@@ -177,9 +178,16 @@ export const planResult = (
   const readable = (row: EncodedRow) =>
     Option.match(plan.readableBy, {
       onNone: () => true,
-      onSome: (principals) => principals.some((p) => granted.has(grantPair(row["access_scope_id"], p)))
+      onSome: (principals) => Arr.some(principals, (p) => granted.has(grantPair(row["access_scope_id"], p)))
     })
-  const ordered = [...rows].filter((row) => planMatches(plan, row) && readable(row)).toSorted(planOrder(plan))
+  const compare = planOrder(plan)
+  const ordered = Arr.sort(
+    Arr.filter([...rows], (row) => planMatches(plan, row) && readable(row)),
+    (a: EncodedRow, b: EncodedRow) => {
+      const result = compare(a, b)
+      return result < 0 ? -1 : result > 0 ? 1 : 0
+    }
+  )
   return Option.match(plan.limit, { onNone: () => ordered, onSome: (n) => ordered.slice(0, n) })
 }
 
@@ -458,7 +466,7 @@ const encode = <T extends AnySyncTable>(table: T, row: unknown): Effect.Effect<E
 
 const toKeyValue = (table: AnySyncTable, field: string, value: unknown) =>
   Effect.gen(function* () {
-    const column = table.columns.find((c) => c.field === field)
+    const column = Option.getOrUndefined(Arr.findFirst(table.columns, (c) => c.field === field))
     if (column === undefined) return yield* new InvalidRow({ table: table.name, message: `unknown field ${field}` })
     const encoded = yield* Schema.encodeUnknownEffect(column.wire)(value).pipe(
       Effect.mapError((error) => new InvalidRow({ table: table.name, message: error.message }))
@@ -476,7 +484,7 @@ const toKeyValue = (table: AnySyncTable, field: string, value: unknown) =>
 export const claimFromGrants =
   (rows: RowStore) =>
   (scopeId: AccessScopeId): Effect.Effect<boolean, StoreUnavailable> =>
-    Effect.map(rows.scan(ScopeGrants), (grants) => !grants.some((g) => g["access_scope_id"] === scopeId))
+    Effect.map(rows.scan(ScopeGrants), (grants) => !Arr.some(grants, (g) => g["access_scope_id"] === scopeId))
 
 /** `actor`'s effective role on a scope, read from the `scope_grants` rows in `rows` (SPEC §4). */
 export const roleFromGrants =
@@ -519,6 +527,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
     before: Option.Option<EncodedRow>,
     after: Option.Option<EncodedRow>
   ) {
+    // oxlint-disable-next-line effecttsgo/prefer-schema-over-json -- Collision-free in-memory identity key, not persisted or transported JSON.
     const key = JSON.stringify([table.name, id])
     if (!seen.has(key)) {
       seen.add(key)
@@ -640,7 +649,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
               return yield* new InvalidRow({ table: table.name, message: `unknown index ${name}` })
             }
             const textColumn = (field: string, needle: string) => {
-              const column = table.columns.find((c) => c.field === field)
+              const column = Option.getOrUndefined(Arr.findFirst(table.columns, (c) => c.field === field))
               return column?.kind === "text" && Search.isPortable(needle)
                 ? Effect.succeed(column)
                 : Effect.fail(
@@ -661,10 +670,12 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
             for (const [field, value] of built.eq) eq.push(yield* toKeyValue(table, field, value))
             const encodedCursors: { after?: ReadonlyArray<KeyValue>; before?: ReadonlyArray<KeyValue> } = {}
             for (const side of ["after", "before"] as const) {
+              // oxlint-disable-next-line effecttsgo/prefer-effect-record -- Optional cursor keys are not a total Record; presence differs from an explicit undefined value.
               if (!Object.hasOwn(cursors, side)) continue
               const cursor: unknown = cursors[side]
               const values: Array<KeyValue> = []
               for (const column of index.key) {
+                // oxlint-disable-next-line effecttsgo/prefer-effect-record -- Validate arbitrary object/array inputs before treating them as cursor records.
                 if (typeof cursor !== "object" || cursor === null || !Object.hasOwn(cursor, column.field)) {
                   return yield* new InvalidRow({ table: table.name, message: `cursor requires ${column.field}` })
                 }

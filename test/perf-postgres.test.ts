@@ -1,6 +1,6 @@
 import { describe, expect, it } from "@effect/vitest"
 import * as PgClient from "@effect/sql-pg/PgClient"
-import { Effect, Option, Schema } from "effect"
+import { Array as Arr, Effect, Option, Schema, String as Str } from "effect"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation } from "echo-sync"
@@ -46,7 +46,7 @@ describe.skipIf(!pgAvailable)("Postgres statement budgets", () => {
         const replica = new Replica("alice", "seek")
         yield* replica.sync(500).pipe(Effect.provideService(SqlClient, counter.client))
         expect(replica.rows.size).toBe(100001) // items plus the readable grant
-        const walks = counter.statements.filter((s) => s.sql.includes('FROM "public"."items" t'))
+        const walks = Arr.filter(counter.statements, (s) => Str.includes('FROM "public"."items" t')(s.sql))
         expect(walks).toHaveLength(201)
         // Explain the driver's actual cached statement, not EXPLAIN <parameterized SQL>, which
         // Postgres custom-plans even under force_generic_plan. Check first and late pages.
@@ -57,11 +57,12 @@ describe.skipIf(!pgAvailable)("Postgres statement budgets", () => {
           const statement = prepared[0]
           expect(statement?.generic_plans).toBeGreaterThan(0n)
           if (statement === undefined) return yield* Effect.die("walk was not prepared")
-          const args = walk.params
-            .map((p) =>
-              typeof p === "number" ? String(p) : p === null ? "NULL" : `'${String(p).replaceAll("'", "''")}'`
-            )
-            .join(", ")
+          const args = Arr.join(
+            Arr.map(walk.params, (p) =>
+              typeof p === "number" ? String(p) : p === null ? "NULL" : `'${Str.replaceAll("'", "''")(String(p))}'`
+            ),
+            ", "
+          )
           const explained = yield* counter.client.unsafe<{ "QUERY PLAN": ReadonlyArray<{ Plan: WalkPlan }> }>(
             `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE "${statement.name}" (${args})`
           )
@@ -111,7 +112,7 @@ describe.skipIf(!pgAvailable)("Postgres statement budgets", () => {
             }
           ]
         }).pipe(Effect.provideService(SqlClient, counter.client))
-        expect(result.results.map((r) => r.outcome._tag)).toEqual(["Applied"])
+        expect(Arr.map(result.results, (r) => r.outcome._tag)).toEqual(["Applied"])
         // rpc.executeBatch: epoch 1 + catalog 1. ledger.runMutation: BEGIN, SET, INSERT client,
         // lock SELECT, dedup SELECT, SAVEPOINT, RELEASE, INSERT ledger, COMMIT = 9.
         // Writer-clock validation uses Effect's clock and adds no SQL statements.
@@ -119,7 +120,7 @@ describe.skipIf(!pgAvailable)("Postgres statement budgets", () => {
         // Trigger functions/log inserts are server-side work, NOT connection statements.
         expect(counter.statements).toHaveLength(11 + 2 * n + 3 * m)
         // Epoch 1 + catalog 3 + lock 1; each get/patch returns row + own grant.
-        expect(counter.statements.reduce((sum, s) => sum + s.rows, 0)).toBe(5 + 2 * n + 2 * m)
+        expect(Arr.reduce(counter.statements, 0, (sum, s) => sum + s.rows)).toBe(5 + 2 * n + 2 * m)
       }
       expect((yield* source<{ body: string }>`SELECT body FROM items WHERE id = 'i'`)[0]?.body).toBe("write-2")
     }).pipe(Effect.scoped, Effect.provide([TestDatabase, Reactivity.layer]))
@@ -140,7 +141,7 @@ describe.skipIf(!pgAvailable)("Postgres statement budgets", () => {
       expect(empty._tag).toBe("PullDone")
       expect(empty.changes).toHaveLength(0)
       expect(counter.statements).toHaveLength(15)
-      expect(counter.statements.reduce((sum, s) => sum + s.rows, 0)).toBe(7)
+      expect(Arr.reduce(counter.statements, 0, (sum, s) => sum + s.rows)).toBe(7)
 
       const k = 3
       for (let i = 0; i < k; i++) yield* source`INSERT INTO items (id, access_scope_id) VALUES (${`i-${i}`}, 's')`
@@ -149,7 +150,7 @@ describe.skipIf(!pgAvailable)("Postgres statement budgets", () => {
       expect(log.changes).toHaveLength(k)
       // K log rows + K payload rows; payload fetch is batched by table, adds ONE statement.
       expect(counter.statements).toHaveLength(16)
-      expect(counter.statements.reduce((sum, s) => sum + s.rows, 0)).toBe(7 + 2 * k)
+      expect(Arr.reduce(counter.statements, 0, (sum, s) => sum + s.rows)).toBe(7 + 2 * k)
 
       // Fresh null-cursor set: no held SELECT or three cursor writes (-4), walk all
       // three tables (+3). Under budget, so still reads log and records PullDone: 14.
@@ -160,7 +161,7 @@ describe.skipIf(!pgAvailable)("Postgres statement budgets", () => {
       expect(walk._tag).toBe("PullDone")
       expect(walk.changes).toHaveLength(k + 1)
       expect(counter.statements).toHaveLength(14)
-      expect(counter.statements.reduce((sum, s) => sum + s.rows, 0)).toBe(7 + k)
+      expect(Arr.reduce(counter.statements, 0, (sum, s) => sum + s.rows)).toBe(7 + k)
 
       // Walk lookahead: first table items fills limit 2, reads 3; no log or held
       // insert, only one walk table: 14 - 2 tables - log - held insert = 10.
@@ -170,7 +171,7 @@ describe.skipIf(!pgAvailable)("Postgres statement budgets", () => {
       expect(page._tag).toBe("PullPage")
       expect(page.changes).toHaveLength(2)
       expect(counter.statements).toHaveLength(10)
-      expect(counter.statements.reduce((sum, s) => sum + s.rows, 0)).toBe(6 + 3)
+      expect(Arr.reduce(counter.statements, 0, (sum, s) => sum + s.rows)).toBe(6 + 3)
       expect(Option.isSome(paged.continuation)).toBe(true)
     }).pipe(Effect.scoped, Effect.provide([TestDatabase, Reactivity.layer]))
   )

@@ -3,7 +3,22 @@ import "../src/client/testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import type * as PgClient from "@effect/sql-pg/PgClient"
 import { describe, expect, it } from "@effect/vitest"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer, Metric, Schema, Scope, Stream, Tracer } from "effect"
+import {
+  Array as Arr,
+  Cause,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Metric,
+  Option,
+  Schema,
+  Scope,
+  Stream,
+  String as Str,
+  Tracer
+} from "effect"
 import { paginate } from "../src/client/sync/testing/Pull.ts"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import { FetchHttpClient, Headers, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
@@ -67,14 +82,17 @@ const device = Effect.fnUntraced(
 it.effect("request failures append no notices and ledgered rejections keep successful batch outcomes", () => {
   const recording = recorder()
   const outcomes = (name: string) =>
-    recording.spans.filter((span) => span.name === name).map((span) => new Map(span.attributes).get("echo.outcome"))
+    Arr.map(
+      Arr.filter(recording.spans, (span) => span.name === name),
+      (span) => new Map(span.attributes).get("echo.outcome")
+    )
   return Effect.gen(function* () {
     let refused = true
     let results: Protocol.PushResponse["results"] = []
     const { engine, storage, sqlite } = yield* device({
       push: (request) => {
         if (refused) return Effect.fail(new Protocol.Unauthorized({ message: secret }))
-        results = request.mutations.map((envelope, index) => ({
+        results = Arr.map(request.mutations, (envelope, index) => ({
           mutationId: envelope.mutationId,
           position: cursor,
           outcome: {
@@ -101,11 +119,11 @@ it.effect("request failures append no notices and ledgered rejections keep succe
     refused = false
     yield* engine.push
     const immediate = yield* storage.transaction(SqliteSyncStorage.notices(sqlite)).pipe(Telemetry.boundary)
-    expect(immediate.map(({ notice }) => notice._tag)).toEqual(["OutcomeUnknown"])
+    expect(Arr.map(immediate, ({ notice }) => notice._tag)).toEqual(["OutcomeUnknown"])
     yield* engine.pull
     const retained = yield* storage.transaction(SqliteSyncStorage.notices(sqlite)).pipe(Telemetry.boundary)
-    expect(retained.map(({ notice }) => notice._tag)).toEqual(["OutcomeUnknown", "Rejected", "Rejected"])
-    expect(retained.flatMap(({ notice }) => (notice._tag === "Rejected" ? [notice.error] : []))).toEqual([
+    expect(Arr.map(retained, ({ notice }) => notice._tag)).toEqual(["OutcomeUnknown", "Rejected", "Rejected"])
+    expect(Arr.flatMap(retained, ({ notice }) => (notice._tag === "Rejected" ? [notice.error] : []))).toEqual([
       new Errors.ConstraintViolated({ kind: "unique", constraint: "unique-title", message: secret }),
       new Mutation.ClockSkew({ createdAt: 40001, serverNow: 10000 })
     ])
@@ -151,26 +169,26 @@ it.live(
         )
       })
       yield* engine.pull.pipe(Effect.withSpan("host.parent"))
-      const pull = recording.spans.find((span) => span.name === "echo.pull")
+      const pull = Option.getOrUndefined(Arr.findFirst(recording.spans, (span) => span.name === "echo.pull"))
       expect(pull).toBeDefined()
-      expect(current).toEqual([0, 1].map(() => ({ spanId: pull?.spanId, traceId: pull?.traceId, sampled: false })))
-      const enqueue = recording.spans.find((span) => span.name === "echo.enqueue")
+      expect(current).toEqual(Arr.map([0, 1], () => ({ spanId: pull?.spanId, traceId: pull?.traceId, sampled: false })))
+      const enqueue = Option.getOrUndefined(Arr.findFirst(recording.spans, (span) => span.name === "echo.enqueue"))
       expect(enqueue?.parentSpanId).toBe(external.spanId)
       expect(enqueue?.parentTraceId).toBe(external.traceId)
       expect(enqueue?.traceId).toBe(external.traceId)
       expect(enqueue?.sampled).toBe(false)
-      const install = recording.spans.find((span) => span.name === "echo.install")
+      const install = Option.getOrUndefined(Arr.findFirst(recording.spans, (span) => span.name === "echo.install"))
       expect(install?.parentSpanId).toBe(pull?.spanId)
       expect(install?.parentTraceId).toBe(pull?.traceId)
-      const root = recording.spans.filter((span) => span.name === "echo.enqueue")[1]
-      const host = recording.spans.find((span) => span.name === "host.parent")
+      const root = Arr.filter(recording.spans, (span) => span.name === "echo.enqueue")[1]
+      const host = Option.getOrUndefined(Arr.findFirst(recording.spans, (span) => span.name === "host.parent"))
       expect(root).toBeDefined()
       expect(host).toBeDefined()
       expect(root?.parentSpanId).toBeUndefined()
       expect(root?.parentTraceId).toBeUndefined()
       expect(root?.traceId).not.toBe(host?.traceId)
       expect(root?.sampled).toBe(false)
-      const explicitRootParent = recording.spans.filter((span) => span.name === "echo.enqueue")[2]
+      const explicitRootParent = Arr.filter(recording.spans, (span) => span.name === "echo.enqueue")[2]
       expect(explicitRootParent?.parentSpanId).toBe(external.spanId)
       expect(explicitRootParent?.parentTraceId).toBe(external.traceId)
       expect(explicitRootParent?.traceId).toBe(external.traceId)
@@ -208,9 +226,10 @@ it.effect("batch telemetry agrees with the loop's whole-cause decision, not the 
         if (expected === "halted") yield* TestClock.adjust("30 seconds")
         expect(pushes).toBe(1)
         expect(
-          recording.spans
-            .filter((span) => span.name === "echo.push")
-            .map((span) => new Map(span.attributes).get("echo.outcome"))
+          Arr.map(
+            Arr.filter(recording.spans, (span) => span.name === "echo.push"),
+            (span) => new Map(span.attributes).get("echo.outcome")
+          )
         ).toEqual([expected])
         expect(
           (yield* Metric.value(Metric.counter("echo.push.total", { attributes: { "echo.outcome": expected } }))).count
@@ -273,9 +292,10 @@ it.effect("the whole final push cause remains authoritative, including typed cle
         if (mode === "typed") {
           // The batch saw only Unauthorized; the loop additionally saw the fatal cleanup error.
           expect(
-            recording.spans
-              .filter((span) => span.name === "echo.push")
-              .map((span) => new Map(span.attributes).get("echo.outcome"))
+            Arr.map(
+              Arr.filter(recording.spans, (span) => span.name === "echo.push"),
+              (span) => new Map(span.attributes).get("echo.outcome")
+            )
           ).toEqual(["unauthorized"])
           expect(
             (yield* Metric.value(Metric.counter("echo.push.total", { attributes: { "echo.outcome": "unauthorized" } })))
@@ -340,13 +360,18 @@ it.effect("throwing host sinks cannot change saved intent, retry deadlines, halt
       }).pipe(Effect.scoped, Effect.provide(recording.layer))
       yield* run
       if (failure === "none" || failure === "logger") {
-        const installs = recording.spans.filter((span) => span.name === "echo.install")
+        const installs = Arr.filter(recording.spans, (span) => span.name === "echo.install")
         expect(installs.length).toBe(3)
         expect(
-          installs.every((span) => span.parent === "echo.pull" && new Map(span.attributes).get("echo.outcome") === "ok")
+          Arr.every(
+            installs,
+            (span) => span.parent === "echo.pull" && new Map(span.attributes).get("echo.outcome") === "ok"
+          )
         ).toBe(true)
       }
-      expect(recording.spans.every((span) => Exit.isSuccess(span.exit) && span.exit.value === undefined)).toBe(true)
+      expect(Arr.every(recording.spans, (span) => Exit.isSuccess(span.exit) && span.exit.value === undefined)).toBe(
+        true
+      )
     }
   })
 )
@@ -366,19 +391,20 @@ it.live("SQLite sync never exports a typed failure, defect, result or dependency
     const failed = yield* Effect.exit(engine.pull)
     expect(Exit.isFailure(failed) && Cause.pretty(failed.cause)).toContain(secret)
     const metrics = yield* Metric.snapshot
-    expect(serialized(metrics.map((metric) => ({ name: metric.id, attributes: metric.attributes })))).not.toContain(
-      secret
-    )
+    expect(
+      serialized(Arr.map(metrics, (metric) => ({ name: metric.id, attributes: metric.attributes })))
+    ).not.toContain(secret)
     expect(
       (yield* storage.transaction(storage.meta).pipe(Effect.provideService(Tracer.Tracer, Tracer.nativeTracer))).cursor
     ).toBe(cursor)
-    expect(recording.spans.map((span) => span.name)).toEqual(
+    expect(Arr.map(recording.spans, (span) => span.name)).toEqual(
       expect.arrayContaining(["echo.enqueue", "echo.push", "echo.pull", "echo.install", "echo.rebase"])
     )
     expect(
-      recording.spans.every(
+      Arr.every(
+        recording.spans,
         (span) =>
-          span.name.startsWith("echo.") &&
+          Str.startsWith("echo.")(span.name) &&
           span.events.length === 0 &&
           span.links === 0 &&
           span.annotations === 0 &&
@@ -388,12 +414,13 @@ it.live("SQLite sync never exports a typed failure, defect, result or dependency
     ).toBe(true)
     expect(serialized(recording.spans)).not.toContain(secret)
     expect(serialized(recording.spans)).not.toContain(cursor.toString())
-    expect(serialized(recording.logs.filter((log) => !log.diagnostics))).not.toContain(secret)
-    expect(serialized(recording.logs.filter((log) => log.diagnostics))).toContain(secret)
+    expect(serialized(Arr.filter(recording.logs, (log) => !log.diagnostics))).not.toContain(secret)
+    expect(serialized(Arr.filter(recording.logs, (log) => log.diagnostics))).toContain(secret)
     expect(
-      recording.spans
-        .filter((span) => span.name === "echo.pull")
-        .map((span) => new Map(span.attributes).get("echo.outcome"))
+      Arr.map(
+        Arr.filter(recording.spans, (span) => span.name === "echo.pull"),
+        (span) => new Map(span.attributes).get("echo.outcome")
+      )
     ).toEqual(["ok", "defect"])
     // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Scoped test telemetry root; the recorder covers SQLite failures and cleanup.
   }).pipe(Effect.scoped, Effect.provide(recording.layer))
@@ -445,13 +472,14 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
           yield* Scope.close(scope, closing)
         }
         expect(seen).toEqual(["interrupted", "defect"])
-        expect(recording.spans.map((span) => span.name)).toEqual(["echo.server.pokes", "echo.server.pokes"])
-        expect(recording.spans.map((span) => new Map(span.attributes).get("echo.outcome"))).toEqual([
+        expect(Arr.map(recording.spans, (span) => span.name)).toEqual(["echo.server.pokes", "echo.server.pokes"])
+        expect(Arr.map(recording.spans, (span) => new Map(span.attributes).get("echo.outcome"))).toEqual([
           "interrupted",
           "defect"
         ])
         expect(
-          recording.spans.every(
+          Arr.every(
+            recording.spans,
             (span) =>
               span.parent === "host.subscription" &&
               Exit.isSuccess(span.exit) &&
@@ -460,13 +488,15 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
           )
         ).toBe(true)
         expect(serialized(recording.spans)).not.toContain(secret)
-        expect(serialized(recording.logs.filter((log) => !log.diagnostics))).not.toContain(secret)
-        expect(serialized(recording.logs.filter((log) => log.diagnostics))).toContain(secret)
+        expect(serialized(Arr.filter(recording.logs, (log) => !log.diagnostics))).not.toContain(secret)
+        expect(serialized(Arr.filter(recording.logs, (log) => log.diagnostics))).toContain(secret)
       }).pipe(Effect.withSpan("host.subscription"), Effect.scoped, Effect.provide([recording.layer, TestDatabase]))
       return program.pipe(
         Effect.tap(() =>
           Effect.sync(() => {
-            expect(recording.spans.find((span) => span.name === "host.subscription")?.events).toEqual([])
+            expect(
+              Option.getOrUndefined(Arr.findFirst(recording.spans, (span) => span.name === "host.subscription"))?.events
+            ).toEqual([])
           })
         )
       )
@@ -559,11 +589,12 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
           expect(Exit.isFailure(failed)).toBe(true)
         }
         const exported = recording.spans
-        expect(exported.map((span) => span.name)).toEqual(
+        expect(Arr.map(exported, (span) => span.name)).toEqual(
           expect.arrayContaining(["echo.server.push", "echo.server.pull", "echo.install"])
         )
         expect(
-          exported.every(
+          Arr.every(
+            exported,
             (span) =>
               span.events.length === 0 &&
               span.links === 0 &&
@@ -574,16 +605,17 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
         ).toBe(true)
         expect(serialized(exported)).not.toContain(secret)
         expect(serialized(exported)).not.toContain(cursor.toString())
-        expect(serialized(recording.logs.filter((log) => !log.diagnostics))).not.toContain(secret)
-        expect(serialized(recording.logs.filter((log) => log.diagnostics))).toContain(secret)
+        expect(serialized(Arr.filter(recording.logs, (log) => !log.diagnostics))).not.toContain(secret)
+        expect(serialized(Arr.filter(recording.logs, (log) => log.diagnostics))).toContain(secret)
         expect(
-          exported
-            .filter((span) => span.name === "echo.server.pull")
-            .map((span) => new Map(span.attributes).get("echo.outcome"))
+          Arr.map(
+            Arr.filter(exported, (span) => span.name === "echo.server.pull"),
+            (span) => new Map(span.attributes).get("echo.outcome")
+          )
         ).toEqual(["done", "unauthorized", "defect"])
         const before = recording.spans.length
         yield* Effect.promise(() => web.handler(new Request("http://echo.test/other")))
-        expect(recording.spans.slice(before).some((span) => span.name === "host.route")).toBe(true)
+        expect(Arr.some(Arr.drop(recording.spans, before), (span) => span.name === "host.route")).toBe(true)
         mode = "ok"
         const first = yield* Deferred.make<void>()
         const beforeStream = recording.spans.length
@@ -601,11 +633,14 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
         // even though the closing request fiber no longer has that span as its ambient parent.
         yield* Effect.promise(web.dispose)
         const streamSpans = recording.spans.slice(beforeStream)
-        const subscription = streamSpans.find((span) => span.name === "echo.server.pokes")
+        const subscription = Option.getOrUndefined(
+          Arr.findFirst(streamSpans, (span) => span.name === "echo.server.pokes")
+        )
         expect(subscription).toBeDefined()
         expect(new Map(subscription?.attributes).get("echo.outcome")).toBe("interrupted")
         expect(
-          streamSpans.every(
+          Arr.every(
+            streamSpans,
             (span) => Exit.isSuccess(span.exit) && span.exit.value === undefined && span.events.length === 0
           )
         ).toBe(true)
@@ -618,9 +653,9 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
 it("engine spans across the e2e run never export an unregistered name or a raw failure cause", () => {
   // These three spans are deliberately host-owned controls, not engine emissions.
   const hostNames = new Set(["host.parent", "host.subscription", "host.route"])
-  const engineSpans = received.filter((span) => !hostNames.has(span.name))
+  const engineSpans = Arr.filter(received, (span) => !hostNames.has(span.name))
   const allowed = new Set<string>(Telemetry.spanNames)
   expect(engineSpans.length).toBeGreaterThan(0)
-  expect([...new Set(engineSpans.map((span) => span.name))].filter((name) => !allowed.has(name))).toEqual([])
-  expect(engineSpans.filter((span) => !Exit.isSuccess(span.exit) || span.exit.value !== undefined)).toEqual([])
+  expect(Arr.filter([...new Set(Arr.map(engineSpans, (span) => span.name))], (name) => !allowed.has(name))).toEqual([])
+  expect(Arr.filter(engineSpans, (span) => !Exit.isSuccess(span.exit) || span.exit.value !== undefined)).toEqual([])
 })

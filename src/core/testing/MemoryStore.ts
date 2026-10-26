@@ -4,13 +4,14 @@
  * Ordering and range matching come from core's single definition (`Store.planMatches`,
  * `Store.planOrder`, `Store.compareText`), never from JS string comparison.
  */
-import { Effect, Option, Semaphore } from "effect"
+import { Array as Arr, Effect, Option, Semaphore } from "effect"
 import { ScopeGrants, Store } from "../index.ts"
 import type { SyncTable } from "../index.ts"
 
 export type Tables = Map<string, Map<string, SyncTable.EncodedRow>>
 
-export const cloneTables = (tables: Tables): Tables => new Map([...tables].map(([name, rows]) => [name, new Map(rows)]))
+export const cloneTables = (tables: Tables): Tables =>
+  new Map(Arr.map([...tables], ([name, rows]) => [name, new Map(rows)]))
 
 export interface MemoryStore extends Store.ReplicaRowStore {
   readonly tables: () => Tables
@@ -61,7 +62,13 @@ export const make = (initial: Tables = new Map()): MemoryStore => {
           Store.planResult(plan, rowsOf(table.name), tables.get(ScopeGrants.ScopeGrants.name)?.values() ?? [])
         )
       ),
-    scan: (table) => Effect.sync(() => rowsOf(table.name).toSorted(byId)),
+    scan: (table) =>
+      Effect.sync(() =>
+        Arr.sort(rowsOf(table.name), (a: SyncTable.EncodedRow, b: SyncTable.EncodedRow) => {
+          const result = byId(a, b)
+          return result < 0 ? -1 : result > 0 ? 1 : 0
+        })
+      ),
     purgeScope: (scopeId) =>
       Effect.sync(() => {
         for (const rows of tables.values()) {

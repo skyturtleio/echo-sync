@@ -1,13 +1,14 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Option, Schema } from "effect"
+import { Array as Arr, Effect, Option, Schema, String as Str } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { Protocol } from "echo-sync"
 import { registerClient } from "./ledger.ts"
 import { maxPullPageBytes, pull } from "./pull.ts"
 import { grant, pgAvailable, registry, TestDatabase } from "./test-support.ts"
 
-const encoded = Schema.encodeSync(Schema.toCodecJson(Protocol.PullResponse))
-const bytes = (response: Protocol.PullResponse) => new TextEncoder().encode(JSON.stringify(encoded(response))).length
+const encoded = Schema.encodeEffect(Schema.fromJsonString(Schema.toCodecJson(Protocol.PullResponse)))
+const bytes = (response: Protocol.PullResponse) =>
+  Effect.map(encoded(response), (text) => new TextEncoder().encode(text).length)
 const request = { principalId: "p", clientId: "d", cursor: null, continuation: Option.none<string>(), limit: 500 }
 
 const records = Effect.gen(function* () {
@@ -20,7 +21,7 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
     Effect.gen(function* () {
       const sql = yield* SqlClient
       yield* grant("p", "s")
-      const body = "水".repeat(180_000)
+      const body = Str.repeat(180_000)("水")
       // A character-count cap would incorrectly accept all three rows together.
       assert.isBelow(body.length * 3, maxPullPageBytes)
       assert.isAbove(new TextEncoder().encode(body).length * 3, maxPullPageBytes)
@@ -32,7 +33,7 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
       while (true) {
         assert.isBelow(pages++, 10)
         const page = yield* pull(registry, { ...request, continuation })
-        assert.isAtMost(bytes(page), maxPullPageBytes)
+        assert.isAtMost(yield* bytes(page), maxPullPageBytes)
         for (const change of page.changes) {
           if (change._tag === "upsert" && change.table === "items") {
             ids.push(String(change.row["id"]))
@@ -60,11 +61,11 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
       assert.strictEqual(initial._tag, "PullDone")
       if (initial._tag !== "PullDone") return
       for (let n = 1; n <= 3; n++) {
-        yield* sql`INSERT INTO items (id, access_scope_id, body) VALUES (${`row-${n}`}, 's', ${"🙂".repeat(140_000)})`
+        yield* sql`INSERT INTO items (id, access_scope_id, body) VALUES (${`row-${n}`}, 's', ${Str.repeat(140_000)("🙂")})`
         // Each row and outcome fits alone, but one of each exceeds the page cap.
-        const outcome = { _tag: "Rejected", error: { _tag: "UnknownMutation", name: "x".repeat(600_000) } }
+        const outcome = { _tag: "Rejected", error: { _tag: "UnknownMutation", name: Str.repeat(600_000)("x") } }
         yield* sql`INSERT INTO echo_sync.mutations (client_id, mutation_id, seq, position, outcome)
-                  VALUES ('d', ${`ack-${n}`}, ${n}, echo_sync.next_position(), ${JSON.stringify(outcome)}::jsonb)`
+                  VALUES ('d', ${`ack-${n}`}, ${n}, echo_sync.next_position(), ${yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Json))(outcome)}::jsonb)`
       }
       let continuation = Option.none<string>()
       const ids: Array<string> = []
@@ -73,9 +74,9 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
       while (true) {
         assert.isBelow(pages++, 10)
         const page = yield* pull(registry, { ...request, cursor: initial.nextCursor, continuation })
-        assert.isAtMost(bytes(page), maxPullPageBytes)
-        ids.push(...page.changes.flatMap((c) => (c._tag === "upsert" ? [String(c.row["id"])] : [])))
-        acks.push(...page.acks.map((ack) => ack.mutationId))
+        assert.isAtMost(yield* bytes(page), maxPullPageBytes)
+        ids.push(...Arr.flatMap(page.changes, (c) => (c._tag === "upsert" ? [String(c.row["id"])] : [])))
+        acks.push(...Arr.map(page.acks, (ack) => ack.mutationId))
         if (page._tag === "PullDone") break
         assert.strictEqual((yield* records).length, 1)
         continuation = Option.some(page.continuation)
@@ -94,11 +95,11 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
       yield* registerClient("p", "d")
       const initial = yield* pull(registry, request)
       if (initial._tag !== "PullDone") return assert.fail("expected initial snapshot")
-      const body = "水".repeat(400_000)
+      const body = Str.repeat(400_000)("水")
       yield* sql`INSERT INTO items (id, access_scope_id, body) VALUES ('large', 's', ${body}), ('next', 's', 'small')`
-      const outcome = { _tag: "Rejected", error: { _tag: "UnknownMutation", name: "x".repeat(maxPullPageBytes) } }
+      const outcome = { _tag: "Rejected", error: { _tag: "UnknownMutation", name: Str.repeat(maxPullPageBytes)("x") } }
       yield* sql`INSERT INTO echo_sync.mutations (client_id, mutation_id, seq, position, outcome)
-                VALUES ('d', 'ack', 1, echo_sync.next_position(), ${JSON.stringify(outcome)}::jsonb)`
+                VALUES ('d', 'ack', 1, echo_sync.next_position(), ${yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Json))(outcome)}::jsonb)`
       for (const cursor of [null, initial.nextCursor]) {
         let continuation = Option.none<string>()
         const ids: Array<string> = []
@@ -112,11 +113,11 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
             ids.push(String(change.row["id"]))
             if (change.row["id"] === "large") {
               assert.strictEqual(change.row["body"], body)
-              assert.isAbove(bytes(page), maxPullPageBytes)
+              assert.isAbove(yield* bytes(page), maxPullPageBytes)
               assert.deepStrictEqual(page.acks, [])
             }
           }
-          acks.push(...page.acks.map((ack) => ack.mutationId))
+          acks.push(...Arr.map(page.acks, (ack) => ack.mutationId))
           if (page._tag === "PullDone") break
           assert.strictEqual((yield* records).length, cursor === null ? 1 : 2)
           continuation = Option.some(page.continuation)
@@ -148,16 +149,16 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
       })
       assert.strictEqual(smallLast._tag, "PullDone")
       assert.deepStrictEqual(
-        [...smallFirst.acks, ...smallLast.acks].map((ack) => ack.mutationId),
+        Arr.map([...smallFirst.acks, ...smallLast.acks], (ack) => ack.mutationId),
         Array.from({ length: 501 }, (_, i) => `small-${i + 1}`)
       )
       yield* registerClient("p", "d")
       const initial = yield* pull(registry, request)
       if (initial._tag !== "PullDone") return assert.fail("expected empty initial snapshot")
       for (let n = 1; n <= 3; n++) {
-        const outcome = { _tag: "Rejected", error: { _tag: "UnknownMutation", name: "x".repeat(600_000) } }
+        const outcome = { _tag: "Rejected", error: { _tag: "UnknownMutation", name: Str.repeat(600_000)("x") } }
         yield* sql`INSERT INTO echo_sync.mutations (client_id, mutation_id, seq, position, outcome)
-                  VALUES ('d', ${`ack-${n}`}, ${n}, echo_sync.next_position(), ${JSON.stringify(outcome)}::jsonb)`
+                  VALUES ('d', ${`ack-${n}`}, ${n}, echo_sync.next_position(), ${yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Json))(outcome)}::jsonb)`
       }
       for (const cursor of [null, initial.nextCursor]) {
         let continuation = Option.none<string>()
@@ -166,18 +167,18 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
         while (true) {
           assert.isBelow(pages++, 5)
           const page = yield* pull(registry, { ...request, cursor, continuation })
-          assert.isAtMost(bytes(page), maxPullPageBytes)
+          assert.isAtMost(yield* bytes(page), maxPullPageBytes)
           assert.deepStrictEqual(page.changes, [])
-          seen.push(...page.acks.map((ack) => ack.mutationId))
+          seen.push(...Arr.map(page.acks, (ack) => ack.mutationId))
           if (page._tag === "PullDone") break
           continuation = Option.some(page.continuation)
         }
         assert.strictEqual(pages, 3)
         assert.deepStrictEqual(seen, ["ack-1", "ack-2", "ack-3"])
       }
-      const outcome = { _tag: "Rejected", error: { _tag: "UnknownMutation", name: "x".repeat(maxPullPageBytes) } }
+      const outcome = { _tag: "Rejected", error: { _tag: "UnknownMutation", name: Str.repeat(maxPullPageBytes)("x") } }
       yield* sql`INSERT INTO echo_sync.mutations (client_id, mutation_id, seq, position, outcome)
-                VALUES ('d', 'too-large', 4, echo_sync.next_position(), ${JSON.stringify(outcome)}::jsonb)`
+                VALUES ('d', 'too-large', 4, echo_sync.next_position(), ${yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Json))(outcome)}::jsonb)`
       const first = yield* pull(registry, request)
       if (first._tag !== "PullPage") return assert.fail("expected ack pagination")
       let continuation = Option.some<string>(first.continuation)
@@ -188,9 +189,9 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
       }
       const final = yield* pull(registry, { ...request, continuation })
       assert.strictEqual(final._tag, "PullDone")
-      assert.isAbove(bytes(final), maxPullPageBytes)
+      assert.isAbove(yield* bytes(final), maxPullPageBytes)
       assert.deepStrictEqual(
-        final.acks.map((ack) => ack.mutationId),
+        Arr.map(final.acks, (ack) => ack.mutationId),
         ["too-large"]
       )
       const delivered = final.acks[0]?.outcome
@@ -211,7 +212,7 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
       yield* sql`INSERT INTO items (id, access_scope_id) VALUES ('a', 's'), ('b', 's')`
       // Continuations are untrusted: repeated readable scopes are not authorization, but still
       // consume bytes when re-encoded. Two log rows ensure this candidate needs a continuation.
-      const continuation = JSON.stringify({
+      const continuation = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Json))({
         clientId: "d",
         principalId: "p",
         cursor: String(initial.nextCursor),
@@ -227,7 +228,7 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
         limit: 1
       })
       if (page._tag !== "PullPage") return assert.fail("expected continuation")
-      assert.isAbove(bytes(page), maxPullPageBytes)
+      assert.isAbove(yield* bytes(page), maxPullPageBytes)
       assert.deepStrictEqual(yield* records, before)
       const final = yield* pull(registry, {
         ...request,
@@ -237,7 +238,7 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
       })
       assert.strictEqual(final._tag, "PullDone")
       assert.deepStrictEqual(
-        [...page.changes, ...final.changes].map((c) => (c._tag === "upsert" ? c.row["id"] : "")),
+        Arr.map([...page.changes, ...final.changes], (c) => (c._tag === "upsert" ? c.row["id"] : "")),
         ["a", "b"]
       )
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
@@ -252,7 +253,7 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
       const page = yield* pull(registry, { ...request, limit: Number.MAX_SAFE_INTEGER })
       assert.strictEqual(page._tag, "PullPage")
       assert.strictEqual(page.changes.length, 500)
-      assert.isAtMost(bytes(page), maxPullPageBytes)
+      assert.isAtMost(yield* bytes(page), maxPullPageBytes)
       assert.deepStrictEqual(yield* records, [])
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))

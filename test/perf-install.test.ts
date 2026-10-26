@@ -1,6 +1,6 @@
 import { expect, it } from "@effect/vitest"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
-import { Effect, Option } from "effect"
+import { Array as Arr, Effect, Number as Num, Option, String as Str } from "effect"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import { SqlClient } from "effect/sql/SqlClient"
 import { makeCompilerSqlite } from "effect/sql/Statement"
@@ -48,9 +48,9 @@ it.live("batched replica upserts keep the last duplicate and split before SQLite
     expect(yield* storage.transaction(storage.revision)).toEqual(revision)
     counter.reset()
     yield* storage.transaction(storage.rows.writeMany(Counters, rows))
-    const writes = counter.statements.filter((s) => s.sql.startsWith('INSERT INTO "counters"'))
+    const writes = Arr.filter(counter.statements, (s) => Str.startsWith('INSERT INTO "counters"')(s.sql))
     expect(writes).toHaveLength(2)
-    expect(writes.every((s) => s.params.length <= 32766)).toBe(true)
+    expect(Arr.every(writes, (s) => s.params.length <= 32766)).toBe(true)
     expect(yield* storage.transaction(storage.rows.read(Counters, "i-0"))).toEqual(Option.some(rows[1]))
     expect(yield* storage.transaction(storage.rows.read(Counters, "i-8191"))).toEqual(
       Option.some({ id: "i-8191", access_scope_id: "s", value: -9, updated_at: 0 })
@@ -164,15 +164,23 @@ it.live("a resumed K-page pull reads only linear staged rows and installs the wh
         count: k / 2
       })
       yield* resumed.engine.pull
-      const stagedReads = counter.statements.filter((s) => /^\s*SELECT\b/i.test(s.sql) && s.sql.includes("echo_staged"))
+      const stagedReads = Arr.filter(
+        counter.statements,
+        (s) => /^\s*SELECT\b/i.test(s.sql) && Str.includes("echo_staged")(s.sql)
+      )
       // One resumed tail read + our progress check + K rows at install. The initial empty
       // tail read returns no row; streaming no longer re-reads progress before each page.
       // A second full-set read would exceed this budget, even though it is still linear.
-      expect(stagedReads.reduce((n, s) => n + s.rows, 0)).toBeLessThanOrEqual(k + 2)
+      expect(Arr.reduce(stagedReads, 0, (n, s) => n + s.rows)).toBeLessThanOrEqual(k + 2)
       expect(
-        (yield* resumed.storage.transaction(resumed.storage.rows.scan(Counters)))
-          .map((r) => r["value"])
-          .toSorted((a, b) => Number(a) - Number(b))
+        Arr.map(
+          Arr.sortWith(
+            yield* resumed.storage.transaction(resumed.storage.rows.scan(Counters)),
+            (r) => Number(r["value"]),
+            Num.Order
+          ),
+          (r) => r["value"]
+        )
       ).toEqual(Array.from({ length: k }, (_, i) => i))
       expect(yield* resumed.storage.transaction(resumed.storage.staged)).toEqual([])
       expect(yield* resumed.storage.transaction(resumed.storage.stagedProgress)).toEqual({
@@ -198,15 +206,21 @@ it.live("install undoes P entries, writes C changes and replays P handlers witho
       expect(result.statements).toHaveLength(8 + 9 * p + Math.ceil(c / 500) + (snapshot ? 3 : 0))
       // Each pending is returned twice; replay reads 2 counter rows + own grant twice
       // (Everyone absent). Meta 1 and one staged JSON row: 6P + 2 returned rows.
-      expect(result.statements.reduce((sum, s) => sum + s.rows, 0)).toBe(6 * p + 2)
-      const writes = result.statements.filter((s) => s.sql.startsWith('INSERT INTO "counters"'))
+      expect(Arr.reduce(result.statements, 0, (sum, s) => sum + s.rows)).toBe(6 * p + 2)
+      const writes = Arr.filter(result.statements, (s) => Str.startsWith('INSERT INTO "counters"')(s.sql))
       expect(writes).toHaveLength(p + Math.ceil(c / 500) + p)
       // Identities/order also catch undoing one entry P times: authoritative writes
       // would hide that mistake in the final replica. Restore is reverse seq order.
-      const idColumn = Counters.columns.findIndex((column) => column.name === "id")
-      const valueColumn = Counters.columns.findIndex((column) => column.name === "value")
+      const idColumn = Option.getOrElse(
+        Arr.findFirstIndex(Counters.columns, (column) => column.name === "id"),
+        () => -1
+      )
+      const valueColumn = Option.getOrElse(
+        Arr.findFirstIndex(Counters.columns, (column) => column.name === "value"),
+        () => -1
+      )
       expect(
-        writes.flatMap((s) =>
+        Arr.flatMap(writes, (s) =>
           Array.from({ length: s.params.length / Counters.columns.length }, (_, i) => [
             s.params[i * Counters.columns.length + idColumn],
             s.params[i * Counters.columns.length + valueColumn]
@@ -217,16 +231,16 @@ it.live("install undoes P entries, writes C changes and replays P handlers witho
         ...Array.from({ length: c }, (_, i) => [`i-${i}`, 200]),
         ...Array.from({ length: p }, (_, i) => [`i-${i}`, 203])
       ])
-      expect(result.statements.filter((s) => s.sql.startsWith("UPDATE echo_outbox SET undo"))).toHaveLength(p)
-      expect(result.final.rows.map((r) => [r["id"], r["value"]])).toEqual(
+      expect(Arr.filter(result.statements, (s) => Str.startsWith("UPDATE echo_outbox SET undo")(s.sql))).toHaveLength(p)
+      expect(Arr.map(result.final.rows, (r) => [r["id"], r["value"]])).toEqual(
         Array.from({ length: c }, (_, i) => [`i-${i}`, i < p ? 203 : 200])
       )
       expect(result.final.pending).toHaveLength(p)
       expect(
-        result.final.pending.map((entry) => ({
+        Arr.map(result.final.pending, (entry) => ({
           mutationId: entry.envelope.mutationId,
           seq: entry.envelope.seq,
-          undo: entry.undo.map((image) => ({
+          undo: Arr.map(entry.undo, (image) => ({
             table: image.table.name,
             id: image.id,
             before: Option.map(image.before, (r) => [r["id"], r["value"]])

@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Fiber, Random, Ref, Schema } from "effect"
+import { Array as Arr, Effect, Fiber, Random, Ref, Schema, String as Str } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, Registry, SyncTable } from "echo-sync"
 import {
@@ -32,7 +32,7 @@ const readableScopes = (principalId: string) =>
     const sql = yield* SqlClient
     const rows = yield* sql<{ scope_id: string }>`
       SELECT access_scope_id AS scope_id FROM echo_sync.scope_grants WHERE principal_id IN (${principalId}, '*')`
-    return new Set(rows.map((r) => r.scope_id))
+    return new Set(Arr.map(rows, (r) => r.scope_id))
   })
 
 describe.skipIf(!pgAvailable)("scope delivery (SPEC §4, §7)", () => {
@@ -56,7 +56,7 @@ describe.skipIf(!pgAvailable)("scope delivery (SPEC §4, §7)", () => {
       assert.deepStrictEqual(newReader.view(), yield* serverView("new"))
       assert.strictEqual(newReader.rows.get("items/a")?.["access_scope_id"], "s2")
       // The old-scope reader received the move as a tombstone, never the new payload.
-      assert.isFalse(oldReader.received.some((c) => c._tag === "upsert" && c.row["access_scope_id"] === "s2"))
+      assert.isFalse(Arr.some(oldReader.received, (c) => c._tag === "upsert" && c.row["access_scope_id"] === "s2"))
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test Postgres composition root; TestDatabase owns creation, migration and cleanup.
     }).pipe(Effect.provide(TestDatabase))
   )
@@ -78,10 +78,10 @@ describe.skipIf(!pgAvailable)("scope delivery (SPEC §4, §7)", () => {
       yield* replica.sync()
       const after = replica.received.slice(before)
       assert.deepStrictEqual(
-        after.filter((c) => c._tag === "scopePurged"),
+        Arr.filter(after, (c) => c._tag === "scopePurged"),
         [{ _tag: "scopePurged", scopeId: "s1" }]
       )
-      assert.isFalse(after.some((c) => c._tag === "upsert" && c.row["access_scope_id"] === "s1"))
+      assert.isFalse(Arr.some(after, (c) => c._tag === "upsert" && c.row["access_scope_id"] === "s1"))
       assert.deepStrictEqual(replica.view(), yield* serverView("p"))
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test Postgres composition root; TestDatabase owns creation, migration and cleanup.
     }).pipe(Effect.provide(TestDatabase))
@@ -97,7 +97,7 @@ describe.skipIf(!pgAvailable)("scope delivery (SPEC §4, §7)", () => {
         for (let i = 0; i < 30; i++) yield* insert(i % 2 === 0 ? "items" : "notes", `pre${i}`, "shared", "v0")
         const replica = new Replica("p", "d")
         yield* replica.sync()
-        assert.isFalse([...replica.rows.values()].some((r) => r["access_scope_id"] === "shared"))
+        assert.isFalse(Arr.some([...replica.rows.values()], (r) => r["access_scope_id"] === "shared"))
 
         yield* grant("p", "shared")
         // Writers keep changing the shared scope (updates, deletes, inserts, moves out) while the
@@ -140,7 +140,7 @@ describe.skipIf(!pgAvailable)("scope delivery (SPEC §4, §7)", () => {
         yield* grant("p0", "s0")
         yield* grant("p1", "s1")
         yield* grant("p2", "s2")
-        const replicas = principals.map((p) => new Replica(p, `${p}-device`))
+        const replicas = Arr.map(principals, (p) => new Replica(p, `${p}-device`))
 
         for (let step = 0; step < 300; step++) {
           const roll = yield* Random.nextIntBetween(0, 99)
@@ -192,10 +192,12 @@ describe.skipIf(!pgAvailable)("scope delivery (SPEC §4, §7)", () => {
         const tables = Registry.make([Items, Notes, Events])
         yield* grant("p", "s1")
         const at = Date.UTC(2026, 9, 21, 6, 30, 15, 123)
+        // oxlint-disable-next-line effecttsgo/global-date-in-effect -- Exercise the SQL driver's native Date binding before verifying epoch-ms wire encoding.
         yield* sql`INSERT INTO events (id, access_scope_id, at) VALUES ('walked', 's1', ${new Date(at)})`
         const replica = new Replica("p", "d", tables)
         yield* replica.sync()
         // After the initial walk, a change arrives through the log path.
+        // oxlint-disable-next-line effecttsgo/global-date-in-effect -- The driver's timestamp input remains a native Date on the incremental path too.
         yield* sql`INSERT INTO events (id, access_scope_id, at) VALUES ('logged', 's1', ${new Date(at + 1)})`
         yield* replica.sync()
 
@@ -208,7 +210,8 @@ describe.skipIf(!pgAvailable)("scope delivery (SPEC §4, §7)", () => {
           assert.deepStrictEqual(row, { id, access_scope_id: "s1", at: ms })
           assert.strictEqual((yield* decode(row)).at.epochMilliseconds, ms)
         }
-        assert.isFalse(JSON.stringify(replica.received).includes("do not ship"))
+        const received = yield* Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Json))(replica.received)
+        assert.isFalse(Str.includes("do not ship")(received))
         // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test Postgres composition root; TestDatabase owns creation, migration and cleanup.
       }).pipe(Effect.provide(TestDatabase))
   )

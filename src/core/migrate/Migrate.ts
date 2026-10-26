@@ -14,7 +14,7 @@
  *
  * `scope_grants` is the engine's table (created by `001_engine`) and is never planned here.
  */
-import { Data, Schema } from "effect"
+import { Array as Arr, Data, Option, pipe, Record as Rec, Schema, String as Str } from "effect"
 import { ScopeGrants } from "../ScopeGrants.ts"
 import { canonicalJson, pgType, type AnySyncTable, type ColumnKind } from "../SyncTable.ts"
 import type { SyncRegistry } from "../Registry.ts"
@@ -49,23 +49,26 @@ export const emptySnapshot: Snapshot = { version: 1, tables: [] }
 
 /** The app tables of a registry (everything but the engine's `scope_grants`), sorted by name. */
 const appTables = (registry: SyncRegistry): ReadonlyArray<AnySyncTable> =>
-  registry.tables
-    .filter((t) => t.name !== ScopeGrants.name)
-    .toSorted((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+  Arr.sort(
+    Arr.filter(registry.tables, (t) => t.name !== ScopeGrants.name),
+    (a: AnySyncTable, b: AnySyncTable) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+  )
 
 /** The snapshot of a registry's app tables. */
 export const snapshotOf = (registry: SyncRegistry): Snapshot => ({
   version: 1,
-  tables: appTables(registry).map((t) => t.manifest)
+  tables: Arr.map(appTables(registry), (t) => t.manifest)
 })
 
 /** Canonical JSON (sorted keys) with a trailing newline: the committed file's exact text. */
 export const encodeSnapshot = (snapshot: Snapshot): string =>
+  // oxlint-disable-next-line effecttsgo/schema-sync -- Public pure migration generator returns text synchronously, including validation failures.
   `${canonicalJson(Schema.encodeSync(Snapshot)(snapshot))}\n`
 
 /** Parses and validates a committed snapshot file. Throws `MigrationPlanError` if malformed. */
 export const decodeSnapshot = (text: string): Snapshot => {
   try {
+    // oxlint-disable-next-line effecttsgo/schema-sync -- Public synchronous file codec preserves its MigrationPlanError throwing contract.
     return Schema.decodeUnknownSync(Schema.fromJsonString(Snapshot))(text)
   } catch (error) {
     throw new MigrationPlanError(`manifest snapshot is malformed: ${String(error)}`)
@@ -107,12 +110,12 @@ export type Step =
 const fail = (message: string): never => {
   throw new MigrationPlanError(message)
 }
-const setKey = (columns: ReadonlyArray<string>) => columns.join("\u0000")
+const setKey = (columns: ReadonlyArray<string>) => Arr.join(columns, "\u0000")
 const quote = (name: string) => `"${name}"`
 const indexName = (table: string, index: string) => `${table}__${index}`
 const columnType = (kind: ColumnKind) => pgType[kind]
 const sameList = (a: ReadonlyArray<string>, b: ReadonlyArray<string>) =>
-  a.length === b.length && a.every((x, i) => x === b[i])
+  a.length === b.length && Arr.every(a, (x, i) => x === b[i])
 
 const notNullSequence = (table: string, column: string): ReadonlyArray<string> => [
   `${table}.${column} is declared NOT NULL. Finish the SPEC §13 sequence by hand, in later deploys:`,
@@ -134,13 +137,13 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
   const ddl = (sql: string, ...comment: ReadonlyArray<string>) =>
     steps.push(comment.length > 0 ? { _tag: "Ddl", sql, comment } : { _tag: "Ddl", sql })
 
-  const before = new Map(previous.tables.map((m) => [m.name, m]))
+  const before = new Map(Arr.map(previous.tables, (m) => [m.name, m]))
   const tables = appTables(registry)
-  const after = new Map(tables.map((t) => [t.name, t]))
+  const after = new Map(Arr.map(tables, (t) => [t.name, t]))
   const drops = new Set(intent.acknowledgeDrops ?? [])
-  const defaults = new Map(Object.entries(intent.defaults ?? {}))
+  const defaults = new Map(Rec.toEntries(intent.defaults ?? {}))
   const usedDefaults = new Set<string>()
-  const tableRenames = new Map(Object.entries(intent.renames?.tables ?? {}))
+  const tableRenames = new Map(Rec.toEntries(intent.renames?.tables ?? {}))
   const renamedFrom = new Set(tableRenames.values())
 
   for (const [to, from] of tableRenames) {
@@ -149,15 +152,16 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
   }
   /** The previous manifest of a current table, resolved through a declared table rename. */
   const previousOf = (table: string) => before.get(table) ?? before.get(tableRenames.get(table) ?? "")
-  for (const [table, columns] of Object.entries(intent.renames?.columns ?? {})) {
+  for (const [table, columns] of Rec.toEntries(intent.renames?.columns ?? {})) {
     const now = after.get(table)
     const was = previousOf(table)
-    if (now === undefined || was === undefined) fail(`renames.columns: "${table}" is not a table in both manifests`)
-    for (const [to, from] of Object.entries(columns)) {
-      if (!now?.manifest.columns.some((c) => c.name === to) || was?.columns.some((c) => c.name === to)) {
+    if (now === undefined || was === undefined)
+      return fail(`renames.columns: "${table}" is not a table in both manifests`)
+    for (const [to, from] of Rec.toEntries(columns)) {
+      if (!Arr.some(now.manifest.columns, (c) => c.name === to) || Arr.some(was.columns, (c) => c.name === to)) {
         fail(`renames.columns: "${table}.${to}" is not a newly declared column`)
       }
-      if (!was?.columns.some((c) => c.name === from) || now?.manifest.columns.some((c) => c.name === from)) {
+      if (!Arr.some(was.columns, (c) => c.name === from) || Arr.some(now.manifest.columns, (c) => c.name === from)) {
         fail(`renames.columns: "${table}.${from}" is not a removed column`)
       }
     }
@@ -179,7 +183,8 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
       todo(
         `Table ${from} is declared renamed to ${name}. Renames are never generated; apply by hand:`,
         `  ALTER TABLE ${quote(from)} RENAME TO ${quote(name)};`,
-        ...was.indexes.map(
+        ...Arr.map(
+          was.indexes,
           (i) => `  ALTER INDEX ${quote(indexName(from, i.name))} RENAME TO ${quote(indexName(name, i.name))};`
         ),
         ...(was.scopeWalkIndex === true
@@ -190,10 +195,10 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
       )
     }
 
-    const renames = new Map(Object.entries(intent.renames?.columns?.[name] ?? {}))
+    const renames = new Map(Rec.toEntries(intent.renames?.columns?.[name] ?? {}))
     const renameSources = new Set(renames.values())
-    const old = new Map(was.columns.map((c) => [c.name, c]))
-    const now = new Map(table.manifest.columns.map((c) => [c.name, c]))
+    const old = new Map(Arr.map(was.columns, (c) => [c.name, c]))
+    const now = new Map(Arr.map(table.manifest.columns, (c) => [c.name, c]))
     // Columns whose rename, drop or kind change is a TODO (old and new names): DDL that
     // references one cannot assume the column exists in its declared shape (SPEC §13), and neither
     // can any DDL on a table whose rename is a TODO.
@@ -204,9 +209,14 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
     }
     /** The TODO a step referencing `refs` waits for, if any. */
     const dependency = (refs: ReadonlyArray<string>) => {
-      const on = refs.filter((r) => blocked.has(r))
+      const on = Arr.filter(refs, (r) => blocked.has(r))
       if (from !== undefined) return `rename of table ${from}`
-      return on.length > 0 ? `TODO for ${on.map((c) => `${name}.${c}`).join(", ")}` : undefined
+      return on.length > 0
+        ? `TODO for ${Arr.join(
+            Arr.map(on, (c) => `${name}.${c}`),
+            ", "
+          )}`
+        : undefined
     }
     const emit = (statement: string, refs: ReadonlyArray<string>, ...comment: ReadonlyArray<string>) => {
       const waits = dependency(refs)
@@ -281,26 +291,29 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
     for (const prior of was.columns) {
       if (now.has(prior.name) || renameSources.has(prior.name)) continue
       const key = `${name}.${prior.name}`
-      const goes = was.indexes.filter((i) => i.columns.includes(prior.name)).map((i) => indexName(name, i.name))
+      const goes = Arr.map(
+        Arr.filter(was.indexes, (i) => Arr.contains(i.columns, prior.name)),
+        (i) => indexName(name, i.name)
+      )
       todo(
         drops.has(key)
           ? `Column ${key} is no longer declared and its drop is acknowledged. Drops are never generated; when no reader needs it:`
           : `Column ${key} is no longer declared; its data is kept. Acknowledge with acknowledgeDrops: ["${key}"]. To drop by hand:`,
         `  ALTER TABLE ${quote(name)} DROP COLUMN ${quote(prior.name)};`,
         ...(goes.length > 0
-          ? [`PostgreSQL drops ${goes.join(", ")} with the column; any replacement index is a TODO below.`]
+          ? [`PostgreSQL drops ${Arr.join(goes, ", ")} with the column; any replacement index is a TODO below.`]
           : [])
       )
     }
 
     // Indexes: inferred (plain DDL inside the Migrator transaction; indexHash rebuilds nothing).
-    const oldIndexes = new Map(was.indexes.map((i) => [i.name, i]))
-    const newIndexes = new Map(table.manifest.indexes.map((i) => [i.name, i]))
+    const oldIndexes = new Map(Arr.map(was.indexes, (i) => [i.name, i]))
+    const newIndexes = new Map(Arr.map(table.manifest.indexes, (i) => [i.name, i]))
     const createFor = (index: string) => {
       const prefix = `CREATE INDEX ${quote(indexName(name, index))} `
-      return (
-        table.postgres.createIndexes.find((statement) => statement.startsWith(prefix)) ??
-        fail(`no DDL for ${name}.${index}`)
+      return Option.getOrElse(
+        Arr.findFirst(table.postgres.createIndexes, (statement) => Str.startsWith(prefix)(statement)),
+        () => fail(`no DDL for ${name}.${index}`)
       )
     }
     if (was.scopeWalkIndex !== true) emit(createFor("echo-scope"), ["access_scope_id", "id"])
@@ -317,35 +330,35 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
       }
       // An index on a dropped column goes with the column (the drop TODO says so): no DROP INDEX.
       // A kind change is hand-carried as add/backfill/drop, which may or may not have removed it.
-      const goesWithColumn = prior.columns.some((c) => !now.has(c) && !renameSources.has(c))
-      const changesKind = prior.columns.some((c) => {
+      const goesWithColumn = Arr.some(prior.columns, (c) => !now.has(c) && !renameSources.has(c))
+      const changesKind = Arr.some(prior.columns, (c) => {
         const current = now.get(c)
         return current !== undefined && old.get(c)?.kind !== current.kind
       })
       const statements = [
-        ...(goesWithColumn ? [] : [changesKind ? drop.replace("DROP INDEX ", "DROP INDEX IF EXISTS ") : drop]),
+        ...(goesWithColumn ? [] : [changesKind ? Str.replace("DROP INDEX ", "DROP INDEX IF EXISTS ")(drop) : drop]),
         ...(next === undefined ? [] : [createFor(next.name)])
       ]
       if (statements.length > 0) {
-        todo(`Depends on the ${waits} above; run by hand after it:`, ...statements.map((st) => `  ${st};`))
+        todo(`Depends on the ${waits} above; run by hand after it:`, ...Arr.map(statements, (st) => `  ${st};`))
       }
     }
     for (const next of table.manifest.indexes) if (!oldIndexes.has(next.name)) emit(createFor(next.name), next.columns)
 
     // Unique sets: TODO only (adding can fail on data; removing needs the generated constraint name).
-    const oldUnique = new Set(was.unique.map(setKey))
-    const newUnique = new Set(table.manifest.unique.map(setKey))
+    const oldUnique = new Set(Arr.map(was.unique, setKey))
+    const newUnique = new Set(Arr.map(table.manifest.unique, setKey))
     for (const cs of table.manifest.unique) {
       if (oldUnique.has(setKey(cs))) continue
       todo(
-        `Unique set (${cs.join(", ")}) added on ${name}. Not generated: it fails on duplicate data. Check, then by hand:`,
-        `  ALTER TABLE ${quote(name)} ADD UNIQUE (${cs.map(quote).join(", ")});`
+        `Unique set (${Arr.join(cs, ", ")}) added on ${name}. Not generated: it fails on duplicate data. Check, then by hand:`,
+        `  ALTER TABLE ${quote(name)} ADD UNIQUE (${Arr.join(Arr.map(cs, quote), ", ")});`
       )
     }
     for (const cs of was.unique) {
       if (newUnique.has(setKey(cs))) continue
       todo(
-        `Unique set (${cs.join(", ")}) removed from ${name}. Not generated: drop its constraint by hand`,
+        `Unique set (${Arr.join(cs, ", ")}) removed from ${name}. Not generated: drop its constraint by hand`,
         `  (find the name with \\d ${name}): ALTER TABLE ${quote(name)} DROP CONSTRAINT <name>;`
       )
     }
@@ -364,12 +377,18 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
   for (const k of defaults.keys())
     if (!usedDefaults.has(k)) fail(`defaults: "${k}" is not a newly declared NOT NULL column`)
   for (const d of drops) {
-    const [table, column] = d.split(".")
+    const [table, column] = Str.split(d, ".")
     const removed =
       column === undefined
         ? before.has(d) && !after.has(d)
-        : (previousOf(table ?? "")?.columns.some((c) => c.name === column) ?? false) &&
-          !(after.get(table ?? "")?.manifest.columns.some((c) => c.name === column) ?? true)
+        : Option.match(Option.fromUndefinedOr(previousOf(table ?? "")), {
+            onNone: () => false,
+            onSome: (previousTable) => Arr.some(previousTable.columns, (c) => c.name === column)
+          }) &&
+          !Option.match(Option.fromUndefinedOr(after.get(table ?? "")), {
+            onNone: () => true,
+            onSome: (currentTable) => Arr.some(currentTable.manifest.columns, (c) => c.name === column)
+          })
     if (!removed) fail(`acknowledgeDrops: "${d}" is not a removed table or column`)
   }
   return steps
@@ -380,17 +399,18 @@ export const plan = (previous: Snapshot, registry: SyncRegistry, intent: Intent 
 // ---------------------------------------------------------------------------------------------
 
 /** Escapes text for a JS template literal. */
-const templateText = (text: string) => text.replaceAll("\\", "\\\\").replaceAll("`", "\\`").replaceAll("${", "\\${")
+const templateText = (text: string) =>
+  pipe(text, Str.replaceAll("\\", "\\\\"), Str.replaceAll("`", "\\`"), Str.replaceAll("${", "\\${"))
 const indent = (text: string, by: string) =>
-  text
-    .split("\n")
-    .map((line) => by + line)
-    .join("\n")
+  Arr.join(
+    Arr.map(Str.split(text, "\n"), (line) => by + line),
+    "\n"
+  )
 
 /** The migration module for `steps`: default export an Effect over `SqlClient`. */
 export const render = (id: string, steps: ReadonlyArray<Step>): string => {
   const body: Array<string> = []
-  const hasDdl = steps.some((s) => s._tag === "Ddl")
+  const hasDdl = Arr.some(steps, (s) => s._tag === "Ddl")
   if (hasDdl) body.push("  const sql = yield* SqlClient")
   for (const step of steps) {
     body.push("")
@@ -402,27 +422,33 @@ export const render = (id: string, steps: ReadonlyArray<Step>): string => {
     body.push(`  yield* sql.unsafe(\`\n${indent(templateText(step.sql), "    ")}\n  \`)`)
   }
   if (!hasDdl) body.push("  yield* Effect.void")
-  return [
-    "/**",
-    ` * ${id}: generated by echo-sync Migrate.generate (SPEC §13) from the committed manifest`,
-    " * snapshot. Review every statement and TODO before committing; migration modules are",
-    " * immutable once released.",
-    " */",
-    'import { Effect } from "effect"',
-    ...(hasDdl ? ['import { SqlClient } from "effect/sql/SqlClient"'] : []),
-    "",
-    "export default Effect.gen(function* () {",
-    ...body,
-    "})",
-    ""
-  ].join("\n")
+  return Arr.join(
+    [
+      "/**",
+      ` * ${id}: generated by echo-sync Migrate.generate (SPEC §13) from the committed manifest`,
+      " * snapshot. Review every statement and TODO before committing; migration modules are",
+      " * immutable once released.",
+      " */",
+      'import { Effect } from "effect"',
+      ...(hasDdl ? ['import { SqlClient } from "effect/sql/SqlClient"'] : []),
+      "",
+      "export default Effect.gen(function* () {",
+      ...body,
+      "})",
+      ""
+    ],
+    "\n"
+  )
 }
 
 /** `NNN_name` after the highest of `existing` (ids like `"002_add_notes"` or file names). */
 export const nextId = (existing: ReadonlyArray<string>, name: string): string => {
   if (!/^[a-z0-9_]+$/.test(name)) throw new MigrationPlanError(`migration name "${name}" must match /^[a-z0-9_]+$/`)
-  const highest = Math.max(0, ...existing.map((e) => Number(/^(\d+)_/.exec(e.replace(/^.*\//, ""))?.[1] ?? 0)))
-  return `${String(highest + 1).padStart(3, "0")}_${name}`
+  const highest = Math.max(
+    0,
+    ...Arr.map(existing, (e) => Number(/^(\d+)_/.exec(Str.replace(/^.*\//, "")(e))?.[1] ?? 0))
+  )
+  return `${Str.padStart(3, "0")(String(highest + 1))}_${name}`
 }
 
 export interface Generated {

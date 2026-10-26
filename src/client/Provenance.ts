@@ -1,3 +1,4 @@
+import * as Arr from "effect/Array"
 import * as Schema from "effect/Schema"
 
 /** A committed snapshot in one storage lifetime. Never compare offsets across epochs. */
@@ -27,15 +28,18 @@ export const classify = (
     return "refresh-required"
   if (incorporated.offset === next.offset) return "unchanged"
   const covered = new Set(
-    applied.flatMap(({ change }) =>
-      change != null &&
-      change.before.epoch === next.epoch &&
-      change.after.epoch === next.epoch &&
-      change.after.offset === change.before.offset + 1 &&
-      change.before.offset >= incorporated.offset &&
-      change.after.offset <= next.offset
-        ? [change.after.offset]
-        : []
+    // Public receipts may be sparse; native flatMap skipped holes, whereas Effect flatMap visits them.
+    Arr.flatMap(
+      Arr.filter(applied, (_, index) => index in applied),
+      ({ change }: (typeof applied)[number]) =>
+        change != null &&
+        change.before.epoch === next.epoch &&
+        change.after.epoch === next.epoch &&
+        change.after.offset === change.before.offset + 1 &&
+        change.before.offset >= incorporated.offset &&
+        change.after.offset <= next.offset
+          ? [change.after.offset]
+          : []
     )
   )
   return covered.size === next.offset - incorporated.offset ? "local-only" : "refresh-required"

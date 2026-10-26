@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as PgMigrator from "@effect/sql-pg/PgMigrator"
-import { DateTime, Effect, Exit, Option } from "effect"
+import { Array as Arr, DateTime, Effect, Exit, Option, Order } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, ScopeGrants, Store } from "echo-sync"
 import engine from "./migrations/001_engine.ts"
@@ -45,7 +45,9 @@ const mutate = (
   Effect.gen(function* () {
     const body = Effect.gen(function* () {
       const sql = yield* SqlClient
-      const rows = yield* RowStore.make(new Map((yield* resolveTables(registry)).map((t) => [t.table.name, t.schema])))
+      const rows = yield* RowStore.make(
+        new Map(Arr.map(yield* resolveTables(registry), (t) => [t.table.name, t.schema]))
+      )
       const { store } = Store.make(rows, {
         actor: AccessScope.PrincipalId.make(actor),
         roleFor: roleFor(sql, actor),
@@ -89,8 +91,11 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (INV-ACL-5)", () => {
       }
       const ids = yield* sql<{ id: string }>`SELECT id FROM echo_sync.scope_grants ORDER BY id`
       assert.deepStrictEqual(
-        ids.map((r) => r.id),
-        accepted.map(([scope, principal]) => derived(scope, principal)).toSorted()
+        Arr.map(ids, (r) => r.id),
+        Arr.sort(
+          Arr.map(accepted, ([scope, principal]) => derived(scope, principal)),
+          Order.String
+        )
       )
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
@@ -109,7 +114,7 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (INV-ACL-5)", () => {
       assert.include(String(Exit.isFailure(failed) ? failed.cause : ""), "scope_grants_id_derived")
       const applied = yield* sql<{ name: string }>`SELECT name FROM echo_sync.migrations ORDER BY migration_id`
       assert.deepStrictEqual(
-        applied.map((r) => r.name),
+        Arr.map(applied, (r) => r.name),
         ["engine"]
       )
 
@@ -118,7 +123,7 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (INV-ACL-5)", () => {
       yield* migrate
       const after = yield* sql<{ name: string }>`SELECT name FROM echo_sync.migrations ORDER BY migration_id`
       assert.deepStrictEqual(
-        after.map((r) => r.name),
+        Arr.map(after, (r) => r.name),
         ["engine", "grant_id_check", "ledger_acked_at", "engine_epoch", "scope_walk_index"]
       )
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
@@ -135,7 +140,7 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (INV-ACL-5)", () => {
         yield* sql`INSERT INTO echo_sync.access_scopes (id) VALUES (${scope})`
         const body = Effect.gen(function* () {
           const tables = yield* resolveTables(registry)
-          const rows = yield* RowStore.make(new Map(tables.map((t) => [t.table.name, t.schema])))
+          const rows = yield* RowStore.make(new Map(Arr.map(tables, (t) => [t.table.name, t.schema])))
           const { store } = Store.make(rows, {
             actor: AccessScope.PrincipalId.make("p"),
             roleFor: () => Effect.succeed(Option.some<AccessScope.Role>("owner")),
@@ -198,7 +203,7 @@ describe.skipIf(!pgAvailable)("self-revocation of a grant (SPEC §4)", () => {
                      VALUES (${derived(scope, principal)}, ${scope}, ${principal}, ${role}, now())`
         }
         yield* sql`INSERT INTO items (id, access_scope_id, body) VALUES ('shared', ${scope}, 'v0')`
-        const [owner, writer, reader] = ["o", "w", "r"].map((p) => new Replica(p, `${p}-device`))
+        const [owner, writer, reader] = Arr.map(["o", "w", "r"], (p) => new Replica(p, `${p}-device`))
         if (owner === undefined || writer === undefined || reader === undefined) return assert.fail("replicas")
         for (const replica of [owner, writer, reader]) yield* replica.sync()
         assert.isTrue(reader.rows.has("items/shared") && writer.rows.has("items/shared"))
@@ -219,23 +224,26 @@ describe.skipIf(!pgAvailable)("self-revocation of a grant (SPEC §4)", () => {
         const grants = yield* sql<{ principal_id: string }>`
           SELECT principal_id FROM echo_sync.scope_grants WHERE access_scope_id = ${scope}`
         assert.deepStrictEqual(
-          grants.map((g) => g.principal_id),
+          Arr.map(grants, (g) => g.principal_id),
           ["o"]
         )
 
-        const before = new Map([owner, writer, reader].map((replica) => [replica, replica.received.length]))
+        const before = new Map(Arr.map([owner, writer, reader], (replica) => [replica, replica.received.length]))
         for (const replica of [owner, writer, reader]) yield* replica.sync()
         const since = (replica: Replica) => replica.received.slice(before.get(replica))
         for (const leaver of [writer, reader]) {
           assert.deepStrictEqual(
-            since(leaver).filter((c) => c._tag === "scopePurged"),
+            Arr.filter(since(leaver), (c) => c._tag === "scopePurged"),
             [{ _tag: "scopePurged", scopeId: scope }],
             leaver.principalId
           )
           assert.deepStrictEqual([...leaver.rows.keys()], [], leaver.principalId)
         }
-        const tombstones = since(owner).flatMap((c) => (c._tag === "tombstone" ? [c.id] : []))
-        assert.deepStrictEqual(tombstones.toSorted(), [derived(scope, "r"), derived(scope, "w")].toSorted())
+        const tombstones = Arr.flatMap(since(owner), (c) => (c._tag === "tombstone" ? [c.id] : []))
+        assert.deepStrictEqual(
+          Arr.sort(tombstones, Order.String),
+          Arr.sort([derived(scope, "r"), derived(scope, "w")], Order.String)
+        )
         assert.strictEqual(owner.rows.get("items/shared")?.["body"], "v1")
         assert.deepStrictEqual(owner.view(), yield* serverView("o"))
         // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.

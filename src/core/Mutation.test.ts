@@ -1,5 +1,5 @@
-import { Cause, DateTime, Effect, Option, Schema, SchemaGetter } from "effect"
-import { describe, expect, it } from "vitest"
+import { Array as Arr, Cause, DateTime, Effect, Option, Schema, SchemaGetter } from "effect"
+import { describe, expect, it } from "@effect/vitest"
 import { AccessScopeId, PrincipalId } from "./AccessScope.ts"
 import { RowNotFound, ScopeForbidden, StoreUnavailable } from "./Errors.ts"
 import { ClientId, MutationId, Seq } from "./Ids.ts"
@@ -62,40 +62,44 @@ const makeStore = () => {
 }
 
 describe("mutation args evolve without breaking queued intents (SPEC §5)", () => {
-  it("unknown nested args are rejected through the wire registry unless stripping is explicitly enabled", async () => {
-    const args = Schema.Struct({
-      customTimes: Schema.Record(Schema.String, Schema.Struct({ minutes: Schema.Int }))
-    })
-    const seen: Array<typeof args.Type> = []
-    const handler = (_: Mutation.MutationContext, value: typeof args.Type) =>
-      Effect.sync(() => {
-        seen.push(value)
+  it.effect(
+    "unknown nested args are rejected through the wire registry unless stripping is explicitly enabled",
+    Effect.fnUntraced(function* () {
+      const args = Schema.Struct({
+        customTimes: Schema.Record(Schema.String, Schema.Struct({ minutes: Schema.Int }))
       })
-    const strict = Mutation.make("strict", { args, handler })
-    const loose = Mutation.make("loose", { args, handler, onExcessProperty: "ignore" })
-    const registry = Mutation.makeRegistry([strict, loose])
-    for (const input of [
-      { customTimes: { night: { minutes: 12, typo: 3 } } },
-      { customTimes: { night: { minutes: 12 } }, typo: 3 }
-    ]) {
-      const envelope = Schema.decodeUnknownSync(Schema.toCodecJson(Mutation.MutationEnvelope))({
-        clientId: "c",
-        mutationId: "m",
-        seq: 1,
-        name: "strict",
-        args: input
-      })
-      const error = await Effect.runPromise(Effect.flip(Mutation.run(registry, envelope, ctx())))
-      expect(error).toBeInstanceOf(Mutation.ArgsDecodeFailed)
-      if (error._tag !== "ArgsDecodeFailed") throw error
-      expect(error.message).toContain("typo")
-      const codec = Schema.toCodecJson(Mutation.MutationOutcome)
-      const wire = Schema.encodeSync(codec)({ _tag: "Rejected", error })
-      expect(Schema.decodeUnknownSync(codec)(JSON.parse(JSON.stringify(wire)))).toEqual({ _tag: "Rejected", error })
-      expect(seen).toEqual([])
-    }
-    await Effect.runPromise(
-      Mutation.run(
+      const seen: Array<typeof args.Type> = []
+      const handler = (_: Mutation.MutationContext, value: typeof args.Type) =>
+        Effect.sync(() => {
+          seen.push(value)
+        })
+      const strict = Mutation.make("strict", { args, handler })
+      const loose = Mutation.make("loose", { args, handler, onExcessProperty: "ignore" })
+      const registry = Mutation.makeRegistry([strict, loose])
+      for (const input of [
+        { customTimes: { night: { minutes: 12, typo: 3 } } },
+        { customTimes: { night: { minutes: 12 } }, typo: 3 }
+      ]) {
+        const envelope = yield* Schema.decodeUnknownEffect(Schema.toCodecJson(Mutation.MutationEnvelope))({
+          clientId: "c",
+          mutationId: "m",
+          seq: 1,
+          name: "strict",
+          args: input
+        })
+        const error = yield* Effect.flip(Mutation.run(registry, envelope, ctx()))
+        expect(error).toBeInstanceOf(Mutation.ArgsDecodeFailed)
+        if (error._tag !== "ArgsDecodeFailed") throw error
+        expect(error.message).toContain("typo")
+        const codec = Schema.toCodecJson(Mutation.MutationOutcome)
+        const wire = yield* Schema.encodeEffect(Schema.fromJsonString(codec))({ _tag: "Rejected", error })
+        expect(yield* Schema.decodeUnknownEffect(Schema.fromJsonString(codec))(wire)).toEqual({
+          _tag: "Rejected",
+          error
+        })
+        expect(seen).toEqual([])
+      }
+      yield* Mutation.run(
         registry,
         {
           name: "loose",
@@ -103,9 +107,7 @@ describe("mutation args evolve without breaking queued intents (SPEC §5)", () =
         },
         ctx()
       )
-    )
-    await Effect.runPromise(
-      Mutation.run(
+      yield* Mutation.run(
         registry,
         {
           name: "strict",
@@ -113,56 +115,60 @@ describe("mutation args evolve without breaking queued intents (SPEC §5)", () =
         },
         ctx()
       )
-    )
-    expect(seen).toEqual([{ customTimes: { night: { minutes: 12 } } }, { customTimes: { night: { minutes: 7 } } }])
-  })
+      expect(seen).toEqual([{ customTimes: { night: { minutes: 12 } } }, { customTimes: { night: { minutes: 7 } } }])
+    })
+  )
 
-  it("a v1 envelope still in an outbox decodes through the wire envelope and runs as v2", async () => {
-    // Exactly what a v1 client persisted and later pushes, as JSON text.
-    const queued: unknown = JSON.parse(
-      `{"clientId":"c1","mutationId":"m-1","seq":1,"name":"todos.setCompleted","args":{"id":"t1","completed":true}}`
-    )
-    const envelope = Schema.decodeUnknownSync(Schema.toCodecJson(Mutation.MutationEnvelope))(queued)
-    const store = makeStore()
-    const now = DateTime.makeUnsafe(1_700_000_000_000)
-    await Effect.runPromise(
-      store.insert(Todos, { id: TodoId.make("t1"), accessScopeId: AccessScopeId.make("s"), completedAt: null })
-    )
-    const ctx = {
-      actor: PrincipalId.make("u"),
-      now,
-      random: Mutation.seededRandom(envelope.clientId, envelope.mutationId),
-      store
-    }
-    await Effect.runPromise(Mutation.run(Mutation.makeRegistry([setCompleted]), envelope, ctx))
-    const row = await Effect.runPromise(store.get(Todos, TodoId.make("t1")))
-    expect(row.completedAt).toEqual(now)
-  })
+  it.effect(
+    "a v1 envelope still in an outbox decodes through the wire envelope and runs as v2",
+    Effect.fnUntraced(function* () {
+      // Exactly what a v1 client persisted and later pushes, as JSON text.
+      const envelope = yield* Schema.decodeUnknownEffect(
+        Schema.fromJsonString(Schema.toCodecJson(Mutation.MutationEnvelope))
+      )(`{"clientId":"c1","mutationId":"m-1","seq":1,"name":"todos.setCompleted","args":{"id":"t1","completed":true}}`)
+      const store = makeStore()
+      const now = DateTime.makeUnsafe(1_700_000_000_000)
+      yield* store.insert(Todos, { id: TodoId.make("t1"), accessScopeId: AccessScopeId.make("s"), completedAt: null })
+      const ctx = {
+        actor: PrincipalId.make("u"),
+        now,
+        random: Mutation.seededRandom(envelope.clientId, envelope.mutationId),
+        store
+      }
+      yield* Mutation.run(Mutation.makeRegistry([setCompleted]), envelope, ctx)
+      const row = yield* store.get(Todos, TodoId.make("t1"))
+      expect(row.completedAt).toEqual(now)
+    })
+  )
 
-  it("v1 args that are neither shape are a typed ArgsDecodeFailed rejection, not a defect", async () => {
-    const ctx = {
-      actor: PrincipalId.make("u"),
-      now: DateTime.makeUnsafe(0),
-      random: Mutation.seededRandom(ClientId.make("c"), MutationId.make("m")),
-      store: makeStore()
-    }
-    const err = await Effect.runPromise(
-      Effect.flip(
+  it.effect(
+    "v1 args that are neither shape are a typed ArgsDecodeFailed rejection, not a defect",
+    Effect.fnUntraced(function* () {
+      const ctx = {
+        actor: PrincipalId.make("u"),
+        now: DateTime.makeUnsafe(0),
+        random: Mutation.seededRandom(ClientId.make("c"), MutationId.make("m")),
+        store: makeStore()
+      }
+      const err = yield* Effect.flip(
         Mutation.run(
           Mutation.makeRegistry([setCompleted]),
           { name: "todos.setCompleted", args: { id: "t1", completed: "yes" } },
           ctx
         )
       )
-    )
-    if (err._tag === "StoreUnavailable") throw err
-    expect(err._tag).toBe("ArgsDecodeFailed")
-    // Rejections travel in push results: they must survive the wire.
-    const wire = Schema.encodeSync(Schema.toCodecJson(Mutation.MutationOutcome))({ _tag: "Rejected", error: err })
-    expect(
-      Schema.decodeUnknownSync(Schema.toCodecJson(Mutation.MutationOutcome))(JSON.parse(JSON.stringify(wire)))
-    ).toEqual({ _tag: "Rejected", error: err })
-  })
+      if (err._tag === "StoreUnavailable") throw err
+      expect(err._tag).toBe("ArgsDecodeFailed")
+      // Rejections travel in push results: they must survive the wire.
+      const wire = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.toCodecJson(Mutation.MutationOutcome)))({
+        _tag: "Rejected",
+        error: err
+      })
+      expect(
+        yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.toCodecJson(Mutation.MutationOutcome)))(wire)
+      ).toEqual({ _tag: "Rejected", error: err })
+    })
+  )
 })
 
 const draw = (c: string, m: string) => {
@@ -184,31 +190,33 @@ const compound = (other: Cause.Reason<{ readonly _tag: "Nope" } | StoreUnavailab
   Effect.failCause(Cause.fromReasons([Cause.makeFailReason({ _tag: "Nope" as const }), other]))
 
 describe("mutation outcome classification over the whole cause (SPEC §5)", () => {
-  it("a domain failure combined with a defect dies with the defect, never a Rejected outcome", async () => {
-    const exit = await Effect.runPromise(
-      Effect.exit(
+  it.effect(
+    "a domain failure combined with a defect dies with the defect, never a Rejected outcome",
+    Effect.fnUntraced(function* () {
+      const exit = yield* Effect.exit(
         Mutation.run(failing(compound(Cause.makeDieReason("programmer bug"))), { name: "x", args: {} }, ctx())
       )
-    )
-    const cause = exit._tag === "Failure" ? exit.cause : Cause.empty
-    expect(exit._tag).toBe("Failure")
-    expect(Cause.hasFails(cause)).toBe(false)
-    expect(Cause.hasDies(cause)).toBe(true)
-    expect(Cause.squash(cause)).not.toMatchObject({ _tag: "DomainError" })
-  })
+      const cause = exit._tag === "Failure" ? exit.cause : Cause.empty
+      expect(exit._tag).toBe("Failure")
+      expect(Cause.hasFails(cause)).toBe(false)
+      expect(Cause.hasDies(cause)).toBe(true)
+      expect(Cause.squash(cause)).not.toMatchObject({ _tag: "DomainError" })
+    })
+  )
 
-  it("StoreUnavailable alongside a domain failure stays transient, never a permanent rejection", async () => {
-    const err = await Effect.runPromise(
-      Effect.flip(
+  it.effect(
+    "StoreUnavailable alongside a domain failure stays transient, never a permanent rejection",
+    Effect.fnUntraced(function* () {
+      const err = yield* Effect.flip(
         Mutation.run(
           failing(compound(Cause.makeFailReason(new StoreUnavailable({ message: "down" })))),
           { name: "x", args: {} },
           ctx()
         )
       )
-    )
-    expect(err._tag).toBe("StoreUnavailable")
-  })
+      expect(err._tag).toBe("StoreUnavailable")
+    })
+  )
 })
 
 const strict = (reasons: ReadonlyArray<Cause.Reason<string | RowNotFound>>) =>
@@ -220,31 +228,37 @@ const strict = (reasons: ReadonlyArray<Cause.Reason<string | RowNotFound>>) =>
     })
   ])
 const outcome = (reasons: ReadonlyArray<Cause.Reason<string | RowNotFound>>) =>
-  Effect.runPromise(Effect.exit(Mutation.run(strict(reasons), { name: "strict", args: {} }, ctx())))
+  Effect.exit(Mutation.run(strict(reasons), { name: "strict", args: {} }, ctx()))
 describe("every domain failure in a cause must encode before any is reported (SPEC §5)", () => {
   const valid = Cause.makeFailReason("valid")
   const unencodable = Cause.makeFailReason("") // type-valid string, rejected by NonEmptyString
 
-  it("an unencodable domain failure next to a valid one dies, in either order, never a DomainError", async () => {
-    for (const reasons of [
-      [valid, unencodable],
-      [unencodable, valid],
-      [Cause.makeFailReason(new RowNotFound({ table: "t", id: "1" })), unencodable]
-    ]) {
-      const exit = await outcome(reasons)
-      const cause = exit._tag === "Failure" ? exit.cause : Cause.empty
-      expect(exit._tag).toBe("Failure")
-      expect(Cause.hasFails(cause)).toBe(false)
-      expect(Cause.hasDies(cause)).toBe(true)
-    }
-  })
+  it.effect(
+    "an unencodable domain failure next to a valid one dies, in either order, never a DomainError",
+    Effect.fnUntraced(function* () {
+      for (const reasons of [
+        [valid, unencodable],
+        [unencodable, valid],
+        [Cause.makeFailReason(new RowNotFound({ table: "t", id: "1" })), unencodable]
+      ]) {
+        const exit = yield* outcome(reasons)
+        const cause = exit._tag === "Failure" ? exit.cause : Cause.empty
+        expect(exit._tag).toBe("Failure")
+        expect(Cause.hasFails(cause)).toBe(false)
+        expect(Cause.hasDies(cause)).toBe(true)
+      }
+    })
+  )
 
-  it("when every failure encodes, the first in cause order is the rejection", async () => {
-    const err = await Effect.runPromise(
-      Effect.flip(Mutation.run(strict([valid, Cause.makeFailReason("second")]), { name: "strict", args: {} }, ctx()))
-    )
-    expect(err).toMatchObject({ _tag: "DomainError", mutation: "strict", error: "valid" })
-  })
+  it.effect(
+    "when every failure encodes, the first in cause order is the rejection",
+    Effect.fnUntraced(function* () {
+      const err = yield* Effect.flip(
+        Mutation.run(strict([valid, Cause.makeFailReason("second")]), { name: "strict", args: {} }, ctx())
+      )
+      expect(err).toMatchObject({ _tag: "DomainError", mutation: "strict", error: "valid" })
+    })
+  )
 })
 
 describe("mutation registry and identity", () => {
@@ -258,25 +272,33 @@ describe("mutation registry and identity", () => {
     expect(draw("c1", "m1")).not.toEqual(draw("c2", "m1"))
   })
 
-  it("the wire rejects seq < 1 and keeps Position exact beyond 2^53", () => {
-    expect(() => Schema.decodeUnknownSync(Seq)(0)).toThrow(/greater than or equal to 1/)
-    const done = { _tag: "PullDone", changes: [], acks: [], nextCursor: "9007199254740993", expiredThrough: 0 }
-    const decoded = Schema.decodeUnknownSync(Schema.toCodecJson(Protocol.PullResponse))(done)
-    expect(decoded._tag === "PullDone" && decoded.nextCursor).toBe(9007199254740993n)
-  })
+  it.effect(
+    "the wire rejects seq < 1 and keeps Position exact beyond 2^53",
+    Effect.fnUntraced(function* () {
+      const error = yield* Effect.flip(Schema.decodeUnknownEffect(Seq)(0))
+      expect(String(error)).toMatch(/greater than or equal to 1/)
+      const done = { _tag: "PullDone", changes: [], acks: [], nextCursor: "9007199254740993", expiredThrough: 0 }
+      const decoded = yield* Schema.decodeUnknownEffect(Schema.toCodecJson(Protocol.PullResponse))(done)
+      expect(decoded._tag === "PullDone" && decoded.nextCursor).toBe(9007199254740993n)
+    })
+  )
 })
 
 /** The NoticeMismatch the decode failed with; anything else (success, defect) fails the test. */
-const mismatchOf = async <A>(effect: Effect.Effect<A, Mutation.NoticeMismatch>) => {
-  const exit = await Effect.runPromise(Effect.exit(effect))
-  if (exit._tag === "Success") throw new Error(`decoded to ${JSON.stringify(exit.value)}`)
-  expect(exit.cause.reasons.every(Cause.isFailReason)).toBe(true)
-  return await Effect.runPromise(Effect.flip(effect))
-}
+const mismatchOf = Effect.fnUntraced(function* <A>(effect: Effect.Effect<A, Mutation.NoticeMismatch>) {
+  const exit = yield* Effect.exit(effect)
+  if (exit._tag === "Success") {
+    const value = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(exit.value)
+    throw new Error(`decoded to ${value}`)
+  }
+  if (!Arr.every(exit.cause.reasons, Cause.isFailReason)) throw new Error(Cause.pretty(exit.cause))
+  return yield* Effect.orDie(Effect.flip(effect))
+})
 
 describe("decodeNotice types a stored notice by its mutation (SPEC §9.5)", () => {
   const TooLate = Schema.TaggedStruct("TooLate", { deadline: Schema.Date })
   const Locked = Schema.TaggedStruct("Locked", { by: Schema.String })
+  // oxlint-disable-next-line effecttsgo/global-date -- Native Date is the declared mutation payload type under test.
   const deadline = new Date(1_700_000_000_000)
   const archive = Mutation.make("todos.archive", {
     args: Schema.Struct({ id: TodoId, at: Schema.Date }),
@@ -303,70 +325,80 @@ describe("decodeNotice types a stored notice by its mutation (SPEC §9.5)", () =
     mutationId: "m-1",
     seq: 3,
     name: "todos.archive",
+    // oxlint-disable-next-line effecttsgo/global-date -- Assert that the wire codec reconstructs the native Date payload.
     args: { id: "t1", at: new Date("2023-11-14T22:13:20.000Z") }
   }
   const forbidden = new ScopeForbidden({ scopeId: AccessScopeId.make("s"), required: "writer", held: null })
   const rejected = (error: Mutation.MutationRejection): Mutation.Notice => ({ _tag: "Rejected", envelope, error })
 
-  it("a notice of one mutation decoded against another, or one its schemas cannot read, is NoticeMismatch, never a value or a defect", async () => {
-    const cases: ReadonlyArray<[string, Effect.Effect<unknown, Mutation.NoticeMismatch>]> = [
-      [
-        "archive's OutcomeUnknown as touch (its args would decode)",
-        Mutation.decodeNotice(touch, { _tag: "OutcomeUnknown", envelope })
-      ],
-      ["archive's rejection as touch", Mutation.decodeNotice(touch, rejected(forbidden))],
-      [
-        "args of another shape under the right name",
-        Mutation.decodeNotice(archive, {
-          _tag: "OutcomeUnknown",
-          envelope: { ...envelope, args: { id: "t1", at: 5 } }
-        })
-      ],
-      [
-        "a domain payload outside the error schema",
-        Mutation.decodeNotice(
-          archive,
-          rejected(new Mutation.DomainError({ mutation: "todos.archive", error: { _tag: "Gone" } }))
-        )
-      ],
-      [
-        "a domain error recorded for another mutation",
-        Mutation.decodeNotice(
-          archive,
-          rejected(new Mutation.DomainError({ mutation: "todos.touch", error: { _tag: "Locked", by: "u" } }))
-        )
+  it.effect(
+    "a notice of one mutation decoded against another, or one its schemas cannot read, is NoticeMismatch, never a value or a defect",
+    Effect.fnUntraced(function* () {
+      const cases: ReadonlyArray<[string, Effect.Effect<unknown, Mutation.NoticeMismatch>]> = [
+        [
+          "archive's OutcomeUnknown as touch (its args would decode)",
+          Mutation.decodeNotice(touch, { _tag: "OutcomeUnknown", envelope })
+        ],
+        ["archive's rejection as touch", Mutation.decodeNotice(touch, rejected(forbidden))],
+        [
+          "args of another shape under the right name",
+          Mutation.decodeNotice(archive, {
+            _tag: "OutcomeUnknown",
+            envelope: { ...envelope, args: { id: "t1", at: 5 } }
+          })
+        ],
+        [
+          "a domain payload outside the error schema",
+          Mutation.decodeNotice(
+            archive,
+            rejected(new Mutation.DomainError({ mutation: "todos.archive", error: { _tag: "Gone" } }))
+          )
+        ],
+        [
+          "a domain error recorded for another mutation",
+          Mutation.decodeNotice(
+            archive,
+            rejected(new Mutation.DomainError({ mutation: "todos.touch", error: { _tag: "Locked", by: "u" } }))
+          )
+        ]
       ]
-    ]
-    for (const [label, effect] of cases) {
-      const error = await mismatchOf(effect).catch((cause: unknown) => {
-        throw new Error(`${label}: ${String(cause)}`)
-      })
-      expect(error).toBeInstanceOf(Mutation.NoticeMismatch)
-    }
-  })
-
-  it("a DomainError payload round-trips to the declared error type; other rejections pass through untouched", async () => {
-    // The rejection exactly as the server produces it: the handler's failure, encoded by archive.
-    const context = {
-      actor: PrincipalId.make("u"),
-      now: DateTime.makeUnsafe(0),
-      random: Mutation.seededRandom(ClientId.make("c1"), MutationId.make("m-1")),
-      store: makeStore()
-    }
-    const rejection = await Effect.runPromise(Effect.flip(archive.execute(context, envelope.args)))
-    if (!(rejection instanceof Mutation.DomainError)) throw new Error(`not a DomainError: ${String(rejection)}`)
-    expect(await Effect.runPromise(Mutation.decodeNotice(archive, rejected(rejection)))).toEqual({
-      _tag: "Rejected",
-      envelope: typedEnvelope,
-      error: { _tag: "DomainError", mutation: "todos.archive", error: { _tag: "TooLate", deadline } }
+      for (const [label, effect] of cases) {
+        const error = yield* mismatchOf(effect).pipe(
+          Effect.catchCause((cause) => Effect.die(new Error(`${label}: ${Cause.pretty(cause)}`)))
+        )
+        expect(error).toBeInstanceOf(Mutation.NoticeMismatch)
+      }
     })
-    const passed = await Effect.runPromise(Mutation.decodeNotice(archive, rejected(forbidden)))
-    expect(passed).toEqual({ _tag: "Rejected", envelope: typedEnvelope, error: forbidden })
-    expect(passed._tag === "Rejected" ? passed.error : undefined).toBe(forbidden)
-  })
+  )
 
-  it("an OutcomeUnknown notice (the user's recovery record) gets typed args and nothing else", async () => {
-    const decoded = await Effect.runPromise(Mutation.decodeNotice(archive, { _tag: "OutcomeUnknown", envelope }))
-    expect(decoded).toStrictEqual({ _tag: "OutcomeUnknown", envelope: typedEnvelope })
-  })
+  it.effect(
+    "a DomainError payload round-trips to the declared error type; other rejections pass through untouched",
+    Effect.fnUntraced(function* () {
+      // The rejection exactly as the server produces it: the handler's failure, encoded by archive.
+      const context = {
+        actor: PrincipalId.make("u"),
+        now: DateTime.makeUnsafe(0),
+        random: Mutation.seededRandom(ClientId.make("c1"), MutationId.make("m-1")),
+        store: makeStore()
+      }
+      const rejection = yield* Effect.flip(archive.execute(context, envelope.args))
+      if (!Schema.is(Mutation.DomainError)(rejection)) throw new Error(`not a DomainError: ${String(rejection)}`)
+      expect(yield* Mutation.decodeNotice(archive, rejected(rejection))).toEqual({
+        _tag: "Rejected",
+        envelope: typedEnvelope,
+        error: { _tag: "DomainError", mutation: "todos.archive", error: { _tag: "TooLate", deadline } }
+      })
+      const passed = yield* Mutation.decodeNotice(archive, rejected(forbidden))
+      expect(passed).toEqual({ _tag: "Rejected", envelope: typedEnvelope, error: forbidden })
+      expect(passed._tag === "Rejected" ? passed.error : undefined).toBe(forbidden)
+    })
+  )
+
+  it.effect(
+    "an OutcomeUnknown notice (the user's recovery record) gets typed args and nothing else",
+    Effect.fnUntraced(function* () {
+      const decoded = yield* Mutation.decodeNotice(archive, { _tag: "OutcomeUnknown", envelope })
+      expect(decoded).toStrictEqual({ _tag: "OutcomeUnknown", envelope: typedEnvelope })
+    })
+  )
 })

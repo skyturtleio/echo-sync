@@ -11,7 +11,7 @@
  * timestamps as epoch ms. Range order is written out (`ASC NULLS FIRST` / `DESC NULLS LAST`) to match
  * core's single comparator; TEXT compares BINARY, which is code-point order for UTF-8.
  */
-import { Effect, Option, Schema } from "effect"
+import { Array as Arr, Effect, Option, Schema, String as Str } from "effect"
 import type * as SqlClient from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
 import { Errors, ScopeGrants, type Registry, Store, type SyncTable } from "echo-sync"
@@ -20,7 +20,7 @@ import * as Keyset from "../internal/Keyset.ts"
 type Table = SyncTable.AnySyncTable
 type Value = SyncTable.SqliteValue
 
-const q = (name: string) => `"${name.replaceAll('"', '""')}"`
+const q = (name: string) => `"${Str.replaceAll('"', '""')(name)}"`
 
 /** Retryable SQL errors become the transient `StoreUnavailable`; any other SQL error is a defect. */
 export const unavailable = <A, R>(
@@ -40,11 +40,17 @@ const bind = (column: SyncTable.Column, value: Schema.Json): Effect.Effect<Value
 const maxParameters = 32766
 
 const upsert = (table: Table) => {
-  const names = table.columns.map((c) => c.name)
-  const updates = names.filter((n) => n !== "id").map((n) => `${q(n)} = excluded.${q(n)}`)
-  const prefix = `INSERT INTO ${q(table.name)} (${names.map(q).join(", ")}) VALUES `
-  const tuple = `(${names.map(() => "?").join(", ")})`
-  const suffix = ` ON CONFLICT ("id") DO ${updates.length === 0 ? "NOTHING" : `UPDATE SET ${updates.join(", ")}`}`
+  const names = Arr.map(table.columns, (c) => c.name)
+  const updates = Arr.map(
+    Arr.filter(names, (n) => n !== "id"),
+    (n) => `${q(n)} = excluded.${q(n)}`
+  )
+  const prefix = `INSERT INTO ${q(table.name)} (${Arr.join(Arr.map(names, q), ", ")}) VALUES `
+  const tuple = `(${Arr.join(
+    Arr.map(names, () => "?"),
+    ", "
+  )})`
+  const suffix = ` ON CONFLICT ("id") DO ${updates.length === 0 ? "NOTHING" : `UPDATE SET ${Arr.join(updates, ", ")}`}`
   const single = prefix + tuple + suffix
   // One bounded cache entry for the latest batch size, in addition to the single-row statement.
   let lastSize = 0
@@ -57,7 +63,13 @@ const upsert = (table: Table) => {
     statement: (size: number) => {
       if (size === 1) return single
       if (size !== lastSize) {
-        lastSql = prefix + Array.from({ length: size }, () => tuple).join(", ") + suffix
+        lastSql =
+          prefix +
+          Arr.join(
+            Arr.makeBy(size, () => tuple),
+            ", "
+          ) +
+          suffix
         lastSize = size
       }
       return lastSql
@@ -93,7 +105,7 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
             yield* unavailable(
               sql.unsafe(
                 plan.statement(1),
-                plan.names.map((n) => stored[n] ?? null)
+                Arr.map(plan.names, (n) => stored[n] ?? null)
               )
             )
           }),
@@ -105,7 +117,7 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
         yield* unavailable(
           sql.unsafe(
             plan.statement(stored.length),
-            stored.flatMap((row) => plan.names.map((n) => row[n] ?? null))
+            Arr.flatMap(stored, (row) => Arr.map(plan.names, (n) => row[n] ?? null))
           )
         )
       }
@@ -141,6 +153,7 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
         }
         where.push(
           ...Keyset.predicates(plan, (column, value) => {
+            // oxlint-disable-next-line effecttsgo/schema-sync -- Keyset's placeholder callback is synchronous; sqlite scalar codecs are synchronous.
             params.push(Schema.encodeSync(column.sqlite)(value))
             return `?${params.length}`
           })
@@ -154,15 +167,21 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
           // reader), found through scope_grants' unique (access_scope_id, principal_id).
           params.push(...plan.readableBy.value)
           where.push(
-            `EXISTS (SELECT 1 FROM ${q(ScopeGrants.ScopeGrants.name)} AS g WHERE g."access_scope_id" = t."access_scope_id" AND g."principal_id" IN (${plan.readableBy.value.map(() => "?").join(", ")}))`
+            `EXISTS (SELECT 1 FROM ${q(ScopeGrants.ScopeGrants.name)} AS g WHERE g."access_scope_id" = t."access_scope_id" AND g."principal_id" IN (${Arr.join(
+              Arr.map(plan.readableBy.value, () => "?"),
+              ", "
+            )}))`
           )
         }
         const dir = plan.order === "asc" ? "ASC NULLS FIRST" : "DESC NULLS LAST"
         return yield* select(
           table,
-          where.length === 0 ? "" : ` WHERE ${where.join(" AND ")}`,
+          where.length === 0 ? "" : ` WHERE ${Arr.join(where, " AND ")}`,
           params,
-          plan.index.key.map((c) => `t.${q(c.name)} ${dir}`).join(", "),
+          Arr.join(
+            Arr.map(plan.index.key, (c) => `t.${q(c.name)} ${dir}`),
+            ", "
+          ),
           Option.match(plan.limit, { onNone: () => "", onSome: (n) => ` LIMIT ${n}` })
         )
       }),

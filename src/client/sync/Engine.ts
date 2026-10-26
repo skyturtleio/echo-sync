@@ -15,7 +15,7 @@
  * would either expose a torn transaction or replay a pending mutation over a server row that
  * already contains it.
  */
-import { Array as Arr, Clock, Effect, Match, Option, Schema, Semaphore, Stream } from "effect"
+import { Array as Arr, Clock, Effect, Match, Option, Record, Schema, Semaphore, Stream } from "effect"
 import { Mutation, Protocol, Store } from "../../core/index.ts"
 import type { AccessScope, Errors, Ids, Registry, SyncTable } from "../../core/index.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
@@ -221,8 +221,8 @@ const rebase = <E>(
       "echo.pending": pending.length,
       "echo.replayed": pending.length - released.length,
       "echo.released": released.length,
-      "echo.notices_rejected": notices.filter((n) => n._tag === "Rejected").length,
-      "echo.notices_unknown": notices.filter((n) => n._tag === "OutcomeUnknown").length
+      "echo.notices_rejected": Arr.filter(notices, (n) => n._tag === "Rejected").length,
+      "echo.notices_unknown": Arr.filter(notices, (n) => n._tag === "OutcomeUnknown").length
     })
   }).pipe((work) => Telemetry.observe(work, "echo.rebase", Telemetry.serverFailure))
 
@@ -230,7 +230,7 @@ const rebase = <E>(
 const decodeRow = (table: SyncTable.AnySyncTable, row: SyncTable.EncodedRow) =>
   Schema.decodeUnknownEffect(table.wire)(row).pipe(
     Effect.mapError((error) =>
-      table.columns.some((column) => !Object.hasOwn(row, column.name))
+      Arr.some(table.columns, (column) => !Record.has(row, column.name))
         ? new ServerOutdated({ table: table.name })
         : new MalformedChange({ table: table.name, message: error.message })
     )
@@ -299,7 +299,9 @@ export const applyPageSet = (
       if (pullFrom(meta) === null) yield* storage.rows.clearAll
       for (const page of set) yield* applyChanges(storage, context.registry, page.changes)
     })
-    const outcomes = new Map(set.flatMap((page) => page.acks.map((ack) => [ack.mutationId, ack.outcome])))
+    const outcomes = new Map(
+      Arr.flatMap(set, (page) => Arr.map(page.acks, (ack) => [ack.mutationId, ack.outcome] as const))
+    )
     yield* rebase(context, install, (envelope) => {
       const outcome = outcomes.get(envelope.mutationId)
       if (outcome !== undefined) return Option.some(noticeFor(envelope, outcome))
@@ -433,9 +435,9 @@ export const make = (options: {
           const { meta, pending } = yield* storage.transaction(
             Effect.all({ meta: storage.meta, pending: storage.pending })
           )
-          const pendingIds = new Set(pending.map((entry) => entry.envelope.mutationId))
+          const pendingIds = new Set(Arr.map(pending, (entry) => entry.envelope.mutationId))
           for (const id of transientAnswers.keys()) if (!pendingIds.has(id)) transientAnswers.delete(id)
-          const batch = pending.filter((entry) => entry.envelope.seq > meta.pushedThrough).slice(0, batchSize)
+          const batch = Arr.filter(pending, (entry) => entry.envelope.seq > meta.pushedThrough).slice(0, batchSize)
           if (!Arr.isReadonlyArrayNonEmpty(batch)) return { processed, stopped: sawTransient }
           // Defer until snapshot install, but keep the cycle retrying without an external wake.
           if (meta.resnapshot) return { processed, stopped: true }
@@ -489,13 +491,15 @@ export const make = (options: {
                   // rebuild the cursor is null); its effect, if any, arrives with the next pull.
                   const cursor = current.cursor
                   const covered = new Map(
-                    response.results
-                      .filter(
+                    Arr.map(
+                      Arr.filter(
+                        response.results,
                         (result) =>
                           (cursor !== null && result.position <= cursor) ||
                           (result.outcome._tag === "Rejected" && result.outcome.error._tag === "ClientExpired")
-                      )
-                      .map((result) => [result.mutationId, result.outcome])
+                      ),
+                      (result) => [result.mutationId, result.outcome] as const
+                    )
                   )
                   if (covered.size > 0 || exhausted) {
                     yield* rebase(context, Effect.void, (envelope) => {
@@ -530,8 +534,8 @@ export const make = (options: {
               }
               yield* Telemetry.annotate({
                 "echo.processed": response.results.length,
-                "echo.applied": response.results.filter((r) => r.outcome._tag === "Applied").length,
-                "echo.rejected": response.results.filter((r) => r.outcome._tag === "Rejected").length,
+                "echo.applied": Arr.filter(response.results, (r) => r.outcome._tag === "Applied").length,
+                "echo.rejected": Arr.filter(response.results, (r) => r.outcome._tag === "Rejected").length,
                 "echo.result": response.results.length < batch.length ? "stopped" : "ok"
               })
               processed += response.results.length
@@ -596,7 +600,8 @@ export const make = (options: {
                         if ((current.epoch ?? null) !== (meta.epoch ?? null)) return undefined
                         yield* applyPageSet(context, set, response)
                         const installed = yield* storage.meta
-                        const retryPush = (yield* storage.pending).some(
+                        const retryPush = Arr.some(
+                          yield* storage.pending,
                           (entry) => entry.envelope.seq > installed.pushedThrough
                         )
                         return { retryPush, set }

@@ -1,4 +1,4 @@
-import { Clock, Config, Effect, Layer, Option, Random, Redacted, Schema } from "effect"
+import { Array as Arr, Clock, Config, Effect, Layer, Option, Random, Redacted, Schema, String as Str } from "effect"
 import * as PgClient from "@effect/sql-pg/PgClient"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
@@ -47,7 +47,7 @@ export const emptyDatabase = (with_ = "") =>
     Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis
       const random = yield* Random.next
-      const name = `echo_test_${now.toString(36)}_${random.toString(36).slice(2, 8)}`
+      const name = `echo_test_${now.toString(36)}_${Str.slice(2, 8)(random.toString(36))}`
       yield* admin(`CREATE DATABASE ${name} ${with_}`)
       yield* Effect.addFinalizer(() => Effect.orDie(admin(`DROP DATABASE ${name} WITH (FORCE)`)))
       const url = new URL(adminUrl)
@@ -124,7 +124,7 @@ export class Replica {
   private stage(response: Protocol.PullResponse) {
     this.received.push(...response.changes)
     this.staged.push(...response.changes)
-    this.stagedAcks.push(...response.acks.map((a) => a.mutationId))
+    this.stagedAcks.push(...Arr.map(response.acks, (a) => a.mutationId))
     if (response._tag === "PullPage") {
       this.continuation = Option.some(response.continuation)
       return
@@ -192,7 +192,7 @@ export class Replica {
 
   /** Applied replica contents in a comparable form: `table/id` → row JSON. */
   view() {
-    return new Map([...this.rows].map(([key, row]) => [key, JSON.stringify(row)]))
+    return new Map(Arr.map([...this.rows], ([key, row]) => [key, JSON.stringify(row)]))
   }
 }
 
@@ -210,7 +210,10 @@ export const serverView = (principalId: string, tables: Registry.SyncRegistry = 
       )
       for (const raw of rows) {
         const row = yield* decodeRow(table, raw)
-        view.set(`${table.name}/${String(row["id"])}`, JSON.stringify(row))
+        view.set(
+          `${table.name}/${String(row["id"])}`,
+          yield* Schema.encodeEffect(Schema.fromJsonString(SyncTable.EncodedRow))(row)
+        )
       }
     }
     return view

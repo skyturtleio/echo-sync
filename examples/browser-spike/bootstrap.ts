@@ -1,13 +1,14 @@
-import { Effect, Exit, Option, Scope, Stream } from "effect"
+import { Array as Arr, Effect, Exit, Option, Scope, Stream, String as Str } from "effect"
+import { randomUUIDv4 } from "../../src/client/Crypto.ts"
 import { LeaderClient, ResetReplica } from "../../src/client/index.ts"
 import type { Rows } from "../../src/client/worker/LeaderRpcs.ts"
 
 const validate = (rows: Rows, scope: string, start: number, count: number) => {
   if (rows.length !== count) throw new Error(`expected ${count} rows, got ${rows.length}`)
-  rows.forEach((row, offset) => {
+  Arr.forEach(rows, (row, offset) => {
     const i = start + offset
     if (
-      row["id"] !== `${scope}-${String(i).padStart(6, "0")}` ||
+      row["id"] !== `${scope}-${Str.padStart(6, "0")(String(i))}` ||
       row["access_scope_id"] !== scope ||
       row["title"] !== `Todo ${i}` ||
       row["note"] !== (i % 3 === 0 ? null : `Note ${i} café`)
@@ -17,7 +18,9 @@ const validate = (rows: Rows, scope: string, start: number, count: number) => {
 }
 const select = "SELECT id, access_scope_id, title, note FROM todos ORDER BY id"
 
+// oxlint-disable-next-line effecttsgo/async-function -- This browser benchmark is a host Promise consumer measuring the public engine boundary, not an engine program.
 const trial = async (count: number) => {
+  // oxlint-disable-next-line effecttsgo/global-fetch -- Control-plane seed request is intentionally a browser fetch outside the measured engine install.
   const response = await fetch(`/admin/bootstrap-seed?count=${count}`, { method: "POST" })
   if (!response.ok) throw new Error(await response.text())
   const seed: unknown = await response.json()
@@ -30,7 +33,7 @@ const trial = async (count: number) => {
     typeof seed.principal !== "string"
   )
     throw new Error("invalid seed response")
-  const identity = { appId: `bootstrap-${crypto.randomUUID()}`, profile: "trial" }
+  const identity = { appId: `bootstrap-${await Effect.runPromise(randomUUIDv4)}`, profile: "trial" }
   const lifetime = Scope.makeUnsafe()
   let worker: Worker | undefined
   const spawnLeader = (name: string) => {
@@ -71,7 +74,9 @@ const trial = async (count: number) => {
     const leader = worker
     if (leader === undefined) throw new Error("leader not spawned")
     // FIFO message to this leader samples completed spans after the first usable query.
+    // oxlint-disable-next-line effecttsgo/new-promise -- Benchmark host reads one post-install worker message after the timing window closes.
     const metrics = await new Promise<{ longestInstallMs: number; installs: number }>((resolve, reject) => {
+      // oxlint-disable-next-line effecttsgo/global-timers -- Host-only worker-message watchdog is outside the engine's clock and measured interval.
       const timer = setTimeout(() => reject(new Error("metrics timeout")), 10_000)
       leader.addEventListener("message", function receive(event: MessageEvent<unknown>) {
         const data = event.data
@@ -124,12 +129,13 @@ const benchmark = {
   start(sizes: Array<number> = [10_000, 100_000], trials = 3) {
     if (benchmark.state !== "ready") throw new Error("already started")
     benchmark.state = "running"
+    // oxlint-disable-next-line effecttsgo/async-function -- DOM benchmark launcher consumes trial Promises and publishes host results.
     void (async () => {
       try {
         if (
           !Number.isSafeInteger(trials) ||
           trials < 1 ||
-          sizes.some((n) => !Number.isSafeInteger(n) || n < 1 || n > 100_000)
+          Arr.some(sizes, (n) => !Number.isSafeInteger(n) || n < 1 || n > 100_000)
         ) {
           throw new Error("invalid sizes or trials")
         }

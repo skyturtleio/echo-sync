@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { DateTime, Deferred, Effect, Ref } from "effect"
+import { Array as Arr, DateTime, Deferred, Effect, Order, Ref, Schema, String as Str } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, Errors, ScopeGrants, Store } from "echo-sync"
 import { type BodyError, runMutation } from "./ledger.ts"
@@ -17,7 +17,7 @@ const S = AccessScope.AccessScopeId.make("created")
 const asMutation = (actor: string, handler: (store: Store.EchoStore) => Effect.Effect<void, BodyError>) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient
-    const rows = yield* RowStore.make(new Map((yield* resolveTables(registry)).map((t) => [t.table.name, t.schema])))
+    const rows = yield* RowStore.make(new Map(Arr.map(yield* resolveTables(registry), (t) => [t.table.name, t.schema])))
     const { store } = Store.make(rows, {
       actor: AccessScope.PrincipalId.make(actor),
       roleFor: roleFor(sql, actor),
@@ -72,7 +72,7 @@ describe.skipIf(!pgAvailable)("scope creation on Postgres (SPEC §4)", () => {
         })
         if (a === undefined || b === undefined) return assert.fail("missing results")
         const outcomes = [outcomeOf(a), outcomeOf(b)]
-        assert.deepStrictEqual(outcomes.toSorted(), ["Applied", "Rejected:ScopeForbidden"])
+        assert.deepStrictEqual(Arr.sort(outcomes, Order.String), ["Applied", "Rejected:ScopeForbidden"])
         // The 40001 path: two first attempts and exactly one retry.
         assert.strictEqual(yield* Ref.get(attempts), 3)
         const winner = outcomes[0] === "Applied" ? "a" : "b"
@@ -152,11 +152,12 @@ describe.skipIf(!pgAvailable)("scope creation on Postgres (SPEC §4)", () => {
         yield* creator.sync()
         yield* stranger.sync()
         const grantKey = `${ScopeGrants.ScopeGrants.name}/${ScopeGrants.grantId(S, AccessScope.PrincipalId.make("a"))}`
-        const keys = [...creator.rows.keys()].toSorted()
-        assert.deepStrictEqual(keys, [grantKey, "items/first"].toSorted())
+        const keys = Arr.sort(creator.rows.keys(), Order.String)
+        assert.deepStrictEqual(keys, Arr.sort([grantKey, "items/first"], Order.String))
         assert.strictEqual(creator.rows.get(grantKey)?.["role"], "owner")
         assert.deepStrictEqual([...stranger.rows.keys()], [])
-        assert.isFalse(stranger.received.some((c) => JSON.stringify(c).includes(S)))
+        const received = yield* Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Json))(stranger.received)
+        assert.isFalse(Str.includes(S)(received))
         // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )

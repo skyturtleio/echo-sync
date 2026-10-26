@@ -1,5 +1,6 @@
 import * as PgClient from "@effect/sql-pg/PgClient"
 import {
+  Array as Arr,
   Cause,
   Context,
   DateTime,
@@ -103,10 +104,12 @@ const classifyCause = <E>(
   | { readonly _tag: "defect"; readonly cause: Cause.Cause<never> }
   | { readonly _tag: "unavailable"; readonly error: SqlError }
   | { readonly _tag: "typed"; readonly cause: Cause.Cause<Exclude<E, SqlError>> } => {
-  if (cause.reasons.some((r) => Cause.isDieReason(r) && !isSqlError(r.defect))) {
+  if (Arr.some(cause.reasons, (r) => Cause.isDieReason(r) && !isSqlError(r.defect))) {
     return {
       _tag: "defect",
-      cause: Cause.fromReasons(cause.reasons.map((r) => (Cause.isFailReason(r) ? Cause.makeDieReason(r.error) : r)))
+      cause: Cause.fromReasons(
+        Arr.map(cause.reasons, (r) => (Cause.isFailReason(r) ? Cause.makeDieReason(r.error) : r))
+      )
     }
   }
   for (const r of cause.reasons) {
@@ -116,7 +119,7 @@ const classifyCause = <E>(
   return {
     _tag: "typed",
     cause: Cause.fromReasons(
-      cause.reasons.flatMap((r): ReadonlyArray<Cause.Reason<Exclude<E, SqlError>>> =>
+      Arr.flatMap(cause.reasons, (r): ReadonlyArray<Cause.Reason<Exclude<E, SqlError>>> =>
         Cause.isFailReason(r) ? (isNotSql(r.error) ? [Cause.makeFailReason(r.error)] : []) : [r]
       )
     )
@@ -199,7 +202,7 @@ export const roleFor = (sql: SqlClient, actor: string) => (scopeId: AccessScope.
       WHERE access_scope_id = ${scopeId} AND principal_id IN (${actor}, '*')`.pipe(
       Effect.mapError(RowStore.unavailable)
     )
-    return Option.fromUndefinedOr(AccessScope.strongest(rows.flatMap((r) => Option.toArray(decodeRole(r.role)))))
+    return Option.fromUndefinedOr(AccessScope.strongest(Arr.flatMap(rows, (r) => Option.toArray(decodeRole(r.role)))))
   })
 
 /**
@@ -376,8 +379,8 @@ export const executeBatch = (
     yield* checkEpoch(request.epoch)
     const sql = yield* SqlClient
     const tables = yield* resolveTables(options.registry)
-    const rowStore = yield* RowStore.make(new Map(tables.map((t) => [t.table.name, t.schema])))
-    const items = request.mutations.map((m) => ({
+    const rowStore = yield* RowStore.make(new Map(Arr.map(tables, (t) => [t.table.name, t.schema])))
+    const items = Arr.map(request.mutations, (m) => ({
       mutationId: m.mutationId,
       seq: BigInt(m.seq),
       body: Effect.gen(function* () {
@@ -404,7 +407,7 @@ export const executeBatch = (
     }))
     const batch = yield* runBatch(actor, request.clientId, items, options.ledger)
     const response: Protocol.PushResponse = {
-      results: batch.processed.map((p) => ({
+      results: Arr.map(batch.processed, (p) => ({
         mutationId: Ids.MutationId.make(p.mutationId),
         position: Ids.Position.make(p.position),
         outcome: p.outcome
@@ -455,8 +458,8 @@ export const handlers = (options: SyncServerOptions) =>
                   Telemetry.annotate({
                     "echo.batch_size": request.mutations.length,
                     "echo.processed": response.results.length,
-                    "echo.applied": response.results.filter((r) => r.outcome._tag === "Applied").length,
-                    "echo.rejected": response.results.filter((r) => r.outcome._tag === "Rejected").length,
+                    "echo.applied": Arr.filter(response.results, (r) => r.outcome._tag === "Applied").length,
+                    "echo.rejected": Arr.filter(response.results, (r) => r.outcome._tag === "Rejected").length,
                     "echo.result": response.results.length < request.mutations.length ? "stopped" : "ok"
                   })
                 ),
@@ -562,10 +565,10 @@ export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor"
       ) =>
         sql<{ scope: string; principal: string }>`
           SELECT DISTINCT access_scope_id AS scope, principal_id AS principal FROM echo_sync.scope_grants
-          WHERE access_scope_id IN ${sql.in([...new Set(pairs.map((p) => p.room))])}
-            AND principal_id IN ${sql.in([...new Set(pairs.map((p) => p.principalId)), "*"])}`.pipe(
+          WHERE access_scope_id IN ${sql.in([...new Set(Arr.map(pairs, (p) => p.room))])}
+            AND principal_id IN ${sql.in([...new Set(Arr.map(pairs, (p) => p.principalId)), "*"])}`.pipe(
           Effect.map((rows) => {
-            const granted = new Set(rows.map((r) => JSON.stringify([r.scope, r.principal])))
+            const granted = new Set(Arr.map(rows, (r) => JSON.stringify([r.scope, r.principal])))
             return (room: AccessScope.AccessScopeId, principalId: string) =>
               granted.has(JSON.stringify([room, principalId])) || granted.has(JSON.stringify([room, "*"]))
           })

@@ -1,5 +1,5 @@
 import { expect, it } from "@effect/vitest"
-import { Effect, Fiber, Queue, References, type Schema, Stream } from "effect"
+import { Array as Arr, Effect, Fiber, Queue, References, type Schema, Stream, String as Str } from "effect"
 import { TestClock } from "effect/testing"
 import { AccessScope, Ids, Protocol } from "echo-sync"
 import * as Presence from "./Presence.ts"
@@ -116,7 +116,7 @@ it.effect(
         yield* Queue.offer(first, heartbeat)
         yield* settle
       }
-      expect(seen.map((s) => s._tag)).toEqual(["snapshot"])
+      expect(Arr.map(seen, (s) => s._tag)).toEqual(["snapshot"])
       expect(server.joins).toEqual(["s0"])
       // Now the connection goes silent: no element for 45 s ends it, and the rejoin (after a 1 s backoff) carries s1.
       yield* TestClock.adjust("46 seconds")
@@ -175,7 +175,7 @@ it.effect(
       expect(fiber.pollUnsafe()).toBeUndefined()
       yield* Queue.fail(yield* server.nextConnection, new Protocol.Forbidden({ room }))
       const exit = yield* Fiber.await(fiber)
-      expect(exit._tag === "Failure" && String(exit.cause).includes("Forbidden")).toBe(true)
+      expect(exit._tag === "Failure" && Str.includes("Forbidden")(String(exit.cause))).toBe(true)
       expect(server.joins.length).toBe(3)
       // The ended subscription is gone: a track is a no-op again.
       yield* presence.track({ room, tabId, state: "late", revision: 2 })
@@ -265,7 +265,7 @@ it.effect("a join carries a genuine (state, revision) pair even when a track rac
         yield* Effect.repeat(Effect.yieldNow, { times: turns })
         yield* presence.track({ room, tabId, state: "s1", revision: 1 })
         yield* settle
-        const torn = pairs.filter((pair) => pair !== "s0@0" && pair !== "s1@1")
+        const torn = Arr.filter(pairs, (pair) => pair !== "s0@0" && pair !== "s1@1")
         expect({ ops, turns, torn }).toEqual({ ops, turns, torn: [] })
         yield* Fiber.interrupt(fiber)
       }

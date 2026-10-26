@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as PgClient from "@effect/sql-pg/PgClient"
-import { Effect, Exit, Layer, Option, Redacted, Schema } from "effect"
+import { Array as Arr, Config, Effect, Exit, Layer, Option, Redacted, Schema, String as Str } from "effect"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
 import { RpcClient, RpcSerialization } from "effect/rpc"
@@ -74,7 +74,7 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
         const host = recorder()
         yield* Startup.prepare({ registry }).pipe(Effect.provideContext(host.context))
         assert.deepStrictEqual(
-          host.spans.map((span) => span.name),
+          Arr.map(host.spans, (span) => span.name),
           ["echo.server.startup"]
         )
         // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
@@ -104,27 +104,30 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
       )
       yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
       const push = (cookie: string, origin: string, bodyCookie: string, bodyOrigin: string) =>
-        Effect.promise(async () => {
-          const response = await web.handler(
-            new Request("http://echo.test/sync", {
-              method: "POST",
-              headers: { cookie, origin, "content-type": "text/plain" },
-              body: `${JSON.stringify({
-                _tag: "Request",
-                id: "1",
-                tag: "push",
-                payload: {
-                  clientId: "http-headers",
-                  mutations: [{ mutationId: "http-mutation", seq: 1, name: "noop", args: {} }]
-                },
-                headers: [
-                  ["cookie", bodyCookie],
-                  ["origin", bodyOrigin]
-                ]
-              })}\n`
-            })
+        Effect.gen(function* () {
+          const body = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({
+            _tag: "Request",
+            id: "1",
+            tag: "push",
+            payload: {
+              clientId: "http-headers",
+              mutations: [{ mutationId: "http-mutation", seq: 1, name: "noop", args: {} }]
+            },
+            headers: [
+              ["cookie", bodyCookie],
+              ["origin", bodyOrigin]
+            ]
+          })
+          const response = yield* Effect.promise(() =>
+            web.handler(
+              new Request("http://echo.test/sync", {
+                method: "POST",
+                headers: { cookie, origin, "content-type": "text/plain" },
+                body: `${body}\n`
+              })
+            )
           )
-          return response.text()
+          return yield* Effect.promise(() => response.text())
         })
       // Real HTTP credentials/policy admit the push despite the conflicting body headers.
       const accepted = yield* push("session=http-secret", "https://app.test", "session=body", "https://evil.test")
@@ -167,24 +170,27 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
         yield* sql`ALTER TABLE items ADD COLUMN extra_note text COLLATE "C"`
         const web = HttpRouter.toWebHandler(yield* serverFor(old), { disableLogger: true })
         yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
-        const pushed = yield* Effect.promise(async () => {
-          const response = await web.handler(
-            new Request("http://echo.test/sync", {
-              method: "POST",
-              headers: { "content-type": "text/plain" },
-              body: `${JSON.stringify({
-                _tag: "Request",
-                id: "1",
-                tag: "push",
-                payload: {
-                  clientId: "old-server-client",
-                  mutations: [{ mutationId: "old-server-push", seq: 1, name: "noop", args: {} }]
-                },
-                headers: []
-              })}\n`
-            })
+        const pushed = yield* Effect.gen(function* () {
+          const body = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({
+            _tag: "Request",
+            id: "1",
+            tag: "push",
+            payload: {
+              clientId: "old-server-client",
+              mutations: [{ mutationId: "old-server-push", seq: 1, name: "noop", args: {} }]
+            },
+            headers: []
+          })
+          const response = yield* Effect.promise(() =>
+            web.handler(
+              new Request("http://echo.test/sync", {
+                method: "POST",
+                headers: { "content-type": "text/plain" },
+                body: `${body}\n`
+              })
+            )
           )
-          return response.text()
+          return yield* Effect.promise(() => response.text())
         })
         assert.include(pushed, '"_tag":"Success"')
         const pulled = yield* pullOnce(old)
@@ -200,7 +206,7 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
         if (drift === undefined || !("_tag" in drift) || drift._tag !== "Drift") {
           return assert.fail(`expected Drift, got ${String(started.cause)}`)
         }
-        assert.isTrue(drift.mismatches.some((m) => m.table === "items" && m.problem.includes("extra_note")))
+        assert.isTrue(Arr.some(drift.mismatches, (m) => m.table === "items" && Str.includes("extra_note")(m.problem)))
         // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
@@ -223,8 +229,11 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
       if (drift === undefined || !("_tag" in drift) || drift._tag !== "Drift") {
         return assert.fail(`expected Drift, got ${String(built.cause)}`)
       }
-      const tables = drift.mismatches.filter((m) => m.problem.includes("body")).map((m) => m.table)
-      assert.deepStrictEqual(tables.toSorted(), ["items", "notes"])
+      const tables = Arr.map(
+        Arr.filter(drift.mismatches, (m) => Str.includes("body")(m.problem)),
+        (m) => m.table
+      )
+      assert.deepStrictEqual(Arr.sort(tables, Str.Order), ["items", "notes"])
       // Through HTTP: no pull is ever answered (the RPC layer is never built).
       assert.isTrue(Exit.isFailure(yield* pullOnce()), "a drifted server answered a pull")
 
@@ -254,7 +263,10 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
           return assert.fail(`expected Drift, got ${String(built.cause)}`)
         }
         assert.deepStrictEqual(
-          error.mismatches.filter((m) => m.table === "missing_table").map((m) => m.problem),
+          Arr.map(
+            Arr.filter(error.mismatches, (m) => m.table === "missing_table"),
+            (m) => m.problem
+          ),
           ["not attached (no echo_sync capture trigger); run attach at startup", "table does not exist"]
         )
         // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
@@ -268,7 +280,7 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
         { concurrency: "unbounded" }
       )
       assert.deepStrictEqual(
-        results.map((r) => r._tag),
+        Arr.map(results, (r) => r._tag),
         ["Success", "Success", "Success", "Success"]
       )
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until concurrent startup attempts finish.
@@ -293,7 +305,7 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
         Array.from({ length: 20 }, () => Effect.exit(Startup.prepare({ registry, appMigrations }))),
         { concurrency: "unbounded" }
       )
-      const failed = results.filter(Exit.isFailure).map((r) => String(r.cause))
+      const failed = Arr.map(Arr.filter(results, Exit.isFailure), (r) => String(r.cause))
       assert.deepStrictEqual(failed, [])
       assert.deepStrictEqual(yield* sql`SELECT n FROM app_migration_runs`, [{ n: 1 }])
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until concurrent startup attempts finish.
@@ -320,12 +332,15 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
         return assert.fail(`expected Drift, got ${String(exit.cause)}`)
       }
       assert.isTrue(
-        error.mismatches.some((m) => m.table === "items" && m.problem.includes("captured in 2 schemas (public, zz)")),
-        JSON.stringify(error.mismatches)
+        Arr.some(
+          error.mismatches,
+          (m) => m.table === "items" && Str.includes("captured in 2 schemas (public, zz)")(m.problem)
+        ),
+        yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(error.mismatches)
       )
       assert.isTrue(
-        error.mismatches.some((m) => m.table === "notes" && m.problem.includes("body")),
-        JSON.stringify(error.mismatches)
+        Arr.some(error.mismatches, (m) => m.table === "notes" && Str.includes("body")(m.problem)),
+        yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(error.mismatches)
       )
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
@@ -341,7 +356,7 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
       if (row === undefined) return assert.fail("no database name")
       yield* sql`ALTER DATABASE ${sql(row.db)} SET search_path = zz, public`
       // Pooled connections keep their session settings, so start a client the setting applies to.
-      const url = new URL(process.env["ECHO_PG_URL"] ?? "")
+      const url = new URL(yield* Config.String("ECHO_PG_URL").pipe(Config.withDefault("")))
       url.pathname = `/${row.db}`
       const exit = yield* Effect.exit(Startup.prepare(options)).pipe(
         // oxlint-disable-next-line effecttsgo/strict-effect-provide -- This startup probe owns its alternate search_path pool only for this invocation.
@@ -354,13 +369,14 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
         return assert.fail(`expected Drift, got ${String(exit.cause)}`)
       }
       assert.isTrue(
-        error.mismatches.some(
+        Arr.some(
+          error.mismatches,
           (m) =>
             m.table === "items" &&
-            m.problem.includes("zz.items") &&
-            m.problem.includes("captured relation is in public")
+            Str.includes("zz.items")(m.problem) &&
+            Str.includes("captured relation is in public")(m.problem)
         ),
-        JSON.stringify(error.mismatches)
+        yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(error.mismatches)
       )
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))

@@ -1,4 +1,4 @@
-import { DateTime, Duration, Effect, Schema } from "effect"
+import { Array as Arr, DateTime, Duration, Effect, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
@@ -95,20 +95,21 @@ export const expireLedger = (options?: { readonly retention?: Duration.Input | u
         const holes = yield* sql<{ client_id: string; seq: bigint; expired_through: bigint }>`
           SELECT m.client_id, m.seq, c.expired_through
           FROM echo_sync.mutations m JOIN echo_sync.clients c USING (client_id)
-          WHERE m.client_id = ANY(${raised.map((r) => r.client_id)}::text[]) AND m.seq <= c.expired_through
+          WHERE m.client_id = ANY(${Arr.map(raised, (r) => r.client_id)}::text[]) AND m.seq <= c.expired_through
             AND m.outcome IS NOT NULL
           ORDER BY m.client_id, m.seq
           LIMIT 10`
         if (holes.length > 0) {
           return yield* Effect.die(
             new Error(
-              `expireLedger: the expired rows are not a seq prefix; rolled back. Live rows at or below the new floor: ${holes
-                .map((h) => `${h.client_id} seq ${h.seq} (floor ${h.expired_through})`)
-                .join(", ")}`
+              `expireLedger: the expired rows are not a seq prefix; rolled back. Live rows at or below the new floor: ${Arr.join(
+                Arr.map(holes, (h) => `${h.client_id} seq ${h.seq} (floor ${h.expired_through})`),
+                ", "
+              )}`
             )
           )
         }
-        return { clients: raised.length, expired: raised.reduce((n, r) => n + Number(r.expired), 0) }
+        return { clients: raised.length, expired: Arr.reduce(raised, 0, (n, r) => n + Number(r.expired)) }
       })
     )
   }).pipe(Telemetry.boundary)

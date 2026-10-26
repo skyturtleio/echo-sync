@@ -3,14 +3,20 @@
 // Bun's node:http compatibility did not propagate downstream disconnect in the smoke test.
 // ECHO_PROXY_RTT_MS=0|75, ECHO_PROXY_PORT=5201, ECHO_PROXY_UPSTREAM=http://127.0.0.1:5200
 // Route Vite's ECHO_SLICE_SERVER through this proxy for BOTH benchmark variants.
+import { Array as Arr, Config, Console, Effect, String as Str } from "effect"
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- This Node-only proxy fingerprints its own source, outside the sync engine.
 import { createHash } from "node:crypto"
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Synchronous source hashing happens once before the benchmark proxy listens.
 import { readFileSync } from "node:fs"
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- The benchmark specifically requires Node HTTP disconnect/backpressure behavior; Bun's alternative failed the smoke test.
 import { createServer, request, type IncomingHttpHeaders, type IncomingMessage } from "node:http"
 
 if (process.versions["bun"] !== undefined) throw new Error("Run this proxy with Node, not Bun (disconnect propagation)")
-const rtt = Number(process.env["ECHO_PROXY_RTT_MS"] ?? "0")
-const port = Number(process.env["ECHO_PROXY_PORT"] ?? "5201")
-const target = new URL(process.env["ECHO_PROXY_UPSTREAM"] ?? "http://127.0.0.1:5200")
+const rtt = Number(Effect.runSync(Config.String("ECHO_PROXY_RTT_MS").pipe(Config.withDefault("0"))))
+const port = Number(Effect.runSync(Config.String("ECHO_PROXY_PORT").pipe(Config.withDefault("5201"))))
+const target = new URL(
+  Effect.runSync(Config.String("ECHO_PROXY_UPSTREAM").pipe(Config.withDefault("http://127.0.0.1:5200")))
+)
 if (rtt !== 0 && rtt !== 75) throw new Error("ECHO_PROXY_RTT_MS must be 0 or 75")
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("invalid ECHO_PROXY_PORT")
 if (
@@ -29,7 +35,7 @@ const sourceSha256 = createHash("sha256")
 const headers = (source: IncomingHttpHeaders) => {
   const result = { ...source }
   for (const name of [
-    ...(source.connection ?? "").split(",").map((token) => token.trim().toLowerCase()),
+    ...Arr.map(Str.split(source.connection ?? "", ","), (token) => Str.toLowerCase(Str.trim(token))),
     "connection",
     "keep-alive",
     "proxy-authenticate",
@@ -67,6 +73,7 @@ const server = createServer((downstream, response) => {
   response.on("error", cancel)
   const afterHalfRtt = (action: () => void) => {
     if (rtt === 0) action()
+    // oxlint-disable-next-line effecttsgo/global-timers -- Native request/response close handlers cancel this socket-owned RTT timer synchronously.
     else timer = setTimeout(action, rtt / 2)
   }
   afterHalfRtt(() => {
@@ -102,5 +109,5 @@ const server = createServer((downstream, response) => {
 })
 server.requestTimeout = 0
 server.listen(port, "127.0.0.1", () => {
-  console.log(JSON.stringify({ port, upstream: target.origin, addedRttMs: rtt, sourceSha256 }))
+  Effect.runSync(Console.log(JSON.stringify({ port, upstream: target.origin, addedRttMs: rtt, sourceSha256 })))
 })

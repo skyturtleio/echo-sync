@@ -21,6 +21,7 @@
  * stream fails `LeaderUnavailable { reason: "Reset" }`, which is not a handover (never retried or
  * resubscribed); `status` reports `reset: true` and stays open. See `enterReset`.
  */
+import * as Arr from "effect/Array"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
@@ -208,7 +209,9 @@ type SubscribeSnapshotFn = <A extends Mutation.PureSchema, S extends Mutation.Pu
   args: A["Type"]
 ) => Stream.Stream<Snapshot<S["Type"]>, SubscribeError>
 
-const isLeaderLost = (e: unknown): e is LeaderUnavailable => e instanceof LeaderUnavailable && e.reason === "LeaderLost"
+const isLeaderLost = (e: unknown): e is LeaderUnavailable =>
+  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Retry only engine-created handovers, not independently declared errors sharing the schema identifier.
+  e instanceof LeaderUnavailable && e.reason === "LeaderLost"
 
 // No tight loop while the old connection is not yet marked lost: the next attempt waits for a new leader.
 const lostBackoff = Schedule.spaced("50 millis")
@@ -219,7 +222,8 @@ const lostBackoff = Schedule.spaced("50 millis")
  */
 const isHandover = <E>(cause: Cause.Cause<E>): boolean =>
   Cause.hasFails(cause) &&
-  cause.reasons.every(
+  Arr.every(
+    cause.reasons,
     (reason) => Cause.isInterruptReason(reason) || (Cause.isFailReason(reason) && isLeaderLost(reason.error))
   )
 

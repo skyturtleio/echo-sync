@@ -2,6 +2,7 @@
 import "./testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { expect, it } from "@effect/vitest"
+import * as Arr from "effect/Array"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as SqlClient from "effect/sql/SqlClient"
@@ -35,7 +36,7 @@ it.effect("an append whose transaction rolls back leaves no row and no gap in se
     expect(crashed).toBe("crash")
     const b = yield* append("b")
     expect(b.seq).toBe(a.seq + 1)
-    expect((yield* Outbox.pending).map((e) => e.mutationId)).toEqual(["a", "b"])
+    expect(Arr.map(yield* Outbox.pending, (e) => e.mutationId)).toEqual(["a", "b"])
     // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test composition root owns an isolated in-memory database for this test only.
   }).pipe(Effect.provide(Db))
 )
@@ -47,7 +48,7 @@ it.effect("pruning released rows keeps pending ones and never lets a seq be reus
     yield* Outbox.markReleased([b.seq])
     yield* TestClock.adjust(Outbox.defaultReleasedRetentionMillis + 1)
     yield* Outbox.pruneReleased()
-    expect((yield* Outbox.pending).map((e) => e.seq)).toEqual([a.seq])
+    expect(Arr.map(yield* Outbox.pending, (e) => e.seq)).toEqual([a.seq])
     expect((yield* rowCount)[0]?.n).toBe(1)
     expect((yield* append("c")).seq).toBe(b.seq + 1)
     // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test composition root owns an isolated in-memory database for this test only.

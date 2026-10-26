@@ -36,6 +36,7 @@
           "effect/sql",
           "effect/workers",
           "@effect/platform-browser",
+          "@effect/platform-bun",
           "@effect/sql-pg",
           "@effect/sql-sqlite-wasm",
           "@effect/vitest"

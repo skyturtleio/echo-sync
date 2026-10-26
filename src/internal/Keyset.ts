@@ -1,3 +1,4 @@
+import { Array as Arr } from "effect"
 import type { IndexRangePlan, KeyValue } from "../core/Store.ts"
 import type { Column } from "../core/SyncTable.ts"
 
@@ -14,14 +15,22 @@ export const predicates = (
     const op = greater ? ">" : "<"
     // An equal fixed prefix contributes nothing to comparison. Removing it lets SQLite
     // seek on the remaining tuple instead of scanning the entire equality group.
-    const offset = plan.eq.every((value, i) => value === cursor[i]) ? plan.eq.length : 0
-    const keys = plan.index.key.slice(offset).map((column, i) => {
+    const offset = Arr.every(plan.eq, (value, i) => value === cursor[i]) ? plan.eq.length : 0
+    const keys = Arr.map(plan.index.key.slice(offset), (column, i) => {
       const value = cursor[offset + i]
       if (value === undefined) throw new Error("keyset cursor must contain every index key")
       return { column, name: `t."${column.name}"`, value, param: value === null ? "NULL" : bind(column, value) }
     })
-    if (keys.every((k) => !k.column.nullable)) {
-      result.push(`(${keys.map((k) => k.name).join(", ")}) ${op} (${keys.map((k) => k.param).join(", ")})`)
+    if (Arr.every(keys, (k) => !k.column.nullable)) {
+      result.push(
+        `(${Arr.join(
+          Arr.map(keys, (k) => k.name),
+          ", "
+        )}) ${op} (${Arr.join(
+          Arr.map(keys, (k) => k.param),
+          ", "
+        )})`
+      )
       continue
     }
     const equal: Array<string> = []
@@ -35,10 +44,10 @@ export const predicates = (
           : greater
             ? `${name} > ${param}`
             : `(${name} IS NULL OR ${name} < ${param})`
-      alternatives.push(`(${[...equal, strict].join(" AND ")})`)
+      alternatives.push(`(${Arr.join([...equal, strict], " AND ")})`)
       equal.push(value === null ? `${name} IS NULL` : `${name} = ${param}`)
     }
-    result.push(`(${alternatives.join(" OR ")})`)
+    result.push(`(${Arr.join(alternatives, " OR ")})`)
   }
   return result
 }

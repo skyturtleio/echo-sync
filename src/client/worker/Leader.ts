@@ -17,6 +17,7 @@
  */
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner"
+import * as Arr from "effect/Array"
 import * as Cause from "effect/Cause"
 import * as Data from "effect/Data"
 import type * as Context from "effect/Context"
@@ -27,6 +28,7 @@ import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
+import * as Str from "effect/String"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Scope from "effect/Scope"
 import * as SqlClient from "effect/sql/SqlClient"
@@ -260,7 +262,7 @@ export const makeHandlers = ({
     // Reads the outbox only: never depends on push state, so a halted push cannot block recovery.
     exportPending: () =>
       storage.transaction(storage.pending).pipe(
-        Effect.map((pending) => pending.map(({ envelope, createdAt }) => ({ envelope, createdAt }))),
+        Effect.map((pending) => Arr.map(pending, ({ envelope, createdAt }) => ({ envelope, createdAt }))),
         Effect.mapError(unavailable)
       )
   })
@@ -335,9 +337,10 @@ type Reset = Extract<ToLeader, { readonly _tag: "Reset" }>
 const isNotFound = (cause: unknown) => cause instanceof DOMException && cause.name === "NotFoundError"
 
 const opfsDirectory = (path: string) =>
+  // oxlint-disable-next-line effecttsgo/async-function -- storageCall adapts the browser's Promise-based OPFS directory walk.
   Platform.storageCall("opening an OPFS directory", async () => {
     let dir = await navigator.storage.getDirectory()
-    for (const part of path.split("/")) dir = await dir.getDirectoryHandle(part)
+    for (const part of Str.split(path, "/")) dir = await dir.getDirectoryHandle(part)
     return dir
   }).pipe(
     Effect.catchIf(

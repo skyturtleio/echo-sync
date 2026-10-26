@@ -1,5 +1,5 @@
 import { expect, it } from "@effect/vitest"
-import { Cause, Clock, Deferred, Effect, Fiber, Option, Queue, Stream } from "effect"
+import { Array as Arr, Cause, Clock, Deferred, Effect, Fiber, Option, Queue, Stream } from "effect"
 import { RpcClientError } from "effect/rpc"
 import { TestClock } from "effect/testing"
 import { Errors, Ids, Protocol } from "echo-sync"
@@ -583,9 +583,10 @@ it.effect("a pokes connection the idle timeout ends must record idle-timeout, an
     yield* settle
     yield* TestClock.adjust("1 second")
     yield* settle
-    const outcomes = host.spans
-      .filter((span) => span.name === "echo.pokes")
-      .map((span) => span.attributes.find(([key]) => key === "echo.outcome")?.[1])
+    const outcomes = Arr.map(
+      Arr.filter(host.spans, (span) => span.name === "echo.pokes"),
+      (span) => Option.getOrUndefined(Arr.findFirst(span.attributes, ([key]) => key === "echo.outcome"))?.[1]
+    )
     expect(outcomes.slice(0, 2)).toEqual(["idle-timeout", "server-end"])
   })
 )

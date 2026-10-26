@@ -1,4 +1,15 @@
-import { Data, DateTime, Predicate, Schema, SchemaAST, SchemaGetter, String as Str } from "effect"
+import {
+  Array as Arr,
+  Data,
+  DateTime,
+  Option,
+  Predicate,
+  Record as Rec,
+  Schema,
+  SchemaAST,
+  SchemaGetter,
+  String as Str
+} from "effect"
 import type { AccessScopeId } from "./AccessScope.ts"
 
 // ---------------------------------------------------------------------------------------------
@@ -201,9 +212,9 @@ const representationId = (ast: SchemaAST.AST): unknown => {
 const checkHas = (check: SchemaAST.Check<unknown>, id: string): boolean =>
   check._tag === "Filter"
     ? check.annotations?.representation?.id === id
-    : check.checks.some((inner) => checkHas(inner, id))
+    : Arr.some(check.checks, (inner) => checkHas(inner, id))
 
-const hasCheck = (ast: SchemaAST.AST, id: string): boolean => (ast.checks ?? []).some((c) => checkHas(c, id))
+const hasCheck = (ast: SchemaAST.AST, id: string): boolean => Arr.some(ast.checks ?? [], (c) => checkHas(c, id))
 
 type Leaf = { readonly kind: ColumnKind } | { readonly problem: string }
 
@@ -264,7 +275,7 @@ const optionalAtField = (ast: SchemaAST.AST, seen: ReadonlySet<SchemaAST.AST> = 
   if (SchemaAST.isOptional(ast)) return true
   if (seen.has(ast)) return false
   const next = new Set(seen).add(ast)
-  if (ast._tag === "Union") return ast.types.some((t) => optionalAtField(t, next))
+  if (ast._tag === "Union") return Arr.some(ast.types, (t) => optionalAtField(t, next))
   if (ast._tag === "Suspend") return optionalAtField(ast.thunk(), next)
   return false
 }
@@ -272,7 +283,7 @@ const optionalAtField = (ast: SchemaAST.AST, seen: ReadonlySet<SchemaAST.AST> = 
 // NullOr(Literals(...)) retains a nested Union in Effect's AST. Classification
 // and timestamp codec selection must inspect the same encoded leaves.
 const unionLeaves = (node: SchemaAST.AST): ReadonlyArray<SchemaAST.AST> =>
-  node._tag === "Union" ? node.types.flatMap(unionLeaves) : [node]
+  node._tag === "Union" ? Arr.flatMap(node.types, unionLeaves) : [node]
 
 /**
  * Classifies a field by its *encoded* side (what is stored), so a transformed field (branded,
@@ -290,7 +301,7 @@ const classify = (ast: SchemaAST.AST): Classified | string => {
     return "problem" in l ? l.problem : { kind: l.kind, nullable: false }
   }
   const types = unionLeaves(encoded)
-  const members = types.filter((t) => t._tag !== "Null")
+  const members = Arr.filter(types, (t) => t._tag !== "Null")
   const nullable = members.length !== types.length
   const [first, ...rest] = members
   if (first === undefined) return "a field cannot be only null"
@@ -298,7 +309,7 @@ const classify = (ast: SchemaAST.AST): Classified | string => {
     const l = leaf(first)
     return "problem" in l ? l.problem : { kind: l.kind, nullable }
   }
-  const kinds = new Set(members.map((m) => (m._tag === "Literal" ? JSON.stringify(leaf(m)) : "structural")))
+  const kinds = new Set(Arr.map(members, (m) => (m._tag === "Literal" ? JSON.stringify(leaf(m)) : "structural")))
   const [only] = kinds
   if (kinds.size === 1 && only !== undefined && only !== "structural") {
     const l = leaf(first)
@@ -310,6 +321,7 @@ const classify = (ast: SchemaAST.AST): Classified | string => {
 const TimestampMillis = Schema.Int.check(Schema.isBetween({ minimum: minTimestampMillis, maximum: maxTimestampMillis }))
 const DateFromWire = TimestampMillis.pipe(
   Schema.decodeTo(Schema.Date, {
+    // oxlint-disable-next-line effecttsgo/global-date -- This public codec must decode to a native Date, not DateTime.
     decode: SchemaGetter.transform((ms: number) => new globalThis.Date(ms)),
     encode: SchemaGetter.transform((d: globalThis.Date) => d.getTime())
   })
@@ -328,7 +340,10 @@ const UtcFromWire = TimestampMillis.pipe(
 const wireFor = (field: Schema.Constraint, c: Classified): Schema.Constraint => {
   if (c.kind !== "timestamp") return Schema.toCodecJson(field)
   const encoded = SchemaAST.toEncoded(field.ast)
-  const stored = unionLeaves(encoded).find((t) => t._tag !== "Null") ?? encoded
+  const stored = Option.getOrElse(
+    Arr.findFirst(unionLeaves(encoded), (t) => t._tag !== "Null"),
+    () => encoded
+  )
   const millis = representationId(stored) === "effect/schema/DateTimeUtc" ? UtcFromWire : DateFromWire
   return (c.nullable ? Schema.NullOr(millis) : millis).pipe(Schema.decodeTo(field))
 }
@@ -348,6 +363,7 @@ const PgInteger = Schema.BigInt.pipe(
 const PgTimestamp = Schema.Date.pipe(
   Schema.decodeTo(TimestampMillis, {
     decode: SchemaGetter.transform((d: globalThis.Date) => d.getTime()),
+    // oxlint-disable-next-line effecttsgo/global-date -- The SQL driver's timestamptz binding requires a native Date.
     encode: SchemaGetter.transform((ms: number) => new globalThis.Date(ms))
   })
 )
@@ -418,12 +434,15 @@ const derived = <T, E>(schema: Schema.Constraint): Schema.Codec<T, E> =>
 
 /** Canonical JSON: object keys sorted, no whitespace. */
 export const canonicalJson = (json: Schema.Json): string => {
-  if (Array.isArray(json)) return `[${json.map(canonicalJson).join(",")}]`
+  if (Arr.isArray<Schema.Json>(json)) return `[${Arr.join(Arr.map(json, canonicalJson), ",")}]`
   if (json !== null && typeof json === "object") {
-    const entries = Object.entries(json)
-      .toSorted(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-      .map(([key, value]) => `${JSON.stringify(key)}:${canonicalJson(value)}`)
-    return `{${entries.join(",")}}`
+    const entries = Arr.map(
+      Arr.sort(Rec.toEntries(json), ([a]: [string, Schema.Json], [b]: [string, Schema.Json]) =>
+        a < b ? -1 : a > b ? 1 : 0
+      ),
+      ([key, value]) => `${JSON.stringify(key)}:${canonicalJson(value)}`
+    )
+    return `{${Arr.join(entries, ",")}}`
   }
   return JSON.stringify(json)
 }
@@ -432,7 +451,7 @@ export const canonicalJson = (json: Schema.Json): string => {
 export const hash = (text: string): string => {
   let h = 0xcbf29ce484222325n
   for (const byte of new TextEncoder().encode(text)) h = BigInt.asUintN(64, (h ^ BigInt(byte)) * 0x100000001b3n)
-  return h.toString(16).padStart(16, "0")
+  return Str.padStart(16, "0")(h.toString(16))
 }
 
 /**
@@ -467,7 +486,7 @@ export const make = <
   const sqliteFields: { [column: string]: Schema.Constraint } = {}
   const manifestColumns: Array<ColumnManifest> = []
 
-  for (const [field, schema] of Object.entries(all)) {
+  for (const [field, schema] of Rec.toEntries(all)) {
     const column = Str.camelToSnake(field)
     if (!fieldName.test(field) || Str.snakeToCamel(column) !== field || column.length > 63) {
       fail(`field "${field}": names must be camelCase (/^[a-z][a-zA-Z0-9]*$/) and round-trip through snake_case`)
@@ -494,7 +513,11 @@ export const make = <
     manifestColumns.push({ name: column, kind: c.kind, nullable: c.nullable })
   }
 
-  const columnOf = (field: string): Column => columns.find((c) => c.field === field) ?? fail(`unknown field "${field}"`)
+  const columnOf = (field: string): Column =>
+    Option.getOrElse(
+      Arr.findFirst(columns, (c) => c.field === field),
+      () => fail(`unknown field "${field}"`)
+    )
   const idColumn = columnOf("id")
   const scopeColumn = columnOf("accessScopeId")
   if (idColumn.kind !== "text" || idColumn.nullable) fail(`"id" must be a non-null string schema`)
@@ -502,11 +525,11 @@ export const make = <
 
   const declared: { readonly [index: string]: ReadonlyArray<string> } = options?.indexes ?? {}
   const indexes: { [index: string]: Index } = {}
-  for (const [index, indexFields] of Object.entries(declared)) {
+  for (const [index, indexFields] of Rec.toEntries(declared)) {
     if (!identifier.test(index) || `${name}__${index}`.length > 63) fail(`index "${index}": invalid name`)
     if (indexFields.length === 0) fail(`index "${index}": needs at least one field`)
     if (new Set(indexFields).size !== indexFields.length) fail(`index "${index}": repeats a field`)
-    const key = indexFields.map(columnOf)
+    const key = Arr.map(indexFields, columnOf)
     for (const c of key) {
       if (c.kind === "json") fail(`index "${index}": field "${c.field}" is a JSON column and cannot be indexed`)
       if (c.field === "id") fail(`index "${index}": "id" is always the implicit last key column`)
@@ -514,17 +537,19 @@ export const make = <
     indexes[index] = { name: index, fields: indexFields, key: [...key, idColumn] }
   }
 
-  const uniqueSets = (options?.unique ?? []).map((fs) => fs.map((f) => columnOf(f).name))
-  const uniques = uniqueSets.map((cs) => `  UNIQUE (${cs.map(quote).join(", ")})`)
+  const uniqueSets = Arr.map(options?.unique ?? [], (fs) => Arr.map(fs, (f) => columnOf(f).name))
+  const uniques = Arr.map(uniqueSets, (cs) => `  UNIQUE (${Arr.join(Arr.map(cs, quote), ", ")})`)
   const pgColumns = [
-    ...columns.map(
+    ...Arr.map(
+      columns,
       (c) =>
         `  ${quote(c.name)} ${pgType[c.kind]}${c.nullable ? "" : " NOT NULL"}${c === idColumn ? " PRIMARY KEY" : ""}`
     ),
     ...uniques
   ]
   const sqliteColumns = [
-    ...columns.map(
+    ...Arr.map(
+      columns,
       (c) =>
         `  ${quote(c.name)} ${sqliteType[c.kind]}${c.nullable ? "" : " NOT NULL"}${c === idColumn ? " PRIMARY KEY" : ""}${
           c.kind === "boolean" ? ` CHECK (${quote(c.name)} IN (0, 1))` : ""
@@ -533,17 +558,22 @@ export const make = <
     ...uniques
   ]
   const indexDdl = (unique: string) =>
-    Object.values(indexes).map(
+    Arr.map(
+      Rec.values(indexes),
       (i) =>
-        `CREATE INDEX ${quote(`${name}__${i.name}`)} ON ${quote(name)} (${i.key
-          .map((c) => `${quote(c.name)} ASC${unique === "pg" && c !== idColumn ? " NULLS FIRST" : ""}`)
-          .join(", ")})`
+        `CREATE INDEX ${quote(`${name}__${i.name}`)} ON ${quote(name)} (${Arr.join(
+          Arr.map(i.key, (c) => `${quote(c.name)} ASC${unique === "pg" && c !== idColumn ? " NULLS FIRST" : ""}`),
+          ", "
+        )})`
     )
 
-  const indexManifest = Object.values(indexes)
-    .map((i) => ({ name: i.name, columns: i.key.map((c) => c.name) }))
-    .toSorted((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
-  const sortedColumns = manifestColumns.toSorted((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+  const indexManifest = Arr.sort(
+    Arr.map(Rec.values(indexes), (i) => ({ name: i.name, columns: Arr.map(i.key, (c) => c.name) })),
+    (a: { readonly name: string }, b: { readonly name: string }) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+  )
+  const sortedColumns = Arr.sort(manifestColumns, (a: ColumnManifest, b: ColumnManifest) =>
+    a.name < b.name ? -1 : a.name > b.name ? 1 : 0
+  )
   const manifest: TableManifest = {
     name,
     columns: sortedColumns,
@@ -553,12 +583,12 @@ export const make = <
     dataHash: hash(
       canonicalJson({
         name,
-        columns: sortedColumns.map((c) => ({ name: c.name, kind: c.kind, nullable: c.nullable }))
+        columns: Arr.map(sortedColumns, (c) => ({ name: c.name, kind: c.kind, nullable: c.nullable }))
       })
     ),
     indexHash: hash(
       canonicalJson({
-        indexes: indexManifest.map((i) => ({ name: i.name, columns: [...i.columns] })),
+        indexes: Arr.map(indexManifest, (i) => ({ name: i.name, columns: [...i.columns] })),
         unique: uniques
       })
     )
@@ -575,7 +605,7 @@ export const make = <
     indexes: typedIndexes,
     manifest,
     postgres: {
-      createTable: `CREATE TABLE ${quote(name)} (\n${pgColumns.join(",\n")}\n)`,
+      createTable: `CREATE TABLE ${quote(name)} (\n${Arr.join(pgColumns, ",\n")}\n)`,
       createIndexes: [
         ...indexDdl("pg"),
         `CREATE INDEX ${quote(`${name}__echo-scope`)} ON ${quote(name)} ("access_scope_id" ASC NULLS FIRST, "id" ASC)`
@@ -583,7 +613,7 @@ export const make = <
       row: derived(Schema.Struct(pgFields))
     },
     sqlite: {
-      createTable: `CREATE TABLE ${quote(name)} (\n${sqliteColumns.join(",\n")}\n) STRICT`,
+      createTable: `CREATE TABLE ${quote(name)} (\n${Arr.join(sqliteColumns, ",\n")}\n) STRICT`,
       createIndexes: indexDdl("sqlite"),
       row: derived(Schema.Struct(sqliteFields))
     }

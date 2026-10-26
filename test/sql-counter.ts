@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Array as Arr, Effect, Stream } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
 import type { Connection } from "effect/sql/SqlConnection"
 import type { Compiler } from "effect/sql/Statement"
@@ -16,7 +16,7 @@ export const countingClient = Effect.fnUntraced(function* (source: SqlClient.Sql
       statements.push(statement)
       return Effect.tap(work, (result) =>
         Effect.sync(() => {
-          if (/^\s*SELECT\b/i.test(sql) && Array.isArray(result)) statement.rows = result.length
+          if (/^\s*SELECT\b/i.test(sql) && Arr.isArray(result)) statement.rows = result.length
         })
       )
     })

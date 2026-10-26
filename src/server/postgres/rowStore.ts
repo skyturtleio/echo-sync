@@ -1,5 +1,5 @@
 import * as PgTypes from "@effect/sql-pg/PgTypes"
-import { Effect, Option, Schema } from "effect"
+import { Array as Arr, Effect, Option, Schema, String as Str } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
 import { Errors, ScopeGrants, Store, type SyncTable } from "echo-sync"
@@ -14,17 +14,20 @@ export const unavailable = (error: SqlError) =>
   new Errors.StoreUnavailable({ message: `${error.reason._tag}: ${error.message}` })
 
 export const isConflictUnavailable = (error: Errors.StoreUnavailable) =>
-  error.message.startsWith("SerializationError:") || error.message.startsWith("DeadlockError:")
+  Str.startsWith("SerializationError:")(error.message) || Str.startsWith("DeadlockError:")(error.message)
 
 /** Quoted SQL identifier. */
-export const q = (name: string) => `"${name.replaceAll('"', '""')}"`
+export const q = (name: string) => `"${Str.replaceAll('"', '""')(name)}"`
 
 /**
  * Declared columns only, so a column the app added to the relation but not to the SyncTable
  * never leaves the database (SPEC §3). Names are validated identifiers (core rejects others).
  */
 export const selectList = (table: SyncTable.AnySyncTable, alias?: string) =>
-  table.columns.map((c) => (alias === undefined ? q(c.name) : `${alias}.${q(c.name)}`)).join(", ")
+  Arr.join(
+    Arr.map(table.columns, (c) => (alias === undefined ? q(c.name) : `${alias}.${q(c.name)}`)),
+    ", "
+  )
 
 /** Postgres row → wire row through the table's own codec. Stored rows are trusted: a failure is a defect. */
 export const decodeRow = (table: SyncTable.AnySyncTable, row: unknown) =>
@@ -32,6 +35,7 @@ export const decodeRow = (table: SyncTable.AnySyncTable, row: unknown) =>
 
 /** Wire value → bind parameter for one column (JSON columns are bound explicitly as jsonb). */
 const bindColumn = (column: SyncTable.Column, value: Schema.Json) => {
+  // oxlint-disable-next-line effecttsgo/schema-sync -- SQL/Keyset statement builders require synchronous pure binding; invalid trusted wire values remain defects.
   const pg = Schema.encodeSync(column.postgres)(value)
   return column.kind === "json" && pg !== null ? PgTypes.jsonb(pg) : pg
 }
@@ -78,12 +82,18 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
         Effect.gen(function* () {
           if (Option.isNone(row))
             return yield* Effect.asVoid(query(table, (rel) => `DELETE FROM ${rel} WHERE "id" = $1`, [id]))
-          const params = table.columns.map((c) => bindColumn(c, row.value[c.name] ?? null))
-          const names = table.columns.map((c) => q(c.name))
+          const params = Arr.map(table.columns, (c) => bindColumn(c, row.value[c.name] ?? null))
+          const names = Arr.map(table.columns, (c) => q(c.name))
           yield* query(
             table,
-            (rel) => `INSERT INTO ${rel} (${names.join(", ")}) VALUES (${names.map((_, i) => `$${i + 1}`).join(", ")})
-             ON CONFLICT ("id") DO UPDATE SET ${names.map((n) => `${n} = EXCLUDED.${n}`).join(", ")}`,
+            (rel) => `INSERT INTO ${rel} (${Arr.join(names, ", ")}) VALUES (${Arr.join(
+              Arr.map(names, (_, i) => `$${i + 1}`),
+              ", "
+            )})
+             ON CONFLICT ("id") DO UPDATE SET ${Arr.join(
+               Arr.map(names, (n) => `${n} = EXCLUDED.${n}`),
+               ", "
+             )}`,
             params
           )
         }).pipe(
@@ -100,7 +110,7 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
       range: (table, plan) => {
         const where: Array<string> = []
         const params: Array<unknown> = []
-        plan.eq.forEach((value, i) => {
+        Arr.forEach(plan.eq, (value, i) => {
           const c = plan.index.key[i]
           if (c === undefined) return
           if (value === null) where.push(`${q(c.name)} IS NULL`)
@@ -146,13 +156,16 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
           limit = ` LIMIT $${params.length}`
         }
         const dir = plan.order === "asc" ? "ASC NULLS FIRST" : "DESC NULLS LAST"
-        const order = plan.index.key.map((c) => `t.${q(c.name)} ${dir}`).join(", ")
+        const order = Arr.join(
+          Arr.map(plan.index.key, (c) => `t.${q(c.name)} ${dir}`),
+          ", "
+        )
         return Effect.andThen(Store.checkLimit(plan.limit), () =>
           Effect.flatMap(
             query(
               table,
               (rel) =>
-                `SELECT ${selectList(table, "t")} FROM ${rel} AS t${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY ${order}${limit}`,
+                `SELECT ${selectList(table, "t")} FROM ${rel} AS t${where.length > 0 ? ` WHERE ${Arr.join(where, " AND ")}` : ""} ORDER BY ${order}${limit}`,
               params
             ).pipe(Effect.mapError(unavailable)),
             (rows) => decodeAll(table, rows)

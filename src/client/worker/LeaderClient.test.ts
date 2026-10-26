@@ -1,5 +1,5 @@
 import { expect, it } from "@effect/vitest"
-import { Cause, Context, Deferred, Effect, Exit, Layer, Option, Scope, Stream } from "effect"
+import { Array as Arr, Cause, Context, Deferred, Effect, Exit, Layer, Option, Schema, Scope, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { AccessScope } from "echo-sync"
 import { RpcClientDefect, RpcClientError } from "effect/rpc/RpcClientError"
@@ -210,7 +210,7 @@ it.live("closing the client's scope while a reset is releasing its locks returns
     channel.postMessage({ _tag: "ResetSignal", appId: "reset", profile: "join" })
     channel.close()
     yield* Deferred.await(releasing).pipe(Effect.timeout("2 seconds"))
-    setTimeout(() => Deferred.doneUnsafe(gate, Effect.void), 50)
+    yield* Effect.forkChild(Effect.andThen(Effect.sleep(50), Deferred.succeed(gate, undefined)))
     yield* Scope.close(scope, Exit.void)
     expect(released).toBe(true)
     expect((yield* Stream.runHead(client.status)).pipe(Option.map((s) => s.reset))).toEqual(Option.some(true))
@@ -251,7 +251,7 @@ const check = <X, A>(
 ) =>
   Effect.gen(function* () {
     const label = (u: unknown) =>
-      u instanceof LeaderUnavailable && u.reason === "LeaderLost" ? "LeaderLost" : u === typed ? "X" : "other"
+      Schema.is(LeaderUnavailable)(u) && u.reason === "LeaderLost" ? "LeaderLost" : u === typed ? "X" : "other"
     const scenarios: ReadonlyArray<{
       readonly first: Cause.Cause<X | RpcClientError>
       readonly opens: number
@@ -300,8 +300,10 @@ const check = <X, A>(
           expect(opens).toBe(scenario.opens)
           if (scenario.fails === undefined) return expect(exit).toEqual(Exit.succeed([fresh]))
           if (Exit.isSuccess(exit)) return expect.fail(`${stream} ended without the leader's failure`)
-          expect(exit.cause.reasons.filter(Cause.isFailReason).map((r) => label(r.error))).toEqual(scenario.fails)
-          expect(exit.cause.reasons.filter(Cause.isDieReason).map((r) => r.defect)).toEqual(scenario.dies)
+          expect(Arr.map(Arr.filter(exit.cause.reasons, Cause.isFailReason), (r) => label(r.error))).toEqual(
+            scenario.fails
+          )
+          expect(Arr.map(Arr.filter(exit.cause.reasons, Cause.isDieReason), (r) => r.defect)).toEqual(scenario.dies)
         })
       )
     }

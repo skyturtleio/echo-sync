@@ -1,5 +1,18 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Option, Ref, Schedule, Schema } from "effect"
+import {
+  Array as Arr,
+  Cause,
+  DateTime,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Option,
+  Order,
+  Ref,
+  Schedule,
+  Schema
+} from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { SqlError, UnknownError } from "effect/sql/SqlError"
 import { AccessScope, Ids, Mutation, Registry, Store, SyncTable } from "echo-sync"
@@ -31,7 +44,7 @@ const asOwner = {
 }
 const attachedRowStore = (registry: Registry.SyncRegistry) =>
   Effect.flatMap(resolveTables(registry), (tables) =>
-    RowStore.make(new Map(tables.map((t) => [t.table.name, t.schema])))
+    RowStore.make(new Map(Arr.map(tables, (t) => [t.table.name, t.schema])))
   )
 
 const fastRetry = { conflictRetry: Schedule.recurs(2) }
@@ -54,7 +67,7 @@ const counterBody = Effect.gen(function* () {
 const ledgerIds = Effect.gen(function* () {
   const sql = yield* SqlClient
   const rows = yield* sql<{ mutation_id: string }>`SELECT mutation_id FROM echo_sync.mutations ORDER BY position`
-  return rows.map((r) => r.mutation_id)
+  return Arr.map(rows, (r) => r.mutation_id)
 })
 
 /** A real Postgres serialization failure (SQLSTATE 40001). */
@@ -69,8 +82,8 @@ const programmerBug = new Error("programmer bug")
 /** The attempt died with the programmer bug still in its cause, and no typed (retryable) failure. */
 const diedWithBug = (exit: Exit.Exit<unknown, unknown>) =>
   Exit.isFailure(exit) &&
-  exit.cause.reasons.some((r) => Cause.isDieReason(r) && r.defect === programmerBug) &&
-  !exit.cause.reasons.some(Cause.isFailReason)
+  Arr.some(exit.cause.reasons, (r) => Cause.isDieReason(r) && r.defect === programmerBug) &&
+  !Arr.some(exit.cause.reasons, Cause.isFailReason)
 
 const rejection = new Mutation.DomainError({ mutation: "test", error: "no" })
 
@@ -143,7 +156,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       )
       assert.strictEqual(result.stopped, null)
       assert.deepStrictEqual(
-        result.processed.map((p) => p.outcome._tag),
+        Arr.map(result.processed, (p) => p.outcome._tag),
         ["Applied", "Rejected", "Applied"]
       )
       assert.strictEqual(attempts, 3, "a unique violation gets the bounded conflict retry")
@@ -232,7 +245,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
           Effect.gen(function* () {
             attempts++
             const existing = yield* store.scan(Items)
-            if (!existing.some((row) => row.body === "shared")) {
+            if (!Arr.some(existing, (row) => row.body === "shared")) {
               yield* Deferred.succeed(readAbsent, undefined)
               yield* Deferred.await(competitorCommitted)
               yield* store.insert(Items, {
@@ -262,7 +275,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       assert.strictEqual(attempts, 2)
       assert.strictEqual(uniqueFailures, 1, "the first attempt must actually hit 23505, not 40001")
       assert.deepStrictEqual(
-        result.processed.map((p) => p.outcome),
+        Arr.map(result.processed, (p) => p.outcome),
         [{ _tag: "Applied" }]
       )
       assert.isTrue((result.processed[0]?.position ?? 0n) > 0n)
@@ -347,7 +360,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       const m4 = { mutationId: "d", seq: 4n, body: appendEffect("4") }
       const first = yield* runBatch("p", "c1", [m1, m2, { mutationId: "c", seq: 3n, body: flaky }, m4], fastRetry)
       assert.deepStrictEqual(
-        first.processed.map((p) => [p.mutationId, p.outcome._tag]),
+        Arr.map(first.processed, (p) => [p.mutationId, p.outcome._tag]),
         [
           ["a", "Applied"],
           ["b", "Rejected"]
@@ -363,13 +376,13 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       const second = yield* runBatch("p", "c1", [m1, m2, { mutationId: "c", seq: 3n, body: appendEffect("3") }, m4])
       assert.strictEqual(second.stopped, null)
       assert.deepStrictEqual(
-        second.processed.map((p) => p.outcome._tag),
+        Arr.map(second.processed, (p) => p.outcome._tag),
         ["Applied", "Rejected", "Applied", "Applied"]
       )
       // Replayed outcomes carry their original positions; new ones come after them.
       assert.deepStrictEqual(second.processed.slice(0, 2), first.processed)
-      const positions = second.processed.map((p) => p.position)
-      assert.isTrue(positions.every((position, i) => i === 0 || (positions[i - 1] ?? position) < position))
+      const positions = Arr.map(second.processed, (p) => p.position)
+      assert.isTrue(Arr.every(positions, (position, i) => i === 0 || (positions[i - 1] ?? position) < position))
       assert.strictEqual(yield* counterBody, "134")
 
       // Acks arrive by pull, in client order, each exactly once.
@@ -601,13 +614,13 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
         yield* sql`UPDATE items SET body = ${String(Number(row?.body ?? "0") + 1)} WHERE id = 'n'`
       })
       const results = yield* Effect.all(
-        ["c1", "c2"].map((clientId) =>
+        Arr.map(["c1", "c2"], (clientId) =>
           runMutation({ principalId: "p", clientId, mutationId: `inc-${clientId}`, seq: 1n }, increment)
         ),
         { concurrency: "unbounded" }
       )
       assert.deepStrictEqual(
-        results.map((r) => r.outcome._tag),
+        Arr.map(results, (r) => r.outcome._tag),
         ["Applied", "Applied"]
       )
       const [row] = yield* sql<{ body: string }>`SELECT body FROM items WHERE id = 'n'`
@@ -633,13 +646,13 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
           })
         })
       const results = yield* Effect.all(
-        ["c1", "c2"].map((clientId) =>
+        Arr.map(["c1", "c2"], (clientId) =>
           runMutation({ principalId: "p", clientId, mutationId: `ins-${clientId}`, seq: 1n }, insert(clientId))
         ),
         { concurrency: "unbounded" }
       )
-      const outcomes = results.map((r) => (r.outcome._tag === "Rejected" ? r.outcome.error._tag : r.outcome._tag))
-      assert.deepStrictEqual(outcomes.toSorted(), ["Applied", "RowAlreadyExists"])
+      const outcomes = Arr.map(results, (r) => (r.outcome._tag === "Rejected" ? r.outcome.error._tag : r.outcome._tag))
+      assert.deepStrictEqual(Arr.sort(outcomes, Order.String), ["Applied", "RowAlreadyExists"])
       const winner = results[0]?.outcome._tag === "Applied" ? "c1" : "c2"
       const rows = yield* sql<{ body: string }>`SELECT body FROM items WHERE id = 'x'`
       assert.deepStrictEqual(rows, [{ body: winner }])

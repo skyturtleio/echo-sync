@@ -1,5 +1,6 @@
-import { DateTime, Effect, Schema, SchemaGetter } from "effect"
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { Array as Arr, DateTime, Effect, Option, Schema, SchemaGetter } from "effect"
+import { describe, expect, it } from "@effect/vitest"
+import { afterAll, beforeAll } from "vitest"
 import { AccessScopeId } from "./AccessScope.ts"
 import * as Registry from "./Registry.ts"
 import * as SyncTable from "./SyncTable.ts"
@@ -17,9 +18,11 @@ const Shape = Schema.Union([
 const IsoFromDate = Schema.NullOr(Schema.Date).pipe(
   Schema.decodeTo(Schema.NullOr(Schema.String), {
     decode: SchemaGetter.transform((d: Date | null) => (d === null ? null : d.toISOString())),
+    // oxlint-disable-next-line effecttsgo/global-date -- This transform deliberately exercises a native Date encoded leaf with a string decoded side.
     encode: SchemaGetter.transform((iso: string | null) => (iso === null ? null : new Date(iso)))
   })
 )
+// oxlint-disable-next-line effecttsgo/global-date -- Schema's Date refinement requires a native Date bound; its preservation is under test.
 const Past = Schema.Date.check(Schema.isLessThanDate(new Date("2100-01-01T00:00:00Z"))).pipe(Schema.brand("Past"))
 
 /** One column of every supported kind, each also in nullable form, plus transformed leaves. */
@@ -69,10 +72,12 @@ const rows: ReadonlyArray<Row> = [
     dblN: null,
     flag: false,
     flagN: null,
+    // oxlint-disable-next-line effecttsgo/global-date -- Native Date at the portable lower timestamp bound is part of the codec fixture.
     date: new Date(SyncTable.minTimestampMillis),
     dateN: null,
     utc: DateTime.makeUnsafe(SyncTable.maxTimestampMillis),
     utcN: null,
+    // oxlint-disable-next-line effecttsgo/global-date -- Nested native Dates must survive JSON-column encoding too.
     doc: { tags: [], when: new Date(-1) },
     docN: null,
     shape: { kind: "circle", r: 0.1 },
@@ -96,14 +101,19 @@ const rows: ReadonlyArray<Row> = [
     dblN: -1.7976931348623157e308,
     flag: true,
     flagN: false,
+    // oxlint-disable-next-line effecttsgo/global-date -- Native Date at the portable upper timestamp bound is part of the codec fixture.
     date: new Date(SyncTable.maxTimestampMillis),
+    // oxlint-disable-next-line effecttsgo/global-date -- Exercises the non-null branch of a nullable native Date column.
     dateN: new Date(0),
     utc: DateTime.makeUnsafe(SyncTable.minTimestampMillis),
     utcN: DateTime.makeUnsafe(-1),
+    // oxlint-disable-next-line effecttsgo/global-date -- Nested Date millisecond precision must survive JSON-column encoding.
     doc: { tags: ["", "😀"], when: new Date(1_700_000_000_123) },
     docN: [Number.MAX_SAFE_INTEGER, -1],
+    // oxlint-disable-next-line effecttsgo/global-date -- Tests a native Date nested inside a tagged union JSON column.
     shape: { kind: "box", at: new Date(0) },
     iso: "2001-02-03T04:05:06.789Z",
+    // oxlint-disable-next-line effecttsgo/global-date -- Branded/refined native Date must retain its declared storage mapping.
     past: Past.make(new Date(-62_135_596_800_000)),
     utcMs: DateTime.makeUnsafe(1),
     fin: -0.25,
@@ -111,42 +121,58 @@ const rows: ReadonlyArray<Row> = [
   }
 ]
 
-const roundTrip = async (dialect: Dialect) => {
-  await dialect.create(Everything)
-  for (const row of rows) await dialect.insert(Everything, Schema.encodeSync(Everything.wire)(row))
-  return (await dialect.readAll(Everything)).map((wire) => Schema.decodeUnknownSync(Everything.wire)(wire))
-}
+const roundTrip = (dialect: Dialect) =>
+  Effect.gen(function* () {
+    yield* Effect.promise(() => dialect.create(Everything))
+    for (const row of rows) {
+      const wire = yield* Schema.encodeEffect(Everything.wire)(row)
+      yield* Effect.promise(() => dialect.insert(Everything, wire))
+    }
+    return yield* Effect.forEach(yield* Effect.promise(() => dialect.readAll(Everything)), (wire) =>
+      Schema.decodeUnknownEffect(Everything.wire)(wire)
+    )
+  })
 
 const expectSameRows = (actual: ReadonlyArray<Row>) => {
   expect(actual).toEqual(rows)
 }
 
 describe("SyncTable codec round-trip", () => {
-  it("the wire form (JSON text, as sent over HTTP) returns every field unchanged", () => {
-    const back = rows.map((row) =>
-      Schema.decodeUnknownSync(Everything.wire)(JSON.parse(JSON.stringify(Schema.encodeSync(Everything.wire)(row))))
-    )
-    expect(back).toEqual(rows)
-  })
+  it.effect("the wire form (JSON text, as sent over HTTP) returns every field unchanged", () =>
+    Effect.gen(function* () {
+      const codec = Schema.fromJsonString(Everything.wire)
+      const back = yield* Effect.forEach(rows, (row) =>
+        Effect.gen(function* () {
+          const json = yield* Schema.encodeEffect(codec)(row)
+          return yield* Schema.decodeUnknownEffect(codec)(json)
+        })
+      )
+      expect(back).toEqual(rows)
+    })
+  )
 
-  it("SQLite stores and returns every supported leaf type unchanged (boundaries, nulls, empty strings)", async () => {
-    const db = sqlite()
-    try {
-      expectSameRows(await roundTrip(db))
-    } finally {
-      await db.close()
-    }
-  })
+  it.effect("SQLite stores and returns every supported leaf type unchanged (boundaries, nulls, empty strings)", () =>
+    Effect.acquireUseRelease(
+      Effect.sync(sqlite),
+      (db) => Effect.map(roundTrip(db), expectSameRows),
+      (db) => Effect.promise(() => db.close())
+    )
+  )
 
   describe.skipIf(!pgAvailable)("Postgres", () => {
     let db: Dialect
-    beforeAll(async () => {
-      db = await postgres()
-    })
-    afterAll(async () => db.close())
-    it("Postgres stores and returns every supported leaf type unchanged (boundaries, nulls, empty strings)", async () => {
-      expectSameRows(await roundTrip(db))
-    })
+    beforeAll(() =>
+      Effect.runPromise(
+        Effect.gen(function* () {
+          db = yield* Effect.promise(postgres)
+        })
+      )
+    )
+    afterAll(() => db.close())
+    it.effect(
+      "Postgres stores and returns every supported leaf type unchanged (boundaries, nulls, empty strings)",
+      () => Effect.map(roundTrip(db), expectSameRows)
+    )
   })
 })
 
@@ -189,7 +215,7 @@ describe("SyncTable declaration-time rejection", () => {
       /field "x".*encoded-side defaults/
     )
     const json = SyncTable.make("t", { ...base, j: Schema.Struct({ a: Schema.optionalKey(Schema.String) }) })
-    expect(json.columns.find((c) => c.field === "j")?.kind).toBe("json")
+    expect(Option.getOrUndefined(Arr.findFirst(json.columns, (c) => c.field === "j"))?.kind).toBe("json")
     // @ts-expect-error optional keys are not supported
     expectRejected(() => SyncTable.make("t", { ...base, o: Schema.optionalKey(Schema.String) }), /field "o".*optional/)
   })
@@ -239,11 +265,15 @@ describe("SyncTable manifest hash", () => {
 
   it("ignores refinements, brands and nested JSON schemas: validation is not storage (SPEC §3)", () => {
     const base = SyncTable.make("notes", fields).manifest.dataHash
-    const same = [
-      SyncTable.make("notes", { ...fields, title: Schema.NonEmptyString }),
-      SyncTable.make("notes", { ...fields, title: Schema.String.pipe(Schema.brand("Title")) }),
-      SyncTable.make("notes", { ...fields, at: Schema.Date.check(Schema.isGreaterThanDate(new Date(0))) })
-    ].map((t) => t.manifest.dataHash)
+    const same = Arr.map(
+      [
+        SyncTable.make("notes", { ...fields, title: Schema.NonEmptyString }),
+        SyncTable.make("notes", { ...fields, title: Schema.String.pipe(Schema.brand("Title")) }),
+        // oxlint-disable-next-line effecttsgo/global-date -- This assertion specifically verifies native Date refinements do not affect the manifest hash.
+        SyncTable.make("notes", { ...fields, at: Schema.Date.check(Schema.isGreaterThanDate(new Date(0))) })
+      ],
+      (t) => t.manifest.dataHash
+    )
     expect(same).toEqual([base, base, base])
     const fin = SyncTable.make("n", { id: ItemId, accessScopeId: AccessScopeId, n: Schema.FiniteFromString })
     const nonNeg = SyncTable.make("n", {
@@ -263,13 +293,16 @@ describe("SyncTable manifest hash", () => {
 
   it("changes when the storage shape changes (nullability, column kind, column set, table name)", () => {
     const base = SyncTable.make("notes", fields).manifest.dataHash
-    const variants = [
-      SyncTable.make("notes", { ...fields, title: Schema.NullOr(Schema.String) }),
-      SyncTable.make("notes", { ...fields, title: Schema.Int }),
-      SyncTable.make("notes", { ...fields, at: Schema.NullOr(Schema.Date) }),
-      SyncTable.make("notes", { ...fields, extra: Schema.Struct({ a: Schema.String }) }),
-      SyncTable.make("notes2", fields)
-    ].map((t) => t.manifest.dataHash)
+    const variants = Arr.map(
+      [
+        SyncTable.make("notes", { ...fields, title: Schema.NullOr(Schema.String) }),
+        SyncTable.make("notes", { ...fields, title: Schema.Int }),
+        SyncTable.make("notes", { ...fields, at: Schema.NullOr(Schema.Date) }),
+        SyncTable.make("notes", { ...fields, extra: Schema.Struct({ a: Schema.String }) }),
+        SyncTable.make("notes2", fields)
+      ],
+      (t) => t.manifest.dataHash
+    )
     expect(new Set([base, ...variants]).size).toBe(variants.length + 1)
   })
 })

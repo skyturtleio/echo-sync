@@ -1,4 +1,4 @@
-import { Option } from "effect"
+import { Array as Arr, Option, Order } from "effect"
 import { ScopeGrants } from "./ScopeGrants.ts"
 import { canonicalJson, hash, SyncTableDeclarationError, type AnySyncTable } from "./SyncTable.ts"
 
@@ -22,15 +22,15 @@ export const make = (tables: ReadonlyArray<AnySyncTable>): SyncRegistry => {
     if (byName.has(table.name)) throw new SyncTableDeclarationError(`SyncRegistry: duplicate table "${table.name}"`)
     byName.set(table.name, table)
   }
-  const sorted = [...byName.keys()].toSorted()
-  const manifests = sorted.flatMap((name) => {
+  const sorted = Arr.sort(byName.keys(), Order.String)
+  const manifests = Arr.flatMap(sorted, (name) => {
     const table = byName.get(name)
     return table === undefined ? [] : [table.manifest]
   })
   return {
     tables: all,
     get: (name) => Option.fromNullishOr(byName.get(name)),
-    dataHash: hash(canonicalJson(manifests.map((m) => ({ name: m.name, dataHash: m.dataHash })))),
-    indexHash: hash(canonicalJson(manifests.map((m) => ({ name: m.name, indexHash: m.indexHash }))))
+    dataHash: hash(canonicalJson(Arr.map(manifests, (m) => ({ name: m.name, dataHash: m.dataHash })))),
+    indexHash: hash(canonicalJson(Arr.map(manifests, (m) => ({ name: m.name, indexHash: m.indexHash }))))
   }
 }

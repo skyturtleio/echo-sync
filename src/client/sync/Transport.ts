@@ -36,8 +36,10 @@ import { CredentialsUnavailable, PullProtocolError, PushIntegrityError, type Pul
 const lift = <E extends { readonly _tag: string }>(
   error: E | RpcClientError.RpcClientError
 ): E | RpcClientError.RpcClientError | CredentialsUnavailable | Protocol.Unauthorized => {
+  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Only this RPC implementation's errors cross the infrastructure boundary, not same-identifier classes.
   if (!(error instanceof RpcClientError.RpcClientError) || error.reason._tag !== "HttpError") return error
   const http = error.reason.cause
+  // oxlint-disable-next-line effecttsgo/instance-of-schema -- A custom fetch may reject with a same-identifier class; that is still a network failure, not engine credentials.
   if (http instanceof HttpClientError.TransportError && http.cause instanceof CredentialsUnavailable) return http.cause
   if (
     http instanceof HttpClientError.StatusCodeError &&

@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Cause, Effect, Exit } from "effect"
+import { Array as Arr, Cause, Effect, Exit, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { isSqlError, SqlError, UnknownError } from "effect/sql/SqlError"
 import { Errors } from "echo-sync"
@@ -29,7 +29,10 @@ const subject = Effect.gen(function* () {
     yield* sql`INSERT INTO echo_sync.access_scopes (id) VALUES (${scope}) ON CONFLICT DO NOTHING`
   }
   const rows = yield* RowStore.make(
-    new Map([...Conformance.tables.map((t) => [t.name, "public"] as const), ["scope_grants", "echo_sync"] as const])
+    new Map([
+      ...Arr.map(Conformance.tables, (t) => [t.name, "public"] as const),
+      ["scope_grants", "echo_sync"] as const
+    ])
   )
   const made: Conformance.RowStoreSubject = {
     rows,
@@ -78,17 +81,20 @@ describe.skipIf(!pgAvailable)("Postgres RowStore conforms to Store.RowStore (SPE
         )
       )
       if (Exit.isSuccess(exit)) return assert.fail("transaction succeeded")
-      const reasons = exit.cause.reasons.map((r) =>
-        Cause.isFailReason(r)
+      const reasons = Arr.map(exit.cause.reasons, (r) => {
+        if (Cause.isFailReason(r) && Schema.is(Errors.StoreUnavailable)(r.error)) {
+          assert.instanceOf(r.error, Errors.StoreUnavailable)
+        }
+        return Cause.isFailReason(r)
           ? r.error === "abort"
             ? "fail:abort"
-            : r.error instanceof Errors.StoreUnavailable
+            : Schema.is(Errors.StoreUnavailable)(r.error)
               ? "fail:StoreUnavailable"
               : "fail:other"
           : Cause.isDieReason(r) && r.defect === bug
             ? "die:bug"
             : "other"
-      )
+      })
       assert.deepStrictEqual(reasons, ["fail:abort", "fail:StoreUnavailable", "die:bug"])
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))

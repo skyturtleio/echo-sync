@@ -2,7 +2,21 @@
 import "../testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { expect, it } from "@effect/vitest"
-import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Scope, Stream } from "effect"
+import {
+  Array as Arr,
+  Cause,
+  DateTime,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Order,
+  Schema,
+  Scope,
+  Stream
+} from "effect"
 import type { Scheduler } from "effect/Scheduler"
 import * as SqlClient from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation, Protocol, Registry, ScopeGrants, SyncTable } from "echo-sync"
@@ -20,7 +34,9 @@ const Db = Layer.effectDiscard(SqliteSyncStorage.migrate(registry)).pipe(
 const makeStorage = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient
   const rows = {
-    ids: Effect.orDie(sql<{ id: string }>`SELECT id FROM t ORDER BY id`).pipe(Effect.map((r) => r.map((x) => x.id)))
+    ids: Effect.orDie(sql<{ id: string }>`SELECT id FROM t ORDER BY id`).pipe(
+      Effect.map((r) => Arr.map(r, (x) => x.id))
+    )
   }
   return { storage: yield* SqliteSyncStorage.make(sql, registry), rows }
 })
@@ -29,8 +45,8 @@ const mid = Ids.MutationId.make
 const seqOf = Ids.Seq.make
 const pos = Ids.Position.make
 const row = (id: string): SyncTable.EncodedRow => ({ id, access_scope_id: "s" })
-const decodePage = Schema.decodeUnknownSync(Protocol.PullPage)
-const decodeDone = Schema.decodeUnknownSync(Protocol.PullDone)
+const decodePage = Schema.decodeUnknownEffect(Protocol.PullPage)
+const decodeDone = Schema.decodeUnknownEffect(Protocol.PullDone)
 
 const entry = (seq: Ids.Seq, mutationId: string) => ({
   envelope: { clientId: Ids.ClientId.make("c"), mutationId: mid(mutationId), seq, name: "t", args: { mutationId } },
@@ -57,7 +73,7 @@ it.effect("queued transactions, reads and pending counts progress before a relea
         const read = yield* Effect.forkChild(
           storage.transaction(
             Effect.map(storage.pending, (pending) => {
-              expect(pending.map((p) => p.envelope.mutationId)).toEqual(["saved"])
+              expect(Arr.map(pending, (p) => p.envelope.mutationId)).toEqual(["saved"])
               order.push("read")
             })
           ),
@@ -132,6 +148,7 @@ it.effect("cancelling queued head, middle and tail work never runs it or release
   }).pipe(Effect.provide(Db))
 )
 
+// oxlint-disable-next-line effecttsgo/async-function -- External scheduler driver must await separately-run runtimes without inheriting the scheduler being interrupted.
 it("interruption at every admission handoff boundary leaves transactions atomic and admission usable", async () => {
   let interrupted = 0
   const outcomes = new Set<number>()
@@ -177,10 +194,10 @@ it("interruption at every admission handoff boundary leaves transactions atomic 
     while (!state.settled) {
       if (yielded) controller.abort()
       tasks.shift()?.()
-      await new Promise((resolve) => setTimeout(resolve, 0))
+      await Effect.runPromise(Effect.sleep(0))
     }
     const exit = await running
-    expect(exit._tag === "Success" || exit.cause.reasons.every((reason) => reason._tag === "Interrupt")).toBe(true)
+    expect(exit._tag === "Success" || Arr.every(exit.cause.reasons, (reason) => reason._tag === "Interrupt")).toBe(true)
     if (exit._tag === "Failure") {
       interrupted++
     }
@@ -189,11 +206,11 @@ it("interruption at every admission handoff boundary leaves transactions atomic 
         Effect.gen(function* () {
           const ids = yield* rows.ids
           const pending = yield* storage.pending
-          expect(ids).toEqual(pending.map((p) => p.envelope.mutationId))
+          expect(ids).toEqual(Arr.map(pending, (p) => p.envelope.mutationId))
           expect(ids.length).toBeLessThanOrEqual(1)
           expect((yield* storage.revision).offset).toBe(ids.length)
           outcomes.add(ids.length)
-          expect(yielded || ids.join() === "saved").toBe(true)
+          expect(yielded || Arr.join(ids, ",") === "saved").toBe(true)
           yield* storage.rows.write(T, "next", Option.some(row("next")))
           expect(yield* rows.ids).toContain("next")
         })
@@ -204,7 +221,7 @@ it("interruption at every admission handoff boundary leaves transactions atomic 
     if (!yielded) break
   }
   expect(interrupted).toBeGreaterThan(10)
-  expect([...outcomes].toSorted()).toEqual([0, 1])
+  expect(Arr.sort(outcomes, Order.Number)).toEqual([0, 1])
 })
 
 it.live("a transaction failing on one fiber rolls back only its own writes while another fiber commits", () =>
@@ -236,7 +253,7 @@ it.live("a transaction failing on one fiber rolls back only its own writes while
     expect(yield* Fiber.join(failing)).toBe("crash")
     expect(yield* rows.ids).toEqual(["kept"])
     const pending = yield* storage.transaction(storage.pending)
-    expect(pending.map((e) => [e.envelope.mutationId, e.envelope.seq])).toEqual([["kept", 1]])
+    expect(Arr.map(pending, (e) => [e.envelope.mutationId, e.envelope.seq])).toEqual([["kept", 1]])
     expect(pending[0]?.undo).toEqual([{ table: T, id: "kept", before: Option.none() }])
     expect(yield* storage.meta).toEqual({ cursor: null, pushedThrough: 0, resnapshot: false })
     // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
@@ -258,7 +275,7 @@ it.effect("nextSeq starts at 1 and never reuses a seq, even after its released r
     expect(yield* append("b")).toBe(2)
     yield* storage.transaction(storage.release([seqOf(2)]))
     expect((yield* storage.lookup(mid("b"))).pipe(Option.map((e) => e.seq))).toEqual(Option.some(2))
-    expect((yield* storage.pending).map((e) => e.envelope.seq)).toEqual([1])
+    expect(Arr.map(yield* storage.pending, (e) => e.envelope.seq)).toEqual([1])
     yield* Effect.provideService(Outbox.pruneReleased(-1), SqlClient.SqlClient, yield* SqlClient.SqlClient)
     expect(yield* storage.lookup(mid("b"))).toEqual(Option.none())
     expect(yield* append("c")).toBe(3)
@@ -269,7 +286,7 @@ it.effect("nextSeq starts at 1 and never reuses a seq, even after its released r
 it.effect("staged pages and meta round-trip with bigint positions", () =>
   Effect.gen(function* () {
     const { storage } = yield* makeStorage
-    const page = decodePage({
+    const page = yield* decodePage({
       _tag: "PullPage",
       changes: [
         { _tag: "upsert", table: "t", row: { id: "r", access_scope_id: "s", n: 1 } },
@@ -317,7 +334,7 @@ it.effect("resuming corrupt staged JSON or a non-string continuation dies naming
       const exit = yield* Effect.exit(storage.transaction(storage.stagedProgress))
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) {
-        expect(exit.cause.reasons.filter(Cause.isDieReason).map((reason) => reason.defect)).toEqual([
+        expect(Arr.map(Arr.filter(exit.cause.reasons, Cause.isDieReason), (reason) => reason.defect)).toEqual([
           expect.objectContaining({ _tag: "CorruptStorage", table: "echo_staged" })
         ])
       }
@@ -384,7 +401,7 @@ const seedOldReplica = Effect.gen(function* () {
       yield* storage.appendPending(entry(yield* storage.nextSeq, "p"))
       yield* storage.appendPending(entry(yield* storage.nextSeq, "r"))
       yield* storage.release([seqOf(2)])
-      yield* storage.stage(page)
+      yield* storage.stage(yield* page)
       yield* storage.setMeta({ cursor: pos(7n), pushedThrough: 2, resnapshot: true })
     })
   )
@@ -397,21 +414,24 @@ const classify = Effect.gen(function* () {
   const hash = yield* sql<{ value: string }>`SELECT value FROM echo_meta WHERE key = 'replica_data_hash'`
   const columns = yield* sql<{ name: string }>`SELECT name FROM pragma_table_info('t')`
   const hasU = (yield* sql`SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'u'`).length === 1
-  const rowIds = (yield* sql<{ id: string }>`SELECT id FROM t`).map((r) => r.id)
+  const rowIds = Arr.map(yield* sql<{ id: string }>`SELECT id FROM t`, (r) => r.id)
   const meta = yield* storage.meta
   const staged = (yield* storage.staged).length
   const pending = yield* storage.pending
-  const undo = pending.flatMap((e) => e.undo).length
+  const undo = Arr.flatMap(pending, (e) => e.undo).length
   // Kept in every outcome: the outbox (pending and released) and pushedThrough.
   const kept =
-    pending.map((e) => e.envelope.seq).join() === "1" &&
+    Arr.join(
+      Arr.map(pending, (e) => String(e.envelope.seq)),
+      ","
+    ) === "1" &&
     Option.isSome(yield* storage.lookup(mid("r"))) &&
     meta.pushedThrough === 2
   const old = [
     hash[0]?.value === registry.dataHash,
     columns.length === 2,
     !hasU,
-    rowIds.join() === "a",
+    Arr.join(rowIds, ",") === "a",
     meta.cursor === 7n,
     meta.resnapshot,
     staged === 1,
@@ -427,9 +447,9 @@ const classify = Effect.gen(function* () {
     staged === 0,
     undo === 0
   ]
-  if (kept && old.every(Boolean)) return "old"
-  if (kept && fresh.every(Boolean)) return "new"
-  return `mixed ${JSON.stringify({ kept, old, fresh })}`
+  if (kept && Arr.every(old, Boolean)) return "old"
+  if (kept && Arr.every(fresh, Boolean)) return "new"
+  return `mixed ${yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({ kept, old, fresh })}`
 })
 
 it.effect("an index-only change keeps rows and cursor; a data-shape change rebuilds and resets them together", () =>
@@ -467,6 +487,7 @@ it.effect("an index-only change keeps rows and cursor; a data-shape change rebui
   }).pipe(Effect.provide(Db))
 )
 
+// oxlint-disable-next-line effecttsgo/async-function -- Drives isolated runtimes with a deliberately controlled scheduler and abort signal; the driver must remain outside them.
 it("a data-shape migration interrupted at any scheduler boundary leaves the old replica or the new one, never a mix", async () => {
   const outcomes = new Map<string, Array<number>>()
   for (let boundary = 1; ; boundary++) {
@@ -498,7 +519,7 @@ it("a data-shape migration interrupted at any scheduler boundary leaves the old 
     if (yielded) controller.abort()
     while (!state.settled) {
       while (tasks.length > 0) tasks.shift()?.()
-      await new Promise((resolve) => setTimeout(resolve, 0))
+      await Effect.runPromise(Effect.sleep(0))
     }
     await migrating
     const outcome = await run(classify)
@@ -507,7 +528,7 @@ it("a data-shape migration interrupted at any scheduler boundary leaves the old 
     await Effect.runPromise(Scope.close(scope, outcome))
     if (!yielded) break // the migration ran to completion before reaching this boundary: the sweep is done
   }
-  expect([...outcomes.keys()].toSorted()).toEqual(["new", "old"])
+  expect(Arr.sort(outcomes.keys(), Order.String)).toEqual(["new", "old"])
   expect((outcomes.get("old") ?? []).length).toBeGreaterThan(10) // the sweep spans the transaction
 })
 
@@ -533,7 +554,7 @@ it.effect("after a rebuild, installing the null-cursor set replays pending on to
       grantedAt: DateTime.makeUnsafe(0)
     })
     // The null-cursor set: the actor's grant and one server row.
-    const done = decodeDone({
+    const done = yield* decodeDone({
       _tag: "PullDone",
       changes: [
         { _tag: "upsert", table: "scope_grants", row: grant },
@@ -546,12 +567,12 @@ it.effect("after a rebuild, installing the null-cursor set replays pending on to
     const context = { storage, mutations: Mutation.makeRegistry([insert]), actor, registry: reshaped }
     yield* storage.transaction(Engine.applyPageSet(context, [], done))
     const rows = yield* storage.rows.scan(tTable)
-    expect(rows.map((r) => [r["id"], r["n"]])).toEqual([
+    expect(Arr.map(rows, (r) => [r["id"], r["n"]])).toEqual([
       ["p", 1],
       ["srv", null]
     ])
     const pending = yield* storage.pending
-    expect(pending.map((e) => [e.envelope.mutationId, e.undo])).toEqual([
+    expect(Arr.map(pending, (e) => [e.envelope.mutationId, e.undo])).toEqual([
       ["p", [{ table: tTable, id: "p", before: Option.none() }]]
     ])
     expect((yield* storage.meta).cursor).toBe(9n)
@@ -580,7 +601,7 @@ it.effect("a database created by main's first outbox DDL migrates forward: undo 
     expect(yield* SqliteSyncStorage.migrate(registry)).toEqual({ rebuilt: false })
     const { storage } = yield* makeStorage
     const pending = yield* storage.transaction(storage.pending)
-    expect(pending.map((e) => [e.envelope.mutationId, e.envelope.seq, e.createdAt, e.undo])).toEqual([
+    expect(Arr.map(pending, (e) => [e.envelope.mutationId, e.envelope.seq, e.createdAt, e.undo])).toEqual([
       ["old1", 1, 5, []]
     ])
     expect(Option.isSome(yield* storage.lookup(mid("old2")))).toBe(true)
@@ -590,7 +611,7 @@ it.effect("a database created by main's first outbox DDL migrates forward: undo 
     expect(yield* storage.transaction(storage.nextSeq)).toBe(3)
     // Idempotent: running it again changes nothing.
     expect(yield* SqliteSyncStorage.migrate(registry)).toEqual({ rebuilt: false })
-    expect((yield* storage.pending).map((e) => e.envelope.mutationId)).toEqual(["old1"])
+    expect(Arr.map(yield* storage.pending, (e) => e.envelope.mutationId)).toEqual(["old1"])
     // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test legacy SQLite composition root; the test owns migration and connection lifetime.
   }).pipe(Effect.provide(SqliteClient.layerMemory({})))
 )
@@ -647,11 +668,16 @@ it.live(
       expect(done).toBe(true)
       // The interrupted body never ran; the others ran after the holder, in some order (no fairness promised).
       expect(ran[0]).toBe("holder")
-      expect(ran.toSorted()).toEqual(["a", "b", "holder"])
+      expect(Arr.sort(ran, Order.String)).toEqual(["a", "b", "holder"])
       expect(inside.max).toBe(1)
       const pending = yield* storage.pending
-      expect(pending.map((e) => e.envelope.mutationId).toSorted()).toEqual(["a", "b"])
-      expect(pending.map((e) => e.envelope.seq)).toEqual([1, 2])
+      expect(
+        Arr.sort(
+          Arr.map(pending, (e) => e.envelope.mutationId),
+          Order.String
+        )
+      ).toEqual(["a", "b"])
+      expect(Arr.map(pending, (e) => e.envelope.seq)).toEqual([1, 2])
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
     }).pipe(Effect.provide(Db))
 )
@@ -673,7 +699,9 @@ it.live("a mutate queued behind a long pull install can be interrupted while it 
     const transport: Engine.Transport = {
       push: () => Effect.die("unused"),
       pull: () =>
-        Stream.succeed(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "5", expiredThrough: 0 }))
+        Stream.fromEffect(
+          Effect.orDie(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "5", expiredThrough: 0 }))
+        )
     }
     const engine = yield* Engine.make({
       clientId: Ids.ClientId.make("c"),

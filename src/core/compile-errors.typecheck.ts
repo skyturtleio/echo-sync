@@ -24,19 +24,19 @@ export const queries = (db: EchoStore) => [
   db
     .query(Todos)
     .withIndex("by_project", (q) => q.eq("projectId", null))
-    .after({ projectId: null, rank: 2, at: new Date(0), id: TodoId.make("a") })
+    .after({ projectId: null, rank: 2, at: new Date(0), id: TodoId.make("a") }) // oxlint-disable-line effecttsgo/global-date -- Native Date is the decoded cursor type being checked.
     .order("desc")
     .take(10),
   db
     .query(Todos)
     .withIndex("by_project", (q) => q.eq("projectId", null))
     // @ts-expect-error cursor includes equality-prefix fields too
-    .after({ rank: 2, at: new Date(0), id: TodoId.make("a") }),
+    .after({ rank: 2, at: new Date(0), id: TodoId.make("a") }), // oxlint-disable-line effecttsgo/global-date -- Keep the Date field valid while checking a missing prefix.
   db
     .query(Todos)
     .withIndex("by_project")
     // @ts-expect-error implicit id is mandatory
-    .before({ projectId: null, rank: 2, at: new Date(0) }),
+    .before({ projectId: null, rank: 2, at: new Date(0) }), // oxlint-disable-line effecttsgo/global-date -- Keep the Date field valid while checking a missing id.
   db
     .query(Todos)
     .withIndex("by_project")
@@ -48,7 +48,7 @@ export const queries = (db: EchoStore) => [
     .order("desc")
     .contains("projectId", "p")
     // @ts-expect-error fluent operations preserve cursor brands
-    .after({ projectId: null, rank: 2, at: new Date(0), id: "a" }),
+    .after({ projectId: null, rank: 2, at: new Date(0), id: "a" }), // oxlint-disable-line effecttsgo/global-date -- Keep the Date field valid while checking an unbranded id.
   db
     .query(Todos)
     .withIndex("by_project", (q) => q.prefix("projectId", "ab"))
@@ -57,7 +57,7 @@ export const queries = (db: EchoStore) => [
   db.query(Todos).withIndex("by_project").contains("rank", "1"),
   // @ts-expect-error prefix must name the next text index field
   db.query(Todos).withIndex("by_project", (q) => q.prefix("rank", "1")),
-  db.query(Todos).withIndex("by_project", (q) => q.eq("projectId", null).eq("rank", 1).gte("at", new Date(0))),
+  db.query(Todos).withIndex("by_project", (q) => q.eq("projectId", null).eq("rank", 1).gte("at", new Date(0))), // oxlint-disable-line effecttsgo/global-date -- A valid Date range bound must compile.
   db.query(Todos).withIndex("by_project", (q) => q.eq("projectId", "p").gt("rank", 1).lt("rank", 5)),
   // @ts-expect-error unknown index name
   db.query(Todos).withIndex("by_nothing"),

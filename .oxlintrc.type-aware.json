@@ -3,7 +3,8 @@
   "extends": [
     "./.oxlintrc.json",
     "./node_modules/@effect/tsgo/oxlint-presets/correctness.json",
-    "./node_modules/@effect/tsgo/oxlint-presets/antipattern.json"
+    "./node_modules/@effect/tsgo/oxlint-presets/antipattern.json",
+    "./node_modules/@effect/tsgo/oxlint-presets/effect-native.json"
   ],
   "categories": {
     "correctness": "off",

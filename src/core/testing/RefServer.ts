@@ -286,12 +286,12 @@ export const make = (options: { readonly pageSize: number; readonly epochs?: boo
             walks.set(scope, Option.some(key))
           }
           // Scopes with nothing left after this page are complete.
-          const remaining = new Set(ordered.slice(options.pageSize).map((r) => r.scope))
+          const remaining = new Set(Arr.map(ordered.slice(options.pageSize), (r) => r.scope))
           for (const scope of walks.keys()) if (!remaining.has(scope)) walks.delete(scope)
           return issue({ ...state, held, walks })
         }
 
-        const entries = log.filter((entry) => entry.position > state.through && held.has(entry.scope))
+        const entries = Arr.filter(log, (entry) => entry.position > state.through && held.has(entry.scope))
         const page = entries.slice(0, options.pageSize)
         for (const entry of page) {
           const row = yield* store.read(entry.table, entry.id)
@@ -342,8 +342,8 @@ export const make = (options: { readonly pageSize: number; readonly epochs?: boo
       const savedLogFloor = logFloor
       const savedRows = MemoryStore.cloneTables(store.tables())
       const savedLog = [...log]
-      const savedLedger = new Map([...ledger].map(([id, entries]) => [id, new Map(entries)]))
-      const savedScopes = new Map([...clientScopes].map(([id, entries]) => [id, new Map(entries)]))
+      const savedLedger = new Map(Arr.map([...ledger], ([id, entries]) => [id, new Map(entries)]))
+      const savedScopes = new Map(Arr.map([...clientScopes], ([id, entries]) => [id, new Map(entries)]))
       const savedFloors = new Map(ledgerFloor)
       const savedHistory = new Map(history)
       const savedExecutions = new Map(executions)
@@ -387,7 +387,7 @@ export const make = (options: { readonly pageSize: number; readonly epochs?: boo
     pull,
     /** Drops log entries with position ≤ `through`; older cursors must resnapshot. */
     gcLog: (through: Position) => {
-      log = log.filter((entry) => entry.position > through)
+      log = Arr.filter(log, (entry) => entry.position > through)
       if (through > logFloor) logFloor = through
     },
     /** Expires ledger entries with position ≤ `through`: outcome cleared, identity kept (SPEC §11). */

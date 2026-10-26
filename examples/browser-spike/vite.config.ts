@@ -1,10 +1,11 @@
 import { fileURLToPath } from "node:url"
+import { Config, Effect } from "effect"
 import { defineConfig, type ProxyOptions } from "vite"
 import { middleware } from "./fakeSync.ts"
 
 // The vertical-slice server (examples/server/main.ts): the real SyncRpcs at /sync, scenario hooks at /admin.
 const sliceProxy: ProxyOptions = {
-  target: process.env["ECHO_SLICE_SERVER"] ?? "http://127.0.0.1:5200"
+  target: Effect.runSync(Config.String("ECHO_SLICE_SERVER").pipe(Config.withDefault("http://127.0.0.1:5200")))
   // No proxy workaround for a server that dies mid-stream: Vite's proxy keeps the browser's pokes response
   // open, and the client's idleTimeout (INV-LOOP-7) ends it, as it would behind any such proxy.
 }

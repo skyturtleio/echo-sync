@@ -1,5 +1,6 @@
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- The CLI and plain Vitest vector gate deliberately compare synchronous filesystem snapshots.
 import { globSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
-import { Schema, SchemaAST } from "effect"
+import { Array as Arr, Console, Effect, Record as Rec, Schema, SchemaAST, String as Str } from "effect"
 import { RpcSchema } from "effect/rpc"
 import * as Protocol from "../src/core/Protocol.ts"
 
@@ -23,16 +24,16 @@ export function samples(ast: SchemaAST.AST): unknown[] {
     case "Boolean":
       return [false, true]
     case "Union":
-      return ast.types.flatMap(samples)
+      return Arr.flatMap(ast.types, samples)
     case "Declaration":
       if (ast.annotations?.["expected"] === "JSON value")
         return [null, false, 7, "text", [1, null], { title: "vector", nested: [true] }]
       throw new Error("Unsupported wire declaration")
     case "Arrays": {
-      const base = ast.elements.map((element) => samples(element)[0])
+      const base = Arr.map(ast.elements, (element) => samples(element)[0])
       const values: unknown[] = [base]
       for (const [index, element] of ast.elements.entries())
-        for (const value of samples(element)) values.push(base.map((old, i) => (i === index ? value : old)))
+        for (const value of samples(element)) values.push(Arr.map(base, (old, i) => (i === index ? value : old)))
       const rest = ast.rest[0]
       if (rest) for (const value of samples(rest)) values.push([...base, value])
       return values
@@ -65,12 +66,12 @@ for (const rpc of [...Protocol.SyncRpcs.requests.values(), ...Protocol.PresenceR
   wireSchemas.set(`${rpc._tag}.error`, RpcSchema.isStreamSchema(success) ? success.error : rpc.errorSchema)
 }
 // Individual named stream variants and errors are also useful as standalone conformance inputs.
-for (const [name, schema] of Object.entries(Protocol)) {
+for (const [name, schema] of Rec.toEntries(Protocol)) {
   if (!Schema.isSchema(schema)) continue
   const ast = Schema.toEncoded(schema).ast
   if (
     ast._tag === "Objects" &&
-    ast.propertySignatures.some((field) => field.name === "_tag" && field.type._tag === "Literal")
+    Arr.some(ast.propertySignatures, (field) => field.name === "_tag" && field.type._tag === "Literal")
   )
     wireSchemas.set(name, schema)
 }
@@ -84,8 +85,11 @@ export function codecs(schema: Schema.Top) {
   const codec = Schema.toCodecJson(Schema.make<Schema.Codec<unknown, unknown>>(schema.ast))
   return {
     schema: codec,
+    // oxlint-disable-next-line effecttsgo/schema-sync -- These codecs are exercised synchronously by the byte-for-byte wire contract gate, outside any Effect runtime.
     decode: Schema.decodeUnknownSync(codec),
+    // oxlint-disable-next-line effecttsgo/schema-sync -- Preserve the gate's synchronous fail-fast codec contract.
     encode: Schema.encodeUnknownSync(codec),
+    // oxlint-disable-next-line effecttsgo/schema-sync -- Value normalization is part of the same synchronous wire oracle.
     value: Schema.encodeUnknownSync(Schema.toCodecJson(Schema.toType(codec)))
   }
 }
@@ -104,7 +108,9 @@ export function generate(schema: Schema.Top): typeof VectorFile.Type {
 }
 
 export function vectorFiles(): Map<string, string> {
-  return new Map([...wireSchemas].map(([name, schema]) => [name, `${JSON.stringify(generate(schema), null, 2)}\n`]))
+  return new Map(
+    Arr.map([...wireSchemas], ([name, schema]) => [name, `${JSON.stringify(generate(schema), null, 2)}\n`])
+  )
 }
 
 if (import.meta.main) {
@@ -114,7 +120,7 @@ if (import.meta.main) {
   let count = 0
   for (const [name, body] of files) {
     const path = `spec/vectors/${name}.json`
-    count += Schema.decodeUnknownSync(VectorFile)(JSON.parse(body)).length
+    count += Effect.runSync(Schema.decodeUnknownEffect(Schema.fromJsonString(VectorFile))(body)).length
     if (check) {
       let existing = ""
       try {
@@ -123,15 +129,15 @@ if (import.meta.main) {
         /* missing is drift */
       }
       if (existing !== body) {
-        console.error(`Wire vector drift: ${path}; run bun run vectors`)
+        Effect.runSync(Console.error(`Wire vector drift: ${path}; run bun run vectors`))
         process.exitCode = 1
       }
     } else writeFileSync(path, body)
   }
   for (const file of globSync("spec/vectors/*.json"))
-    if (!files.has(file.slice("spec/vectors/".length, -5))) {
-      console.error(`Obsolete vector file: ${file}`)
+    if (!files.has(Str.slice("spec/vectors/".length, -5)(file))) {
+      Effect.runSync(Console.error(`Obsolete vector file: ${file}`))
       process.exitCode = 1
     }
-  console.log(`${count} wire vectors in ${files.size} files${check ? " checked" : " generated"}`)
+  Effect.runSync(Console.log(`${count} wire vectors in ${files.size} files${check ? " checked" : " generated"}`))
 }

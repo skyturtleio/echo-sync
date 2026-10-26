@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as PgMigrator from "@effect/sql-pg/PgMigrator"
-import { Cause, type Duration, Effect, Exit, Option } from "effect"
+import { Array as Arr, Cause, type Duration, Effect, Exit, Option, Schema, String as Str } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { TestClock } from "effect/testing"
 import { collectGarbage, expireLedger, LedgerRetentionTooShort } from "./gc.ts"
@@ -178,9 +178,14 @@ const ledgerClient = Effect.gen(function* () {
     })
   )
   /** Rows that still hold their outcome; an expired row keeps only its identity. */
-  const seqs = Effect.map(state, (s) => s.rows.filter((r) => r.live).map((r) => Number(r.seq)))
+  const seqs = Effect.map(state, (s) =>
+    Arr.map(
+      Arr.filter(s.rows, (r) => r.live),
+      (r) => Number(r.seq)
+    )
+  )
   /** Every identity in the ledger, expired or not: expiry never removes one. */
-  const identities = Effect.map(state, (s) => s.rows.map((r) => Number(r.seq)))
+  const identities = Effect.map(state, (s) => Arr.map(s.rows, (r) => Number(r.seq)))
   return { replica, counter, submit, state, seqs, identities, ageAcks }
 })
 
@@ -467,21 +472,28 @@ describe.skipIf(!pgAvailable)("ledger expiry (SPEC §11)", () => {
 
 /** A well-formed, decodable continuation for client `d` of principal `p`. */
 const forge = (cursor: bigint | null, position: string) =>
-  Option.some(
-    JSON.stringify({
+  Effect.map(
+    Schema.encodeEffect(Schema.fromJsonString(Schema.Json))({
       clientId: "d",
       principalId: "p",
       cursor: cursor === null ? null : String(cursor),
       position,
       scopes: [],
       walking: []
-    })
+    }),
+    Option.some
   )
 
 const expectStale = (cursor: bigint | null, position: string) =>
   Effect.gen(function* () {
     const failure = yield* Effect.flip(
-      pull(registry, { principalId: "p", clientId: "d", cursor, continuation: forge(cursor, position), limit: 10 })
+      pull(registry, {
+        principalId: "p",
+        clientId: "d",
+        cursor,
+        continuation: yield* forge(cursor, position),
+        limit: 10
+      })
     )
     assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "staleContinuation")
   })
@@ -510,7 +522,7 @@ describe.skipIf(!pgAvailable)("pull continuation (SPEC §7)", () => {
         const failure = yield* Effect.flip(pull(registry, { ...replay, continuation, limit: 10 }))
         assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "staleContinuation")
       }
-      const tampered = page.continuation.replace(/"position":"\d+"/, '"position":"x"')
+      const tampered = Str.replace(/"position":"\d+"/, '"position":"x"')(page.continuation)
       assert.notStrictEqual(tampered, page.continuation)
       for (const garbled of ["", "not json", tampered]) {
         const failure = yield* Effect.flip(
@@ -562,7 +574,7 @@ describe.skipIf(!pgAvailable)("pull continuation (SPEC §7)", () => {
       const received = replica.received.length
       yield* replica.sync()
       assert.deepStrictEqual(
-        replica.received.slice(received).filter((c) => c._tag === "scopePurged"),
+        Arr.filter(replica.received.slice(received), (c) => c._tag === "scopePurged"),
         [{ _tag: "scopePurged", scopeId: "B" }]
       )
       assert.deepStrictEqual(replica.view(), yield* serverView("p"))
@@ -575,7 +587,14 @@ describe.skipIf(!pgAvailable)("pull continuation (SPEC §7)", () => {
       yield* grant("p", "s1")
       for (const id of ["a", "b"]) yield* insert(id)
       const continuation = Option.some(
-        JSON.stringify({ clientId: "d", principalId: "p", cursor: "1", position: "1", scopes: ["s1"], walking: [] })
+        yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Json))({
+          clientId: "d",
+          principalId: "p",
+          cursor: "1",
+          position: "1",
+          scopes: ["s1"],
+          walking: []
+        })
       )
       const failure = yield* Effect.flip(
         pull(registry, { principalId: "p", clientId: "d", cursor: 1n, continuation, limit: 10 })

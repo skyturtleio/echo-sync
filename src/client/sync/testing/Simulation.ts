@@ -22,7 +22,19 @@
  * unexecuted with exactly one notice; outboxes empty, replicas equal the server restricted
  * to readable scopes, and each server rejection surfaced as exactly one notice.
  */
-import { Array as Arr, Clock, Deferred, Effect, Fiber, Option, Order, Schema, Stream } from "effect"
+import {
+  Array as Arr,
+  Clock,
+  Deferred,
+  Effect,
+  Fiber,
+  Option,
+  Order,
+  Record,
+  Schema,
+  Stream,
+  String as Str
+} from "effect"
 import { TestClock } from "effect/testing"
 import { RpcClientError } from "effect/rpc"
 import * as Engine from "../Engine.ts"
@@ -70,7 +82,7 @@ export class InvariantViolated extends Schema.TaggedError<
   trace: Schema.Array(Schema.String)
 }) {
   override get message() {
-    return `seed=${this.seed} step=${this.step}: ${this.invariant}: ${this.detail}\n  last events:\n    ${this.trace.join("\n    ")}`
+    return `seed=${this.seed} step=${this.step}: ${this.invariant}: ${this.detail}\n  last events:\n    ${Arr.join(this.trace, "\n    ")}`
   }
 }
 
@@ -142,19 +154,19 @@ const canonical = (tables: MemoryStore.Tables): string => {
   const lines: Array<string> = []
   for (const [table, rows] of tables) {
     for (const row of rows.values()) {
-      const sorted = Arr.sort(Object.keys(row), Order.String).map((k) => `${k}=${JSON.stringify(row[k])}`)
-      lines.push(`${table}/${row["id"]}{${sorted.join(",")}}`)
+      const sorted = Arr.map(Arr.sort(Record.keys(row), Order.String), (k) => `${k}=${JSON.stringify(row[k])}`)
+      lines.push(`${table}/${row["id"]}{${Arr.join(sorted, ",")}}`)
     }
   }
-  return Arr.sort(lines, Order.String).join("\n")
+  return Arr.join(Arr.sort(lines, Order.String), "\n")
 }
 
 const diff = (actual: string, expected: string) => {
-  const a = new Set(actual.split("\n"))
-  const e = new Set(expected.split("\n"))
-  const extra = [...a].filter((l) => l !== "" && !e.has(l))
-  const missing = [...e].filter((l) => l !== "" && !a.has(l))
-  return `replica has [${extra.join("; ")}] but should have [${missing.join("; ")}]`
+  const a = new Set(Str.split(actual, "\n"))
+  const e = new Set(Str.split(expected, "\n"))
+  const extra = Arr.filter(a, (l) => l !== "" && !e.has(l))
+  const missing = Arr.filter(e, (l) => l !== "" && !a.has(l))
+  return `replica has [${Arr.join(extra, "; ")}] but should have [${Arr.join(missing, "; ")}]`
 }
 
 /**
@@ -273,8 +285,12 @@ export const run = (options: Options) =>
               if (options.persistentTransient === true && persistent === undefined) {
                 persistent = { clientId, mutationId: request.mutations[0].mutationId }
               }
-              const blockedAt = request.mutations.findIndex(
-                (entry) => persistent?.clientId === clientId && persistent.mutationId === entry.mutationId
+              const blockedAt = Option.getOrElse(
+                Arr.findFirstIndex(
+                  request.mutations,
+                  (entry) => persistent?.clientId === clientId && persistent.mutationId === entry.mutationId
+                ),
+                () => -1
               )
               const randomStop =
                 faults && rng.chance(0.15) ? rng.int(request.mutations.length) : request.mutations.length
@@ -455,10 +471,10 @@ export const run = (options: Options) =>
       self.pipe(
         Effect.asVoid,
         Effect.catch((error) => {
-          if (error instanceof RpcClientError.RpcClientError) {
+          if (Schema.is(RpcClientError.RpcClientError)(error)) {
             return Effect.sync(() => note(`  ↳ ${error._tag}`))
           }
-          if (error instanceof Engine.LocallyRejected) return Effect.sync(() => note(`  ↳ ${error._tag}`))
+          if (Schema.is(Engine.LocallyRejected)(error)) return Effect.sync(() => note(`  ↳ ${error._tag}`))
           return Effect.fail(error)
         })
       )
@@ -534,7 +550,9 @@ export const run = (options: Options) =>
      */
     const record = (envelope: MutationEnvelope) =>
       Effect.gen(function* () {
-        const same = committed.find((e) => e.clientId === envelope.clientId && e.seq === envelope.seq)
+        const same = Option.getOrUndefined(
+          Arr.findFirst(committed, (e) => e.clientId === envelope.clientId && e.seq === envelope.seq)
+        )
         if (same === undefined) {
           committed.push(envelope)
           return
@@ -552,12 +570,13 @@ export const run = (options: Options) =>
     /** Runs a push and counts duplicates its response released (only the backstop can). */
     const countingBackstop = <A, E, R>(client: Client, self: Effect.Effect<A, E, R>) =>
       Effect.gen(function* () {
-        const pendingBefore = client.disk.outbox
-          .map((p) => dupKey(client.clientId, p.envelope.seq))
-          .filter((key) => duplicates.has(key))
+        const pendingBefore = Arr.filter(
+          Arr.map(client.disk.outbox, (p) => dupKey(client.clientId, p.envelope.seq)),
+          (key) => duplicates.has(key)
+        )
         const result = yield* self
-        const pendingAfter = new Set(client.disk.outbox.map((p) => dupKey(client.clientId, p.envelope.seq)))
-        stats.backstopReleases += pendingBefore.filter((key) => !pendingAfter.has(key)).length
+        const pendingAfter = new Set(Arr.map(client.disk.outbox, (p) => dupKey(client.clientId, p.envelope.seq)))
+        stats.backstopReleases += Arr.filter(pendingBefore, (key) => !pendingAfter.has(key)).length
         return result
       })
 
@@ -577,8 +596,9 @@ export const run = (options: Options) =>
     const mutateStep = (client: Client) =>
       Effect.gen(function* () {
         // Enqueue retried after its original was released (a handover retry landing late).
-        const releasedHere = committed.filter(
-          (e) => e.clientId === client.clientId && !client.disk.outbox.some((p) => p.envelope.seq === e.seq)
+        const releasedHere = Arr.filter(
+          committed,
+          (e) => e.clientId === client.clientId && !Arr.some(client.disk.outbox, (p) => p.envelope.seq === e.seq)
         )
         const late = rng.pick(releasedHere)
         if (Option.isSome(late) && rng.chance(0.08)) {
@@ -629,7 +649,9 @@ export const run = (options: Options) =>
         const mutationId = Ids.MutationId.make(
           `m${rng.int(2 ** 30).toString(36)}-${client.clientId}-${client.disk.lastSeq}`
         )
-        note(`${client.clientId}: mutate ${name} ${JSON.stringify(args)}`)
+        note(
+          `${client.clientId}: mutate ${name} ${yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(args)}`
+        )
         yield* ignoreExpected(withClock(client, client.engine.mutate(mutationId, name, args).pipe(Effect.tap(record))))
       })
 
@@ -679,7 +701,7 @@ export const run = (options: Options) =>
         note(`${client.clientId}: crash armed`)
         yield* op.pipe(
           Effect.catchDefect((defect) =>
-            defect instanceof MemorySyncStorage.SimulatedCrash
+            Schema.is(MemorySyncStorage.SimulatedCrash)(defect)
               ? Effect.sync(() => {
                   stats.crashes++
                   note("  ↳ crashed mid-transaction")
@@ -704,7 +726,7 @@ export const run = (options: Options) =>
         disk.replica.replace(new Map())
         disk.meta = { ...disk.meta, cursor: null, resnapshot: false }
         disk.staged = []
-        disk.outbox = disk.outbox.map((entry) => ({ ...entry, undo: [] }))
+        disk.outbox = Arr.map(disk.outbox, (entry) => ({ ...entry, undo: [] }))
         client.rebuiltThrough = Option.some({ seq: disk.lastSeq, pending: disk.outbox.length })
         yield* reload(client)
       })
@@ -739,7 +761,7 @@ export const run = (options: Options) =>
       const roll = rng.int(100)
       if (options.restores === true && roll >= 97) {
         const pending = new Set(
-          clients.flatMap((c) => c.disk.outbox.map((e) => `${c.clientId}#${e.envelope.mutationId}`))
+          Arr.flatMap(clients, (c) => Arr.map(c.disk.outbox, (e) => `${c.clientId}#${e.envelope.mutationId}`))
         )
         // Released intent is outside the recovery guarantee; pending intent must still drain.
         for (const envelope of committed) {
@@ -779,7 +801,7 @@ export const run = (options: Options) =>
         yield* pull(client)
         yield* checkClient(client)
       }
-      const settled = clients.every((c) => c.disk.outbox.length === 0 && c.disk.meta.cursor === server.head())
+      const settled = Arr.every(clients, (c) => c.disk.outbox.length === 0 && c.disk.meta.cursor === server.head())
       if (settled) break
     }
 
@@ -787,7 +809,10 @@ export const run = (options: Options) =>
       if (client.disk.outbox.length > 0) {
         return yield* violated(
           "no intent lost: outbox drains after quiescence",
-          `${client.clientId} still pending ${client.disk.outbox.map((e) => e.envelope.mutationId).join(",")}`
+          `${client.clientId} still pending ${Arr.join(
+            Arr.map(client.disk.outbox, (e) => e.envelope.mutationId),
+            ","
+          )}`
         )
       }
       const expected = canonical(yield* view(server.store.tables(), client.principal))
@@ -799,11 +824,14 @@ export const run = (options: Options) =>
       const key = `${envelope.clientId}#${envelope.mutationId}`
       const count = server.executions.get(key) ?? 0
       const ledger = server.ledgerEntry(envelope.clientId, envelope.mutationId)
-      const client = clients.find((c) => c.clientId === envelope.clientId)
+      const client = Option.getOrUndefined(Arr.findFirst(clients, (c) => c.clientId === envelope.clientId))
       const exhausted =
-        client?.disk.notices.filter(
-          (n) => n.envelope.seq === envelope.seq && n._tag === "Rejected" && n.error._tag === "TransientExhausted"
-        ) ?? []
+        client === undefined
+          ? []
+          : Arr.filter(
+              client.disk.notices,
+              (n) => n.envelope.seq === envelope.seq && n._tag === "Rejected" && n.error._tag === "TransientExhausted"
+            )
       if (exhausted.length > 0) {
         if (exhausted.length !== 1 || count !== 0 || Option.isSome(ledger)) {
           return yield* violated("exhausted intent is unexecuted and noticed exactly once", key)
@@ -813,9 +841,13 @@ export const run = (options: Options) =>
       }
       if (count !== 1 && !(count === 0 && lostReleased.has(key)))
         return yield* violated("every committed intent executes exactly once", `${key} executed ${count}×`)
-      const notices = client?.disk.notices.filter((n) => n.envelope.seq === envelope.seq).length ?? 0
+      const notices =
+        client === undefined ? 0 : Arr.filter(client.disk.notices, (n) => n.envelope.seq === envelope.seq).length
       const rejected = Option.isSome(ledger) && ledger.value.outcome._tag === "Rejected"
-      const unknown = client?.disk.notices.some((n) => n.envelope.seq === envelope.seq && n._tag === "OutcomeUnknown")
+      const unknown =
+        client === undefined
+          ? undefined
+          : Arr.some(client.disk.notices, (n) => n.envelope.seq === envelope.seq && n._tag === "OutcomeUnknown")
       // After restore, a released identity may be re-enqueued and receive a different verdict.
       // Its old notice belongs to the old seq, not this timeline's later execution.
       if (
@@ -834,7 +866,7 @@ export const run = (options: Options) =>
       }
     }
     for (const client of clients) {
-      stats.expired += client.disk.notices.filter((n) => n._tag === "OutcomeUnknown").length
+      stats.expired += Arr.filter(client.disk.notices, (n) => n._tag === "OutcomeUnknown").length
     }
     stats.mutations = committed.length
     const result: Stats = stats

@@ -8,6 +8,7 @@
  * running. The halt is surfaced through `status`, and the pending outbox stays exportable.
  */
 import {
+  Array as Arr,
   Cause,
   Clock,
   Deferred,
@@ -325,8 +326,8 @@ export const followPokes = (options: {
                 pull.pipe(
                   Effect.tap((elements) =>
                     Telemetry.annotate({
-                      "echo.pokes": elements.filter((element) => element._tag === "poke").length,
-                      "echo.heartbeats": elements.filter((element) => element._tag === "heartbeat").length
+                      "echo.pokes": Arr.filter(elements, (element) => element._tag === "poke").length,
+                      "echo.heartbeats": Arr.filter(elements, (element) => element._tag === "heartbeat").length
                     })
                   ),
                   Effect.tapCause(() =>

@@ -5,6 +5,7 @@
  */
 /// <reference lib="webworker" />
 import * as BrowserCrypto from "@effect/platform-browser/BrowserCrypto"
+import * as Arr from "effect/Array"
 import * as Crypto from "effect/Crypto"
 import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
@@ -14,6 +15,7 @@ import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
+import * as Str from "effect/String"
 
 const noop = () => {}
 
@@ -177,6 +179,7 @@ const request = (
         }
         if (signal.aborted) return undefined
         let release = noop
+        // oxlint-disable-next-line effecttsgo/new-promise -- Web Locks holds ownership until its callback's Promise settles; release resolves that exact Promise.
         const held = new Promise<void>((resolve) => {
           release = resolve
         })
@@ -245,7 +248,7 @@ export const isLockHeld = (name: string): Effect.Effect<boolean, LockError> =>
     try: () => navigator.locks.query(),
     catch: (cause) => lockError(name, cause)
   }).pipe(
-    Effect.map((snapshot) => (snapshot.held ?? []).some((lock) => lock.name === name && lock.mode === "exclusive"))
+    Effect.map((snapshot) => Arr.some(snapshot.held ?? [], (lock) => lock.name === name && lock.mode === "exclusive"))
   )
 
 /**
@@ -283,11 +286,12 @@ export const tabCapability = (): { readonly unsupported: string | undefined; rea
  * does not crash on a handle still held by its predecessor.
  */
 export const awaitOpfsPoolFree = (directory: string): Effect.Effect<void, BrowserStorageError> =>
+  // oxlint-disable-next-line effecttsgo/async-function -- storageCall adapts Promise-based OPFS traversal and normalizes browser failures.
   storageCall("waiting for the OPFS pool to be free", async () => {
     const root = await navigator.storage.getDirectory()
     let dir = root
     try {
-      for (const part of directory.split("/")) dir = await dir.getDirectoryHandle(part)
+      for (const part of Str.split(directory, "/")) dir = await dir.getDirectoryHandle(part)
     } catch {
       return
     }
@@ -304,7 +308,8 @@ export const awaitOpfsPoolFree = (directory: string): Effect.Effect<void, Browse
       ).pipe(
         Stream.runForEach((handle) =>
           handle instanceof FileSystemFileHandle
-            ? storageCall("waiting for the OPFS pool to be free", async () => {
+            ? // oxlint-disable-next-line effecttsgo/async-function -- OPFS exposes access-handle acquisition as a Promise; storageCall maps rejection.
+              storageCall("waiting for the OPFS pool to be free", async () => {
                 const access = await handle.createSyncAccessHandle()
                 access.close()
               })

@@ -5,6 +5,8 @@
  *
  *   bun cdp/kill-router.ts "$(agent-browser get cdp-url)" echo:<appId>:<profile>:router
  */
+import { Array as Arr, Console, Effect } from "effect"
+
 const [url, name] = process.argv.slice(2)
 if (url === undefined || name === undefined) throw new Error("usage: kill-router.ts <cdp-url> <router name>")
 
@@ -18,18 +20,20 @@ socket.addEventListener("message", (event) => {
   }
 })
 const call = (method: string, params: object): Promise<unknown> =>
+  // oxlint-disable-next-line effecttsgo/new-promise -- CDP correlation table resolves external WebSocket replies by request id.
   new Promise((resolve) => {
     nextId++
     replies.set(nextId, resolve)
     socket.send(JSON.stringify({ id: nextId, method, params }))
   })
-await new Promise((resolve) => socket.addEventListener("open", resolve))
+await Effect.runPromise(Effect.callback<void>((resume) => socket.addEventListener("open", () => resume(Effect.void))))
 
+// oxlint-disable-next-line effecttsgo/async-function -- This browser driver consumes the external CDP Promise protocol, not the sync engine.
 const routers = async (): Promise<Array<string>> => {
   const result = await call("Target.getTargets", {})
   const infos = typeof result === "object" && result !== null && "targetInfos" in result ? result.targetInfos : []
-  if (!Array.isArray(infos)) return []
-  return infos.flatMap((info: unknown) =>
+  if (!Arr.isArray(infos)) return []
+  return Arr.flatMap(infos, (info: unknown) =>
     typeof info === "object" &&
     info !== null &&
     "type" in info &&
@@ -47,9 +51,9 @@ const found = await routers()
 for (const targetId of found) await call("Target.closeTarget", { targetId })
 let left = found.length
 for (let i = 0; i < 100 && left > 0; i++) {
-  await new Promise((resolve) => setTimeout(resolve, 50))
+  await Effect.runPromise(Effect.sleep("50 millis"))
   left = (await routers()).length
 }
 socket.close()
-console.log(JSON.stringify({ killed: found.length, left }))
+Effect.runSync(Console.log(JSON.stringify({ killed: found.length, left })))
 process.exit(found.length > 0 && left === 0 ? 0 : 1)

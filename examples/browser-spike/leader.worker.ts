@@ -1,4 +1,4 @@
-import { Effect } from "effect"
+import { Effect, String as Str } from "effect"
 import { runLeaderWorker } from "../../src/client/worker/index.ts"
 import { clientMutations, principalHeader, registry } from "./app.ts"
 
@@ -6,8 +6,8 @@ import { clientMutations, principalHeader, registry } from "./app.ts"
 const flags = new URLSearchParams(self.location.search)
 
 const isCrashResponse = (message: unknown): boolean =>
-  JSON.stringify(message ?? null).includes('"mutationId":"crash-after-commit') &&
-  JSON.stringify(message).includes('"_tag":"Exit"')
+  Str.includes('"mutationId":"crash-after-commit')(JSON.stringify(message ?? null)) &&
+  Str.includes('"_tag":"Exit"')(JSON.stringify(message))
 
 if (flags.has("crashAfterCommit")) {
   // Commit-before-lost-response crash point: an `enqueue` response exists only after its transaction
@@ -24,10 +24,12 @@ if (flags.has("crashAfterCommit")) {
 if (flags.has("failOpen")) {
   // OPFS startup failure on demand: the first sync access handle request blocks until another tab posts on
   // the "echo-test:fail-open" channel, then fails, so the candidate holds the leader lock while it waits.
+  // oxlint-disable-next-line effecttsgo/new-promise -- Deliberately park the native OPFS Promise before the engine's open attempt, independently of its runtime.
   const gate = new Promise<void>((resolve) => {
     new BroadcastChannel("echo-test:fail-open").addEventListener("message", () => resolve())
   })
   Object.defineProperty(FileSystemFileHandle.prototype, "createSyncAccessHandle", {
+    // oxlint-disable-next-line effecttsgo/async-function -- The replacement must reject the browser OPFS Promise with the injected DOMException.
     value: async () => {
       await gate
       throw new DOMException("injected OPFS startup failure", "NotReadableError")
@@ -50,6 +52,7 @@ if (resetFault !== null) {
   }
   const stall = () => {
     announce()
+    // oxlint-disable-next-line effecttsgo/new-promise -- A never-settling browser filesystem Promise is the fault being tested; worker termination is its only cleanup.
     return new Promise<never>(() => {})
   }
   const proto = FileSystemDirectoryHandle.prototype
@@ -57,7 +60,7 @@ if (resetFault !== null) {
     const getFileHandle = proto.getFileHandle
     Object.defineProperty(proto, "getFileHandle", {
       value: function (this: FileSystemDirectoryHandle, name: string, options?: FileSystemGetFileOptions) {
-        if (options?.create === true && name.startsWith("~")) return stall()
+        if (options?.create === true && Str.startsWith("~")(name)) return stall()
         return Reflect.apply(getFileHandle, this, [name, options])
       }
     })
@@ -65,6 +68,7 @@ if (resetFault !== null) {
   if (resetFault === "midRemoval") {
     const removeEntry = proto.removeEntry
     Object.defineProperty(proto, "removeEntry", {
+      // oxlint-disable-next-line effecttsgo/async-function -- Raw OPFS replacement removes one actual file, then intentionally stalls its native Promise.
       value: async function (this: FileSystemDirectoryHandle, name: string, options?: FileSystemRemoveOptions) {
         if (options?.recursive !== true) return Reflect.apply(removeEntry, this, [name, options])
         const dir = await this.getDirectoryHandle(name)
@@ -75,7 +79,7 @@ if (resetFault !== null) {
           // The pool keeps each file's SQLite path at the start of its header; skip the database itself.
           const header = new Uint8Array(await (await handle.getFile()).slice(0, 512).arrayBuffer())
           const path = new TextDecoder().decode(header.subarray(0, Math.max(0, header.indexOf(0))))
-          if (path.endsWith(".db")) continue
+          if (Str.endsWith(".db")(path)) continue
           await Reflect.apply(removeEntry, dir, [handle.name])
           break
         }
@@ -105,7 +109,7 @@ if (flags.has("net")) {
   Object.defineProperty(globalThis, "fetch", {
     value: (input: RequestInfo | URL, init?: RequestInit) => {
       const url = input instanceof Request ? input.url : String(input)
-      if (syncUrl === null || !url.startsWith(syncUrl)) return fetch(input, init)
+      if (syncUrl === null || !Str.startsWith(syncUrl)(url)) return fetch(input, init)
       if (offline) return Promise.reject(new TypeError("Failed to fetch (harness: network offline)"))
       const signal = init?.signal ? AbortSignal.any([init.signal, period.signal]) : period.signal
       return fetch(input, { ...init, signal })

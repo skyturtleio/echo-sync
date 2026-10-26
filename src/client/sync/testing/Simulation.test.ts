@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import type { Scheduler } from "effect/Scheduler"
-import { DateTime, Deferred, Effect, Fiber, Option, Schema } from "effect"
+import { Array as Arr, Config, DateTime, Deferred, Effect, Fiber, Option, Record, Schema } from "effect"
 import * as Engine from "../Engine.ts"
 import { Errors, Ids, Mutation, Protocol, ScopeGrants } from "../../../core/index.ts"
 import type { SyncTable } from "../../../core/index.ts"
@@ -20,12 +20,19 @@ import * as Simulation from "./Simulation.ts"
 import { paginate } from "./Pull.ts"
 
 // Reproduce a failure with SIM_SEED=<seed>; widen the sweep with SIM_SEEDS=<n>.
-const only = Number(process.env["SIM_SEED"] ?? 0)
-const seeds = only > 0 ? [only] : Array.from({ length: Number(process.env["SIM_SEEDS"] ?? 40) }, (_, i) => i + 1)
+const only = Number(Effect.runSync(Config.String("SIM_SEED").pipe(Config.withDefault("0"))))
+const seeds =
+  only > 0
+    ? [only]
+    : Array.from(
+        { length: Number(Effect.runSync(Config.String("SIM_SEEDS").pipe(Config.withDefault("40")))) },
+        (_, i) => i + 1
+      )
 
 const grant = grantRow("s", "p", "owner")
 const grantId = ScopeGrants.grantId(scope("s"), principal("p"))
 const counterRow = (id: string, value: number): SyncTable.EncodedRow =>
+  // oxlint-disable-next-line effecttsgo/schema-sync -- Pure synchronous fixture constructor reused by scheduler drivers; codec has no async transforms and invalid fixtures must throw.
   Schema.encodeSync(Counters.wire)({
     id: CounterId.make(id),
     accessScopeId: scope("s"),
@@ -145,11 +152,14 @@ const transientScenario = (scenario: {
     assert.equal(disk.meta.pushedThrough, next.seq)
     if (!scenario.applied) {
       assert.deepEqual(
-        disk.outbox.map((entry) => entry.envelope.mutationId),
+        Arr.map(disk.outbox, (entry) => entry.envelope.mutationId),
         [id("next")]
       )
       assert.lengthOf(disk.notices, 1)
-      const notice = yield* Schema.decodeUnknownEffect(Mutation.Notice)(JSON.parse(JSON.stringify(disk.notices[0])))
+      const noticeCodec = Schema.fromJsonString(Mutation.Notice)
+      const notice = yield* Schema.decodeUnknownEffect(noticeCodec)(
+        yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(disk.notices[0])
+      )
       assert.equal(notice.envelope.mutationId, id("blocked"))
       assert.equal(notice._tag, "Rejected")
       if (notice._tag === "Rejected")
@@ -384,7 +394,7 @@ describe("reconciliation simulation", () => {
           yield* Deferred.succeed(release, undefined)
           yield* Fiber.join(suspended)
           assert.strictEqual(disk.meta.epoch, server.epoch())
-          assert.isTrue(disk.outbox.some((entry) => entry.envelope.mutationId === "pending"))
+          assert.isTrue(Arr.some(disk.outbox, (entry) => entry.envelope.mutationId === "pending"))
           yield* engine.push
           yield* engine.pull
           assert.strictEqual(valueOf(disk, "x"), delayed === "push" ? 3 : 8)
@@ -437,7 +447,7 @@ describe("reconciliation simulation", () => {
         }
         // The schedule must actually reach the hard paths, or the sweep proves nothing.
         if (only === 0) {
-          for (const [path, count] of Object.entries(reached))
+          for (const [path, count] of Record.toEntries(reached))
             assert.isAbove(count, 0, `schedule never reached ${path}`)
         }
       }),
@@ -510,7 +520,7 @@ describe("reconciliation simulation", () => {
         transport: {
           push: (request) =>
             Effect.succeed({
-              results: request.mutations.map((m) => ({
+              results: Arr.map(request.mutations, (m) => ({
                 mutationId: m.mutationId,
                 outcome: { _tag: "Applied" as const },
                 position: position(5n)
@@ -604,7 +614,10 @@ describe("reconciliation simulation", () => {
           })
         const owners = (scopeId: string) =>
           Effect.map(server.store.scan(ScopeGrants.ScopeGrants), (rows) =>
-            rows.filter((r) => r["access_scope_id"] === scopeId).map((r) => `${r["principal_id"]}:${r["role"]}`)
+            Arr.map(
+              Arr.filter(rows, (r) => r["access_scope_id"] === scopeId),
+              (r) => `${r["principal_id"]}:${r["role"]}`
+            )
           )
         yield* server.writeDirect([{ table: Counters, id: "taken", row: Option.some(counterRow("taken", 0)) }])
 
@@ -635,6 +648,7 @@ describe("reconciliation simulation", () => {
   )
 
   // Reviewer's reproduction: interrupt at every scheduler boundary of one transaction.
+  // oxlint-disable-next-line effecttsgo/async-function -- External driver controls the scheduler and abort signal of each separately-run transaction; it cannot share that runtime.
   it("an interrupted storage transaction commits rows, seq and meta together or not at all", async () => {
     const split: Array<number> = []
     const outcomes = new Set<boolean>()
@@ -815,12 +829,12 @@ describe("reconciliation simulation", () => {
         yield* engine.mutate(id("m4"), "increment", { id: "x", by: 1000 })
         assert.strictEqual((yield* engine.push).processed, 4)
         assert.deepStrictEqual(
-          disk.outbox.map((entry) => entry.envelope.mutationId),
+          Arr.map(disk.outbox, (entry) => entry.envelope.mutationId),
           ["m2", "m3", "m4"],
           "only the expired identity releases before the covering pull"
         )
         assert.deepStrictEqual(
-          disk.notices.map((notice) => [notice._tag, notice.envelope.mutationId]),
+          Arr.map(disk.notices, (notice) => [notice._tag, notice.envelope.mutationId]),
           [["OutcomeUnknown", "m1"]]
         )
         // m1's optimistic effect is gone; all unacked effects still remain.
@@ -831,10 +845,11 @@ describe("reconciliation simulation", () => {
         // These JSON-only fields use the same notice schema as durable SQLite and the tab RPC.
         const noticeJson = Schema.Array(Mutation.Notice)
         const encoded = yield* Schema.encodeEffect(noticeJson)(disk.notices)
-        const decoded = yield* Schema.decodeUnknownEffect(noticeJson)(JSON.parse(JSON.stringify(encoded)))
+        const json = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(encoded)
+        const decoded = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(noticeJson))(json)
         assert.deepStrictEqual(decoded, disk.notices)
         assert.deepStrictEqual(
-          decoded.map((notice) => [notice._tag, notice.envelope.mutationId]),
+          Arr.map(decoded, (notice) => [notice._tag, notice.envelope.mutationId]),
           [
             ["OutcomeUnknown", "m1"],
             ["Rejected", "m3"],
@@ -842,7 +857,7 @@ describe("reconciliation simulation", () => {
           ]
         )
         assert.deepStrictEqual(
-          encoded.slice(1).map((notice) => (notice._tag === "Rejected" ? notice.error : undefined)),
+          Arr.map(encoded.slice(1), (notice) => (notice._tag === "Rejected" ? notice.error : undefined)),
           [
             { _tag: "ConstraintViolated", kind: "unique", constraint: "counter_unique", message: "duplicate counter" },
             { _tag: "ConstraintViolated", kind: "other", constraint: null, message: "counter check" }

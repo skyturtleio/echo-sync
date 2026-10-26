@@ -1,5 +1,5 @@
 import { expect, it } from "@effect/vitest"
-import { Deferred, Effect, Exit, Fiber, Option, Stream } from "effect"
+import { Deferred, Effect, Exit, Fiber, Option, Schema, Stream } from "effect"
 import { RpcClientDefect, RpcClientError } from "effect/rpc/RpcClientError"
 import * as LeaderRoute from "./LeaderRoute.ts"
 import { type LeaderInfo, LeaderUnavailable } from "./LeaderRpcs.ts"
@@ -32,9 +32,8 @@ const connected = (leaderId: string, client: LeaderConnection) =>
 
 /** The failed request's `LeaderUnavailable`, if that is how it failed. */
 const unavailable = <A, E>(exit: Exit.Exit<A, E>) =>
-  Option.filter(
-    Exit.isFailure(exit) ? Exit.findErrorOption(exit) : Option.none(),
-    (e): e is E & LeaderUnavailable => e instanceof LeaderUnavailable
+  Option.filter(Exit.isFailure(exit) ? Exit.findErrorOption(exit) : Option.none(), (e): e is E & LeaderUnavailable =>
+    Schema.is(LeaderUnavailable)(e)
   )
 
 /** The `LeaderUnavailable` reason a request failed with; anything else (success, interruption) is "other". */

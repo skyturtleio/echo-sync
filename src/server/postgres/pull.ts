@@ -38,7 +38,7 @@ const Continuation = Schema.Struct({
 })
 type Continuation = typeof Continuation.Type
 const ContinuationJson = Schema.fromJsonString(Continuation)
-const encodeContinuation = Schema.encodeSync(ContinuationJson)
+const encodeContinuation = Schema.encodeEffect(ContinuationJson)
 const decodeContinuation = Schema.decodeUnknownEffect(ContinuationJson)
 
 /** Untrusted compatibility advice, never authorization. Omission serves every client. */
@@ -65,7 +65,7 @@ export const maxPullPageBytes = 1_048_576
 // A configured row budget is an upper bound, not a target. Bound candidate construction even
 // for very large limits; this does not bound individual rows, acks or membership metadata.
 const maxPullPageRows = 500
-const encodeResponse = Schema.encodeSync(Schema.toCodecJson(Protocol.PullResponse))
+const encodeResponse = Schema.encodeEffect(Schema.fromJsonString(Schema.toCodecJson(Protocol.PullResponse)))
 const utf8 = new TextEncoder()
 
 interface LogEntry {
@@ -186,9 +186,12 @@ export const pull = Effect.fnUntraced(function* (
         }
 
         const readable = new Set(
-          (yield* sql<{ access_scope_id: string }>`
+          Arr.map(
+            yield* sql<{ access_scope_id: string }>`
           SELECT DISTINCT access_scope_id FROM echo_sync.scope_grants
-          WHERE principal_id IN (${request.principalId}, '*')`).map((r) => r.access_scope_id)
+          WHERE principal_id IN (${request.principalId}, '*')`,
+            (r) => r.access_scope_id
+          )
         )
         const tables = yield* resolveTables(registry)
         const position = base ?? state.head
@@ -200,12 +203,12 @@ export const pull = Effect.fnUntraced(function* (
           if (readable.has(scopeId)) scopes.push(scopeId)
           else changes.push(purged(scopeId))
         }
-        walking = walking.filter((walk) => {
+        walking = Arr.filter(walking, (walk) => {
           if (readable.has(walk.scopeId)) return true
           changes.push(purged(walk.scopeId))
           return false
         })
-        const known = new Set([...scopes, ...walking.map((w) => w.scopeId)])
+        const known = new Set([...scopes, ...Arr.map(walking, (w) => w.scopeId)])
         for (const scopeId of Arr.sort(readable, compare)) {
           if (!known.has(scopeId)) walking.push({ scopeId, after: null })
         }
@@ -288,15 +291,17 @@ export const pull = Effect.fnUntraced(function* (
                 changes,
                 acks,
                 continuation: Protocol.PullContinuation.make(
-                  encodeContinuation({
-                    clientId: request.clientId,
-                    principalId: request.principalId,
-                    cursor: request.cursor,
-                    position: nextPosition,
-                    ackPosition: acksDone ? nextPosition : (acks.at(-1)?.position ?? ackFloor),
-                    scopes,
-                    walking
-                  })
+                  yield* Effect.orDie(
+                    encodeContinuation({
+                      clientId: request.clientId,
+                      principalId: request.principalId,
+                      cursor: request.cursor,
+                      position: nextPosition,
+                      ackPosition: acksDone ? nextPosition : (acks.at(-1)?.position ?? ackFloor),
+                      scopes,
+                      walking
+                    })
+                  )
                 )
               }
         // At PullDone the delivered set is the readable set of this snapshot (every readable scope
@@ -308,7 +313,7 @@ export const pull = Effect.fnUntraced(function* (
       // atomic data has no matching write-size limit, so the minimum candidate must make progress.
       while (true) {
         const page = yield* candidate
-        if (utf8.encode(JSON.stringify(encodeResponse(page.result))).byteLength <= maxPullPageBytes) return page
+        if (utf8.encode(yield* Effect.orDie(encodeResponse(page.result))).byteLength <= maxPullPageBytes) return page
         if (limit <= 1) {
           // A row and an ack may each fit separately but not together. Preserve ack progress
           // in the continuation and deliver it on a later page rather than refusing the pair.
@@ -360,7 +365,12 @@ const fetchPayloads = Effect.fnUntraced(function* (tables: ReadonlyArray<Resolve
   const payloads = new Map<string, Payload>()
   for (const { table, schema } of tables) {
     const ids = [
-      ...new Set(entries.filter((e) => e.op === "upsert" && e.table_name === table.name).map((e) => e.row_id))
+      ...new Set(
+        Arr.map(
+          Arr.filter(entries, (e) => e.op === "upsert" && e.table_name === table.name),
+          (e) => e.row_id
+        )
+      )
     ]
     if (ids.length === 0) continue
     // Declared columns only (INV-TBL-4): an undeclared column never leaves the database.

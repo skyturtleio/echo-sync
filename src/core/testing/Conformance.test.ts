@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Cause, Effect, Exit, Option } from "effect"
+import { Array as Arr, Cause, Effect, Exit, Option, String as Str } from "effect"
 import { Store } from "../index.ts"
 import * as Conformance from "./Conformance.ts"
 import * as MemoryStore from "./MemoryStore.ts"
@@ -87,7 +87,7 @@ const filtersAfter = (rewrite: (plan: Store.IndexRangePlan) => Store.IndexRangeP
     }
   })
 const scopedLimit = (checks: ReadonlyArray<Conformance.Check<never>>) =>
-  checks.filter((check) => check.name.startsWith("a limited range with a readable-scope constraint"))
+  Arr.filter(checks, (check) => Str.startsWith("a limited range with a readable-scope constraint")(check.name))
 
 describe("the scoped-limit check catches stores that do not push the scope filter under the limit (open item 8)", () => {
   // v1's Store.make: the limit applied to the store's rows before the readable-scope filter.
@@ -132,7 +132,7 @@ const asyncStore = (broken: boolean) =>
               Effect.onExit((exit) =>
                 Effect.sync(() => {
                   if (exit._tag === "Success") return
-                  const interrupted = exit.cause.reasons.some((reason) => reason._tag === "Interrupt")
+                  const interrupted = Arr.some(exit.cause.reasons, (reason) => reason._tag === "Interrupt")
                   if (broken && interrupted && state.resumed) return // the bug
                   store.replace(before)
                 })
@@ -146,8 +146,14 @@ const asyncStore = (broken: boolean) =>
 describe("the interrupt sweep reaches checkpoints after asynchronous I/O resumes", () => {
   mustCatch(
     "a store whose rollback is skipped after an asynchronous resumption",
-    Conformance.rowStore(asyncStore(true)).filter((check) => check.name.startsWith("a transaction that fails"))
+    Arr.filter(Conformance.rowStore(asyncStore(true)), (check) =>
+      Str.startsWith("a transaction that fails")(check.name)
+    )
   )
   // Control: the same asynchronous store with a correct rollback passes.
-  register(Conformance.rowStore(asyncStore(false)).filter((check) => check.name.startsWith("a transaction that fails")))
+  register(
+    Arr.filter(Conformance.rowStore(asyncStore(false)), (check) =>
+      Str.startsWith("a transaction that fails")(check.name)
+    )
+  )
 })

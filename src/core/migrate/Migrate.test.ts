@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { Schema } from "effect"
+import { Array as Arr, Option, Schema, String as Str } from "effect"
 import { AccessScopeId } from "../AccessScope.ts"
 import * as Registry from "../Registry.ts"
 import * as SyncTable from "../SyncTable.ts"
@@ -10,14 +10,19 @@ const base = { id: Id, accessScopeId: AccessScopeId }
 
 const snapshotOf = (...tables: ReadonlyArray<SyncTable.AnySyncTable>) =>
   Migrate.decodeSnapshot(Migrate.encodeSnapshot(Migrate.snapshotOf(Registry.make(tables))))
-const ddlOf = (steps: ReadonlyArray<Migrate.Step>) => steps.flatMap((s) => (s._tag === "Ddl" ? [s.sql] : []))
-const todos = (steps: ReadonlyArray<Migrate.Step>) => steps.filter((s) => s._tag === "Todo")
+const ddlOf = (steps: ReadonlyArray<Migrate.Step>) => Arr.flatMap(steps, (s) => (s._tag === "Ddl" ? [s.sql] : []))
+const todos = (steps: ReadonlyArray<Migrate.Step>) => Arr.filter(steps, (s) => s._tag === "Todo")
 const lines = (steps: ReadonlyArray<Migrate.Step>) =>
-  todos(steps).map((s) => (s._tag === "Todo" ? s.lines.join("\n") : ""))
+  Arr.map(todos(steps), (s) => (s._tag === "Todo" ? Arr.join(s.lines, "\n") : ""))
 /** The complete SQL statements the TODOs ask for, in the order a reader carries them out. */
 const handStatements = (steps: ReadonlyArray<Migrate.Step>) =>
-  todos(steps).flatMap((s) =>
-    s._tag === "Todo" ? s.lines.filter((l) => /^ {2}[A-Z]+ [^<]*;$/.test(l)).map((l) => l.trim()) : []
+  Arr.flatMap(todos(steps), (s) =>
+    s._tag === "Todo"
+      ? Arr.map(
+          Arr.filter(s.lines, (l) => /^ {2}[A-Z]+ [^<]*;$/.test(l)),
+          Str.trim
+        )
+      : []
   )
 
 describe("the generator never emits DDL for a rename, drop, lossy type change or unique-set change (SPEC ยง13)", () => {
@@ -55,9 +60,10 @@ describe("the generator never emits DDL for a rename, drop, lossy type change or
   it.each(cases)("%s", (_, tables, intent) => {
     const steps = Migrate.plan(before, Registry.make(tables), intent)
     expect(ddlOf(steps)).toEqual([])
-    const text = todos(steps)
-      .flatMap((s) => (s._tag === "Todo" ? s.lines : []))
-      .join("\n")
+    const text = Arr.join(
+      Arr.flatMap(todos(steps), (s) => (s._tag === "Todo" ? s.lines : [])),
+      "\n"
+    )
     for (const expected of [
       'RENAME COLUMN "title" TO "heading"',
       'DROP COLUMN "legacy"',
@@ -73,10 +79,10 @@ describe("the generator never emits DDL for a rename, drop, lossy type change or
     const source = Migrate.render("002_x", steps)
     expect(source).not.toContain("sql.unsafe")
     expect(
-      source
-        .split("\n")
-        .filter((l) => /RENAME|DROP (COLUMN|TABLE)|ADD UNIQUE/.test(l))
-        .every((l) => l.trimStart().startsWith("// TODO(migration)"))
+      Arr.every(
+        Arr.filter(Str.split(source, "\n"), (l) => /RENAME|DROP (COLUMN|TABLE)|ADD UNIQUE/.test(l)),
+        (l) => Str.startsWith("// TODO(migration)")(Str.trimStart(l))
+      )
     ).toBe(true)
   })
 
@@ -208,7 +214,7 @@ describe("DDL that depends on a TODO rename or kind change is a TODO too (SPEC ย
     )
     expect(ddlOf(steps)).toEqual([])
     expect(handStatements(steps)).toEqual(['ALTER TABLE "docs" DROP COLUMN "title";'])
-    expect(lines(steps).join("\n")).toContain("PostgreSQL drops docs__by_title with the column")
+    expect(Arr.join(lines(steps), "\n")).toContain("PostgreSQL drops docs__by_title with the column")
   })
 
   it("every change on a renamed table is a TODO after it, using the explicitly renamed index names", () => {
@@ -244,7 +250,10 @@ describe("safe changes become exactly the pinned DDL", () => {
     expect(generated.source).toContain('"status" text COLLATE "C"')
     expect(generated.source).not.toContain('"status" jsonb')
     const snapshot = Migrate.decodeSnapshot(generated.snapshot)
-    expect(snapshot.tables[0]?.columns.find((c) => c.name === "status")).toEqual({
+    const first = snapshot.tables[0]
+    expect(
+      first === undefined ? undefined : Option.getOrUndefined(Arr.findFirst(first.columns, (c) => c.name === "status"))
+    ).toEqual({
       name: "status",
       kind: "text",
       nullable: true
@@ -252,9 +261,12 @@ describe("safe changes become exactly the pinned DDL", () => {
     for (const status of [null, "open", "done"]) {
       const row = { id: "n", access_scope_id: "s", status }
       for (const codec of [table.postgres.row, table.sqlite.row]) {
+        // oxlint-disable-next-line effecttsgo/schema-sync -- Exercise the pure synchronous dialect codec contract alongside its throwing validation path.
         expect(Schema.encodeSync(codec)(row)).toEqual(row)
+        // oxlint-disable-next-line effecttsgo/schema-sync -- The synchronous decoding path must preserve the row unchanged.
         expect(Schema.decodeUnknownSync(codec)(row)).toEqual(row)
         expect(() =>
+          // oxlint-disable-next-line effecttsgo/schema-sync -- Assert the synchronous API throws, rather than accepting an invalid literal.
           Schema.decodeUnknownSync(table.wire)(Schema.decodeUnknownSync(codec)({ ...row, status: "invalid" }))
         ).toThrow(/open|done/)
       }
@@ -262,9 +274,9 @@ describe("safe changes become exactly the pinned DDL", () => {
     // Reproduce the previously committed storage manifest, not a freshly classified declaration.
     const old = {
       ...snapshot,
-      tables: snapshot.tables.map((t) => ({
+      tables: Arr.map(snapshot.tables, (t) => ({
         ...t,
-        columns: t.columns.map((c) => (c.name === "status" ? { ...c, kind: "json" as const } : c))
+        columns: Arr.map(t.columns, (c) => (c.name === "status" ? { ...c, kind: "json" as const } : c))
       }))
     }
     const upgrade = Migrate.generate({ previous: old, registry, existing: [generated.id], name: "text_status" })
@@ -339,7 +351,7 @@ describe("safe changes become exactly the pinned DDL", () => {
   it("scope_grants is the engine's table and is never planned; no change plans nothing", () => {
     const t = SyncTable.make("notes", base)
     expect(Migrate.plan(snapshotOf(t), Registry.make([t]))).toEqual([])
-    expect(Migrate.snapshotOf(Registry.make([t])).tables.map((m) => m.name)).toEqual(["notes"])
+    expect(Arr.map(Migrate.snapshotOf(Registry.make([t])).tables, (m) => m.name)).toEqual(["notes"])
   })
 
   it("migrations are numbered after the highest existing one", () => {

@@ -3,7 +3,9 @@ import "../testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { expect, it } from "@effect/vitest"
 import {
+  Array as Arr,
   Cause,
+  Clock,
   DateTime,
   Deferred,
   Effect,
@@ -15,7 +17,8 @@ import {
   References,
   Schema,
   Scope,
-  Stream
+  Stream,
+  String as Str
 } from "effect"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import { RpcClientError, RpcTest } from "effect/rpc"
@@ -36,8 +39,8 @@ const registry = Registry.make([T])
 const Db = Layer.effectDiscard(SqliteSyncStorage.migrate(registry)).pipe(
   Layer.provideMerge(SqliteClient.layerMemory({}))
 )
-const decodeDone = Schema.decodeUnknownSync(Protocol.PullDone)
-const position = Schema.decodeUnknownSync(Ids.Position)("1")
+const decodeDone = (value: unknown) => Effect.orDie(Schema.decodeUnknownEffect(Protocol.PullDone)(value))
+const position = Ids.Position.make(1n)
 
 it.live("an enqueue cancelled while its COMMIT runs still wakes the loop: the entry is pushed with no other wake", () =>
   Effect.gen(function* () {
@@ -63,9 +66,9 @@ it.live("an enqueue cancelled while its COMMIT runs still wakes the loop: the en
     const transport: Engine.Transport = {
       push: (request) =>
         Effect.andThen(
-          Effect.sync(() => void pushed.push(...request.mutations.map((m) => m.mutationId))),
+          Effect.sync(() => void pushed.push(...Arr.map(request.mutations, (m) => m.mutationId))),
           Effect.as(Deferred.succeed(pushObserved, undefined), {
-            results: request.mutations.map((m) => ({
+            results: Arr.map(request.mutations, (m) => ({
               mutationId: m.mutationId,
               position,
               outcome: { _tag: "Applied" as const }
@@ -73,7 +76,7 @@ it.live("an enqueue cancelled while its COMMIT runs still wakes the loop: the en
           })
         ),
       pull: () =>
-        Stream.succeed(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "1", expiredThrough: 0 }))
+        Stream.fromEffect(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "1", expiredThrough: 0 }))
     }
     const engine = yield* Engine.make({
       clientId: Ids.ClientId.make("c"),
@@ -101,7 +104,7 @@ it.live("an enqueue cancelled while its COMMIT runs still wakes the loop: the en
     const enqueue = yield* Effect.forkChild(enqueueAndWake(engine, loop.wake)(Ids.MutationId.make("m"), "add", {}))
     yield* Deferred.await(committed)
     // COMMIT is done and the permit released; only the wrapper's tap holds the enqueue's fiber.
-    expect((yield* real.transaction(real.pending)).map((e) => e.envelope.mutationId)).toEqual(["m"])
+    expect(Arr.map(yield* real.transaction(real.pending), (e) => e.envelope.mutationId)).toEqual(["m"])
     expect(pushed).toEqual([])
     const interrupting = yield* Effect.forkChild(Fiber.interrupt(enqueue))
     yield* Effect.yieldNow
@@ -167,7 +170,7 @@ const addRaw = Mutation.make("raw.add", {
 const rawRows = Query.make("raw.rows", {
   args: Schema.Struct({}),
   success: Schema.Array(Schema.String),
-  handler: (db) => Effect.map(db.scan(Raw), (rows) => rows.map((row) => row.id))
+  handler: (db) => Effect.map(db.scan(Raw), (rows) => Arr.map(rows, (row) => row.id))
 })
 /** Store writes need no services; a test-only guard so the runtime-reached write can be run. */
 const isStoreWrite = (u: unknown): u is Effect.Effect<void, unknown> => Effect.isEffect(u)
@@ -200,14 +203,18 @@ const searchDocs = Query.make("docs.search", {
   args: Schema.String,
   success: Schema.Array(Schema.String),
   handler: (db, needle) =>
-    Effect.map(db.query(Docs).withIndex("by_body").contains("body", needle).take(5), (rows) => rows.map((r) => r.id))
+    Effect.map(db.query(Docs).withIndex("by_body").contains("body", needle).take(5), (rows) =>
+      Arr.map(rows, (r) => r.id)
+    )
 })
 
 const pageDocs = Query.make("docs.page", {
   args: Schema.Struct({ body: Schema.String, id: RowId }),
   success: Schema.Array(Schema.String),
   handler: (db, cursor) =>
-    Effect.map(db.query(Docs).withIndex("by_body").order("desc").after(cursor).take(2), (rows) => rows.map((r) => r.id))
+    Effect.map(db.query(Docs).withIndex("by_body").order("desc").after(cursor).take(2), (rows) =>
+      Arr.map(rows, (r) => r.id)
+    )
 })
 
 const leaderRpc = (options: { readonly allowRawExec: boolean; readonly transport?: Engine.Transport }) =>
@@ -219,7 +226,9 @@ const leaderRpc = (options: { readonly allowRawExec: boolean; readonly transport
     yield* SqliteSyncStorage.migrate(queryRegistry).pipe(Effect.provideService(SqlClient.SqlClient, sql))
     const storage = yield* SqliteSyncStorage.make(sql, queryRegistry)
     const put = <T extends SyncTable.AnySyncTable>(table: T, row: Store.RowOf<T>) =>
-      storage.rows.write(table, row.id, Option.some(Schema.encodeUnknownSync(table.wire)(row)))
+      Effect.flatMap(Effect.orDie(Schema.encodeUnknownEffect(table.wire)(row)), (encoded) =>
+        storage.rows.write(table, row.id, Option.some(encoded))
+      )
     const write = <T extends SyncTable.AnySyncTable>(table: T, row: Store.RowOf<T>) =>
       storage.transaction(put(table, row))
     yield* write(ScopeGrants.ScopeGrants, {
@@ -238,7 +247,7 @@ const leaderRpc = (options: { readonly allowRawExec: boolean; readonly transport
       transport: options.transport ?? {
         push: () => Effect.die(new Error("no transport")),
         pull: () =>
-          Stream.succeed(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "2", expiredThrough: 0 }))
+          Stream.fromEffect(decodeDone({ _tag: "PullDone", changes: [], acks: [], nextCursor: "2", expiredThrough: 0 }))
       }
     })
     const handlers = yield* makeHandlers({
@@ -330,7 +339,7 @@ it.live("every emission of a query is one snapshot: two tables written together 
       seen.push(last)
     }
     seen.push(...(yield* Queue.clear(emissions)))
-    expect(seen.filter((e) => e.value.l !== e.value.r)).toEqual([])
+    expect(Arr.filter(seen, (e) => e.value.l !== e.value.r)).toEqual([])
     // Each writer commits both rows once. A revision read after releasing admission can get ahead
     // of the result; one based on statement count or mutation seq cannot satisfy this either.
     for (const snapshot of seen) {
@@ -498,6 +507,11 @@ it.live(
       // The consumer may coalesce a and b; both intervals, not just the newest receipt, are required.
       expect(Provenance.classify(initial.revision, b.revision, [second])).toBe("refresh-required")
       expect(Provenance.classify(initial.revision, b.revision, [second, first, first])).toBe("local-only")
+      // Sparse receipt lists have the same meaning as their present entries; holes are not receipts.
+      const sparse: Array<typeof first> = []
+      sparse[2] = first
+      sparse[4] = second
+      expect(Provenance.classify(initial.revision, b.revision, sparse)).toBe("local-only")
       expect(Provenance.classify(a.revision, b.revision, [second])).toBe("local-only")
       expect(Provenance.classify(b.revision, a.revision, [first, second])).toBe("refresh-required")
 
@@ -547,7 +561,7 @@ it.live(
           push: () => Effect.die("unused"),
           pull: () =>
             online
-              ? Stream.succeed(
+              ? Stream.fromEffect(
                   decodeDone({
                     _tag: "PullDone",
                     changes:
@@ -599,7 +613,7 @@ it.live(
       expect(Provenance.classify(initial.revision, latest.revision, [rejected, own])).toBe("refresh-required")
       expect(Provenance.classify(reconciled.revision, latest.revision, [own])).toBe("local-only")
       const notices = yield* Stream.runHead(api.notices).pipe(Effect.map(Option.getOrThrow))
-      expect(notices.map(({ notice }) => notice._tag)).toEqual(["Rejected"])
+      expect(Arr.map(notices, ({ notice }) => notice._tag)).toEqual(["Rejected"])
       // An own rejection with NO external rows must still undo the local effect and require refresh.
       rejectedId = own.mutationId
       cursor = "3"
@@ -755,7 +769,7 @@ const noticeFor = (mutationId: string, seq: number) => ({
 })
 
 const ids = (list: ReadonlyArray<{ readonly notice: { readonly envelope: { readonly mutationId: string } } }>) =>
-  list.map((n) => n.notice.envelope.mutationId)
+  Arr.map(list, (n) => n.notice.envelope.mutationId)
 
 it.live("a dismissed notice is gone from the notices stream, and an undismissed one survives a pull", () =>
   Effect.gen(function* () {
@@ -765,7 +779,7 @@ it.live("a dismissed notice is gone from the notices stream, and an undismissed 
     const { next } = yield* collect(api.notices)
     const first = yield* next
     expect(ids(first)).toEqual(["m1", "m2"])
-    const m1 = first.find((n) => n.notice.envelope.mutationId === "m1")
+    const m1 = Option.getOrUndefined(Arr.findFirst(first, (n) => n.notice.envelope.mutationId === "m1"))
     yield* api.dismissNotices(m1 === undefined ? [] : [m1.id])
     expect(ids(yield* next)).toEqual(["m2"])
     yield* engine.pull
@@ -790,7 +804,7 @@ const unreachable = () =>
   new RpcClientError.RpcClientError({ reason: new RpcClientError.RpcClientDefect({ message: "offline", cause: null }) })
 const pushOffline = unreachable
 const pullOffline = unreachable
-const decodePush = Schema.decodeUnknownSync(Protocol.PushResponse)
+const decodePush = (value: unknown) => Effect.orDie(Schema.decodeUnknownEffect(Protocol.PushResponse)(value))
 
 /** One replica database, shared by the successive leaders of a test (a handover keeps the file). */
 const replicaDb = Effect.gen(function* () {
@@ -874,22 +888,22 @@ it.live(
       let cursor = 1
       const transport: Engine.Transport = {
         push: (request) =>
-          Effect.sync(() =>
+          Effect.suspend(() =>
             decodePush({
-              results: request.mutations.map((m) => {
+              results: Arr.map(request.mutations, (m) => {
                 positions.set(m.mutationId, ++next)
                 return { mutationId: m.mutationId, position: String(next), outcome: { _tag: "Applied" } }
               })
             })
           ),
         pull: paginate(() =>
-          Effect.map(Queue.take(pulls), (acked) => {
-            const acks = acked.map((id) => ({
+          Effect.flatMap(Queue.take(pulls), (acked) => {
+            const acks = Arr.map(acked, (id) => ({
               mutationId: id,
               position: String(positions.get(id) ?? 0),
               outcome: { _tag: "Applied" }
             }))
-            cursor = Math.max(cursor, ...acked.map((id) => positions.get(id) ?? 0))
+            cursor = Math.max(cursor, ...Arr.map(acked, (id) => positions.get(id) ?? 0))
             return decodeDone({ _tag: "PullDone", changes: [], acks, nextCursor: String(cursor), expiredThrough: 0 })
           })
         )
@@ -981,7 +995,7 @@ it.live("requestSync during backoff runs the next cycle at once and leaves a hal
     })
     const halted = yield* awaitStatus(emissions, (s) => s.push._tag === "Halted" && s.phase === "backoff")
     const pullsBefore = calls.pull
-    expect(halted.nextRetryAt ?? 0).toBeGreaterThan(Date.now() + 30 * 60_000)
+    expect(halted.nextRetryAt ?? 0).toBeGreaterThan((yield* Clock.currentTimeMillis) + 30 * 60_000)
     expect(halted.lastSyncedAt).toBeNull()
 
     yield* api.requestSync
@@ -1011,22 +1025,22 @@ it.live(
         push: (request) =>
           Effect.suspend(() => {
             pushes++
-            const results = request.mutations.map((m) => {
+            const results = Arr.map(request.mutations, (m) => {
               const at = recorded.get(m.mutationId) ?? ++next
               recorded.set(m.mutationId, at)
               return { mutationId: m.mutationId, position: String(at), outcome: { _tag: "Applied" } }
             })
             // The first push that carries a mutation commits on the server, then its response is lost.
-            return pushes === 1 ? Effect.fail(pushOffline()) : Effect.succeed(decodePush({ results }))
+            return pushes === 1 ? Effect.fail(pushOffline()) : decodePush({ results })
           }),
         pull: paginate(() =>
-          Effect.map(Queue.take(pulls), (acked) => {
-            const acks = acked.map((id) => ({
+          Effect.flatMap(Queue.take(pulls), (acked) => {
+            const acks = Arr.map(acked, (id) => ({
               mutationId: id,
               position: String(recorded.get(id) ?? 0),
               outcome: { _tag: "Applied" }
             }))
-            cursor = Math.max(cursor, ...acked.map((id) => recorded.get(id) ?? 0))
+            cursor = Math.max(cursor, ...Arr.map(acked, (id) => recorded.get(id) ?? 0))
             return decodeDone({ _tag: "PullDone", changes: [], acks, nextCursor: String(cursor), expiredThrough: 0 })
           })
         )
@@ -1052,7 +1066,10 @@ it.live(
       })
       // Cycle 2: the push reaches the server but its response is lost; the pull installs nothing for m1.
       yield* awaitStatus(emissions, (s) => s.phase === "pulling" && s.pendingMutations === 1)
-      const from = log.findIndex((s) => s.pendingMutations === 1)
+      const from = Option.getOrElse(
+        Arr.findFirstIndex(log, (s) => s.pendingMutations === 1),
+        () => -1
+      )
       yield* Queue.offer(pulls, [])
       const failed = yield* awaitStatus(emissions, (s) => s.phase === "backoff")
       expect([failed.pendingMutations, failed.lastSyncedAt, failed.lastError === null]).toEqual([1, t1, false])
@@ -1067,8 +1084,10 @@ it.live(
         (s) => s.pendingMutations === 0 && s.lastSyncedAt !== null && s.lastSyncedAt !== t1
       )
       // Every status between the enqueue and the authoritative ack's install counted m1.
-      expect(log.slice(from, beforeAck).map((s) => s.pendingMutations)).toEqual(log.slice(from, beforeAck).map(() => 1))
-      expect(log.slice(from, beforeAck).every((s) => s.lastSyncedAt === t1)).toBe(true)
+      expect(Arr.map(log.slice(from, beforeAck), (s) => s.pendingMutations)).toEqual(
+        Arr.map(log.slice(from, beforeAck), () => 1)
+      )
+      expect(Arr.every(log.slice(from, beforeAck), (s) => s.lastSyncedAt === t1)).toBe(true)
       expect(released.lastSyncedAt ?? 0).toBeGreaterThan(t1 ?? Number.POSITIVE_INFINITY)
     }).pipe(Effect.scoped)
 )
@@ -1111,9 +1130,10 @@ it.live(
           Effect.suspend(() =>
             Deferred.isDoneUnsafe(lost) && !Deferred.isDoneUnsafe(elected)
               ? Effect.fail(leaderLost)
-              : Effect.sync(() => {
+              : Effect.gen(function* () {
+                  const json = yield* Effect.orDie(Schema.encodeEffect(Schema.fromJsonString(Schema.Json))(state))
                   tracks.push(state)
-                  pairs.push(`track ${JSON.stringify(state)}@${revision}`)
+                  pairs.push(`track ${json}@${revision}`)
                   held[leader] = state
                 })
           )
@@ -1240,11 +1260,11 @@ it.live(
         const a = yield* Effect.forkChild(preempted(Effect.exit(Stream.runDrain(api.presence(room, "a"))), ops))
         const b = yield* Effect.forkChild(preempted(Effect.exit(Stream.runDrain(api.presence(room, "b"))), ops))
         yield* Effect.repeat(Effect.yieldNow, { times: 100 })
-        const ended = [a.pollUnsafe(), b.pollUnsafe()].filter((x) => x !== undefined)
+        const ended = Arr.filter([a.pollUnsafe(), b.pollUnsafe()], (x) => x !== undefined)
         const refused = ended[0]?._tag === "Success" ? ended[0].value : undefined
         expect({ ops, opens: seen.opens, ended: ended.length }).toEqual({ ops, opens: 1, ended: 1 })
         expect(
-          refused !== undefined && Exit.isFailure(refused) && String(refused.cause).includes("PresenceAlreadyOpen")
+          refused !== undefined && Exit.isFailure(refused) && Str.includes("PresenceAlreadyOpen")(String(refused.cause))
         ).toBe(true)
         yield* Fiber.interrupt(a)
         yield* Fiber.interrupt(b)
@@ -1300,7 +1320,7 @@ it.live("a tab's presence open carries a genuine (state, revision) pair even whe
         yield* Effect.repeat(Effect.yieldNow, { times: turns })
         yield* api.track(room, "s1")
         yield* Effect.repeat(Effect.yieldNow, { times: 50 })
-        const torn = pairs.filter((p) => p !== "s0@0" && p !== "s1@1")
+        const torn = Arr.filter(pairs, (p) => p !== "s0@0" && p !== "s1@1")
         expect({ ops, turns, torn }).toEqual({ ops, turns, torn: [] })
         yield* Fiber.interrupt(fiber)
       }

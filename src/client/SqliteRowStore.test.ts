@@ -2,7 +2,20 @@
 import "./testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { expect, it } from "@effect/vitest"
-import { Cause, Effect, Exit, Fiber, Layer, Option, Queue, Schema, Stream } from "effect"
+import {
+  Array as Arr,
+  Cause,
+  DateTime,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Queue,
+  Schema,
+  Stream,
+  String as Str
+} from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
 import { AccessScope, Errors, Registry, Store, SyncTable } from "echo-sync"
 import * as Outbox from "./Outbox.ts"
@@ -43,17 +56,19 @@ const rng = (seed: number) => {
   return { next, pick }
 }
 
-const randomRows = (r: ReturnType<typeof rng>, n: number): Array<SyncTable.EncodedRow> =>
-  Array.from({ length: n }, (_, i) =>
-    Schema.encodeSync(Items.wire)({
-      id: ItemId.make(`i${String(i).padStart(3, "0")}`),
-      accessScopeId: AccessScope.AccessScopeId.make(r.pick(["s1", "s2"], "s1")),
-      label: r.pick(labels, null),
-      rank: r.pick(ranks, null),
-      flag: r.next() < 0.5,
-      at: new Date(r.pick(times, 0)),
-      doc: { tags: [r.pick(["x", "y"], "x")] }
-    })
+const randomRows = (r: ReturnType<typeof rng>, n: number) =>
+  Effect.forEach(
+    Array.from({ length: n }, (_, i) => i),
+    (i) =>
+      Schema.encodeEffect(Items.wire)({
+        id: ItemId.make(`i${Str.padStart(3, "0")(String(i))}`),
+        accessScopeId: AccessScope.AccessScopeId.make(r.pick(["s1", "s2"], "s1")),
+        label: r.pick(labels, null),
+        rank: r.pick(ranks, null),
+        flag: r.next() < 0.5,
+        at: DateTime.toDateUtc(DateTime.makeUnsafe(r.pick(times, 0))),
+        doc: { tags: [r.pick(["x", "y"], "x")] }
+      })
   )
 
 const randomPlan = (r: ReturnType<typeof rng>): Store.IndexRangePlan => {
@@ -64,10 +79,10 @@ const randomPlan = (r: ReturnType<typeof rng>): Store.IndexRangePlan => {
   const domain: ReadonlyArray<string | number | boolean> =
     eq.length === 0
       ? byLabel
-        ? labels.filter((l) => l !== null)
+        ? Arr.filter(labels, (l) => l !== null)
         : [true, false]
       : byLabel
-        ? ranks.filter((x) => x !== null)
+        ? Arr.filter(ranks, (x) => x !== null)
         : times
   const bound = (): Option.Option<Store.Bound> =>
     r.next() < 0.5 ? Option.none() : Option.some({ value: r.pick(domain, 0), inclusive: r.next() < 0.5 })
@@ -86,17 +101,17 @@ const Db = Layer.effectDiscard(SqliteSyncStorage.migrate(registry)).pipe(
   Layer.provideMerge(SqliteClient.layerMemory({}))
 )
 const storeFor = Effect.map(SqlClient.SqlClient, (sql) => ({ sql, store: SqliteRowStore.make(sql, registry) }))
-const ids = (rows: ReadonlyArray<SyncTable.EncodedRow>) => rows.map((row) => row["id"])
+const ids = (rows: ReadonlyArray<SyncTable.EncodedRow>) => Arr.map(rows, (row) => row["id"])
 const note = (id: string, scope: string, body: string): SyncTable.EncodedRow => ({ id, access_scope_id: scope, body })
 const appendIntent = Outbox.append({ clientId: "c", mutationId: "m", name: "t", args: {} })
-const pendingIds = Effect.map(Outbox.pending, (entries) => entries.map((e) => e.mutationId))
+const pendingIds = Effect.map(Outbox.pending, (entries) => Arr.map(entries, (e) => e.mutationId))
 
 it.effect("range returns exactly core's reference rows in core's reference order (seeded random plans)", () =>
   Effect.gen(function* () {
     const { sql, store } = yield* storeFor
     for (const seed of [1, 2, 3]) {
       const r = rng(seed)
-      const rows = randomRows(r, 80)
+      const rows = yield* randomRows(r, 80)
       yield* sql.withTransaction(
         Effect.gen(function* () {
           yield* store.clearAll
@@ -105,11 +120,21 @@ it.effect("range returns exactly core's reference rows in core's reference order
       )
       for (let i = 0; i < 150; i++) {
         const plan = randomPlan(r)
-        const expected = ids(rows.filter((row) => Store.planMatches(plan, row)).toSorted(Store.planOrder(plan)))
-        const actual = ids(yield* store.range(Items, plan))
-        expect(actual, `seed ${seed} plan ${i}: ${JSON.stringify({ ...plan, index: plan.index.name })}`).toEqual(
-          expected
+        const compare = Store.planOrder(plan)
+        const expected = ids(
+          Arr.sort(
+            Arr.filter(rows, (row) => Store.planMatches(plan, row)),
+            (a: SyncTable.EncodedRow, b: SyncTable.EncodedRow) => {
+              const compared = compare(a, b)
+              return compared < 0 ? -1 : compared > 0 ? 1 : 0
+            }
+          )
         )
+        const actual = ids(yield* store.range(Items, plan))
+        expect(
+          actual,
+          `seed ${seed} plan ${i}: ${yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({ ...plan, index: plan.index.name })}`
+        ).toEqual(expected)
       }
     }
     // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
@@ -119,14 +144,14 @@ it.effect("range returns exactly core's reference rows in core's reference order
 it.effect("write/read round-trips every column kind; None deletes; scan orders ids by code point", () =>
   Effect.gen(function* () {
     const { store } = yield* storeFor
-    const rows = randomRows(rng(9), 5)
+    const rows = yield* randomRows(rng(9), 5)
     const odd = yield* Schema.encodeEffect(Items.wire)({
       id: ItemId.make("😀"),
       accessScopeId: AccessScope.AccessScopeId.make("s1"),
       label: "\uFFFF",
       rank: null,
       flag: true,
-      at: new Date(1_700_000_000_123),
+      at: DateTime.toDateUtc(DateTime.makeUnsafe(1_700_000_000_123)),
       doc: { tags: ["q", "r"] }
     })
     for (const row of [...rows, odd]) yield* store.write(Items, String(row["id"]), Option.some(row))
@@ -144,13 +169,16 @@ it.effect("write/read round-trips every column kind; None deletes; scan orders i
 it.effect("clearAll and purgeScope touch only replicated rows; the outbox and meta survive", () =>
   Effect.gen(function* () {
     const { sql, store } = yield* storeFor
-    for (const row of randomRows(rng(4), 20)) yield* store.write(Items, String(row["id"]), Option.some(row))
+    for (const row of yield* randomRows(rng(4), 20)) yield* store.write(Items, String(row["id"]), Option.some(row))
     yield* store.write(Notes, "n1", Option.some(note("n1", "s1", "x")))
     yield* store.write(Notes, "n2", Option.some(note("n2", "s2", "y")))
     yield* appendIntent
 
     yield* store.purgeScope(AccessScope.AccessScopeId.make("s1"))
-    const scopes = [...(yield* store.scan(Items)), ...(yield* store.scan(Notes))].map((row) => row["access_scope_id"])
+    const scopes = Arr.map(
+      [...(yield* store.scan(Items)), ...(yield* store.scan(Notes))],
+      (row) => row["access_scope_id"]
+    )
     expect(scopes.length).toBeGreaterThan(0)
     expect(new Set(scopes)).toEqual(new Set(["s2"]))
 
@@ -175,7 +203,7 @@ it.live("clearAll re-emits a live query on the cleared table, even when nothing 
         (rows) =>
           Queue.offer(
             emissions,
-            rows.map((r) => r.id)
+            Arr.map(rows, (r) => r.id)
           )
       )
     )
@@ -200,17 +228,19 @@ it.live("clearAll re-emits a live query on the cleared table, even when nothing 
 const corruption = <A, E>(exit: Exit.Exit<A, E>) =>
   Option.fromNullishOr(
     Exit.isFailure(exit)
-      ? exit.cause.reasons
-          .filter(Cause.isDieReason)
-          .map((reason) => reason.defect)
-          .find((defect): defect is Errors.CorruptStorage => defect instanceof Errors.CorruptStorage)
+      ? Option.getOrUndefined(
+          Arr.findFirst(
+            Arr.map(Arr.filter(exit.cause.reasons, Cause.isDieReason), (reason) => reason.defect),
+            (defect): defect is Errors.CorruptStorage => defect instanceof Errors.CorruptStorage
+          )
+        )
       : undefined
   )
 
 it.effect("a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError", () =>
   Effect.gen(function* () {
     const { sql, store } = yield* storeFor
-    const [row] = randomRows(rng(4), 1)
+    const [row] = yield* randomRows(rng(4), 1)
     if (row === undefined) return yield* Effect.die("no row")
     yield* store.write(Items, "i000", Option.some(row))
     // An edit outside echo-sync that the column codec cannot read.

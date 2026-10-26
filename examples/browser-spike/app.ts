@@ -10,7 +10,7 @@
  *   server-only title check; a missing row is the store's `RowNotFound` rejection.
  * - `todos.delete` deletes an existing todo; a missing row is `RowNotFound`.
  */
-import { Deferred, Effect, Schema } from "effect"
+import { Deferred, Effect, Schema, String as Str } from "effect"
 import { AccessScope, Mutation, Registry, SyncTable } from "../../src/core/index.ts"
 
 const TodoId = Schema.String.check(Schema.isNonEmpty()).pipe(Schema.brand("harness/TodoId"))
@@ -67,7 +67,7 @@ const addTodo = (side: "client" | "server") =>
           serverHooks.started.set(args.id, (serverHooks.started.get(args.id) ?? 0) + 1)
           const name = gateIn(args.title)
           if (name !== undefined) yield* Deferred.await(gate(name))
-          if (serverHooks.rejecting && args.title.includes("server-rejects")) {
+          if (serverHooks.rejecting && Str.includes("server-rejects")(args.title)) {
             return yield* Effect.fail({ reason: "blocked-title" as const, title: args.title })
           }
         }
@@ -96,7 +96,7 @@ const updateTodo = (side: "client" | "server") =>
       Effect.gen(function* () {
         if (side === "server") {
           yield* serverStart(args.id, args.title)
-          if (serverHooks.rejecting && args.title?.includes("server-rejects") === true) {
+          if (serverHooks.rejecting && args.title !== undefined && Str.includes("server-rejects")(args.title)) {
             return yield* Effect.fail({ reason: "blocked-title" as const, title: args.title })
           }
         }

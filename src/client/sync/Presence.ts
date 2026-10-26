@@ -21,7 +21,19 @@
  * key ends the older server stream (SPEC §10.2); the older one is always ours and already abandoned
  * here, so that is expected. Presence never touches the replica or the outbox.
  */
-import { Cause, Deferred, Duration, Effect, Exit, Queue, Schedule, type Schema, Stream } from "effect"
+import {
+  Array as Arr,
+  Cause,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Option,
+  Queue,
+  Schedule,
+  type Schema,
+  Stream
+} from "effect"
 import type { AccessScope, Protocol } from "echo-sync"
 import * as Telemetry from "../../internal/Telemetry.ts"
 import { cappedExponential } from "./Backoff.ts"
@@ -174,10 +186,12 @@ export const make = <E, F extends E>(options: {
           )
           if (Deferred.isDoneUnsafe(sub.replaced)) return yield* Queue.end(out)
           if (Exit.isFailure(ended)) {
-            const fatal = ended.cause.reasons
-              .filter(Cause.isFailReason)
-              .map((reason) => reason.error)
-              .find(options.isFatal)
+            const fatal = Option.getOrUndefined(
+              Arr.findFirst(
+                Arr.map(Arr.filter(ended.cause.reasons, Cause.isFailReason), (reason) => reason.error),
+                options.isFatal
+              )
+            )
             if (fatal !== undefined) return yield* Effect.fail(fatal)
           }
           if (delivered) wait = yield* Schedule.toStepWithSleep(backoff)

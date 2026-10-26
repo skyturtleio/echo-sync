@@ -3,7 +3,7 @@
  * must fit FoldKit's own `Subscription`, `Command` and `ManagedResource` types, both with the client held by
  * a ManagedResource (NilBurger) and as the static `LeaderClient` service (HeyBabe). Not run.
  */
-import { Effect, Schema } from "effect"
+import { Array as Arr, Effect, Schema } from "effect"
 import { Mutation, Query } from "echo-sync"
 import { LeaderClient } from "echo-sync/client"
 import * as Echo from "echo-sync/foldkit"
@@ -42,7 +42,7 @@ export const subscriptions = Subscription.make<{}, Message, Services>()(() => ({
   ),
   notices: Subscription.persistentEntry(
     Echo.notices(Sync.get, {
-      onValue: (list) => Message.NoticesChanged({ ids: list.map(({ id }) => id) }),
+      onValue: (list) => Message.NoticesChanged({ ids: Arr.map(list, ({ id }) => id) }),
       onFailure: failed
     })
   )

@@ -1,4 +1,4 @@
-import { Deferred, type Duration, Effect, PubSub, Ref, type Scope, Semaphore, Stream } from "effect"
+import { Array as Arr, Deferred, type Duration, Effect, PubSub, Ref, type Scope, Semaphore, Stream } from "effect"
 import { type AccessScope, Protocol } from "echo-sync"
 
 /** An entry, the room it is in, and the revision of its state (SPEC §10 revision fencing). */
@@ -45,7 +45,10 @@ const snapshotOf = (
 ): Protocol.RoomSnapshot => ({
   _tag: "snapshot",
   room,
-  entries: [...(all.get(room)?.members.values() ?? [])].map((m) => m.entry).toSorted(byKey)
+  entries: Arr.sort(
+    Arr.map([...(all.get(room)?.members.values() ?? [])], (m) => m.entry),
+    byKey
+  )
 })
 
 const heartbeat: Protocol.RoomElement = { _tag: "heartbeat" }
@@ -226,8 +229,8 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
         gate.withPermit(
           Effect.gen(function* () {
             const seen = yield* Ref.get(rooms)
-            const pairs = [...seen].flatMap(([room, { members }]) =>
-              [...new Set([...members.values()].map((m) => m.entry.principalId))].map((principalId) => ({
+            const pairs = Arr.flatMap([...seen], ([room, { members }]) =>
+              Arr.map([...new Set(Arr.map([...members.values()], (m) => m.entry.principalId))], (principalId) => ({
                 room,
                 principalId
               }))
@@ -237,9 +240,10 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
             for (const { room, principalId } of pairs) {
               if (held(room, principalId)) continue
               const asked = new Set(
-                [...(seen.get(room)?.members.values() ?? [])]
-                  .filter((m) => m.entry.principalId === principalId)
-                  .map((m) => m.ended)
+                Arr.map(
+                  Arr.filter([...(seen.get(room)?.members.values() ?? [])], (m) => m.entry.principalId === principalId),
+                  (m) => m.ended
+                )
               )
               yield* Effect.uninterruptible(
                 Effect.gen(function* () {

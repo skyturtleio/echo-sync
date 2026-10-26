@@ -1,5 +1,5 @@
 /** Native OPFS test entry: host-owned runtime, tracerLogger, and deliberate sensitive failures. */
-import { Effect, Fiber, Metric, Schema } from "effect"
+import { Array as Arr, Effect, Fiber, Metric, Schema, String as Str } from "effect"
 import { Mutation } from "../../src/core/index.ts"
 import { leaderWorker } from "../../src/client/worker/index.ts"
 import { recorder, serialized } from "../../test/telemetry-recorder.ts"
@@ -54,13 +54,19 @@ self.addEventListener("message", (event: MessageEvent) => {
       // Lock release resolves a browser promise; scope closure is not a browser-task completion barrier.
       for (
         let i = 0;
-        i < 100 && held.held?.some((lock) => lock.name?.startsWith(`echo:${identity}:native:leader`));
+        i < 100 &&
+        Arr.some(
+          held.held ?? [],
+          (lock) => lock.name !== undefined && Str.startsWith(`echo:${identity}:native:leader`)(lock.name)
+        );
         i++
       ) {
         yield* Effect.sleep("20 millis")
         held = yield* Effect.promise(() => navigator.locks.query())
       }
-      const telemetry: unknown = JSON.parse(serialized({ spans: recording.spans, logs: recording.logs, metrics, held }))
+      const telemetry = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))(
+        serialized({ spans: recording.spans, logs: recording.logs, metrics, held })
+      )
       self.postMessage({ telemetry }, { transfer: [] })
     })
   )

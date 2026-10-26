@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Deferred, Effect, Fiber, Random, Ref } from "effect"
+import { Array as Arr, Deferred, Effect, Fiber, Random, Ref } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { grant, pgAvailable, Replica, TestDatabase } from "./test-support.ts"
 
@@ -39,8 +39,11 @@ const writersRaceAPullingReader = Effect.gen(function* () {
   // position the cursor already passed never will.
   yield* replica.sync()
 
-  const received = new Set(replica.received.flatMap((c) => (c._tag === "upsert" ? [String(c.row["id"])] : [])))
-  return Array.from({ length: writers }, (_, i) => `w${i}`).filter((id) => !received.has(id))
+  const received = new Set(Arr.flatMap(replica.received, (c) => (c._tag === "upsert" ? [String(c.row["id"])] : [])))
+  return Arr.filter(
+    Array.from({ length: writers }, (_, i) => `w${i}`),
+    (id) => !received.has(id)
+  )
 })
 
 /**
@@ -92,8 +95,8 @@ const readerPullsBetweenOutOfOrderCommits = Effect.gen(function* () {
   yield* Fiber.join(writerB)
   yield* replica.sync()
 
-  const received = new Set(replica.received.flatMap((c) => (c._tag === "upsert" ? [String(c.row["id"])] : [])))
-  return ["a", "b"].filter((id) => !received.has(id))
+  const received = new Set(Arr.flatMap(replica.received, (c) => (c._tag === "upsert" ? [String(c.row["id"])] : [])))
+  return Arr.filter(["a", "b"], (id) => !received.has(id))
 }).pipe(Effect.scoped)
 
 /** The engine's position allocation with the advisory lock removed; everything else unchanged. */

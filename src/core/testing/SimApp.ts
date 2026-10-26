@@ -87,6 +87,7 @@ export const principal = (id: string) => AccessScope.PrincipalId.make(id)
 
 /** A `scope_grants` row in wire form, with core's derived id (SPEC §4). */
 export const grantRow = (scopeId: string, who: string, role: AccessScope.Role): SyncTable.EncodedRow =>
+  // oxlint-disable-next-line effecttsgo/schema-sync -- Pure simulation fixture constructor is used by synchronous model transitions; no runtime services are required.
   Schema.encodeSync(ScopeGrants.ScopeGrants.wire)({
     id: ScopeGrants.grantId(scope(scopeId), principal(who)),
     accessScopeId: scope(scopeId),

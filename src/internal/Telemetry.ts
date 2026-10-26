@@ -1,5 +1,6 @@
 /** Engine telemetry boundary. No dependency span, event, result or cause crosses it. */
 import {
+  Array as Arr,
   Cause,
   Channel,
   Clock,
@@ -208,7 +209,7 @@ export const boundary = <A, E, R>(work: Effect.Effect<A, E, R>): Effect.Effect<A
         })
     wrapped.add(tracer)
     const loggers = new Set(
-      [...fiber.getRef(Logger.CurrentLoggers)].map((logger) => {
+      Arr.map([...fiber.getRef(Logger.CurrentLoggers)], (logger) => {
         if (wrappedLoggers.has(logger)) return logger
         const safe = Logger.make<unknown, void>((options) => {
           const diagnostics = options.fiber.getRef(References.CurrentLogAnnotations)["echo.diagnostics"] === true
@@ -216,8 +217,8 @@ export const boundary = <A, E, R>(work: Effect.Effect<A, E, R>): Effect.Effect<A
           if (
             !diagnostics &&
             !(
-              Array.isArray(options.message) &&
-              options.message.every((message: unknown) => typeof message === "string" && messages.has(message))
+              Arr.isArray(options.message) &&
+              Arr.every(options.message, (message: unknown) => typeof message === "string" && messages.has(message))
             )
           )
             return
@@ -300,8 +301,8 @@ export const serverFailure = (_cause: Cause.Cause<unknown>): Outcome => "server"
 export const byFailure =
   <E>(name: (error: E) => Outcome) =>
   (cause: Cause.Cause<E>): Outcome => {
-    const failures = cause.reasons.filter(Cause.isFailReason).map((reason) => name(reason.error))
-    return failures.includes("halted") ? "halted" : (failures[0] ?? "server")
+    const failures = Arr.map(Arr.filter(cause.reasons, Cause.isFailReason), (reason) => name(reason.error))
+    return Arr.contains(failures, "halted") ? "halted" : (failures[0] ?? "server")
   }
 
 export const annotate = (attributes: Attributes) =>

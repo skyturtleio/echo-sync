@@ -16,7 +16,7 @@
  * (`indnkeyatts`) are compared, never `INCLUDE` payload. Extra live columns and indexes
  * are allowed. The engine's own tables are not checked.
  */
-import { Effect, Schema } from "effect"
+import { Array as Arr, Effect, Option, Record as Rec, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { Registry, SyncTable } from "echo-sync"
 import * as Telemetry from "../../internal/Telemetry.ts"
@@ -27,7 +27,10 @@ export type Mismatch = typeof Mismatch.Type
 // oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class Drift extends Schema.TaggedError<Drift>()("Drift", { mismatches: Schema.Array(Mismatch) }) {
   override get message() {
-    return `schema drift (refusing to serve):\n${this.mismatches.map((m) => `  ${m.table}: ${m.problem}`).join("\n")}`
+    return `schema drift (refusing to serve):\n${Arr.join(
+      Arr.map(this.mismatches, (m) => `  ${m.table}: ${m.problem}`),
+      "\n"
+    )}`
   }
 }
 
@@ -101,26 +104,31 @@ interface KeyColumn {
 }
 
 const sameList = (a: ReadonlyArray<unknown>, b: ReadonlyArray<unknown>) =>
-  a.length === b.length && a.every((x, i) => x === b[i])
+  a.length === b.length && Arr.every(a, (x, i) => x === b[i])
 const keyText = (k: KeyColumn) => `${k.column}|${k.option}|${k.collation}`
-const sameKey = (a: ReadonlyArray<KeyColumn>, b: ReadonlyArray<KeyColumn>) => sameList(a.map(keyText), b.map(keyText))
+const sameKey = (a: ReadonlyArray<KeyColumn>, b: ReadonlyArray<KeyColumn>) =>
+  sameList(Arr.map(a, keyText), Arr.map(b, keyText))
 
 const describeKey = (rows: ReadonlyArray<KeyColumn>) =>
-  rows
-    .map((r) => {
+  Arr.join(
+    Arr.map(rows, (r) => {
       const option = r.option ?? 0
       const dir = option & INDOPTION_DESC ? "DESC" : "ASC"
       const nulls = option & INDOPTION_NULLS_FIRST ? "NULLS FIRST" : "NULLS LAST"
       return `${r.column ?? "<expr>"} ${dir} ${nulls}${r.collation === null ? "" : ` COLLATE "${r.collation}"`}`
-    })
-    .join(", ")
+    }),
+    ", "
+  )
 
 const describeTrigger = (t: TriggerRow) =>
   `${t.name} (tgtype ${t.type}, tgenabled ${t.enabled}${t.when ? ", WHEN clause" : ""}${t.columnList ? ", column list" : ""})`
 
 /** The key of an index (its first `indnkeyatts` columns). */
 const keyOf = (rows: ReadonlyArray<IndexColumnRow>): ReadonlyArray<KeyColumn> =>
-  rows.filter((r) => r.key).map((r) => ({ column: r.column, option: r.option, collation: r.collation }))
+  Arr.map(
+    Arr.filter(rows, (r) => r.key),
+    (r) => ({ column: r.column, option: r.option, collation: r.collation })
+  )
 
 /** Index key collation of a column kind (text columns are declared `COLLATE "C"`). */
 const collationOf = (kind: SyncTable.ColumnKind) => (kind === "text" ? "C" : null)
@@ -147,7 +155,7 @@ const checkRelation = Effect.fn("verify.checkRelation")(function* (
     [true, "capture", CAPTURE_TYPE, "AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW"],
     [false, "truncate guard", GUARD_TYPE, "BEFORE TRUNCATE FOR EACH STATEMENT"]
   ] as const) {
-    const found = triggers.filter((t) => t.capture === capture)
+    const found = Arr.filter(triggers, (t) => t.capture === capture)
     if (found.length === 0) drift(`missing the echo_sync ${label} trigger`)
     if (capture && found.length > 1) drift(`has ${found.length} echo_sync capture triggers, expected one`)
     for (const t of found) {
@@ -162,7 +170,7 @@ const checkRelation = Effect.fn("verify.checkRelation")(function* (
              a.attnotnull AS "notNull", co.collname AS collation
       FROM pg_attribute a LEFT JOIN pg_collation co ON co.oid = a.attcollation
       WHERE a.attrelid = ${relation.oid}::oid AND a.attnum > 0 AND NOT a.attisdropped`
-  const live = new Map(columns.map((c) => [c.name, c]))
+  const live = new Map(Arr.map(columns, (c) => [c.name, c]))
   for (const column of table.columns) {
     const c = live.get(column.name)
     if (c === undefined) {
@@ -203,9 +211,9 @@ const checkRelation = Effect.fn("verify.checkRelation")(function* (
     byIndex.set(row.index, list)
   }
   const indexes = [...byIndex.values()]
-  const kindOf = new Map(table.columns.map((c) => [c.name, c.kind]))
+  const kindOf = new Map(Arr.map(table.columns, (c) => [c.name, c.kind]))
 
-  const pk = indexes.find((rows) => rows[0]?.primary === true)
+  const pk = Option.getOrUndefined(Arr.findFirst(indexes, (rows) => rows[0]?.primary === true))
   const pkKey = pk === undefined ? [] : keyOf(pk)
   const idKey: ReadonlyArray<KeyColumn> = [
     { column: "id", option: 0, collation: collationOf(kindOf.get("id") ?? "text") }
@@ -217,16 +225,16 @@ const checkRelation = Effect.fn("verify.checkRelation")(function* (
   }
 
   for (const index of [
-    ...Object.values(table.indexes),
+    ...Rec.values(table.indexes),
     {
       name: "echo-scope",
-      key: ["access_scope_id", "id"].flatMap((name) => table.columns.filter((c) => c.name === name))
+      key: Arr.flatMap(["access_scope_id", "id"], (name) => Arr.filter(table.columns, (c) => c.name === name))
     }
   ]) {
     const name = `${table.name}__${index.name}`
     const rows = byIndex.get(name)
     // SPEC §3: NULLS FIRST on declared fields, plain ASC (NULLS LAST) on the trailing id.
-    const want: ReadonlyArray<KeyColumn> = index.key.map((c, i) => ({
+    const want: ReadonlyArray<KeyColumn> = Arr.map(index.key, (c, i) => ({
       column: c.name,
       option: i === index.key.length - 1 ? 0 : INDOPTION_NULLS_FIRST,
       collation: collationOf(c.kind)
@@ -238,11 +246,14 @@ const checkRelation = Effect.fn("verify.checkRelation")(function* (
     const first = rows[0]
     const ok = first !== undefined && first.plain && !first.unique && first.usable && sameKey(keyOf(rows), want)
     if (!ok) {
-      const flags = [
-        first?.plain ? "" : " non-plain",
-        first?.unique ? " unique" : "",
-        first?.usable ? "" : " not valid/ready/live"
-      ].join("")
+      const flags = Arr.join(
+        [
+          first?.plain ? "" : " non-plain",
+          first?.unique ? " unique" : "",
+          first?.usable ? "" : " not valid/ready/live"
+        ],
+        ""
+      )
       drift(`index ${name} is (${describeKey(keyOf(rows))})${flags}, declared (${describeKey(want)})`)
     }
   }
@@ -250,12 +261,12 @@ const checkRelation = Effect.fn("verify.checkRelation")(function* (
   for (const set of table.manifest.unique) {
     // The shape SyncTable's UNIQUE (…) constraint generates: default ASC NULLS LAST, the
     // column's collation, NULLS DISTINCT.
-    const want: ReadonlyArray<KeyColumn> = set.map((column) => ({
+    const want: ReadonlyArray<KeyColumn> = Arr.map(set, (column) => ({
       column,
       option: 0,
       collation: collationOf(kindOf.get(column) ?? "text")
     }))
-    const backed = indexes.some((rows) => {
+    const backed = Arr.some(indexes, (rows) => {
       const first = rows[0]
       return (
         first !== undefined &&
@@ -268,7 +279,9 @@ const checkRelation = Effect.fn("verify.checkRelation")(function* (
       )
     })
     if (!backed) {
-      drift(`declared unique set (${set.join(", ")}) has no valid unique index with key exactly (${describeKey(want)})`)
+      drift(
+        `declared unique set (${Arr.join(set, ", ")}) has no valid unique index with key exactly (${describeKey(want)})`
+      )
     }
   }
 })
@@ -292,7 +305,10 @@ export const verify = (registry: Registry.SyncRegistry) =>
         // indistinguishable log rows, however well-formed each is (attach refuses this).
         mismatches.push({
           table: table.name,
-          problem: `captured in ${attached.length} schemas (${attached.map((r) => r.schema).join(", ")}); the log names tables unqualified, so exactly one may be attached`
+          problem: `captured in ${attached.length} schemas (${Arr.join(
+            Arr.map(attached, (r) => r.schema),
+            ", "
+          )}); the log names tables unqualified, so exactly one may be attached`
         })
       }
       if (attached.length > 0) {
@@ -302,10 +318,13 @@ export const verify = (registry: Registry.SyncRegistry) =>
           SELECT c.oid::int AS oid, n.nspname AS schema FROM pg_class c
           JOIN pg_namespace n ON n.oid = c.relnamespace
           WHERE c.oid = to_regclass(quote_ident(${table.name}))`
-        if (resolved !== undefined && !attached.some((r) => r.oid === resolved.oid)) {
+        if (resolved !== undefined && !Arr.some(attached, (r) => r.oid === resolved.oid)) {
           mismatches.push({
             table: table.name,
-            problem: `the unqualified name resolves through search_path to ${resolved.schema}.${table.name}, but the captured relation is in ${attached.map((r) => r.schema).join(", ")}; fix search_path or attach with an explicit schema`
+            problem: `the unqualified name resolves through search_path to ${resolved.schema}.${table.name}, but the captured relation is in ${Arr.join(
+              Arr.map(attached, (r) => r.schema),
+              ", "
+            )}; fix search_path or attach with an explicit schema`
           })
         }
       }

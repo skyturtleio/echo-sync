@@ -1,9 +1,10 @@
 // oxlint-disable-next-line import/no-unassigned-import -- wa-sqlite file fetch under Node/Bun
 import "../src/client/testing/nodeWasm.ts"
 import { strict as assert } from "node:assert"
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- The benchmark checks Git synchronously before entering its measured Effect runtime.
 import { execFileSync } from "node:child_process"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
-import { Effect, Option, Stream } from "effect"
+import { Array as Arr, Console, Effect, Option, Stream, String as Str } from "effect"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import { AccessScope, Ids, Protocol, ScopeGrants } from "echo-sync"
 import { clientRegistry, Counters, grantRow, mutations, principal } from "../src/core/testing/SimApp.ts"
@@ -84,11 +85,11 @@ export const installFixture = Effect.fnUntraced(function* (p: number, c: number,
 
 if (import.meta.main) {
   assert.equal(
-    execFileSync("git", ["status", "--porcelain"], { encoding: "utf8" }).trim(),
+    Str.trim(execFileSync("git", ["status", "--porcelain"], { encoding: "utf8" })),
     "",
     "measure only a clean tree"
   )
-  const commit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim()
+  const commit = Str.trim(execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }))
   for (const { p, c } of [
     { p: 5, c: 50 },
     { p: 500, c: 5000 }
@@ -101,21 +102,23 @@ if (import.meta.main) {
     assert.equal(result.final.rows.length, c)
     assert.equal(result.final.meta.cursor, 2n)
     for (const stored of result.final.rows) {
-      const index = Number(String(stored["id"]).slice(2))
+      const index = Number(Str.slice(2)(String(stored["id"])))
       assert.equal(stored["value"], index < p ? 203 : 200)
     }
-    console.log(
-      JSON.stringify({
-        commit,
-        pending: p,
-        changes: c,
-        pages: result.pages,
-        millis: result.millis,
-        statements: result.statements.length,
-        rowsReturned: result.statements.reduce((sum, s) => sum + s.rows, 0),
-        finalRows: result.final.rows.length,
-        finalPending: result.final.pending.length
-      })
+    Effect.runSync(
+      Console.log(
+        JSON.stringify({
+          commit,
+          pending: p,
+          changes: c,
+          pages: result.pages,
+          millis: result.millis,
+          statements: result.statements.length,
+          rowsReturned: Arr.reduce(result.statements, 0, (sum, s) => sum + s.rows),
+          finalRows: result.final.rows.length,
+          finalPending: result.final.pending.length
+        })
+      )
     )
   }
 }

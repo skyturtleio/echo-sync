@@ -3,7 +3,7 @@ import "../src/client/testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { assert, describe, it } from "@effect/vitest"
 import type * as PgClient from "@effect/sql-pg/PgClient"
-import { Context, Effect, Layer, Option, Schema } from "effect"
+import { Array as Arr, Clock, Context, Effect, Layer, Option, Schema, String as Str } from "effect"
 import { TestClock } from "effect/testing"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
@@ -55,11 +55,15 @@ const serve = Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
   const sent = { push: 0 }
   const fetch: typeof globalThis.fetch = Object.assign(
-    async (input: RequestInfo | URL, init?: RequestInit) => {
-      const request = new Request(input, init)
-      if ((await request.clone().text()).includes('"tag":"push"')) sent.push++
-      return web.handler(request)
-    },
+    (input: RequestInfo | URL, init?: RequestInit) =>
+      // oxlint-disable-next-line effecttsgo/run-effect-inside-effect -- Fetch is an externally invoked Promise callback, not work executed by the fixture's constructing fiber.
+      Effect.runPromise(
+        Effect.gen(function* () {
+          const request = new Request(input, init)
+          if (Str.includes('"tag":"push"')(yield* Effect.promise(() => request.clone().text()))) sent.push++
+          return yield* Effect.promise(() => web.handler(request))
+        })
+      ),
     { preconnect: globalThis.fetch.preconnect }
   )
   return { sent, fetch }
@@ -81,7 +85,7 @@ const device = Effect.gen(function* () {
     transport
   })
   const items = Effect.orDie(sqlite<{ id: string }>`SELECT id FROM items ORDER BY id`).pipe(
-    Effect.map((rows) => rows.map((r) => r.id))
+    Effect.map((rows) => Arr.map(rows, (r) => r.id))
   )
   return { sqlite, storage, engine, items }
 })
@@ -133,7 +137,7 @@ describe.skipIf(!pgAvailable)("expiry floor (SPEC §11) against the real server"
           yield* engine.mutate(mid("pushed"), "items.append", { id: "i1", suffix: "p" })
           yield* engine.push
           yield* engine.mutate(mid("unsent"), "items.append", { id: "i1", suffix: "u" })
-          const pending = (yield* storage.transaction(storage.pending)).map((p) => p.envelope)
+          const pending = Arr.map(yield* storage.transaction(storage.pending), (p) => p.envelope)
           assert.strictEqual((yield* storage.transaction(storage.meta)).pushedThrough, 2)
 
           // Restore the authoritative row, log and ledger to the saved point. Leave held-scope
@@ -152,7 +156,7 @@ describe.skipIf(!pgAvailable)("expiry floor (SPEC §11) against the real server"
           assert.notStrictEqual(fresh.epoch, saved.epoch)
           assert.strictEqual(fresh.pushedThrough, 0)
           assert.deepStrictEqual(
-            (yield* storage.transaction(storage.pending)).map((p) => p.envelope),
+            Arr.map(yield* storage.transaction(storage.pending), (p) => p.envelope),
             pending
           )
           assert.deepStrictEqual(yield* sqlite<{ body: string }>`SELECT body FROM items`, [{ body: "pu" }])
@@ -208,12 +212,12 @@ describe.skipIf(!pgAvailable)("expiry floor (SPEC §11) against the real server"
           // The pull alone settled m2: OutcomeUnknown, released, its optimistic effect gone with the rebase.
           // m3, above the floor, is untouched: still pending, still applied optimistically.
           assert.deepStrictEqual(
-            (yield* storage.transaction(storage.pending)).map((e) => e.envelope.mutationId),
+            Arr.map(yield* storage.transaction(storage.pending), (e) => e.envelope.mutationId),
             ["m3"]
           )
           const notices = yield* SqliteSyncStorage.notices(sqlite)
           assert.deepStrictEqual(
-            notices.map(({ notice }) => [notice._tag, notice.envelope.mutationId, notice.envelope.seq]),
+            Arr.map(notices, ({ notice }) => [notice._tag, notice.envelope.mutationId, notice.envelope.seq]),
             [["OutcomeUnknown", "m2", 2]]
           )
           const outbox = yield* Effect.orDie(
@@ -232,7 +236,7 @@ describe.skipIf(!pgAvailable)("expiry floor (SPEC §11) against the real server"
           assert.deepStrictEqual(yield* ledger("m2"), [])
           assert.deepStrictEqual((yield* ledger("m1")).length, 1)
           assert.deepStrictEqual(
-            (yield* ledger("m3")).map((r) => Number(r.seq)),
+            Arr.map(yield* ledger("m3"), (r) => Number(r.seq)),
             [3]
           )
           assert.strictEqual((yield* SqliteSyncStorage.notices(sqlite)).length, 1)
@@ -272,13 +276,13 @@ describe.skipIf(!pgAvailable)("expiry floor (SPEC §11) against the real server"
           const restored = yield* device
           yield* restore(restored.sqlite, copy)
           assert.deepStrictEqual(
-            (yield* restored.storage.transaction(restored.storage.pending)).map((e) => e.envelope.mutationId),
+            Arr.map(yield* restored.storage.transaction(restored.storage.pending), (e) => e.envelope.mutationId),
             ["m1"]
           )
           yield* restored.engine.pull
           const notices = yield* SqliteSyncStorage.notices(restored.sqlite)
           assert.deepStrictEqual(
-            notices.map(({ notice }) => [notice._tag, notice.envelope.mutationId]),
+            Arr.map(notices, ({ notice }) => [notice._tag, notice.envelope.mutationId]),
             [["OutcomeUnknown", "m1"]]
           )
           assert.deepStrictEqual(yield* restored.storage.transaction(restored.storage.pending), [])
@@ -326,7 +330,8 @@ describe.skipIf(!pgAvailable)("expiry floor (SPEC §11) against the real server"
           assert.strictEqual((yield* append).seq, 1)
 
           // 25 hours on, the leader prunes released rows; ten days on, the server expires the row.
-          yield* Effect.andThen(TestClock.setTime(Date.now() + 25 * 60 * 60 * 1000), Outbox.pruneReleased()).pipe(
+          const pruneAt = (yield* Clock.currentTimeMillis) + 25 * 60 * 60 * 1000
+          yield* Effect.andThen(TestClock.setTime(pruneAt), Outbox.pruneReleased()).pipe(
             // oxlint-disable-next-line effecttsgo/strict-effect-provide -- This retention probe owns an advanced clock only while pruning, leaving server and transport clocks live.
             Effect.provide(TestClock.layer()),
             Effect.provideService(SqlClient, leader.sqlite)
@@ -346,7 +351,7 @@ describe.skipIf(!pgAvailable)("expiry floor (SPEC §11) against the real server"
           assert.deepStrictEqual(ledger, [{ seq: "1", position, outcome: null }], "the retry recorded nothing")
           const notices = yield* SqliteSyncStorage.notices(leader.sqlite)
           assert.deepStrictEqual(
-            notices.map(({ notice }) => [notice._tag, notice.envelope.mutationId, notice.envelope.seq]),
+            Arr.map(notices, ({ notice }) => [notice._tag, notice.envelope.mutationId, notice.envelope.seq]),
             [["OutcomeUnknown", "m1", 2]]
           )
           assert.deepStrictEqual(yield* leader.storage.transaction(leader.storage.pending), [])

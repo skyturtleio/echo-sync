@@ -315,10 +315,11 @@ reference defaults, not the diagnostic-changing `--fast` preset.
   Effect's enhanced Go compiler. `bun run typecheck:tsrs` checks the same projects with its
   enhanced Rust compiler.
 - `bun run lint` first preserves the original syntax-based correctness/suspicious checks,
-  then runs `.oxlintrc.type-aware.json`: all 26 Effect correctness rules and all 20 anti-pattern
-  rules, plus explicit promise and inferred-`any` safety rules. Both passes fail on warnings.
+  then runs `.oxlintrc.type-aware.json`: all 26 Effect correctness rules, all 20 anti-pattern
+  rules and all 25 Effect-native rules, plus explicit promise and inferred-`any` safety rules.
+  Both passes fail on warnings.
   The second profile turns off category expansion so it adds only the selected rules;
-  Effect's style and Effect-native presets are not enabled.
+  Effect's style preset is not enabled.
 - `bun run check` includes both compilers, both lint passes, registry/vector checks,
   formatting and unit tests. Run `bun run test:pg` with the disposable Postgres running for
   integration coverage; browser commands remain in `AGENTS.md`.
@@ -364,6 +365,12 @@ provisioning stays lazy, so importing the engine does not acquire browser servic
 zero-argument RPC methods mirror the generated client contract; the ledger test's returned
 Effect deliberately allocates a reusable concurrent barrier. These are documented exceptions,
 not an invitation to disable a rule for a whole file or all tests.
+
+Effect-native rules prefer Effect collections, configuration, clocks, schemas and owned async
+work. Platform APIs remain at actual host boundaries: browser workers, Web Locks, OPFS, DOM
+events and external browser drivers still have their native contracts. Line-local explanations
+identify those boundaries and synchronous wire/source-inspection oracles; converting a native
+host contract into a new engine abstraction purely for lint is not the goal.
 
 The plugin explicitly allows only the unstable Effect module families already used by the
 engine/harness (SQL, RPC, HTTP, workers, reactivity, Crypto and their platform packages). New

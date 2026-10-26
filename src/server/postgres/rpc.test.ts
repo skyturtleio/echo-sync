@@ -16,7 +16,8 @@ import {
   Ref,
   Schedule,
   Schema,
-  Stream
+  Stream,
+  String as Str
 } from "effect"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
@@ -137,7 +138,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
     Effect.gen(function* () {
       yield* writer
       const client = yield* connect
-      const body = "水".repeat(400_000)
+      const body = Str.repeat(400_000)("水")
       const pushed = yield* client.push(
         push([
           ["large", body],
@@ -145,7 +146,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
         ])
       )
       assert.deepStrictEqual(
-        pushed.results.map((r) => r.outcome._tag),
+        Arr.map(pushed.results, (r) => r.outcome._tag),
         ["Applied", "Applied"]
       )
       const pages = yield* Stream.runCollect(
@@ -157,18 +158,18 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
         })
       )
       assert.strictEqual(pages.at(-1)?._tag, "PullDone")
-      const rows = pages.flatMap((p) =>
-        p.changes.flatMap((c) => (c._tag === "upsert" && c.table === "items" ? [c.row] : []))
+      const rows = Arr.flatMap(pages, (p) =>
+        Arr.flatMap(p.changes, (c) => (c._tag === "upsert" && c.table === "items" ? [c.row] : []))
       )
       assert.deepStrictEqual(
-        rows.map((r) => [r["id"], r["body"]]),
+        Arr.map(rows, (r) => [r["id"], r["body"]]),
         [
           ["large", body],
           ["next", "small"]
         ]
       )
       assert.deepStrictEqual(
-        pages.flatMap((p) => p.acks.map((a) => a.mutationId)),
+        Arr.flatMap(pages, (p) => Arr.map(p.acks, (a) => a.mutationId)),
         ["large", "next"]
       )
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
@@ -312,7 +313,8 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
         )
         assert.isTrue(
           Exit.isFailure(exit) &&
-            exit.cause.reasons.some(
+            Arr.some(
+              exit.cause.reasons,
               (reason) =>
                 Cause.isDieReason(reason) &&
                 reason.defect instanceof RangeError &&
@@ -439,7 +441,9 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
       assert.deepStrictEqual(pulled.acks, [
         { mutationId: result.mutationId, position: result.position, outcome: result.outcome }
       ])
-      assert.isTrue(pulled.changes.some((c) => c._tag === "upsert" && c.table === "items" && c.row["body"] === "hello"))
+      assert.isTrue(
+        Arr.some(pulled.changes, (c) => c._tag === "upsert" && c.table === "items" && c.row["body"] === "hello")
+      )
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
@@ -468,12 +472,12 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
       )
       if (!Exit.isSuccess(exit)) return assert.fail(`push failed: ${String(exit.cause)}`)
       assert.deepStrictEqual(
-        exit.value.results.map((r) => r.mutationId),
+        Arr.map(exit.value.results, (r) => r.mutationId),
         ["m1"]
       )
       const ledgered = yield* sql<{ mutation_id: string }>`SELECT mutation_id FROM echo_sync.mutations`
       assert.deepStrictEqual(
-        ledgered.map((r) => r.mutation_id),
+        Arr.map(ledgered, (r) => r.mutation_id),
         ["m1"]
       )
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
@@ -596,7 +600,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
       const killed = sql<{ killed: boolean }>`
         SELECT pg_terminate_backend(pid) AS killed FROM pg_stat_activity
         WHERE datname = current_database() AND query ILIKE 'listen%'`.pipe(
-        Effect.flatMap((rows) => (rows.some((r) => r.killed) ? Effect.void : Effect.fail("no listener yet"))),
+        Effect.flatMap((rows) => (Arr.some(rows, (r) => r.killed) ? Effect.void : Effect.fail("no listener yet"))),
         Effect.retry(Schedule.spaced("20 millis").pipe(Schedule.upTo({ times: 100 })))
       )
       yield* killed
@@ -698,15 +702,16 @@ describe.skipIf(!pgAvailable)("the replica's principal against the authenticated
           for (const exit of exits) {
             const error = refusal(exit)
             assert.strictEqual(error?._tag, "Unauthorized", String(exit))
-            if (!(error instanceof Protocol.Unauthorized)) return assert.fail(`expected Unauthorized: ${String(exit)}`)
+            if (!Schema.is(Protocol.Unauthorized)(error)) return assert.fail(`expected Unauthorized: ${String(exit)}`)
+            assert.instanceOf(error, Protocol.Unauthorized)
             assert.strictEqual(error.reason, "principalMismatch")
             messages.add(error !== undefined && "message" in error ? String(error.message) : "")
           }
           // One fixed message, naming neither principal.
           assert.strictEqual(messages.size, 1)
           assert.isFalse(
-            [...messages].some((m) => m.includes(alice) || m.includes(bob)),
-            [...messages].join()
+            Arr.some([...messages], (m) => Str.includes(alice)(m) || Str.includes(bob)(m)),
+            Arr.join([...messages], ",")
           )
           assert.deepStrictEqual({ ...counts, state: yield* state }, before)
         })
@@ -749,7 +754,8 @@ describe.skipIf(!pgAvailable)("the replica's principal against the authenticated
       )
       const error = refusal(yield* Effect.exit(client.pull(pullFor("refused"))))
       assert.strictEqual(error?._tag, "Unauthorized")
-      if (!(error instanceof Protocol.Unauthorized)) return assert.fail(`expected Unauthorized: ${String(error)}`)
+      if (!Schema.is(Protocol.Unauthorized)(error)) return assert.fail(`expected Unauthorized: ${String(error)}`)
+      assert.instanceOf(error, Protocol.Unauthorized)
       assert.strictEqual(error.reason, "authenticationRefused")
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
@@ -763,7 +769,8 @@ describe.skipIf(!pgAvailable)("the replica's principal against the authenticated
       const other = yield* connectTo(db, undefined, () => Effect.succeed(AccessScope.PrincipalId.make("other")))
       const error = refusal(yield* Effect.exit(other.pull(pullFor("bound-client"))))
       assert.strictEqual(error?._tag, "Unauthorized")
-      if (!(error instanceof Protocol.Unauthorized)) return assert.fail(`expected Unauthorized: ${String(error)}`)
+      if (!Schema.is(Protocol.Unauthorized)(error)) return assert.fail(`expected Unauthorized: ${String(error)}`)
+      assert.instanceOf(error, Protocol.Unauthorized)
       assert.strictEqual(error.reason, "clientPrincipalMismatch")
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
@@ -807,7 +814,8 @@ describe.skipIf(!pgAvailable)("the everyone principal at the RPC boundary (SPEC 
       for (const exit of exits) {
         const error = refusal(exit)
         assert.strictEqual(error?._tag, "Unauthorized", String(exit))
-        if (!(error instanceof Protocol.Unauthorized)) return assert.fail(`expected Unauthorized: ${String(exit)}`)
+        if (!Schema.is(Protocol.Unauthorized)(error)) return assert.fail(`expected Unauthorized: ${String(exit)}`)
+        assert.instanceOf(error, Protocol.Unauthorized)
         assert.strictEqual(error.reason, "wildcardPrincipal")
       }
       const after = yield* sql<{ clients: number; ledger: number }>`
@@ -899,7 +907,7 @@ describe.skipIf(!pgAvailable)("one LISTEN per server process (SPEC §10.1)", () 
         })
         if (pulled._tag !== "PullDone") return assert.fail("expected PullDone")
         assert.isTrue(
-          pulled.changes.some((c) => c._tag === "upsert" && c.table === "items" && c.row["id"] === "before")
+          Arr.some(pulled.changes, (c) => c._tag === "upsert" && c.table === "items" && c.row["id"] === "before")
         )
         yield* sql`INSERT INTO items (id, access_scope_id) VALUES ('after', 's1')`
         yield* nextPoke(received)
@@ -925,7 +933,7 @@ describe.skipIf(!pgAvailable)("one LISTEN per server process (SPEC §10.1)", () 
           Effect.timeoutOption(Queue.take(ended), "5 seconds")
         )
         assert.deepStrictEqual(
-          endings.map((e) => Option.getOrElse(e, () => "still open")),
+          Arr.map(endings, (e) => Option.getOrElse(e, () => "still open")),
           ["ServerUnavailable", "ServerUnavailable", "ServerUnavailable"]
         )
 
@@ -956,7 +964,9 @@ describe.skipIf(!pgAvailable)("pokes liveness (SPEC §10.1)", () => {
         const pulls = { n: 0 }
         // The leader's loop: followPokes over the real RPC stream, `wake` is what runs a pull.
         const stream = client.pokes({ clientId: Ids.ClientId.make("d") }).pipe(
-          Stream.tap((element) => Effect.sync(() => void seen.push({ tag: element._tag, at: Date.now() }))),
+          Stream.tap((element) =>
+            Effect.map(Clock.currentTimeMillis, (at) => void seen.push({ tag: element._tag, at }))
+          ),
           Stream.catchTag("ResnapshotRequired", (error) => Stream.die(error))
         )
         yield* Effect.forkChild(
@@ -969,13 +979,13 @@ describe.skipIf(!pgAvailable)("pokes liveness (SPEC §10.1)", () => {
         // No commit happened: the initial poke, then heartbeats only, never more than one interval
         // (plus scheduling slack) apart.
         assert.deepStrictEqual(
-          seen.map((e) => e.tag),
+          Arr.map(seen, (e) => e.tag),
           ["poke", ...Arr.makeBy(seen.length - 1, () => "heartbeat")]
         )
-        const gaps = seen.slice(1).map((e, i) => e.at - (seen[i]?.at ?? e.at))
+        const gaps = Arr.map(seen.slice(1), (e, i) => e.at - (seen[i]?.at ?? e.at))
         assert.isTrue(
-          gaps.every((gap) => gap < 450),
-          `gaps ${gaps.join(", ")} ms`
+          Arr.every(gaps, (gap) => gap < 450),
+          `gaps ${Arr.join(Arr.map(gaps, String), ", ")} ms`
         )
         assert.strictEqual(pulls.n, 1) // the initial poke's pull only
         // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
@@ -985,7 +995,7 @@ describe.skipIf(!pgAvailable)("pokes liveness (SPEC §10.1)", () => {
 })
 
 /** A channel name over 63 bytes: `PgClient.listen` reserves its pool connection, then rejects it. */
-const tooLong = "x".repeat(64)
+const tooLong = Str.repeat(64)("x")
 
 /**
  * The test database's own pool of 3, whose `listen` the test can steer: while `failing()` the
@@ -1011,7 +1021,8 @@ const steeredPool = (failing: () => boolean) =>
   })
 
 /** Real time, independent of the TestClock. */
-const realSleep = (ms: number) => Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+const realSleep = (ms: number) =>
+  Effect.sleep(ms).pipe(Effect.provideService(Clock.Clock, Context.get(Context.empty(), Clock.Clock)))
 const eventually = <E, R>(check: Effect.Effect<boolean, E, R>, what: string) =>
   Effect.gen(function* () {
     for (let i = 0; i < 250; i++) {
@@ -1130,6 +1141,9 @@ describe.skipIf(!pgAvailable)("re-establishing the shared LISTEN (SPEC §10.1)",
 /** The tag of the exit's sole typed failure, or a description of why there is none. */
 const failureTag = (exit: Exit.Exit<unknown, { readonly _tag: string }>) => {
   if (Exit.isSuccess(exit)) return "success"
-  if (exit.cause.reasons.some((r) => !Cause.isFailReason(r))) return `not a typed failure: ${String(exit.cause)}`
-  return exit.cause.reasons.map((r) => (Cause.isFailReason(r) ? r.error._tag : "")).join(",")
+  if (Arr.some(exit.cause.reasons, (r) => !Cause.isFailReason(r))) return `not a typed failure: ${String(exit.cause)}`
+  return Arr.join(
+    Arr.map(exit.cause.reasons, (r) => (Cause.isFailReason(r) ? r.error._tag : "")),
+    ","
+  )
 }

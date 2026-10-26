@@ -3,7 +3,7 @@ import "../src/client/testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { assert, describe, it } from "@effect/vitest"
 import type * as PgClient from "@effect/sql-pg/PgClient"
-import { Context, Effect, Fiber, Layer, Option, Schema, Stream } from "effect"
+import { Array as Arr, Context, Effect, Fiber, Layer, Option, Schema, Stream } from "effect"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as HttpRouter from "effect/http/HttpRouter"
 import { SqlClient } from "effect/sql/SqlClient"
@@ -73,7 +73,9 @@ const setup = Effect.gen(function* () {
       grants: sqlite<{ g: string }>`SELECT access_scope_id || ':' || principal_id AS g FROM scope_grants ORDER BY g`,
       items: sqlite<{ id: string }>`SELECT id FROM items ORDER BY id`
     })
-  ).pipe(Effect.map(({ grants, items }) => ({ grants: grants.map((r) => r.g), items: items.map((r) => r.id) })))
+  ).pipe(
+    Effect.map(({ grants, items }) => ({ grants: Arr.map(grants, (r) => r.g), items: Arr.map(items, (r) => r.id) }))
+  )
   /** Every server row a request could bind, ledger, record or write, in full. */
   const server = Effect.gen(function* () {
     const pg = yield* SqlClient
@@ -92,7 +94,8 @@ const setup = Effect.gen(function* () {
     return {
       clients: yield* pg<{ client_id: string; principal_id: string }>`
         SELECT client_id, principal_id FROM echo_sync.clients ORDER BY client_id`,
-      ledger: (yield* pg<{ mutation_id: string }>`SELECT mutation_id FROM echo_sync.mutations ORDER BY position`).map(
+      ledger: Arr.map(
+        yield* pg<{ mutation_id: string }>`SELECT mutation_id FROM echo_sync.mutations ORDER BY position`,
         (r) => r.mutation_id
       )
     }
@@ -127,7 +130,7 @@ describe.skipIf(!pgAvailable)("replica principal vs. session (SPEC §5) against 
         const before = { server: yield* server, local: yield* local }
         assert.deepStrictEqual((yield* serverRows).clients, [])
         assert.deepStrictEqual(
-          before.local.pending.map((p) => p.envelope),
+          Arr.map(before.local.pending, (p) => p.envelope),
           [yield* Schema.encodeEffect(Mutation.MutationEnvelope)(write)]
         )
         const loop = yield* SyncLoop.make({
@@ -192,7 +195,7 @@ describe.skipIf(!pgAvailable)("replica principal vs. session (SPEC §5) against 
         assert.deepStrictEqual({ server: yield* server, local: yield* local }, before)
         assert.deepStrictEqual((yield* serverRows).ledger, [])
         assert.deepStrictEqual(
-          before.local.pending.map((p) => p.envelope),
+          Arr.map(before.local.pending, (p) => p.envelope),
           [yield* Schema.encodeEffect(Mutation.MutationEnvelope)(write)]
         )
 

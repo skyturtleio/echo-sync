@@ -55,6 +55,7 @@ export const lostError = (leaderId: string, detail?: string) =>
     message: `leader ${leaderId} went away${detail === undefined ? "" : `: ${detail}`}`
   })
 
+// oxlint-disable-next-line effecttsgo/instance-of-schema -- Only the connected RPC implementation's failures signal connection loss, not same-identifier domain classes.
 const isRpcClientError = (u: unknown): u is RpcClientError => u instanceof RpcClientError
 
 export const makeUnsafe = (): LeaderRoute => {

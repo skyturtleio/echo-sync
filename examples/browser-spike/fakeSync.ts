@@ -4,8 +4,9 @@
  * an empty `PullDone`, and pokes sends one poke and then ends cleanly. Per-client counters are served at
  * `/fake-sync/stats?clientId=…`, so a scenario can watch the leader's sync loop from outside.
  */
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Vite middleware exposes Node HTTP types at its platform boundary.
 import type { IncomingMessage, ServerResponse } from "node:http"
-import { Effect, Layer, Schema, Stream } from "effect"
+import { Effect, Layer, Stream, String as Str } from "effect"
 import { HttpRouter } from "effect/http"
 import { RpcSerialization, RpcServer } from "effect/rpc"
 import { Ids, Protocol } from "../../src/core/index.ts"
@@ -41,7 +42,7 @@ const handlers = Protocol.SyncRpcs.toLayer({
       _tag: "PullDone" as const,
       changes: [],
       acks: [],
-      nextCursor: Schema.decodeUnknownSync(Ids.Position)("1"),
+      nextCursor: Ids.Position.make(1n),
       expiredThrough: Ids.SeqFloor.make(0)
     })
   },
@@ -59,6 +60,7 @@ const web = HttpRouter.toWebHandler(
 )
 
 const body = (req: IncomingMessage): Promise<Buffer> =>
+  // oxlint-disable-next-line effecttsgo/new-promise -- Bridge Vite's native Node IncomingMessage events to its Promise-based web handler.
   new Promise((resolve, reject) => {
     const chunks: Array<Buffer> = []
     req.on("data", (chunk: Buffer) => chunks.push(chunk))
@@ -69,13 +71,14 @@ const body = (req: IncomingMessage): Promise<Buffer> =>
 export const middleware = (req: IncomingMessage, res: ServerResponse, next: () => void): void => {
   const url = new URL(req.url ?? "/", "http://harness")
   // `RpcClient.layerProtocolHttp({ url })` posts to `<url>/` (it prepends `url` to the path "/").
-  if (url.pathname.endsWith("/")) url.pathname = url.pathname.slice(0, -1)
+  if (Str.endsWith("/")(url.pathname)) url.pathname = Str.slice(0, -1)(url.pathname)
   if (url.pathname === "/fake-sync/stats") {
     res.setHeader("content-type", "application/json")
     res.end(JSON.stringify(statsFor(url.searchParams.get("clientId") ?? "")))
     return
   }
   if (url.pathname !== "/fake-sync/rpc") return next()
+  // oxlint-disable-next-line effecttsgo/async-function -- Connect middleware is a Node HTTP host boundary adapting request/response Promises, not engine logic.
   void (async () => {
     const response = await web.handler(
       new Request(url, { method: req.method ?? "POST", body: new Uint8Array(await body(req)) })

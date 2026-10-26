@@ -1,4 +1,4 @@
-import { Cause, Data, DateTime, Effect, Option, Random, Schema } from "effect"
+import { Array as Arr, Cause, Data, DateTime, Effect, Option, Random, Schema } from "effect"
 import type { PrincipalId } from "./AccessScope.ts"
 import {
   ConstraintViolated,
@@ -146,17 +146,24 @@ export interface Mutation<Name extends string, A extends PureSchema, E extends P
 }
 
 const isStoreFailure = (e: unknown): e is StoreError | ArgsDecodeFailed =>
+  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Only engine-created errors are store failures; structural domain lookalikes must still be encoded.
   e instanceof RowNotFound ||
+  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve nominal store/domain failure classification.
   e instanceof RowAlreadyExists ||
+  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve nominal store/domain failure classification.
   e instanceof ScopeForbidden ||
+  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve nominal store/domain failure classification.
   e instanceof InvalidRow ||
+  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve nominal store/domain failure classification.
   e instanceof ConstraintViolated ||
+  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve nominal store/domain failure classification.
   e instanceof StoreUnavailable ||
+  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve nominal store/domain failure classification.
   e instanceof ArgsDecodeFailed
 
 /** Turns every failure in `cause` into a defect, keeping dies and interrupts. */
 const asDefects = (cause: Cause.Cause<unknown>): Cause.Cause<never> =>
-  Cause.fromReasons(cause.reasons.map((r) => (Cause.isFailReason(r) ? Cause.makeDieReason(r.error) : r)))
+  Cause.fromReasons(Arr.map(cause.reasons, (r) => (Cause.isFailReason(r) ? Cause.makeDieReason(r.error) : r)))
 
 export const make = <const Name extends string, A extends PureSchema, E extends PureSchema = Schema.Never>(
   name: Name,
@@ -182,13 +189,14 @@ export const make = <const Name extends string, A extends PureSchema, E extends 
    * anywhere is transient. Only a cause made purely of permanent failures is a rejection.
    */
   const classify = (cause: Cause.Cause<unknown>): Effect.Effect<never, MutationRejection | StoreUnavailable> => {
-    const failures = cause.reasons.filter(Cause.isFailReason).map((r) => r.error)
+    const failures = Arr.map(Arr.filter(cause.reasons, Cause.isFailReason), (r) => r.error)
     const [first] = failures
     if (first === undefined || failures.length !== cause.reasons.length) {
       return Effect.failCause(asDefects(cause))
     }
-    const transient = failures.find((e) => e instanceof StoreUnavailable)
-    if (transient !== undefined) return Effect.fail(transient)
+    // oxlint-disable-next-line effecttsgo/instance-of-schema -- A structural domain error is not an infrastructure failure.
+    const transient = Arr.findFirst(failures, (e) => e instanceof StoreUnavailable)
+    if (Option.isSome(transient)) return Effect.fail(transient.value)
     // Every domain failure must be declared and encodable, not only the one reported (INV-MUT-3):
     // an undeclared or unencodable domain error anywhere is a bug in the mutation, so the
     // mutation dies with the full cause. Otherwise the first failure in cause order is reported.
@@ -358,6 +366,7 @@ export const runHandler = (
     const rejection = yield* run(mutations, envelope, ctx).pipe(
       Effect.as(Option.none<MutationRejection>()),
       Effect.catch((error) =>
+        // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve the nominal infrastructure-failure boundary.
         error instanceof StoreUnavailable ? Effect.fail(error) : Effect.succeed(Option.some(error))
       )
     )

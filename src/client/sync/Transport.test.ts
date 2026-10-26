@@ -1,5 +1,5 @@
 import { expect, it } from "@effect/vitest"
-import { Cause, Effect, Exit, Layer, Option, Schema, Stream } from "effect"
+import { Array as Arr, Cause, Effect, Exit, Layer, Option, Order, Record, Schema, Stream, String as Str } from "effect"
 import { FetchHttpClient, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
 import { Rpc, RpcClient, RpcGroup, RpcSerialization, RpcServer } from "effect/rpc"
 import { AccessScope, Ids, Mutation, Protocol, Registry } from "echo-sync"
@@ -114,7 +114,8 @@ const skewedPull = (() => {
     ])
   )
 })()
-const position = Schema.decodeUnknownSync(Ids.Position)("7")
+const position = Ids.Position.make(7n)
+const decodeDone = (value: unknown) => Effect.orDie(Schema.decodeUnknownEffect(Protocol.PullDone)(value))
 
 it.effect("an epoch-refused pokes connection wakes pull even when the restored server has no new writes", () =>
   Effect.gen(function* () {
@@ -149,7 +150,7 @@ const failureOf = <A, E>(exit: Exit.Exit<A, E>) =>
 const isFatal = (failure: SyncFailure.PushFailure) => Option.isSome(SyncFailure.classifyPush(Cause.fail(failure)).halt)
 
 it("Unauthorized reason schema matches the closed catalog in SPEC §15", () => {
-  const fromSchema = Protocol.UnauthorizedReason.ast.types.map((member) => {
+  const fromSchema = Arr.map(Protocol.UnauthorizedReason.ast.types, (member) => {
     if (member._tag !== "Literal" || typeof member.literal !== "string") throw new Error("expected a string literal")
     return member.literal
   })
@@ -247,7 +248,7 @@ it.effect("a processed push returns core's result; a rejection keeps its class a
       serve({
         push: (req) =>
           Effect.succeed({
-            results: req.mutations.map((m) => ({
+            results: Arr.map(req.mutations, (m) => ({
               mutationId: m.mutationId,
               position,
               outcome: { _tag: "Rejected" as const, error: new Mutation.UnknownMutation({ name: m.name }) }
@@ -257,7 +258,7 @@ it.effect("a processed push returns core's result; a rejection keeps its class a
       (t) => t.push(batch(1))
     )
     const results = Exit.isSuccess(exit) ? exit.value.results : []
-    expect(results.map((r) => [r.mutationId, r.position, r.outcome._tag])).toEqual([["m1", 7n, "Rejected"]])
+    expect(Arr.map(results, (r) => [r.mutationId, r.position, r.outcome._tag])).toEqual([["m1", 7n, "Rejected"]])
     const outcome = results[0]?.outcome
     expect(outcome?._tag === "Rejected" ? outcome.error : undefined).toEqual(
       new Mutation.UnknownMutation({ name: "todo.add" })
@@ -310,7 +311,7 @@ it.effect("a transport built with headers sends them on push, pull and the pokes
             Effect.sync(() => {
               seen["push"] = headers["x-echo-principal"]
               return {
-                results: request.mutations.map((m) => ({
+                results: Arr.map(request.mutations, (m) => ({
                   mutationId: m.mutationId,
                   position,
                   outcome: { _tag: "Applied" as const }
@@ -318,16 +319,18 @@ it.effect("a transport built with headers sends them on push, pull and the pokes
               }
             }),
           pull: (_, { headers }) =>
-            Stream.sync(() => {
-              seen["pull"] = headers["x-echo-principal"]
-              return Schema.decodeUnknownSync(Protocol.PullDone)({
-                _tag: "PullDone",
-                changes: [],
-                acks: [],
-                nextCursor: "1",
-                expiredThrough: 0
+            Stream.fromEffect(
+              Effect.suspend(() => {
+                seen["pull"] = headers["x-echo-principal"]
+                return decodeDone({
+                  _tag: "PullDone",
+                  changes: [],
+                  acks: [],
+                  nextCursor: "1",
+                  expiredThrough: 0
+                })
               })
-            }),
+            ),
           pokes: (_, { headers }) =>
             Stream.fromEffect(Effect.sync(() => (seen["pokes"] = headers["x-echo-principal"]))).pipe(
               Stream.as({ _tag: "poke" as const })
@@ -412,22 +415,22 @@ it.effect("an older server serves principal-asserting RPCs but its unary pull fa
     // The keys of each payload as the previous server decoded it.
     const decoded: Record<string, ReadonlyArray<string>> = {}
     const record = (rpc: string, payload: object) =>
-      Effect.sync(() => void (decoded[rpc] = Object.keys(payload).toSorted()))
+      Effect.sync(() => void (decoded[rpc] = Arr.sort(Record.keys(payload), Order.String)))
     const app = RpcServer.layerHttp({ group: PreviousRpcs, path: "/rpc", protocol: "http" }).pipe(
       Layer.provide([
         PreviousRpcs.toLayer({
           push: (request) =>
             Effect.as(record("push", request), {
-              results: request.mutations.map((m) => ({
+              results: Arr.map(request.mutations, (m) => ({
                 mutationId: m.mutationId,
                 position,
                 outcome: { _tag: "Applied" as const }
               }))
             }),
           pull: (request) =>
-            Effect.as(
+            Effect.andThen(
               record("pull", request),
-              Schema.decodeUnknownSync(Protocol.PullDone)({
+              decodeDone({
                 _tag: "PullDone",
                 changes: [],
                 acks: [],
@@ -448,9 +451,10 @@ it.effect("an older server serves principal-asserting RPCs but its unary pull fa
     // What this client put on the wire: every request line names the replica principal.
     const lines: Array<string> = []
     const fetch = Object.assign(
+      // oxlint-disable-next-line effecttsgo/async-function -- Native fetch adapter captures Request bytes before forwarding to the in-process HTTP handler.
       async (input: URL | RequestInfo, init?: RequestInit) => {
         const request = new Request(input, init)
-        lines.push(...(await request.clone().text()).trim().split("\n"))
+        lines.push(...Str.split(Str.trim(await request.clone().text()), "\n"))
         return web.handler(request)
       },
       { preconnect: globalThis.fetch.preconnect }
@@ -477,10 +481,11 @@ it.effect("an older server serves principal-asserting RPCs but its unary pull fa
       tag: Schema.optionalKey(Schema.String),
       payload: Schema.optionalKey(Schema.Struct({ principal: Schema.optionalKey(Schema.String) }))
     })
-    const sent = lines
-      .map((line) => Schema.decodeUnknownSync(Schema.fromJsonString(Message))(line))
-      .filter((m) => m._tag === "Request")
-    expect(sent.map((m) => [m.tag, m.payload?.principal])).toEqual([
+    const sent = Arr.filter(
+      yield* Effect.forEach(lines, (line) => Schema.decodeUnknownEffect(Schema.fromJsonString(Message))(line)),
+      (m) => m._tag === "Request"
+    )
+    expect(Arr.map(sent, (m) => [m.tag, m.payload?.principal])).toEqual([
       ["push", "alice"],
       ["pull", "alice"],
       ["pokes", "alice"],
@@ -546,12 +551,18 @@ const credentials = Effect.gen(function* () {
           Effect.as(
             Effect.andThen(
               Effect.suspend(() => (state.pushDefect === undefined ? Effect.void : Effect.die(state.pushDefect))),
-              authenticate(`push(${request.mutations.map((m) => `${m.mutationId}#${m.seq}`).join(",")})`, headers)
+              authenticate(
+                `push(${Arr.join(
+                  Arr.map(request.mutations, (m) => `${m.mutationId}#${m.seq}`),
+                  ","
+                )})`,
+                headers
+              )
             ),
             {
               results: state.stopPush
                 ? []
-                : request.mutations.map((m) => ({
+                : Arr.map(request.mutations, (m) => ({
                     mutationId: m.mutationId,
                     position,
                     outcome: { _tag: "Applied" as const }
@@ -560,7 +571,7 @@ const credentials = Effect.gen(function* () {
           ),
         pull: (_, { headers }) =>
           Stream.fromEffect(
-            Effect.as(
+            Effect.andThen(
               Effect.andThen(
                 authenticate("pull", headers),
                 Effect.suspend(() =>
@@ -571,7 +582,7 @@ const credentials = Effect.gen(function* () {
                       : Effect.void
                 )
               ),
-              Schema.decodeUnknownSync(Protocol.PullDone)({
+              decodeDone({
                 _tag: "PullDone",
                 changes: [],
                 acks: [],
@@ -673,7 +684,7 @@ const eventually = (check: () => boolean, what: string) =>
   Effect.gen(function* () {
     for (let i = 0; i < 500; i++) {
       if (check()) return
-      yield* Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 10)))
+      yield* Effect.sleep(10)
     }
     return yield* Effect.die(`timed out waiting for ${what}`)
   })
@@ -691,12 +702,15 @@ it.live(
       // The app renews; the loop's next retry carries it.
       state.client = "t2"
       yield* eventually(() => seen.includes("push(m1#1):t2"), "the renewed push")
-      const pushes = seen.filter((e) => e.startsWith("push"))
-      const accepted = pushes.indexOf("push(m1#1):t2")
-      expect(pushes.slice(0, accepted).every((e) => e === "push(m1#1):t1:rejected")).toBe(true)
+      const pushes = Arr.filter(seen, Str.startsWith("push"))
+      const accepted = Option.getOrElse(
+        Arr.findFirstIndex(pushes, (e) => e === "push(m1#1):t2"),
+        () => -1
+      )
+      expect(Arr.every(pushes.slice(0, accepted), (e) => e === "push(m1#1):t1:rejected")).toBe(true)
       expect(accepted).toBeGreaterThan(0)
-      expect(statuses.some((s) => s.lastError !== null)).toBe(true)
-      expect(statuses.map((s) => s.push._tag)).not.toContain("Halted")
+      expect(Arr.some(statuses, (s) => s.lastError !== null)).toBe(true)
+      expect(Arr.map(statuses, (s) => s.push._tag)).not.toContain("Halted")
     }).pipe(Effect.scoped),
   15_000
 )
@@ -711,9 +725,9 @@ it.live(
       yield* Effect.forkChild(loop.run.pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)))
       yield* eventually(() => seen.includes("push(m1#1):t1"), "the push after the failed acquisition")
       // The first push never reached the server; the retry sent the same entry once.
-      expect(seen.filter((e) => e.startsWith("push"))).toEqual(["push(m1#1):t1"])
-      expect(statuses.some((s) => s.lastError !== null)).toBe(true)
-      expect(statuses.map((s) => s.push._tag)).not.toContain("Halted")
+      expect(Arr.filter(seen, Str.startsWith("push"))).toEqual(["push(m1#1):t1"])
+      expect(Arr.some(statuses, (s) => s.lastError !== null)).toBe(true)
+      expect(Arr.map(statuses, (s) => s.push._tag)).not.toContain("Halted")
     }).pipe(Effect.scoped),
   15_000
 )
@@ -758,7 +772,7 @@ it.live(
           Transport.layerProtocolHttp(
             "http://echo.test/rpc",
             Effect.andThen(
-              Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 300))),
+              Effect.sleep(300),
               Effect.sync(() => {
                 state.evaluations++
                 return { authorization: state.client }
@@ -790,7 +804,7 @@ it.live(
 
 /** The first `lastError` the loop reported. */
 const firstError = (statuses: ReadonlyArray<SyncLoop.SyncStatus>) =>
-  statuses.find((s) => s.lastError !== null)?.lastError
+  Option.getOrUndefined(Arr.findFirst(statuses, (s) => s.lastError !== null))?.lastError
 
 /** Runs the real loop over the fixture until it reports an error, and returns that error. */
 const errorOf = (fixture: Effect.Success<typeof credentials>, transport = fixture.transport) =>
@@ -811,6 +825,21 @@ it.live("a syncHeaders that dies is reported as kind credentials", () =>
   }).pipe(Effect.scoped)
 )
 
+class ForeignCredentials extends Schema.TaggedError<
+  ForeignCredentials,
+  { readonly ForeignCredentials: unique symbol }
+>()("CredentialsUnavailable", { message: Schema.String }) {}
+
+it.live("a fetch failure with a same-identifier foreign schema class stays network, not credentials", () =>
+  Effect.gen(function* () {
+    const fixture = yield* credentials
+    const foreign = new ForeignCredentials({ message: "foreign credential-shaped fetch rejection" })
+    expect(Schema.is(SyncFailure.CredentialsUnavailable)(foreign)).toBe(true)
+    const fetch = Object.assign(() => Promise.reject(foreign), { preconnect: globalThis.fetch.preconnect })
+    expect((yield* errorOf({ ...fixture, fetch }))?.kind).toBe("network")
+  }).pipe(Effect.scoped)
+)
+
 it.live(
   "a refused connection is reported as kind network, and the request's headers never reach the message",
   () =>
@@ -828,7 +857,7 @@ it.live(
       yield* eventually(() => firstError(statuses) !== undefined, "a lastError")
       const error = firstError(statuses)
       expect(error?.kind).toBe("network")
-      expect(error?.message.trim().length).toBeGreaterThan(0)
+      expect(error == null ? undefined : Str.trim(error.message).length).toBeGreaterThan(0)
       expect(error?.message).not.toContain("secret-4f9c2e")
     }).pipe(Effect.scoped),
   15_000
@@ -886,7 +915,7 @@ it.live(
           const { loop, statuses, pending } = yield* loopOver(transport)
           yield* Effect.forkChild(loop.run.pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)))
           yield* eventually(
-            () => statuses.filter((s) => s.phase === "backoff").length >= 2,
+            () => Arr.filter(statuses, (s) => s.phase === "backoff").length >= 2,
             "two failed cycles with backoff"
           )
           expect(firstError(statuses)).toEqual(
@@ -895,10 +924,17 @@ it.live(
               : { kind: "unauthorized", message: "the server rejected the credential (httpUnauthorized)" }
           )
           expect(received.length).toBeGreaterThanOrEqual(4) // push and pull, then their retries
-          expect(received.every((token) => token === "valid-token")).toBe(true)
-          expect(statuses.map((s) => s.push._tag)).not.toContain("Halted")
-          expect(statuses.filter((s) => s.phase === "backoff").every((s) => s.nextRetryAt !== null)).toBe(true)
-          expect((yield* pending).map((entry) => [entry.envelope.mutationId, entry.envelope.seq])).toEqual([["m1", 1]])
+          expect(Arr.every(received, (token) => token === "valid-token")).toBe(true)
+          expect(Arr.map(statuses, (s) => s.push._tag)).not.toContain("Halted")
+          expect(
+            Arr.every(
+              Arr.filter(statuses, (s) => s.phase === "backoff"),
+              (s) => s.nextRetryAt !== null
+            )
+          ).toBe(true)
+          expect(Arr.map(yield* pending, (entry) => [entry.envelope.mutationId, entry.envelope.seq])).toEqual([
+            ["m1", 1]
+          ])
         }).pipe(Effect.scoped)
       }
     }).pipe(Effect.scoped)
@@ -933,7 +969,11 @@ const statusText = (
     const { loop, statuses } = yield* loopOver(transport)
     yield* Effect.forkChild(loop.run.pipe(Effect.provideService(FetchHttpClient.Fetch, fixture.fetch)))
     yield* eventually(() => done(statuses), "the failure in status")
-    return { text: JSON.stringify(statuses), statuses }
+    return {
+      // Serialize the entire emission without a typed codec dropping excess fields: secrets anywhere must fail.
+      text: yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(statuses),
+      statuses
+    }
   })
 
 const hasError = (statuses: ReadonlyArray<SyncLoop.SyncStatus>) => firstError(statuses) !== undefined
@@ -990,9 +1030,9 @@ it.live("no syncStatus string carries a secret from the failure: the Halted reas
   Effect.gen(function* () {
     const fixture = yield* credentials
     fixture.state.pushDefect = new Error(`handler crashed on ${sentinel}`)
-    const { text, statuses } = yield* statusText(fixture, (all) => all.some((s) => s.push._tag === "Halted"))
+    const { text, statuses } = yield* statusText(fixture, (all) => Arr.some(all, (s) => s.push._tag === "Halted"))
     expect(text).not.toContain(sentinel)
-    expect(statuses.find((s) => s.push._tag === "Halted")?.push).toEqual({
+    expect(Option.getOrUndefined(Arr.findFirst(statuses, (s) => s.push._tag === "Halted"))?.push).toEqual({
       _tag: "Halted",
       message: "the server ended the push with a defect"
     })

@@ -15,6 +15,7 @@
  * the single leader connection, so local order is total and gap-free (a rolled-back append also rolls
  * back its `sqlite_sequence` bump, and AUTOINCREMENT never reuses a removed seq).
  */
+import * as Arr from "effect/Array"
 import * as Clock from "effect/Clock"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
@@ -53,7 +54,7 @@ const toEntries = (rows: ReadonlyArray<unknown>): Effect.Effect<ReadonlyArray<Ou
   // defect, never something a caller can recover from by retrying.
   Effect.forEach(rows, (row) => Store.decodeStored(EntryRow, "echo_outbox", row)).pipe(
     Effect.map((decoded) =>
-      decoded.map((r) => ({
+      Arr.map(decoded, (r) => ({
         seq: r.seq,
         clientId: r.client_id,
         mutationId: r.mutation_id,

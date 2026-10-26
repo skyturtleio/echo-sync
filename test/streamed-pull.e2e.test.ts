@@ -3,7 +3,7 @@ import "../src/client/testing/nodeWasm.ts"
 import { describe, expect, it } from "@effect/vitest"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import type * as PgClient from "@effect/sql-pg/PgClient"
-import { Context, Deferred, Effect, Fiber, Layer, Option, Schema, Stream } from "effect"
+import { Context, Deferred, Effect, Fiber, Layer, Option, Schema, Stream, String as Str } from "effect"
 import { FetchHttpClient, HttpRouter } from "effect/http"
 import { Rpc, RpcClient, RpcGroup, RpcSerialization, RpcServer } from "effect/rpc"
 import * as Reactivity from "effect/reactivity/Reactivity"
@@ -124,7 +124,7 @@ describe.skipIf(!pgAvailable)("streamed pull over real HTTP codecs and SQLite", 
         const pg = Context.get(db, SqlClient)
         yield* grant("p", "s")
         // An indivisible row above the page target must survive staging, disconnect and install.
-        const large = "水".repeat(400_000)
+        const large = Str.repeat(400_000)("水")
         yield* pg`INSERT INTO items (id, access_scope_id, body) VALUES ('a','s',${large}), ('b','s','two'), ('c','s','three')`
         const connection = yield* connect(
           layerHttp({

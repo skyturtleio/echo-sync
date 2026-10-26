@@ -1,14 +1,17 @@
 // Node implements the Web Locks API (navigator.locks), so the lock helpers run here unmodified.
 import { expect, it } from "@effect/vitest"
+import * as Arr from "effect/Array"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Scope from "effect/Scope"
+import * as Str from "effect/String"
 import * as Platform from "./platform.ts"
+import { randomUUIDv4 } from "../Crypto.ts"
 
 const pendingFor = (name: string) =>
   Effect.promise(() => navigator.locks.query()).pipe(
-    Effect.map((snapshot) => (snapshot.pending ?? []).filter((lock) => lock.name === name).length)
+    Effect.map((snapshot) => Arr.filter(snapshot.pending ?? [], (lock) => lock.name === name).length)
   )
 
 const waitUntil = (condition: Effect.Effect<boolean>) =>
@@ -16,7 +19,7 @@ const waitUntil = (condition: Effect.Effect<boolean>) =>
 
 it.live("an interrupted lock wait leaves the queue and never acquires the lock afterwards", () =>
   Effect.gen(function* () {
-    const name = `test:${crypto.randomUUID()}`
+    const name = `test:${yield* randomUUIDv4}`
     const holder = yield* Scope.make()
     yield* Platform.holdLock(name).pipe(Scope.provide(holder))
 
@@ -39,7 +42,7 @@ it.live(
       // The holder's release and the waiter's deadline race at every offset around the deadline; whichever wins,
       // a waiter that answers `false` must not be granted the lock later (INV-BRW-7 reset `closeTimeout`).
       for (let offset = -3; offset <= 3; offset++) {
-        const name = `test:${crypto.randomUUID()}`
+        const name = `test:${yield* randomUUIDv4}`
         const holder = yield* Scope.make()
         yield* Platform.holdLock(name).pipe(Scope.provide(holder))
         const release = yield* Effect.forkChild(
@@ -61,8 +64,9 @@ it.live(
 
 it.live("a name held only in shared mode does not count as held (a dead leader's watchers)", () =>
   Effect.gen(function* () {
-    const name = `test:${crypto.randomUUID()}`
+    const name = `test:${yield* randomUUIDv4}`
     let drop: (() => void) | undefined
+    // oxlint-disable-next-line effecttsgo/new-promise -- The actual Web Locks callback must return a pending Promise to hold the shared lock until drop().
     const shared = navigator.locks.request(name, { mode: "shared" }, () => new Promise<void>((r) => (drop = r)))
     yield* waitUntil(Effect.sync(() => drop !== undefined))
     expect(yield* Platform.isLockHeld(name)).toBe(false)
@@ -96,30 +100,32 @@ it.live(
   () =>
     Effect.sync(() => {
       // 256 + 4 + 14 = 274 characters of path, far inside the pool's 502: only the per-name bound refuses.
-      expect(Platform.validateIdentity({ appId: "app", profile: "p".repeat(256) })).toContain("profile is 256 bytes")
-      expect(Platform.validateIdentity({ appId: "a".repeat(256), profile: "p" })).toContain("appId is 256 bytes")
-      expect(Platform.validateIdentity({ appId: "app", profile: "p".repeat(255) })).toBeUndefined()
-      expect(Platform.validateIdentity({ appId: "a".repeat(255), profile: "p" })).toBeUndefined()
+      expect(Platform.validateIdentity({ appId: "app", profile: Str.repeat(256)("p") })).toContain(
+        "profile is 256 bytes"
+      )
+      expect(Platform.validateIdentity({ appId: Str.repeat(256)("a"), profile: "p" })).toContain("appId is 256 bytes")
+      expect(Platform.validateIdentity({ appId: "app", profile: Str.repeat(255)("p") })).toBeUndefined()
+      expect(Platform.validateIdentity({ appId: Str.repeat(255)("a"), profile: "p" })).toBeUndefined()
     })
 )
 
 // Derived from the pinned AccessHandlePoolVFS: it stores "/" + SQLite's file name and throws once the
 // UTF-8 path reaches HEADER_MAX_PATH_SIZE = 512 bytes; the longest file name is "<db>-journal".
 const stored = (identity: Platform.ReplicaIdentity) => `/${Platform.dbName(identity)}-journal`
-const fill = (n: number) => "p".repeat(n)
+const fill = (n: number) => Str.repeat(n)("p")
 
 it.live(
   "the longest identity whose journal path fits the pool's 512-byte path header is accepted; one more character is not",
   () =>
-    Effect.sync(() => {
+    Effect.gen(function* () {
       // Split across both segments: each is also bounded by maxSegmentBytes.
-      const appId = "a".repeat(511 - stored({ appId: "", profile: fill(Platform.maxSegmentBytes) }).length)
+      const appId = Str.repeat(511 - stored({ appId: "", profile: fill(Platform.maxSegmentBytes) }).length)("a")
       const longest = { appId, profile: fill(Platform.maxSegmentBytes) }
       expect(new TextEncoder().encode(stored(longest)).length).toBe(511)
       expect(Platform.validateIdentity(longest)).toBeUndefined()
       const tooLong = { appId: `${appId}a`, profile: longest.profile }
       expect(Platform.validateIdentity(tooLong)).toContain(String(Platform.maxDbNameLength))
       // The trial's identity (a UUID profile) is well inside the bound.
-      expect(Platform.validateIdentity({ appId: "heybabe-trial", profile: crypto.randomUUID() })).toBeUndefined()
+      expect(Platform.validateIdentity({ appId: "heybabe-trial", profile: yield* randomUUIDv4 })).toBeUndefined()
     })
 )

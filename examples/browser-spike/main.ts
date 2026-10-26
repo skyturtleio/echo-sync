@@ -8,6 +8,8 @@ import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
+import { Array as Arr, Clock, DateTime, Record as Rec, String as Str } from "effect"
+import { randomUUIDv4 } from "../../src/client/Crypto.ts"
 import * as LeaderClientModule from "../../src/client/worker/LeaderClient.ts"
 import type { OutboxEnvelope, QueryResult, SqlParams } from "../../src/client/worker/LeaderRpcs.ts"
 import type { ToRouter } from "../../src/client/worker/messages.ts"
@@ -23,6 +25,7 @@ const profile = params.get("profile") ?? "default"
 const noSharedWorker = params.has("noSharedWorker")
 
 let releaseEpochWatch = () => {}
+// oxlint-disable-next-line effecttsgo/new-promise -- Fault injection must return the real browser lock callback's shared, manually released Promise.
 const epochWatchGate = new Promise<void>((resolve) => {
   releaseEpochWatch = resolve
 })
@@ -35,10 +38,15 @@ if (params.has("holdEpochWatch")) {
   Object.defineProperty(locks, "request", {
     value: (name: string, options: LockOptions, callback: LockGrantedCallback<unknown>) =>
       options.mode === "shared" && isEpoch(name)
-        ? request(name, options, async (lock) => {
-            await epochWatchGate
-            return callback(lock)
-          })
+        ? request(
+            name,
+            options,
+            // oxlint-disable-next-line effecttsgo/async-function -- Browser lock replacement preserves the Promise callback contract and delayed grant timing.
+            async (lock) => {
+              await epochWatchGate
+              return callback(lock)
+            }
+          )
         : request(name, options, callback)
   })
 }
@@ -48,7 +56,7 @@ if (params.has("ignoreReset")) {
   const add = BroadcastChannel.prototype.addEventListener
   Object.defineProperty(BroadcastChannel.prototype, "addEventListener", {
     value: function (this: BroadcastChannel, ...args: Parameters<typeof add>): unknown {
-      if (this.name.startsWith("echo:") && this.name.endsWith(":reset")) return
+      if (Str.startsWith("echo:")(this.name) && Str.endsWith(":reset")(this.name)) return
       return Reflect.apply(add, this, args)
     }
   })
@@ -62,7 +70,7 @@ if (params.has("closeOnReset")) {
   const add = BroadcastChannel.prototype.addEventListener
   Object.defineProperty(BroadcastChannel.prototype, "addEventListener", {
     value: function (this: BroadcastChannel, type: string, listener: EventListener, ...rest: Array<unknown>): unknown {
-      if (!(this.name.startsWith("echo:") && this.name.endsWith(":reset"))) {
+      if (!(Str.startsWith("echo:")(this.name) && Str.endsWith(":reset")(this.name))) {
         return Reflect.apply(add, this, [type, listener, ...rest])
       }
       const wrapped = (event: Event) => {
@@ -81,7 +89,8 @@ if (noSharedWorker) {
 const $ = (id: string) => document.getElementById(id)
 const log = (line: string) => {
   const el = $("log")
-  if (el) el.textContent = `${new Date().toISOString().slice(11, 23)} ${line}\n${el.textContent ?? ""}`
+  if (el)
+    el.textContent = `${Str.slice(11, 23)(DateTime.formatIso(DateTime.nowUnsafe()))} ${line}\n${el.textContent ?? ""}`
 }
 
 const netKey = `${appId}/${profile}`
@@ -115,7 +124,7 @@ const spawnRouter = (name: string) => {
 const spawnLeaderWith = (extra: Readonly<Record<string, string>>) => (name: string) => {
   const url = new URL("./leader.worker.ts", import.meta.url)
   for (const flag of ["crashAfterCommit", "failOpen"]) if (params.has(flag)) url.searchParams.set(flag, "")
-  for (const [flag, value] of Object.entries(extra)) url.searchParams.set(flag, value)
+  for (const [flag, value] of Rec.toEntries(extra)) url.searchParams.set(flag, value)
   const syncUrl = params.get("syncUrl")
   if (syncUrl !== null) url.searchParams.set("syncUrl", syncUrl)
   // The harness network gate (`echo.setOffline`), per identity; the state outlives a reload.
@@ -191,17 +200,22 @@ const echo = {
   statusLog,
   statusWatch,
   /** `client.mutate` (the retrying write API) with mutation `t`; resolves with how long it took. */
+  // oxlint-disable-next-line effecttsgo/async-function -- window.echo is the Promise-based browser automation boundary, not engine control flow.
   mutate: async (args: Schema.Json = {}) => {
     const started = performance.now()
     const outcome = await run(client.mutate(t, args))
     return { ...outcome, ms: Math.round(performance.now() - started) }
   },
   /** Every Web Lock, held or pending, of this page's identity (or `target`), by name and mode. */
+  // oxlint-disable-next-line effecttsgo/async-function -- Browser automation directly inspects the Promise-based Web Locks API.
   locksFor: async (target: { readonly appId: string; readonly profile: string } = { appId, profile }) => {
     const prefix = `echo:${target.appId}:${target.profile}:`
     const snapshot = await navigator.locks.query()
     const pick = (locks: ReadonlyArray<LockInfo> | undefined) =>
-      (locks ?? []).filter((l) => l.name?.startsWith(prefix) === true).map((l) => `${l.mode}:${l.name}`)
+      Arr.map(
+        Arr.filter(locks ?? [], (l) => l.name !== undefined && Str.startsWith(prefix)(l.name)),
+        (l) => `${l.mode}:${l.name}`
+      )
     return { held: pick(snapshot.held), pending: pick(snapshot.pending) }
   },
   /** Lets the epoch-lock callbacks held by `?holdEpochWatch` run. */
@@ -250,7 +264,7 @@ const echo = {
     const fiber = Effect.runFork(
       Stream.runForEach(client.presence(AccessScope.AccessScopeId.make(room), state), (snapshot) =>
         Effect.sync(
-          () => void watch.snapshots.push(snapshot.entries.map((e) => `${e.tabId}=${JSON.stringify(e.state)}`))
+          () => void watch.snapshots.push(Arr.map(snapshot.entries, (e) => `${e.tabId}=${JSON.stringify(e.state)}`))
         )
       ).pipe(
         Effect.exit,
@@ -272,21 +286,25 @@ const echo = {
     return true
   },
   /** With `?closeOnReset`: resolves once the scope close forked by the reset completed, with this page's locks. */
+  // oxlint-disable-next-line effecttsgo/async-function -- Preserve the automation surface's Promise result, including native Promise flattening.
   closedOnReset: async () => {
     const settled = await echo.until(() => closedOnReset)
     return settled === undefined ? null : settled
   },
   /** This page's own (not its workers') Web Locks of its identity, held or pending, as `mode:name`. */
+  // oxlint-disable-next-line effecttsgo/async-function -- Web Locks inspection is an external Promise interface.
   pageLocks: async () => {
-    const probe = `echo-test:probe:${crypto.randomUUID()}`
+    const probe = `echo-test:probe:${await Effect.runPromise(randomUUIDv4)}`
+    // oxlint-disable-next-line effecttsgo/async-function -- The lock remains held until this browser callback's Promise settles.
     return navigator.locks.request(probe, async () => {
       const snapshot = await navigator.locks.query()
-      const self = (snapshot.held ?? []).find((l) => l.name === probe)?.clientId
+      const self = Option.getOrUndefined(Arr.findFirst(snapshot.held ?? [], (l) => l.name === probe))?.clientId
       const prefix = `echo:${appId}:${profile}:`
       const pick = (locks: ReadonlyArray<LockInfo> | undefined) =>
-        (locks ?? [])
-          .filter((l) => l.clientId === self && l.name?.startsWith(prefix) === true)
-          .map((l) => `${l.mode}:${l.name}`)
+        Arr.map(
+          Arr.filter(locks ?? [], (l) => l.clientId === self && l.name !== undefined && Str.startsWith(prefix)(l.name)),
+          (l) => `${l.mode}:${l.name}`
+        )
       return { held: pick(snapshot.held), pending: pick(snapshot.pending) }
     })
   },
@@ -296,6 +314,7 @@ const echo = {
    * terminates its worker, as soon as its worker reaches that point (`interrupted: true`); a reset that never
    * reaches it completes as usual (`interrupted: false`).
    */
+  // oxlint-disable-next-line effecttsgo/async-function -- Automation combines the engine's result with wall-clock timing at its Promise boundary.
   resetReplica: async (
     target: { readonly appId: string; readonly profile: string } = { appId, profile },
     discardPending = false,
@@ -304,7 +323,8 @@ const echo = {
   ) => {
     const started = performance.now()
     const crash = fault === "beforeTombstone" || fault === "midRemoval" ? fault : undefined
-    const faultChannel = `echo-test:reset-fault:${crypto.randomUUID()}`
+    const faultChannel = `echo-test:reset-fault:${await Effect.runPromise(randomUUIDv4)}`
+    // oxlint-disable-next-line effecttsgo/new-promise -- The fault must be armed before the reset worker starts, and stay pending when no crash point is requested.
     const hit = new Promise<void>((resolve) => {
       if (crash === undefined) return
       const channel = new BroadcastChannel(faultChannel)
@@ -362,6 +382,7 @@ const echo = {
    * Fault injection: overwrite the SQLite header of `<appId>/<profile>`'s database file in its pool (the
    * pool keeps its own 4096-byte header per file, path first), so the database no longer opens.
    */
+  // oxlint-disable-next-line effecttsgo/async-function -- Fault injection intentionally drives raw OPFS Promise/async-iterator APIs outside the engine.
   corruptReplica: async (targetApp: string, targetProfile: string): Promise<boolean> => {
     let dir = await navigator.storage.getDirectory()
     for (const part of ["echo-sync", targetApp, targetProfile]) dir = await dir.getDirectoryHandle(part)
@@ -371,7 +392,7 @@ const echo = {
       if (!(handle instanceof FileSystemFileHandle)) continue
       const header = new Uint8Array(await (await handle.getFile()).slice(0, 512).arrayBuffer())
       const path = new TextDecoder().decode(header.subarray(0, Math.max(0, header.indexOf(0))))
-      if (!path.endsWith(`${targetProfile}.db`)) continue
+      if (!Str.endsWith(`${targetProfile}.db`)(path)) continue
       const writable = await handle.createWritable({ keepExistingData: true })
       await writable.write({ type: "write", position: 4096, data: new Uint8Array(100).fill(0x5a) })
       await writable.close()
@@ -380,9 +401,10 @@ const echo = {
     return false
   },
   /** Entry names in an OPFS directory (`a/b/c`), or `null` if it does not exist. */
+  // oxlint-disable-next-line effecttsgo/async-function -- Browser automation reads the raw OPFS async iterator independently of engine behavior.
   opfsList: async (path: string): Promise<Array<string> | null> => {
     let dir = await navigator.storage.getDirectory()
-    for (const part of path.split("/")) {
+    for (const part of Str.split(path, "/")) {
       const next = await dir.getDirectoryHandle(part).catch(() => undefined)
       if (next === undefined) return null
       dir = next
@@ -392,7 +414,7 @@ const echo = {
     // oxlint-disable-next-line typescript/consistent-type-assertions -- platform edge, see above
     const iterable = dir as unknown as { values(): AsyncIterable<FileSystemHandle> }
     for await (const handle of iterable.values()) names.push(handle.name)
-    return names.toSorted()
+    return Arr.sort(names, Str.Order)
   },
   watchStatus: () => {
     Effect.runFork(
@@ -407,15 +429,18 @@ const echo = {
   },
   status: () => Effect.runPromise(currentStatus),
   /** Status once a leader is connected, or the current status after `timeoutMs`. */
-  ready: async (timeoutMs = 10_000) => {
-    const deadline = Date.now() + timeoutMs
-    let status = await Effect.runPromise(currentStatus)
-    while (status.leaderId === undefined && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 50))
-      status = await Effect.runPromise(currentStatus)
-    }
-    return status
-  },
+  ready: (timeoutMs = 10_000) =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        const deadline = (yield* Clock.currentTimeMillis) + timeoutMs
+        let status = yield* currentStatus
+        while (status.leaderId === undefined && (yield* Clock.currentTimeMillis) < deadline) {
+          yield* Effect.sleep("50 millis")
+          status = yield* currentStatus
+        }
+        return status
+      })
+    ),
   info: () => run(client.leaderInfo),
   /** The current notice list (first emission of the notices stream). */
   notices: () => run(Stream.runHead(client.notices).pipe(Effect.map((head) => Option.getOrElse(head, () => [])))),
@@ -427,6 +452,7 @@ const echo = {
   enqueue: (envelope: OutboxEnvelope) => run(client.enqueue(envelope)),
   /** Retry on LeaderUnavailable{LeaderLost} — safe because enqueue is idempotent on mutationId. */
   /** Resolves `{ ok, value, attempts }`; `attempts > 1` means at least one try ended in `LeaderLost`. */
+  // oxlint-disable-next-line effecttsgo/async-function -- The automation Promise wraps the engine's typed retry program with a test observation count.
   enqueueRetrying: async (envelope: OutboxEnvelope) => {
     let attempts = 0
     const outcome = await run(
@@ -443,20 +469,24 @@ const echo = {
     return { ...outcome, attempts }
   },
   /** Poll `condition` until it is truthy; returns its value, or `undefined` after `timeoutMs`. */
-  until: async <A>(condition: () => A | Promise<A>, timeoutMs = 15_000): Promise<A | undefined> => {
-    const deadline = Date.now() + timeoutMs
-    while (Date.now() < deadline) {
-      const value = await condition()
-      if (value) return value
-      await new Promise((resolve) => setTimeout(resolve, 20))
-    }
-    return undefined
-  },
+  until: <A>(condition: () => A | Promise<A>, timeoutMs = 15_000): Promise<A | undefined> =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        const deadline = (yield* Clock.currentTimeMillis) + timeoutMs
+        while ((yield* Clock.currentTimeMillis) < deadline) {
+          const value = yield* Effect.promise(() => Promise.resolve(condition()))
+          if (value) return value
+          yield* Effect.sleep("20 millis")
+        }
+        return undefined
+      })
+    ),
   /**
    * Cross-tab start barrier: resolves when any other tab calls `release(name)`. BroadcastChannel delivery
    * is not subject to background-tab timer throttling, unlike a shared wall-clock start time.
    */
   barrier: (name: string): Promise<void> =>
+    // oxlint-disable-next-line effecttsgo/new-promise -- Cross-tab driver API resolves on an actual BroadcastChannel event; no engine fiber owns this barrier.
     new Promise((resolve) => {
       const channel = new BroadcastChannel(`echo-test:${name}`)
       channel.addEventListener("message", () => {
@@ -488,7 +518,7 @@ const echo = {
   subscribe: (statements: ReadonlyArray<string>, tables: ReadonlyArray<string>): Subscription => {
     const sub: Subscription = { emissions: [], ended: undefined, cancel: () => Effect.runFork(Fiber.interrupt(fiber)) }
     const fiber = Effect.runFork(
-      client.subscribeRaw({ statements: statements.map((sql) => ({ sql, params: [] })), tables }).pipe(
+      client.subscribeRaw({ statements: Arr.map(statements, (sql) => ({ sql, params: [] })), tables }).pipe(
         Stream.runForEach((result) => Effect.sync(() => void sub.emissions.push(result))),
         Effect.exit,
         Effect.map((exit) => {
@@ -508,15 +538,16 @@ declare global {
 window.echo = echo
 
 // Live UI: status badge and a live count, re-subscribing on handover.
+// oxlint-disable-next-line effecttsgo/async-function -- DOM rendering is the non-Effect host boundary consuming the tab API.
 const render = async () => {
   const status = await echo.status()
   const info = await Effect.runPromise(client.leaderInfo.pipe(Effect.option, Effect.timeoutOption("50 millis")))
   const tab = $("tab")
-  if (tab) tab.textContent = status.tabId.slice(0, 8)
+  if (tab) tab.textContent = Str.slice(0, 8)(status.tabId)
   const mode = $("mode")
   if (mode) mode.textContent = status.mode
   const leader = $("leader")
-  if (leader) leader.textContent = status.leaderId?.slice(0, 8) ?? "—"
+  if (leader) leader.textContent = status.leaderId === undefined ? "—" : Str.slice(0, 8)(status.leaderId)
   const db = $("db")
   if (db) db.textContent = info._tag === "Some" && info.value._tag === "Some" ? info.value.value.dbName : "—"
   const badge = $("badge")
@@ -525,6 +556,7 @@ const render = async () => {
     badge.textContent = status.leaderId === undefined ? "no leader" : status.isLeaderTab ? "LEADER TAB" : "follower"
   }
 }
+// oxlint-disable-next-line effecttsgo/global-timers -- Host DOM refresh keeps its fixed browser cadence independently of the leader's Effect clock and lifetime.
 setInterval(() => void render(), 250)
 
 const liveCount = Effect.gen(function* () {
@@ -544,6 +576,7 @@ const liveCount = Effect.gen(function* () {
 }).pipe(
   Effect.tapError((e) => Effect.sync(() => log(`subscription ended: ${e._tag} ${"reason" in e ? e.reason : ""}`))),
   Effect.retry({ while: (e) => e._tag === "LeaderUnavailable" && e.reason === "LeaderLost" }),
+  // oxlint-disable-next-line effecttsgo/prefer-schema-over-json -- Dev-only log intentionally formats the raw error's JavaScript enumerable fields, not a wire schema.
   Effect.catch((e) => Effect.sync(() => log(`live query stopped: ${JSON.stringify(e)}`)))
 )
 Effect.runFork(liveCount)

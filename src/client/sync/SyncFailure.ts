@@ -4,7 +4,7 @@
  * Transport failures retain their original tags. The RPC-derived unions make additions require a
  * catalog mapping; whole-cause precedence remains separate from each error's meaning (SPEC §15).
  */
-import { Cause, Match, Option, Schema } from "effect"
+import { Array as Arr, Cause, Match, Option, Schema } from "effect"
 import type { Outcome } from "../../internal/Telemetry.ts"
 import type { Rpc, RpcClientError, RpcGroup } from "effect/rpc"
 import { type Errors, Protocol } from "echo-sync"
@@ -81,7 +81,7 @@ export const unauthorizedReason = (
   cause: Cause.Cause<PushFailure | PullFailure>
 ): Option.Option<Protocol.UnauthorizedReason> => {
   for (const failure of failures(cause)) {
-    if (failure instanceof Protocol.Unauthorized && failure.reason !== undefined) return Option.some(failure.reason)
+    if (Schema.is(Protocol.Unauthorized)(failure) && failure.reason !== undefined) return Option.some(failure.reason)
   }
   return Option.none()
 }
@@ -153,7 +153,7 @@ const pushMeaning = (failure: PushFailure): PushMeaning => ({
 })
 
 const failures = <E>(cause: Cause.Cause<E>): ReadonlyArray<E> =>
-  cause.reasons.filter(Cause.isFailReason).map((reason) => reason.error)
+  Arr.map(Arr.filter(cause.reasons, Cause.isFailReason), (reason) => reason.error)
 
 /**
  * `kind` and `halt` decide the status; `outcome` names the typed failures for telemetry (interruption and
@@ -172,8 +172,8 @@ export interface PushVerdict {
  * arrives as an untagged defect. Interruption is the caller's to handle first.
  */
 export const classifyPush = (cause: Cause.Cause<PushFailure>): PushVerdict => {
-  const meanings = failures(cause).map(pushMeaning)
-  const halting = meanings.find((m) => Option.isSome(m.halt))
+  const meanings = Arr.map(failures(cause), pushMeaning)
+  const halting = Option.getOrUndefined(Arr.findFirst(meanings, (m) => Option.isSome(m.halt)))
   const decisive = halting ?? meanings[0]
   const dies = Cause.hasDies(cause)
   return {
@@ -190,7 +190,7 @@ export interface PullVerdict {
 
 /** Verdict on a pull: its first failure; a defect anywhere is a transient `server` failure (it never halts). */
 export const classifyPull = (cause: Cause.Cause<PullFailure>): PullVerdict => {
-  const first = failures(cause).map(failureMeaning)[0]
+  const first = Arr.map(failures(cause), failureMeaning)[0]
   return {
     kind: Cause.hasDies(cause) || first === undefined ? "server" : first.kind,
     outcome: first?.outcome ?? "server"

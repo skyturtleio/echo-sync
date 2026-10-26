@@ -94,6 +94,7 @@ it.effect(
       expect(command).toEqual({ _tag: "Defect" })
       const mutated = yield* Echo.mutate(client(calls({ enqueue: () => Effect.die(SECRET) })), m, { v: 1 }, eh())
       expect(mutated).toEqual({ _tag: "Defect" })
+      // oxlint-disable-next-line effecttsgo/prefer-schema-over-json -- Inspect all returned properties with the native sink; schema projection could hide a secret leak.
       expect(JSON.stringify([fromSource, midStream, command, mutated])).not.toContain("secret")
       expect(logged).toEqual([])
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test composition root owns the recording logger for this test's emissions only.

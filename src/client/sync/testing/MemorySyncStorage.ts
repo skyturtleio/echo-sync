@@ -10,7 +10,7 @@
  * from the body's exit (like SQLite's BEGIN/COMMIT); the replica's own `transaction` is not
  * nested, because nested finalizers can observe different exits and split the commit.
  */
-import { Effect, Option, Schema, Semaphore } from "effect"
+import { Array as Arr, Effect, Option, Schema, Semaphore } from "effect"
 import * as Engine from "../Engine.ts"
 import { Ids } from "../../../core/index.ts"
 import type { Mutation, Protocol } from "../../../core/index.ts"
@@ -112,8 +112,8 @@ export const make = (disk: Disk): Engine.SyncStorage => {
     lookup: (mutationId) =>
       Effect.sync(() =>
         Option.fromNullishOr(
-          disk.outbox.find((entry) => entry.envelope.mutationId === mutationId)?.envelope ??
-            disk.released.get(mutationId)
+          Option.getOrUndefined(Arr.findFirst(disk.outbox, (entry) => entry.envelope.mutationId === mutationId))
+            ?.envelope ?? disk.released.get(mutationId)
         )
       ),
     nextSeq: Effect.sync(() => {
@@ -126,7 +126,7 @@ export const make = (disk: Disk): Engine.SyncStorage => {
       }),
     setUndo: (seq, undo) =>
       Effect.sync(() => {
-        disk.outbox = disk.outbox.map((e) => (e.envelope.seq === seq ? { ...e, undo } : e))
+        disk.outbox = Arr.map(disk.outbox, (e) => (e.envelope.seq === seq ? { ...e, undo } : e))
       }),
     release: (seqs) =>
       Effect.sync(() => {
@@ -134,7 +134,7 @@ export const make = (disk: Disk): Engine.SyncStorage => {
         for (const entry of disk.outbox) {
           if (gone.has(entry.envelope.seq)) disk.released.set(entry.envelope.mutationId, entry.envelope)
         }
-        disk.outbox = disk.outbox.filter((e) => !gone.has(e.envelope.seq))
+        disk.outbox = Arr.filter(disk.outbox, (e) => !gone.has(e.envelope.seq))
       }),
     staged: Effect.sync(() => disk.staged),
     stagedProgress: Effect.sync(() => ({

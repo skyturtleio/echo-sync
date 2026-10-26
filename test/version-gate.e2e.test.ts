@@ -3,7 +3,7 @@ import "../src/client/testing/nodeWasm.ts"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import type * as PgClient from "@effect/sql-pg/PgClient"
 import { describe, expect, it } from "@effect/vitest"
-import { Clock, Context, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
+import { Array as Arr, Clock, Context, Effect, Exit, Fiber, Layer, Option, Schema, Stream, String as Str } from "effect"
 import { FetchHttpClient, HttpRouter } from "effect/http"
 import { TestClock } from "effect/testing"
 import { SqlClient } from "effect/sql/SqlClient"
@@ -56,17 +56,27 @@ const serve = Effect.fnUntraced(function* (tables: Registry.SyncRegistry, client
   const sent: Array<{ tag: string; payload: Protocol.PushRequest | Protocol.PullRequest }> = []
   const Request = Schema.Struct({ tag: Schema.String, payload: Schema.Unknown })
   const fetch: typeof globalThis.fetch = Object.assign(
-    async (input: RequestInfo | URL, init?: RequestInit) => {
-      const request = new globalThis.Request(input, init)
-      for (const line of (await request.clone().text()).trim().split("\n")) {
-        const message = Schema.decodeUnknownSync(Schema.fromJsonString(Request))(line)
-        if (message.tag === "push")
-          sent.push({ tag: "push", payload: Schema.decodeUnknownSync(Protocol.PushRequest)(message.payload) })
-        if (message.tag === "pull")
-          sent.push({ tag: "pull", payload: Schema.decodeUnknownSync(Protocol.PullRequest)(message.payload) })
-      }
-      return web.handler(request)
-    },
+    (input: RequestInfo | URL, init?: RequestInit) =>
+      // oxlint-disable-next-line effecttsgo/run-effect-inside-effect -- The HTTP client invokes this Promise boundary after fixture construction; it is not a nested runner in the constructing fiber.
+      Effect.runPromise(
+        Effect.gen(function* () {
+          const request = new globalThis.Request(input, init)
+          for (const line of Str.split(Str.trim(yield* Effect.promise(() => request.clone().text())), "\n")) {
+            const message = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Request))(line)
+            if (message.tag === "push")
+              sent.push({
+                tag: "push",
+                payload: yield* Schema.decodeUnknownEffect(Protocol.PushRequest)(message.payload)
+              })
+            if (message.tag === "pull")
+              sent.push({
+                tag: "pull",
+                payload: yield* Schema.decodeUnknownEffect(Protocol.PullRequest)(message.payload)
+              })
+          }
+          return yield* Effect.promise(() => web.handler(request))
+        })
+      ),
     { preconnect: globalThis.fetch.preconnect }
   )
   // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Connection fixture owns the HTTP transport in the enclosing test scope.
@@ -136,8 +146,8 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
         ])
         expect(oldRegistry.dataHash).not.toBe(newRegistry.dataHash)
         // First discover the server epoch, then stream the snapshot; the later pull is incremental.
-        expect(sent.map(({ tag }) => tag)).toEqual(["pull", "pull", "push", "pull"])
-        expect(sent.every(({ payload }) => payload.clientVersion?.wireVersion === Protocol.wireVersion)).toBe(true)
+        expect(Arr.map(sent, ({ tag }) => tag)).toEqual(["pull", "pull", "push", "pull"])
+        expect(Arr.every(sent, ({ payload }) => payload.clientVersion?.wireVersion === Protocol.wireVersion)).toBe(true)
         // The streaming wire floor refuses a missing version before registering a legacy pull.
         const legacy = yield* Effect.flip(
           last(transport.pull({ clientId: Ids.ClientId.make("legacy"), cursor: null, continuation: Option.none() }))
@@ -176,7 +186,12 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
           name: "current"
         })
         const history = Migrate.decodeSnapshot(second.snapshot).history ?? []
-        const allowed = new Set(history.filter((h) => Number(h.migration.split("_")[0]) >= 2).map((h) => h.dataHash))
+        const allowed = new Set(
+          Arr.map(
+            Arr.filter(history, (h) => Number(Str.split(h.migration, "_")[0]) >= 2),
+            (h) => h.dataHash
+          )
+        )
         let enforce = false
         const policy: ClientPolicy = (version) =>
           !enforce ||
@@ -214,7 +229,7 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
         expect(refusal?._tag).toBe("ClientOutdated")
         const pushRefusal = yield* Effect.flip(engine.push)
         expect(pushRefusal).toBeInstanceOf(Protocol.ClientOutdated)
-        expect(history.map((h) => h.migration)).toEqual(["001_old", "002_current"])
+        expect(Arr.map(history, (h) => h.migration)).toEqual(["001_old", "002_current"])
         expect(allowed.size).toBe(1)
         const loop = yield* SyncLoop.make({
           engine,
@@ -238,12 +253,14 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
         expect(yield* storage.meta).toEqual(beforeMeta)
         expect((yield* storage.rows.scan(Items)).slice(0, 1)).toEqual(beforeRows)
         // Local revision receipts are not persisted in the mutation envelope.
-        const envelopes = [original, offline].map((receipt) => Schema.encodeSync(Mutation.MutationEnvelope)(receipt))
-        expect((yield* storage.pending).map((p) => p.envelope)).toEqual(envelopes)
+        const envelopes = yield* Effect.forEach([original, offline], (receipt) =>
+          Schema.encodeEffect(Mutation.MutationEnvelope)(receipt)
+        )
+        expect(Arr.map(yield* storage.pending, (p) => p.envelope)).toEqual(envelopes)
         yield* Fiber.interrupt(running)
         // Reopen the same database with fresh storage/engine handles and the normal registry migration.
         const updated = yield* device(Registry.make([Items, Notes]), transport, sqlite)
-        expect((yield* updated.storage.pending).map((p) => p.envelope)).toEqual(envelopes)
+        expect(Arr.map(yield* updated.storage.pending, (p) => p.envelope)).toEqual(envelopes)
         const resumed = yield* SyncLoop.make({
           engine: updated.engine,
           pendingMutations: updated.storage.pendingCount
@@ -252,7 +269,12 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
         yield* waitFor(resumed, (s) => s.lastSyncedAt !== null && s.pendingMutations === 0)
         expect((yield* resumed.status).lastError).toBeNull()
         expect((yield* resumed.status).pendingMutations).toBe(0)
-        expect(sent.filter((r) => r.tag === "push").map((r) => r.payload.clientVersion)).toEqual([
+        expect(
+          Arr.map(
+            Arr.filter(sent, (r) => r.tag === "push"),
+            (r) => r.payload.clientVersion
+          )
+        ).toEqual([
           { dataHash: oldRegistry.dataHash, wireVersion: Protocol.wireVersion },
           { dataHash: oldRegistry.dataHash, wireVersion: Protocol.wireVersion },
           { dataHash: registry.dataHash, wireVersion: Protocol.wireVersion }
@@ -345,7 +367,12 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
         expect(yield* storage.rows.scan(Notes)).toEqual([])
         const staged = yield* storage.staged
         expect(staged).toHaveLength(1)
-        expect(staged.flatMap((p) => p.changes).map((c) => (c._tag === "upsert" ? c.table : c._tag))).toEqual(["notes"])
+        expect(
+          Arr.map(
+            Arr.flatMap(staged, (p) => p.changes),
+            (c) => (c._tag === "upsert" ? c.table : c._tag)
+          )
+        ).toEqual(["notes"])
         const attempts = sent.length
         yield* clock.adjust("1 second")
         yield* waitFor(loop, (s) => s.phase === "backoff" && s.nextRetryAt !== null && s.nextRetryAt > 1000)
@@ -360,13 +387,12 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
         expect(yield* storage.meta).toEqual(savedMeta)
         expect(yield* storage.staged).toEqual(staged)
         expect(
-          sent
-            .slice(attempts)
-            .every(
-              (r) =>
-                r.payload.clientVersion?.dataHash === newRegistry.dataHash &&
-                r.payload.clientVersion.wireVersion === Protocol.wireVersion
-            )
+          Arr.every(
+            Arr.drop(sent, attempts),
+            (r) =>
+              r.payload.clientVersion?.dataHash === newRegistry.dataHash &&
+              r.payload.clientVersion.wireVersion === Protocol.wireVersion
+          )
         ).toBe(true)
         // The same leader must recover when the server catches up, without clearing valid staging.
         yield* pg`ALTER TABLE items ADD COLUMN extra_note text COLLATE "C"`
@@ -375,7 +401,7 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
         yield* clock.adjust("2 seconds")
         yield* waitFor(loop, (s) => s.lastSyncedAt !== null)
         expect((yield* loop.status).lastError).toBeNull()
-        expect((yield* storage.pending).map((p) => p.envelope)).toEqual(savedPending.map((p) => p.envelope))
+        expect(Arr.map(yield* storage.pending, (p) => p.envelope)).toEqual(Arr.map(savedPending, (p) => p.envelope))
         expect((yield* loop.status).pendingMutations).toBe(1)
         expect(yield* storage.rows.scan(extendedItems)).toEqual([
           { id: "kept", access_scope_id: "s1", body: "installed", extra_note: null },

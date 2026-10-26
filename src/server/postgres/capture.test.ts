@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Deferred, Effect, Exit, Fiber, Schema } from "effect"
+import { Array as Arr, Deferred, Effect, Exit, Fiber, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { AccessScope, Registry, SyncTable } from "echo-sync"
 import { attach, syncedTables } from "./schema.ts"
@@ -85,7 +85,10 @@ describe.skipIf(!pgAvailable)("change capture (SPEC §6)", () => {
       const failure = yield* Effect.flip(attach(Items, { schema: "Public" }))
       assert.strictEqual(failure._tag, "TableNameConflict")
       assert.deepStrictEqual(
-        (yield* syncedTables).filter((t) => t.name === "items").map((t) => t.schema),
+        Arr.map(
+          Arr.filter(yield* syncedTables, (t) => t.name === "items"),
+          (t) => t.schema
+        ),
         ["public"]
       )
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
@@ -114,8 +117,8 @@ describe.skipIf(!pgAvailable)("change capture (SPEC §6)", () => {
       const results = yield* Effect.forEach(["a", "b"], (schema) => Effect.result(attach(Dup, { schema })), {
         concurrency: "unbounded"
       })
-      assert.deepStrictEqual(results.filter((r) => r._tag === "Success").length, 1)
-      const captured = (yield* syncedTables).filter((t) => t.name === "dup")
+      assert.deepStrictEqual(Arr.filter(results, (r) => r._tag === "Success").length, 1)
+      const captured = Arr.filter(yield* syncedTables, (t) => t.name === "dup")
       assert.strictEqual(captured.length, 1)
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
@@ -175,7 +178,7 @@ describe.skipIf(!pgAvailable)("change capture (SPEC §6)", () => {
         yield* Deferred.succeed(otherAttached, undefined)
         const exit = yield* Fiber.join(t2)
         assert.isTrue(Exit.hasDies(exit))
-        assert.strictEqual((yield* syncedTables).filter((t) => t.name === "dup").length, 1)
+        assert.strictEqual(Arr.filter(yield* syncedTables, (t) => t.name === "dup").length, 1)
         // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )

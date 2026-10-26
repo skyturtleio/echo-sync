@@ -1,5 +1,5 @@
 import * as PgTypes from "@effect/sql-pg/PgTypes"
-import { Cause, Effect, Option, Schedule, Schema } from "effect"
+import { Array as Arr, Cause, Effect, Option, Schedule, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
 import { Errors, Ids, Mutation, Protocol, Store } from "echo-sync"
@@ -67,7 +67,7 @@ export interface LedgerOptions {
 
 const defaultConflictRetry = Schedule.exponential("10 millis").pipe(Schedule.upTo({ times: 4 }))
 
-const encodeOutcome = Schema.encodeSync(MutationOutcomeJson)
+const encodeOutcome = Schema.encodeEffect(MutationOutcomeJson)
 
 const transient = (envelope: Envelope, error: SqlError | Errors.StoreUnavailable) =>
   new MutationTransient({
@@ -86,7 +86,9 @@ const isConflict = (error: unknown) =>
     (error.reason._tag === "SerializationError" ||
       error.reason._tag === "DeadlockError" ||
       error.reason._tag === "UniqueViolation")) ||
+  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Retry only nominal infrastructure failures, not structural domain lookalikes.
   (error instanceof Errors.StoreUnavailable && isConflictUnavailable(error)) ||
+  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve nominal constraint classification during retries.
   (error instanceof Errors.ConstraintViolated && error.kind === "unique")
 
 /** A reason that makes the attempt a defect (INV-MUT-3 precedence: defect > transient > rejection). */
@@ -108,9 +110,9 @@ class FailedAttempt {
   constructor(attempt: Cause.Cause<AttemptError>) {
     this.attempt = attempt
     this.retryable =
-      !attempt.reasons.some(Cause.isDieReason) &&
-      !attempt.reasons.some(isDefectReason) &&
-      attempt.reasons.some((r) => Cause.isFailReason(r) && isConflict(r.error))
+      !Arr.some(attempt.reasons, Cause.isDieReason) &&
+      !Arr.some(attempt.reasons, isDefectReason) &&
+      Arr.some(attempt.reasons, (r) => Cause.isFailReason(r) && isConflict(r.error))
   }
 }
 
@@ -122,7 +124,7 @@ const asRejection = (
   cause: Cause.Cause<AttemptError>,
   uniqueExhausted = false
 ): Mutation.MutationRejection | undefined => {
-  const errors = cause.reasons.flatMap((r) => {
+  const errors = Arr.flatMap(cause.reasons, (r) => {
     if (!Cause.isFailReason(r)) return []
     const error = r.error
     if (
@@ -144,9 +146,11 @@ const asRejection = (
   return errors.length === cause.reasons.length &&
     first !== undefined &&
     isRejection(first) &&
-    errors.every(
+    Arr.every(
+      errors,
       (error) =>
         isRejection(error) &&
+        // oxlint-disable-next-line effecttsgo/instance-of-schema -- Structural rejection validation above does not change nominal retry eligibility.
         (uniqueExhausted || !(error instanceof Errors.ConstraintViolated && error.kind === "unique"))
     )
     ? first
@@ -169,7 +173,7 @@ const classify = (
 ): Effect.Effect<never, MutationTransient | ClientForbidden> => {
   const die = Effect.failCause(
     Cause.fromReasons<never>(
-      cause.reasons.map((r) =>
+      Arr.map(cause.reasons, (r) =>
         Cause.isFailReason(r)
           ? Cause.makeDieReason(r.error)
           : Cause.isDieReason(r)
@@ -178,14 +182,20 @@ const classify = (
       )
     )
   )
-  if (cause.reasons.some(isDefectReason)) return die
-  const failure = cause.reasons
-    .map((r) => (Cause.isFailReason(r) ? r.error : Cause.isDieReason(r) ? r.defect : undefined))
-    .find((e) => isSqlError(e) || e instanceof Errors.StoreUnavailable)
+  if (Arr.some(cause.reasons, isDefectReason)) return die
+  const failure = Option.getOrUndefined(
+    Arr.findFirst(
+      Arr.map(cause.reasons, (r) => (Cause.isFailReason(r) ? r.error : Cause.isDieReason(r) ? r.defect : undefined)),
+      // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve the nominal infrastructure/domain failure boundary.
+      (e) => isSqlError(e) || e instanceof Errors.StoreUnavailable
+    )
+  )
+  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve the nominal infrastructure/domain failure boundary.
   if (isSqlError(failure) || failure instanceof Errors.StoreUnavailable) {
     return Effect.fail(transient(envelope, failure))
   }
   for (const r of cause.reasons) {
+    // oxlint-disable-next-line effecttsgo/instance-of-schema -- Client binding failures originate here, not in structurally similar domain errors.
     if (Cause.isFailReason(r) && r.error instanceof ClientForbidden) return Effect.fail(r.error)
   }
   return die
@@ -343,10 +353,11 @@ export const runMutation = <R>(
               : Effect.succeed<MutationOutcome>({ _tag: "Rejected", error: rejection })
           })
         )
+        const encodedOutcome = yield* Effect.orDie(encodeOutcome(outcome))
         const inserted = yield* sql<{ position: bigint }>`
           INSERT INTO echo_sync.mutations (client_id, mutation_id, seq, position, outcome)
           VALUES (${envelope.clientId}, ${envelope.mutationId}, ${envelope.seq}, echo_sync.next_position(),
-                  ${PgTypes.jsonb(encodeOutcome(outcome))})
+                  ${PgTypes.jsonb(encodedOutcome)})
           RETURNING position`
         const position = inserted[0]?.position
         if (position === undefined) return yield* Effect.die("INSERT … RETURNING returned no row")
@@ -404,6 +415,7 @@ export const runBatch = <R>(
         item.body,
         options
       ).pipe(Effect.catchTag("MutationTransient", (error) => Effect.succeed(error)))
+      // oxlint-disable-next-line effecttsgo/instance-of-schema -- Discriminate the actual caught transient from successful processed values without structural validation.
       if (result instanceof MutationTransient) return { processed, stopped: result }
       processed.push({ mutationId: item.mutationId, ...result })
     }
