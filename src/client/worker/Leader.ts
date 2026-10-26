@@ -331,21 +331,19 @@ type Init = Extract<ToLeader, { readonly _tag: "Init" }>
 type Reset = Extract<ToLeader, { readonly _tag: "Reset" }>
 
 /** The OPFS directory for `path`, or `undefined` if some part of it does not exist. */
+const isNotFound = (cause: unknown) => cause instanceof DOMException && cause.name === "NotFoundError"
+
 const opfsDirectory = (path: string) =>
   Platform.storageCall("opening an OPFS directory", async () => {
     let dir = await navigator.storage.getDirectory()
-    for (const part of path.split("/")) {
-      try {
-        dir = await dir.getDirectoryHandle(part)
-      } catch (cause) {
-        if (cause instanceof DOMException && cause.name === "NotFoundError") return undefined
-        throw cause
-      }
-    }
+    for (const part of path.split("/")) dir = await dir.getDirectoryHandle(part)
     return dir
-  })
-
-const isNotFound = (cause: unknown) => cause instanceof DOMException && cause.name === "NotFoundError"
+  }).pipe(
+    Effect.catchIf(
+      (error) => isNotFound(error.cause),
+      () => Effect.succeed(undefined)
+    )
+  )
 
 /** Remove `name` from `parent`; an entry that is already gone counts as removed. */
 const removeIfPresent = (
@@ -354,10 +352,11 @@ const removeIfPresent = (
   name: string,
   options?: FileSystemRemoveOptions
 ) =>
-  Platform.storageCall(`removing ${what}`, () =>
-    parent.removeEntry(name, options).catch((cause: unknown) => {
-      if (!isNotFound(cause)) throw cause
-    })
+  Platform.storageCall(`removing ${what}`, () => parent.removeEntry(name, options)).pipe(
+    Effect.catchIf(
+      (error) => isNotFound(error.cause),
+      () => Effect.void
+    )
   )
 
 /**
@@ -382,12 +381,12 @@ const completeInterruptedReset = Effect.fn("Leader.completeInterruptedReset")(fu
   if (parent === undefined) return false
   const tombstone = yield* Platform.tombstoneName(identity)
   const condemned = yield* Platform.storageCall("looking up the reset tombstone", () =>
-    parent.getFileHandle(tombstone).then(
-      () => true,
-      (cause: unknown) => {
-        if (isNotFound(cause)) return false
-        throw cause
-      }
+    parent.getFileHandle(tombstone)
+  ).pipe(
+    Effect.as(true),
+    Effect.catchIf(
+      (error) => isNotFound(error.cause),
+      () => Effect.succeed(false)
     )
   )
   if (!condemned) return false
