@@ -9,6 +9,7 @@ import * as Arr from "effect/Array"
 import * as Crypto from "effect/Crypto"
 import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Hex from "effect/encoding/Hex"
 import * as Option from "effect/Option"
 import * as Schedule from "effect/Schedule"
@@ -16,8 +17,6 @@ import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as Str from "effect/String"
-
-const noop = () => {}
 
 export interface ReplicaIdentity {
   readonly appId: string
@@ -158,71 +157,73 @@ export class LockError extends Schema.TaggedError<LockError>()("LockError", {
 const lockError = (name: string, cause: unknown) => new LockError({ name, message: describe(cause) })
 
 /**
- * Request `name` and resolve with a release function once granted (or `undefined` when `ifAvailable`
- * and the lock is taken). Interrupting the wait aborts the queued request; a grant that races with the
- * interruption is released immediately, so a cancelled waiter never ends up holding the lock.
+ * Register ownership before requesting a lock. The native callback transfers its release function
+ * directly into that ownership cell, never through a resumable Effect continuation. Failed or timed
+ * out attempts close their cell even when the caller's scope remains open.
  */
-const request = (
+const request = Effect.fnUntraced(function* (
   name: string,
-  options: { readonly mode: LockMode; readonly ifAvailable?: true; readonly withinMillis?: number }
-): Effect.Effect<(() => void) | undefined, LockError> => {
-  const acquire = Effect.callback<(() => void) | undefined, LockError>((resume, signal) => {
-    // `signal` and `ifAvailable` cannot be combined; an ifAvailable request never queues anyway.
-    const lockOptions: LockOptions = options.ifAvailable
-      ? { mode: options.mode, ifAvailable: true }
-      : { mode: options.mode, signal }
-    navigator.locks
-      .request(name, lockOptions, (lock) => {
-        if (lock === null) {
-          resume(Effect.succeed(undefined))
-          return undefined
-        }
-        if (signal.aborted) return undefined
-        let release = noop
-        // oxlint-disable-next-line effecttsgo/new-promise -- Web Locks holds ownership until its callback's Promise settles; release resolves that exact Promise.
-        const held = new Promise<void>((resolve) => {
-          release = resolve
-        })
-        resume(Effect.succeed(release))
-        return held
+  options: { readonly ifAvailable?: true; readonly withinMillis?: number }
+) {
+  let closed = false
+  let release: (() => void) | undefined
+  const close = () => {
+    if (closed) return
+    closed = true
+    const owned = release
+    release = undefined
+    owned?.()
+  }
+  return yield* Effect.uninterruptibleMask((restore) =>
+    Effect.gen(function* () {
+      yield* Effect.addFinalizer(() => Effect.sync(close))
+      const acquire = Effect.callback<boolean, LockError>((resume, signal) => {
+        // `signal` and `ifAvailable` cannot be combined; an ifAvailable request never queues anyway.
+        const lockOptions: LockOptions = options.ifAvailable
+          ? { mode: "exclusive", ifAvailable: true }
+          : { mode: "exclusive", signal }
+        navigator.locks
+          .request(name, lockOptions, (lock) => {
+            if (lock === null || closed || signal.aborted) {
+              resume(Effect.succeed(false))
+              return undefined
+            }
+            // oxlint-disable-next-line effecttsgo/new-promise -- Web Locks holds ownership until its callback's Promise settles; release resolves that exact Promise.
+            const held = new Promise<void>((resolve) => {
+              release = resolve
+            })
+            resume(Effect.succeed(true))
+            return held
+          })
+          .catch((cause: unknown) => {
+            if (!signal.aborted) resume(Effect.fail(lockError(name, cause)))
+          })
       })
-      .catch((cause: unknown) => {
-        if (!signal.aborted) resume(Effect.fail(lockError(name, cause)))
-      })
-  })
-  const within = options.withinMillis
-  return within !== undefined && Number.isFinite(within)
-    ? acquire.pipe(
-        // Timeout interrupts the callback, aborting the queued request. A late grant sees the aborted signal.
-        Effect.timeoutOption(Math.min(Math.max(within, 0), 2_147_483_647)),
-        Effect.map(Option.getOrUndefined)
-      )
-    : acquire
-}
-
-/** Releases the granted lock when the enclosing scope closes; the wait itself stays interruptible. */
-const holdUntilScopeCloses = (acquire: Effect.Effect<(() => void) | undefined, LockError>) =>
-  Effect.uninterruptibleMask((restore) =>
-    Effect.flatMap(restore(acquire), (release) =>
-      release === undefined
-        ? Effect.succeed(false)
-        : Effect.as(
-            Effect.addFinalizer(() => Effect.sync(release)),
-            true
-          )
-    )
+      const within = options.withinMillis
+      const wait =
+        within !== undefined && Number.isFinite(within)
+          ? acquire.pipe(
+              Effect.timeoutOption(Math.min(Math.max(within, 0), 2_147_483_647)),
+              Effect.map(Option.getOrElse(() => false))
+            )
+          : acquire
+      return yield* restore(wait)
+    })
+  ).pipe(
+    // Observe interruption delivered when the mask exits, not just the native wait's success.
+    Effect.onExit((exit) => (Exit.isSuccess(exit) && exit.value ? Effect.void : Effect.sync(close)))
   )
+})
 
 /**
  * Hold an exclusive Web Lock until the enclosing scope closes. Resolves once the lock is granted; the
  * wait is interruptible. The browser releases the lock automatically if the holding agent dies.
  */
-export const holdLock = (name: string): Effect.Effect<void, LockError, Scope.Scope> =>
-  Effect.asVoid(holdUntilScopeCloses(request(name, { mode: "exclusive" })))
+export const holdLock = (name: string): Effect.Effect<void, LockError, Scope.Scope> => Effect.asVoid(request(name, {}))
 
 /** Like `holdLock` but never waits: `true` and the lock is held if it was free, `false` otherwise. */
 export const tryHoldLock = (name: string): Effect.Effect<boolean, LockError, Scope.Scope> =>
-  holdUntilScopeCloses(request(name, { mode: "exclusive", ifAvailable: true }))
+  request(name, { ifAvailable: true })
 
 /**
  * Like `holdLock` but waits at most `millis` (non-finite: no deadline): `true` and the lock is held if it was
@@ -230,14 +231,23 @@ export const tryHoldLock = (name: string): Effect.Effect<boolean, LockError, Sco
  * whose callback runs after the deadline fired is released at once (see `request`).
  */
 export const holdLockWithin = (name: string, millis: number): Effect.Effect<boolean, LockError, Scope.Scope> =>
-  holdUntilScopeCloses(request(name, { mode: "exclusive", withinMillis: millis }))
+  request(name, { withinMillis: millis })
 
 /**
  * Completes when the exclusive holder of `name` releases it (or immediately if nobody holds it).
  * A shared-mode request, released at once, so any number of watchers are woken together.
  */
 export const awaitLockReleased = (name: string): Effect.Effect<void, LockError> =>
-  Effect.flatMap(request(name, { mode: "shared" }), (release) => Effect.sync(() => release?.()))
+  Effect.callback((resume, signal) => {
+    navigator.locks
+      .request(name, { mode: "shared", signal }, () => {
+        // Returning from the native callback releases the lock even if resume yields or is interrupted.
+        resume(Effect.void)
+      })
+      .catch((cause: unknown) => {
+        if (!signal.aborted) resume(Effect.fail(lockError(name, cause)))
+      })
+  })
 
 /**
  * Whether some agent currently holds `name` exclusively. Shared holders do not count: right after an

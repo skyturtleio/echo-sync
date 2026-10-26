@@ -1426,8 +1426,9 @@ replica.
   Lock (`tryHoldLock` then `holdLock`; `Waiting` is reported only when the first try fails,
   `Elected` once the database is open and the leader serves, `Failed` on any startup failure);
   the leader then takes its epoch lock, waits for a dead predecessor's OPFS access handles with
-  exponential backoff for at most 10.22 s, completes any interrupted reset (tombstone), and
-  opens the pool. Exhausting that bound is `LeaderFailed`; it does not retry.
+  exponential backoff with at most 10.22 s of retry sleeps, completes any interrupted reset
+  (tombstone), and opens the pool. Exhausting the retry schedule is `LeaderFailed`; it does
+  not retry. This is not a wall-clock deadline on a nonsettling native storage operation.
 
   **Rationale (2026-10-24):** Browser release of synchronous access handles can lag lock release
   for several seconds, so the former 2 s fixed poll turned a recoverable handover into a terminal
@@ -1507,6 +1508,18 @@ replica.
 server-origin audit trail or an engine-retained cause log. A last-writer label or comparison
 to a newer mutation receipt cannot prove that intervening external changes were incorporated;
 conservative refresh is preferable, including for own mutations later reconciled by the server.
+
+- INV-BRW-14: Web Lock acquisition MUST register scoped ownership before starting the native
+  request. An attempt cancelled before its successful ownership handoff, failing, or timing out
+  MUST release a granted lock or make a late grant release itself without requiring caller-scope
+  closure, even if the scheduler yields after native grant. After successful handoff, the supplied
+  scope owns the lock until it closes; later interruption of an enclosing fiber does not revoke
+  that ownership. Waiting MUST remain interruptible; shared release watchers MUST release in
+  the native callback, not in a later Effect continuation.
+
+  **Rationale (2026-10-26):** An adversarial scheduler reproduced granted locks retained after
+  interrupted fibers completed. A pre-registered ownership cell closes the grant-to-finalizer
+  gap without masking native waits; assuming synchronous continuation scheduling was rejected.
 
 ### Details
 
@@ -2367,6 +2380,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-BRW-11 | partial | Browser scenarios cover OPFS handles held for 4 s and past the 10 s bound; no literal test-title citation |
 | INV-BRW-12 | covered | `Leader.test` "snapshot provenance requires every incorporated local receipt and never certifies a rollback or an unknown gap", "every emission of a query is one snapshot: two tables written together never disagree" |
 | INV-BRW-13 | covered | `Leader.test` "snapshot provenance requires every incorporated local receipt and never certifies a rollback or an unknown gap", "reconnecting pull and rejection remain refresh-required between local commits even when their notifications coalesce", "snapshot resubscription after leader loss cannot reuse the old lifetime's local receipts" |
+| INV-BRW-14 | covered | `platform.test` "a granted lock stays owned by its scope or cancelled attempt despite scheduler delays", "a deadline after native grant releases the lock while its caller scope remains open", "interrupting a caller after lock acquisition cannot revoke ownership from its still-open scope", "an interrupted lock wait leaves the queue and never acquires the lock afterwards", "a lock wait that reaches its deadline as the holder lets go either holds the lock or leaves nothing held or queued" |
 | INV-SCH-1 | partial | `Migrate.test` "a NOT NULL column without a default is added nullable with the SPEC §13 TODO, never SET NOT NULL", "nullable literal unions generate TEXT and an old JSON manifest requires a manual kind migration"; destructive and safe DDL groups need individual citations |
 | INV-SCH-2 | covered | `Migrate.test` "an intent naming something the diff does not contain is refused, not ignored", "a combined table and column rename is one table TODO and one column TODO, no DDL, no intent error", "an index on a renamed column is a TODO; unrelated changes in the same table stay DDL" |
 | INV-SCH-3 | covered | `Migrate.test` "migrations are numbered after the highest existing one", "scope_grants is the engine's table and is never planned; no change plans nothing"; `version-gate.e2e` "a client below the generated floor stops retrying, can mutate offline, and delivers the original intents after update" (history) |
@@ -2437,7 +2451,7 @@ machine-verifiable literal test-title citations.
 | log GC retention | caller-supplied (no default) | `gc.ts` | argument |
 | released-row marker retention | 24 h | `Outbox.ts` | `pruneReleased(retentionMillis)` |
 | reset `closeTimeout` | 5 s, must be finite | `ResetReplica.ts` | `closeTimeout` |
-| `awaitOpfsPoolFree` | exponential 20 ms … 5.12 s, 9 retries / 10.22 s total | `platform.ts` | no |
+| `awaitOpfsPoolFree` | exponential 20 ms … 5.12 s, 9 retries / 10.22 s total retry sleeps, not a native-call deadline | `platform.ts` | no |
 | `LeaderLost` retry spacing (`mutate`, `requestSync`, `dismissNotices`) | 50 ms, unbounded | `LeaderClient.ts` | no |
 | resubscribe delay after `LeaderLost` | 50 ms | `LeaderClient.ts` | no |
 | replica revision offset | 0 … `Number.MAX_SAFE_INTEGER`; next advance rotates epoch to offset 0, with no local interval | `SqliteSyncStorage.ts`, §12.3 | no |
@@ -2511,11 +2525,12 @@ files even when nonempty; the VFS otherwise grows only an empty pool, and interr
 can leave too little capacity for the next write. Access handles can outlive the dead
 worker's locks briefly; the bounded `awaitOpfsPoolFree` handover wait in §12 covers that lag.
 
-Lock waits abort queued requests on interruption and release a grant racing with the abort.
-The cancellation argument currently relies on Effect's default scheduler entering the
-uninterruptible hold region synchronously after grant. A custom scheduler yielding there
-(or before a shared watcher releases its grant) could retain a granted lock until agent death;
-scheduler-independent resolver cleanup remains deferred.
+Lock waits register an ownership cell and scope finalizer before starting the native request.
+The grant callback either stores release in that live cell before resuming, or returns at once
+if the attempt was cancelled or closed. Failed and timed-out attempts close their cell while
+successful attempts retain ownership until scope closure. Shared release watchers return
+directly from their native callback. Cleanup therefore does not depend on synchronous Effect
+continuation scheduling (INV-BRW-14); queued waits remain interruptible.
 
 The storage gate retains its owner at the head of an insertion-ordered set of Deferreds.
 Release removes that head and signals the next without making admission available to new

@@ -1,9 +1,11 @@
 // Node implements the Web Locks API (navigator.locks), so the lock helpers run here unmodified.
 import { expect, it } from "@effect/vitest"
 import * as Arr from "effect/Array"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import * as Scheduler from "effect/Scheduler"
 import * as Scope from "effect/Scope"
 import * as Str from "effect/String"
 import * as Platform from "./platform.ts"
@@ -16,6 +18,139 @@ const pendingFor = (name: string) =>
 
 const waitUntil = (condition: Effect.Effect<boolean>) =>
   Effect.repeat(condition, { until: (done) => done, times: 1000 }).pipe(Effect.asVoid)
+
+const pausingScheduler = (gap = 0) => {
+  const tasks: Array<() => void> = []
+  let armed = false
+  let paused = false
+  let steps = 0
+  const flush = () => {
+    while (tasks.length > 0) tasks.shift()?.()
+  }
+  const scheduler: Scheduler.Scheduler = {
+    executionMode: "async",
+    shouldYield: () => {
+      if (!armed || steps++ !== gap) return false
+      armed = false
+      paused = true
+      return true
+    },
+    makeDispatcher: () => ({ scheduleTask: (task) => tasks.push(task), flush })
+  }
+  return {
+    scheduler,
+    flush,
+    arm: () => {
+      armed = true
+    },
+    disarm: () => {
+      armed = false
+    },
+    paused: () => paused
+  }
+}
+
+it.live("a granted lock stays owned by its scope or cancelled attempt despite scheduler delays", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const operations = [
+        Platform.holdLock,
+        Platform.tryHoldLock,
+        (name: string) => Platform.holdLockWithin(name, 1000),
+        Platform.awaitLockReleased
+      ]
+      for (const operation of operations) {
+        for (let gap = 0; gap <= 40; gap++) {
+          const name = `test:${yield* randomUUIDv4}`
+          const owner = yield* Effect.acquireRelease(Scope.make(), (scope) => Scope.close(scope, Exit.void))
+          const driver = pausingScheduler(gap)
+          // This child uses a deliberately stalled scheduler; the test remains on the live scheduler.
+          const fiber = yield* Effect.forkChild(operation(name).pipe(Scope.provide(owner))).pipe(
+            // oxlint-disable-next-line effecttsgo/strict-effect-provide -- This fixture installs the adversarial scheduler only while creating its child fiber.
+            Effect.provideService(Scheduler.Scheduler, driver.scheduler)
+          )
+          driver.flush()
+          driver.arm()
+          yield* Effect.repeat(Effect.sleep(1), {
+            until: () => driver.paused() || fiber.pollUnsafe() !== undefined,
+            times: 1000
+          })
+          expect(driver.paused() || fiber.pollUnsafe() !== undefined).toBe(true)
+          if (driver.paused()) {
+            fiber.interruptUnsafe()
+            driver.flush()
+            const exit = fiber.pollUnsafe()
+            expect(exit).toBeDefined()
+            if (exit !== undefined) expect(Exit.isFailure(exit)).toBe(true)
+          }
+          if (driver.paused() && gap === 0) {
+            // The callback's success has not been consumed: cancellation must release before scope closure.
+            yield* Effect.sleep(5)
+            expect(yield* Effect.scoped(Platform.tryHoldLock(name))).toBe(true)
+          }
+          // A completed acquisition's captured finalizer context must not stall the test's cleanup.
+          driver.disarm()
+          // Later interruption does not revoke a successful handoff to an independently owned scope.
+          yield* Scope.close(owner, Exit.void)
+          yield* Effect.sleep(5)
+          expect(yield* Effect.scoped(Platform.tryHoldLock(name)), `${operation.name}: scheduler gap ${gap}`).toBe(true)
+        }
+      }
+    })
+  )
+)
+
+it.live("a deadline after native grant releases the lock while its caller scope remains open", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const name = `test:${yield* randomUUIDv4}`
+      const owner = yield* Effect.acquireRelease(Scope.make(), (scope) => Scope.close(scope, Exit.void))
+      const driver = pausingScheduler()
+      const fiber = yield* Effect.forkChild(Platform.holdLockWithin(name, 100).pipe(Scope.provide(owner))).pipe(
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- This fixture stalls the acquiring child while the test and deadline continue independently.
+        Effect.provideService(Scheduler.Scheduler, driver.scheduler)
+      )
+      driver.flush()
+      driver.arm()
+      yield* Effect.repeat(Effect.sleep(1), { until: driver.paused, times: 1000 })
+      expect(driver.paused()).toBe(true)
+      expect(yield* Platform.isLockHeld(name)).toBe(true)
+      yield* Effect.sleep(120)
+      driver.flush()
+      expect(fiber.pollUnsafe()).toEqual(Exit.succeed(false))
+      expect(yield* Effect.scoped(Platform.tryHoldLock(name))).toBe(true)
+    })
+  )
+)
+
+it.live("interrupting a caller after lock acquisition cannot revoke ownership from its still-open scope", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      for (const operation of [
+        Platform.holdLock,
+        Platform.tryHoldLock,
+        (name: string) => Platform.holdLockWithin(name, 1000)
+      ]) {
+        const name = `test:${yield* randomUUIDv4}`
+        const owner = yield* Effect.acquireRelease(Scope.make(), (scope) => Scope.close(scope, Exit.void))
+        const acquired = yield* Deferred.make<void>()
+        const caller = yield* Effect.forkChild(
+          operation(name).pipe(
+            Scope.provide(owner),
+            Effect.andThen(Deferred.succeed(acquired, undefined)),
+            Effect.andThen(Effect.never)
+          )
+        )
+        yield* Deferred.await(acquired)
+        yield* Fiber.interrupt(caller)
+        expect(yield* Effect.scoped(Platform.tryHoldLock(name))).toBe(false)
+        yield* Scope.close(owner, Exit.void)
+        yield* waitUntil(Effect.map(Effect.orDie(Platform.isLockHeld(name)), (held) => !held))
+        expect(yield* Effect.scoped(Platform.tryHoldLock(name))).toBe(true)
+      }
+    })
+  )
+)
 
 it.live("an interrupted lock wait leaves the queue and never acquires the lock afterwards", () =>
   Effect.gen(function* () {
