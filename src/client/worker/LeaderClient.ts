@@ -71,6 +71,7 @@ import {
 import * as Platform from "./platform.ts"
 import * as LeaderRoute from "./LeaderRoute.ts"
 import { TabPlatform } from "./TabPlatform.ts"
+import { randomUUIDv4 } from "../Crypto.ts"
 
 export interface LeaderClientConfig extends TabApiOptions {
   readonly appId: string
@@ -293,7 +294,7 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
         )
       )
       // Fixed once, before the first attempt: every retry presents the same idempotency key (INV-BRW-4).
-      const mutationId = options?.mutationId ?? Ids.MutationId.make(crypto.randomUUID())
+      const mutationId = options?.mutationId ?? Ids.MutationId.make(yield* randomUUIDv4)
       return yield* calls
         .enqueue({ mutationId, name: mutation.name, args: encoded })
         .pipe(Effect.retry({ while: isLeaderLost, schedule: lostBackoff }))
@@ -445,7 +446,7 @@ export const make = (config: LeaderClientConfig): Effect.Effect<LeaderClient["Se
     const unsupported = Platform.validateIdentity(identity) ?? capability.unsupported
     const mode: Mode =
       unsupported !== undefined ? "unsupported" : capability.sharedWorker ? "shared-worker" : "single-tab"
-    const tabId = crypto.randomUUID()
+    const tabId = yield* randomUUIDv4
     const scope = yield* Effect.scope
     /**
      * Everything that keeps this client in the topology: the tab lock, lock watchers, router acceptance and

@@ -45,6 +45,7 @@ import { type Endpoint, type FromLeader, isToLeader, type ResetOutcome, type ToL
 import * as OpfsSqlite from "./OpfsSqlite.ts"
 import * as Platform from "./platform.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
+import { randomUUIDv4 } from "../Crypto.ts"
 
 const causeMessage = (cause: unknown): string =>
   typeof cause === "string"
@@ -499,7 +500,7 @@ const program = Effect.fn("Leader.program")(
       Telemetry.serverFailure
     )
     // The leader lock is held from here until this worker dies.
-    const leaderId = crypto.randomUUID()
+    const leaderId = yield* randomUUIDv4
     yield* Platform.holdLock(Platform.leaderEpochLockName(identity, leaderId))
     // A dead predecessor's access handles can outlive its locks. Wait after both locks and before inspecting
     // a reset tombstone, so the next step never races a lingering pool handle.

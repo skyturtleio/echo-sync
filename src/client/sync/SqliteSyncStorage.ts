@@ -21,6 +21,7 @@ import * as Outbox from "../Outbox.ts"
 import * as SqliteRowStore from "../SqliteRowStore.ts"
 import type { LocalChange, Revision } from "../Provenance.ts"
 import type * as Engine from "./Engine.ts"
+import { randomUUIDv4 } from "../Crypto.ts"
 
 const StoredPage = Schema.fromJsonString(Protocol.PullPage)
 const StoredUndo = Schema.fromJsonString(
@@ -205,13 +206,13 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
         )
       })
     )
-  let revision: Revision = { epoch: crypto.randomUUID(), offset: 0 }
+  let revision: Revision = { epoch: Effect.runSync(randomUUIDv4), offset: 0 }
   let changed = false
   let appended = false
   const advance = () => {
     revision =
       revision.offset === Number.MAX_SAFE_INTEGER
-        ? { epoch: crypto.randomUUID(), offset: 0 }
+        ? { epoch: Effect.runSync(randomUUIDv4), offset: 0 }
         : { ...revision, offset: revision.offset + 1 }
   }
   const touch = <A, E, R>(self: Effect.Effect<A, E, R>) =>

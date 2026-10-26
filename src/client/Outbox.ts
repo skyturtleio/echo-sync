@@ -22,6 +22,7 @@ import { Store } from "echo-sync"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
+import { randomUUIDv4 } from "./Crypto.ts"
 
 export const OutboxEntry = Schema.Struct({
   seq: Schema.Number,
@@ -118,7 +119,7 @@ export const clientId: Effect.Effect<string, SqlError, SqlClient.SqlClient> = Ef
   const sql = yield* SqlClient.SqlClient
   return yield* sql.withTransaction(
     Effect.gen(function* () {
-      const fresh = crypto.randomUUID()
+      const fresh = yield* randomUUIDv4
       yield* sql`INSERT INTO echo_meta (key, value) VALUES ('client_id', ${fresh}) ON CONFLICT (key) DO NOTHING`
       const rows = yield* sql<{ readonly value: string }>`SELECT value FROM echo_meta WHERE key = 'client_id'`
       return rows[0]?.value ?? fresh
