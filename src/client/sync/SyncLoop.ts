@@ -28,6 +28,7 @@ import type * as Engine from "./Engine.ts"
 import * as SyncFailure from "./SyncFailure.ts"
 import { type PullReason, SyncErrorKind } from "./SyncFailure.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
+import { cappedExponential } from "./Backoff.ts"
 
 export const PushState = Schema.Union([
   Schema.TaggedStruct("Active", {}),
@@ -89,15 +90,6 @@ const messages: Record<SyncErrorKind, string> = {
 }
 
 const stoppedBatch: SyncError = { kind: "server", message: "the server stopped the push batch at a transient failure" }
-
-const backoff = (base: number, cap: number) =>
-  Schedule.exponential(base).pipe(
-    // The original policy leaves the first delay uncapped, even when base > cap.
-    // Keep a zero base zero even after exponential's attempt counter overflows its power.
-    Schedule.modifyDelay(({ attempt, duration }) =>
-      Effect.succeed(attempt === 1 || base === 0 ? base : Math.min(Duration.toMillis(duration), cap))
-    )
-  )
 
 /**
  * The status consequences of a failure cause (INV-LOOP-5: defect > integrity > transient), never just
@@ -235,7 +227,7 @@ export const make = (options: {
 
     const run = Effect.gen(function* () {
       yield* Effect.forkChild(followPending)
-      const schedule = backoff(base, cap)
+      const schedule = cappedExponential(base, cap)
       let step = yield* Schedule.toStep(schedule)
       while (true) {
         const failed = yield* cycle
@@ -303,7 +295,7 @@ export const followPokes = (options: {
     const base = Duration.toMillis(Duration.fromInputUnsafe(options.retryDelay ?? "1 second"))
     const cap = Duration.toMillis(Duration.fromInputUnsafe(options.maxRetryDelay ?? "30 seconds"))
     const idleTimeout = options.idleTimeout ?? "45 seconds"
-    const schedule = backoff(base, cap)
+    const schedule = cappedExponential(base, cap)
     let step = yield* Schedule.toStepWithSleep(schedule)
     // Preparation runs first and is never counted as silence; the clock starts when the stream is
     // first pulled, which is when its request is sent, and bounds the first element and every gap.

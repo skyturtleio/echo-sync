@@ -24,6 +24,7 @@
 import { Cause, Deferred, Duration, Effect, Exit, Queue, Schedule, type Schema, Stream } from "effect"
 import type { AccessScope, Protocol } from "echo-sync"
 import * as Telemetry from "../../internal/Telemetry.ts"
+import { cappedExponential } from "./Backoff.ts"
 
 export interface Upstream<E> {
   /**
@@ -76,10 +77,7 @@ export const make = <E, F extends E>(options: {
   const idleTimeout = options.idleTimeout ?? "45 seconds"
   const base = Duration.toMillis(Duration.fromInputUnsafe(options.retryDelay ?? "1 second"))
   const cap = Duration.toMillis(Duration.fromInputUnsafe(options.maxRetryDelay ?? "30 seconds"))
-  const backoff = Schedule.min([Schedule.exponential(base), Schedule.spaced(cap)]).pipe(
-    // The first wait is the base even when configured above the cap.
-    Schedule.modifyDelay(({ attempt, duration }) => Effect.succeed(attempt === 1 ? base : duration))
-  )
+  const backoff = cappedExponential(base, cap)
   const subscriptions = new Map<string, Subscription>()
 
   /**

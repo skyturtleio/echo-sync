@@ -72,6 +72,7 @@ import * as Platform from "./platform.ts"
 import * as LeaderRoute from "./LeaderRoute.ts"
 import { TabPlatform } from "./TabPlatform.ts"
 import { randomUUIDv4 } from "../Crypto.ts"
+import { cappedExponential } from "../sync/Backoff.ts"
 
 export interface LeaderClientConfig extends TabApiOptions {
   readonly appId: string
@@ -356,10 +357,7 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
    */
   const deliver = (room: AccessScope.AccessScopeId, cell: Cell, sent: number) =>
     Effect.gen(function* () {
-      const backoff = Schedule.min([Schedule.exponential(retryBase), Schedule.spaced(30_000)]).pipe(
-        // The first wait is the base even when configured above the cap.
-        Schedule.modifyDelay(({ attempt, duration }) => Effect.succeed(attempt === 1 ? retryBase : duration))
-      )
+      const backoff = cappedExponential(retryBase, 30_000)
       let wait = yield* Schedule.toStepWithSleep(backoff)
       while (true) {
         const wake = Deferred.makeUnsafe<void>()
