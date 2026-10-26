@@ -24,6 +24,7 @@ import * as Telemetry from "../../internal/Telemetry.ts"
 export const Mismatch = Schema.Struct({ table: Schema.String, problem: Schema.String })
 export type Mismatch = typeof Mismatch.Type
 
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class Drift extends Schema.TaggedError<Drift>()("Drift", { mismatches: Schema.Array(Mismatch) }) {
   override get message() {
     return `schema drift (refusing to serve):\n${this.mismatches.map((m) => `  ${m.table}: ${m.problem}`).join("\n")}`

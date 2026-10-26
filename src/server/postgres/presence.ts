@@ -113,7 +113,7 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
           const fresh = yield* PubSub.sliding<void>(1)
           const ended = yield* Deferred.make<void, Protocol.Forbidden>()
           const installed = yield* Ref.modify(rooms, (all) => {
-            const room = all.get(joined.room) ?? { members: new Map(), changes: fresh }
+            const room: Room = all.get(joined.room) ?? { members: new Map(), changes: fresh }
             const stored = room.members.get(key)
             if (stored !== undefined && joined.revision < stored.revision) return [undefined, all] as const
             const members = new Map(room.members).set(key, { entry, revision: joined.revision, ended })
@@ -162,7 +162,7 @@ export const make = (options: { readonly heartbeatInterval: Duration.Input }) =>
        * installed after a check (the gate) reads the grant after that check did. A revocation or
        * replacement while `admit` is pending ends the stream without waiting for it.
        */
-      join: <E>(
+      join: <E = never>(
         joined: Joined,
         admit: Effect.Effect<boolean, E> = Effect.succeed(true)
       ): Stream.Stream<Protocol.RoomElement, Protocol.Forbidden | E> =>

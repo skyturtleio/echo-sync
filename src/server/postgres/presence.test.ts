@@ -36,6 +36,7 @@ const server = Effect.gen(function* () {
       { preconnect: globalThis.fetch.preconnect }
     )
     return RpcClient.make(Protocol.PresenceRpcs).pipe(
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Presence fixture owns this client's HTTP transport for the enclosing test scope.
       Effect.provide(
         RpcClient.layerProtocolHttp({ url: "http://echo.test/sync" }).pipe(
           Layer.provide([
@@ -647,6 +648,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (SPEC §10)", () => 
       const observer = yield* open(yield* connect("p"), payload("c0", "watch"))
       yield* until(observer.snapshots, ["p/c0/watch=null"])
       assert.isFalse(observer.seen.flat().some((value) => value.includes("wildcard") || value.includes("unseen")))
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped presence clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -663,6 +665,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (SPEC §10)", () => 
         yield* until(leaving.snapshots, ["p/c0/watch=null", 'p/c1/t1={"cursor":3}'])
         yield* Fiber.interrupt(leaving.fiber) // the tab closes: its request is aborted
         yield* until(observer.snapshots, ["p/c0/watch=null"])
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped presence clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     30_000
   )
@@ -691,6 +694,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (SPEC §10)", () => 
         observer.seen.flat().filter((e) => !e.startsWith("p/")),
         []
       )
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped presence clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -724,6 +728,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (SPEC §10)", () => 
         yield* until(observer.snapshots, ['p/c0/watch="changed"', "q/cq/t2=null"])
         assert.isFalse(observer.seen.flat().some((e) => e.includes("switched") || e.includes("/t1=")))
         yield* Fiber.interrupt(own.fiber)
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped presence clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -760,6 +765,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (SPEC §10)", () => 
         yield* q.track(payload("cq", "t1", "after revoke", 1))
         yield* (yield* connect("p")).track(payload("c0", "watch", "changed", 1))
         yield* until(observer.snapshots, ['p/c0/watch="changed"'])
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped presence clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     30_000
   )
@@ -804,6 +810,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (SPEC §10)", () => 
         yield* q.track({ ...payload("cq", "t2", "still here", 1), room: AccessScope.AccessScopeId.make("s2") })
         yield* until(qs2.snapshots, ['q/cq/t2="still here"'])
         assert.isUndefined(observer.fiber.pollUnsafe(), "p's own grant still holds")
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped presence clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     30_000
   )
@@ -832,6 +839,7 @@ describe.skipIf(!pgAvailable)("presence over the sync mount (SPEC §10)", () => 
         yield* until(observer.snapshots, ["p/c0/watch=null", 'p/c1/t2="two, again"'])
         yield* client.track(payload("c1", "t2", "still here", 1))
         yield* until(observer.snapshots, ["p/c0/watch=null", 'p/c1/t2="still here"'])
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped presence clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     30_000
   )

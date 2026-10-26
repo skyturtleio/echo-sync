@@ -21,7 +21,7 @@ const freshDatabase = Effect.gen(function* () {
   return sql
 })
 
-const register = (checks: ReadonlyArray<Conformance.Check<Scope.Scope>>) => {
+const register = <E>(checks: ReadonlyArray<Conformance.Check<Scope.Scope, E>>) => {
   for (const check of checks) {
     it.effect(check.name, () => Effect.map(check.run, (cases) => assert.isAbove(cases, 0)), 60_000)
   }

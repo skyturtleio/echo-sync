@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Option } from "effect"
+import { Effect, Exit, Option } from "effect"
 import { Ids } from "../../../core/index.ts"
 import type { Store } from "../../../core/index.ts"
 import * as Conformance from "../../../core/testing/Conformance.ts"
@@ -36,6 +36,24 @@ const memorySubject = Effect.sync(() => {
 describe("MemorySyncStorage conforms to SyncStorage", () => {
   register(Conformance.syncStorage(Effect.map(memorySubject, ({ subject }) => subject)))
 })
+
+it.effect("conformance retains typed reopen and pruning failures rather than disguising them as violations", () =>
+  Effect.gen(function* () {
+    for (const operation of ["reopen", "pruneReleased"]) {
+      const failure = new Error(`${operation} refused`)
+      const checks = Conformance.syncStorage(
+        Effect.map(memorySubject, ({ subject }) => ({
+          ...subject,
+          reopen: operation === "reopen" ? Effect.fail(failure) : subject.reopen,
+          pruneReleased: operation === "pruneReleased" ? Effect.fail(failure) : subject.pruneReleased
+        }))
+      )
+      const check = checks.find((c) => c.name.startsWith("seq is never reused:"))
+      if (check === undefined) return assert.fail("missing seq durability check")
+      assert.deepStrictEqual(yield* Effect.exit(check.run), Exit.fail(failure))
+    }
+  })
+)
 
 /**
  * Like a real database handle: a reopen closes every earlier handle, and a closed handle dies on

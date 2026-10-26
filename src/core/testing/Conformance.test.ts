@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Option } from "effect"
+import { Cause, Effect, Exit, Option } from "effect"
 import { Store } from "../index.ts"
 import * as Conformance from "./Conformance.ts"
 import * as MemoryStore from "./MemoryStore.ts"
@@ -27,6 +27,26 @@ const mustCatch = (label: string, checks: ReadonlyArray<Conformance.Check<never>
     )
   }
 }
+
+it.effect("conformance preserves typed setup failures, defects and interruption without reducing mixed causes", () =>
+  Effect.gen(function* () {
+    for (const cause of [
+      Cause.fail("setup refused"),
+      Cause.die("setup defect"),
+      Cause.interrupt(),
+      Cause.fromReasons([
+        Cause.makeFailReason("setup refused"),
+        Cause.makeDieReason("cleanup defect"),
+        Cause.makeInterruptReason()
+      ])
+    ]) {
+      for (const check of Conformance.rowStore(Effect.failCause(cause))) {
+        const exit = yield* Effect.exit(check.run)
+        assert.deepStrictEqual(exit, Exit.failCause(cause))
+      }
+    }
+  })
+)
 
 describe("MemoryStore conforms to ReplicaRowStore (the reference semantics)", () => {
   it.effect("literal search filters before limits and prefix ranges preserve Unicode boundaries", () =>

@@ -189,7 +189,7 @@ export const router = (self: SharedWorkerScope): Effect.Effect<void> =>
       )
     )
     self.addEventListener("connect", onConnect)
-    yield* Effect.never.pipe(
+    return yield* Effect.never.pipe(
       Effect.ensuring(
         Effect.sync(() => {
           open = false

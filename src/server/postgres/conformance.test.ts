@@ -55,6 +55,7 @@ describe.skipIf(!pgAvailable)("Postgres RowStore conforms to Store.RowStore (SPE
   for (const check of Conformance.rowStore(subject)) {
     it.live(
       check.name,
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Each conformance case owns a fresh disposable database for its run.
       () => Effect.map(check.run, (cases) => assert.isAbove(cases, 0)).pipe(Effect.provide(TestDatabase)),
       120_000
     )
@@ -89,6 +90,7 @@ describe.skipIf(!pgAvailable)("Postgres RowStore conforms to Store.RowStore (SPE
             : "other"
       )
       assert.deepStrictEqual(reasons, ["fail:abort", "fail:StoreUnavailable", "die:bug"])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 })

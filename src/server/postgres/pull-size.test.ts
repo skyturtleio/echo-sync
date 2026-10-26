@@ -48,6 +48,7 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
       }
       assert.isAbove(pages, 1)
       assert.deepStrictEqual(ids, ["row-1", "row-2", "row-3"])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -82,6 +83,7 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
       assert.isAbove(pages, 1)
       assert.deepStrictEqual(ids, ["row-1", "row-2", "row-3"])
       assert.deepStrictEqual(acks, ["ack-1", "ack-2", "ack-3"])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -125,6 +127,7 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
       assert.deepStrictEqual(yield* sql`SELECT acked_at FROM echo_sync.mutations WHERE client_id = 'd'`, [
         { acked_at: null }
       ])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -195,6 +198,7 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
         return assert.fail("expected UnknownMutation outcome")
       }
       assert.strictEqual(delivered.error.name, outcome.error.name)
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -236,6 +240,7 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
         [...page.changes, ...final.changes].map((c) => (c._tag === "upsert" ? c.row["id"] : "")),
         ["a", "b"]
       )
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -249,6 +254,7 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
       assert.strictEqual(page.changes.length, 500)
       assert.isAtMost(bytes(page), maxPullPageBytes)
       assert.deepStrictEqual(yield* records, [])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 })

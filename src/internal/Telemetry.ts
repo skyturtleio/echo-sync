@@ -221,7 +221,7 @@ export const boundary = <A, E, R>(work: Effect.Effect<A, E, R>): Effect.Effect<A
             )
           )
             return
-          guard(() =>
+          guard((): unknown =>
             logger.log({
               ...options,
               cause: diagnostics ? options.cause : Cause.empty
@@ -349,7 +349,7 @@ export const histogram = (name: "echo.push.batch_size" | "echo.pull.pages", n: n
 export const observeStream = <A, E, R>(
   work: Stream.Stream<A, E, R>,
   name: Name,
-  failure: (cause: Cause.Cause<E>) => Outcome
+  failure: (cause: Cause.Cause<NoInfer<E>>) => Outcome
 ): Stream.Stream<A, E, R> =>
   stream(
     Stream.unwrap(
@@ -375,7 +375,7 @@ export const observeStream = <A, E, R>(
 export const observe = <A, E, R>(
   work: Effect.Effect<A, E, R>,
   name: Name,
-  failure: (cause: Cause.Cause<E>) => Outcome
+  failure: (cause: Cause.Cause<NoInfer<E>>) => Outcome
 ): Effect.Effect<A, E, R> =>
   boundary(
     Effect.suspend(() => {

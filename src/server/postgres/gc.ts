@@ -33,6 +33,7 @@ export const collectGarbage = Effect.fnUntraced(function* (retention: Duration.I
 }, Telemetry.boundary)
 
 /** `expireLedger` was constructed with a retention below `minimumLedgerRetention`. */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class LedgerRetentionTooShort extends Schema.TaggedError<LedgerRetentionTooShort>()("LedgerRetentionTooShort", {
   retentionMillis: Schema.Number,
   minimumMillis: Schema.Number

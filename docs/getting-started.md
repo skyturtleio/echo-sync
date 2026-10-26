@@ -303,3 +303,72 @@ after the restore fence, clients without the epoch field receive `ClientOutdated
 update. Epoch-aware clients replace their replica and resend pending mutations without
 changing `clientId`. Mutations already acknowledged and released before the restore are lost
 if they are absent from the backup; this mechanism cannot recover them. See SPEC §7.4 and §11.1.
+
+## 8. Contributor type checking and editor setup
+
+Install with `bun install --frozen-lockfile`. The lockfile pins TypeScript `7.1.0-beta`,
+`@effect/tsgo` `0.59.0`, tsrs `0.20.0-ts7.1.0-beta`, Oxlint `1.89.0` and its type-aware
+backend `oxlint-tsgolint` `7.0.2005`. tsrs targets the same TypeScript beta; it runs with
+reference defaults, not the diagnostic-changing `--fast` preset.
+
+- `bun run typecheck` checks the root project and all five example/driver projects with
+  Effect's enhanced Go compiler. `bun run typecheck:tsrs` checks the same projects with its
+  enhanced Rust compiler.
+- `bun run lint` first preserves the original syntax-based correctness/suspicious checks,
+  then runs `.oxlintrc.type-aware.json`: all 26 Effect correctness rules and all 20 anti-pattern
+  rules, plus explicit promise and inferred-`any` safety rules. Both passes fail on warnings.
+  The second profile turns off category expansion so it adds only the selected rules;
+  Effect's style and Effect-native presets are not enabled.
+- `bun run check` includes both compilers, both lint passes, registry/vector checks,
+  formatting and unit tests. Run `bun run test:pg` with the disposable Postgres running for
+  integration coverage; browser commands remain in `AGENTS.md`.
+
+All enhanced tools run through `effect-tsgo tsc@…`, `effect-tsgo tsrs@…` or
+`effect-tsgo oxlint`. There is deliberately no install/prepare patch hook: never run
+`effect-tsgo patch` for this repo. Installed compiler and linter packages remain untouched.
+
+In VS Code on macOS/Linux, install the workspace recommendations (**TypeScript 7** and **Oxc**),
+trust the workspace and accept the workspace SDK when prompted. The editor extension host needs
+Node `22.12+` (or a newer supported major) on its `PATH`; Bun alone cannot run these Node launchers.
+The committed settings use
+`.vscode/tsdk/tsgo` for the TypeScript server and `.vscode/oxlint` for type-aware/Effect
+diagnostics. These small executable launchers are needed because the editors accept executable
+paths rather than commands with arguments; they delegate to the installed Effect tooling and
+never copy or modify binaries. Effect diagnostics come from Oxlint only (`diagnostics: false`
+in the TypeScript plugin prevents duplicates); Effect quick fixes/refactors still use the
+enhanced TypeScript server. The editor uses the selected type-aware profile; the CLI additionally
+runs the full original syntax-category gate. Restart both servers after changing tool versions.
+
+Other LSP clients can launch `bun run lsp` (TypeScript/Effect features) and
+`bun run effect-tsgo oxlint --lsp` (lint diagnostics), with the repository as their working
+directory. Oxlint's LSP takes its configuration through `initialize.initializationOptions`,
+not the CLI `--config` flag: send an array containing `{ "workspaceUri": "file:///absolute/repo",
+"options": { "configPath": "/absolute/repo/.oxlintrc.type-aware.json", "run": "onType" } }`.
+Use the real repository URI/path and return the same options object for its
+`workspace/configuration` requests for section `oxc_language_server`. TypeScript uses LSP
+pull diagnostics (`textDocument/diagnostic`); Oxlint publishes diagnostics on document changes.
+Do not also start a stock TypeScript server.
+The VS Code SDK launcher is not a Windows `.exe`; Windows editors need their own supported
+command-based LSP configuration. Effect's packaged tsrs/Oxlint integrations do not support musl.
+
+No correctness or anti-pattern rule is globally disabled. Generic helpers preserve their actual
+error channels rather than erasing them to `unknown`; telemetry classifiers cannot widen the
+observed operation's error type. Declaration-local exceptions preserve public errors' structural
+assignability and existing `name` identity payloads (their discriminant is `_tag`). Internal
+testing errors use nominal brands. Changing a public error's type or encoded fields merely to
+satisfy a heuristic would be a separate API design change.
+
+Line-local anti-pattern exceptions identify real composition roots: test/fixture runtimes,
+administrative runners, per-tab RPC servers and browser telemetry roots. Encapsulated Web Crypto
+provisioning stays lazy, so importing the engine does not acquire browser services. Callable
+zero-argument RPC methods mirror the generated client contract; the ledger test's returned
+Effect deliberately allocates a reusable concurrent barrier. These are documented exceptions,
+not an invitation to disable a rule for a whole file or all tests.
+
+The plugin explicitly allows only the unstable Effect module families already used by the
+engine/harness (SQL, RPC, HTTP, workers, reactivity, Crypto and their platform packages). New
+unstable module families and experimental APIs are still checked. JavaScript browser probes
+remain syntax-linted; type-aware checks cover TypeScript projects. Other local exceptions
+document runtime-reflection boundaries, untyped third-party matchers, generated imports, proxy
+forwarding, the private driver protocol and promise cleanup callbacks; unsafe inference elsewhere
+remains an error.

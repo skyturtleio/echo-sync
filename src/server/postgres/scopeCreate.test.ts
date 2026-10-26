@@ -78,6 +78,7 @@ describe.skipIf(!pgAvailable)("scope creation on Postgres (SPEC §4)", () => {
         const winner = outcomes[0] === "Applied" ? "a" : "b"
         assert.deepStrictEqual(yield* grantsIn(S), [{ principal_id: winner, role: "owner" }])
         assert.deepStrictEqual(yield* accessRows(S), [{ n: 1 }])
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -124,6 +125,7 @@ describe.skipIf(!pgAvailable)("scope creation on Postgres (SPEC §4)", () => {
           asMutation("d", (store) => store.createScope(other))
         )
         assert.strictEqual(outcomeOf(retried), "Applied")
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -155,6 +157,7 @@ describe.skipIf(!pgAvailable)("scope creation on Postgres (SPEC §4)", () => {
         assert.strictEqual(creator.rows.get(grantKey)?.["role"], "owner")
         assert.deepStrictEqual([...stranger.rows.keys()], [])
         assert.isFalse(stranger.received.some((c) => JSON.stringify(c).includes(S)))
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 })

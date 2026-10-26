@@ -48,6 +48,7 @@ const connect = Effect.fnUntraced(function* (app: Layer.Layer<never, never, Http
     Layer.provide(Layer.succeed(FetchHttpClient.Fetch)(fetch))
   )
   // Fetch is read from the request fiber, not captured by the HTTP client layer.
+  // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Connection fixture owns the streaming RPC transport in the enclosing test scope.
   const rpc = yield* Transport.make.pipe(Effect.provide(protocol))
   const transport: Engine.Transport = {
     push: (r) => rpc.push(r).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)),
@@ -180,6 +181,7 @@ describe.skipIf(!pgAvailable)("streamed pull over real HTTP codecs and SQLite", 
             error: Schema.Union([Protocol.ClientOutdated, Protocol.Unauthorized])
           })
         )
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Legacy-client fixture shares this test connection's protocol until the enclosing scope closes.
         const legacy = yield* RpcClient.make(legacyGroup).pipe(Effect.provide(connection.protocol))
         for (const wireVersion of [0, 1]) {
           const error = yield* Effect.flip(
@@ -188,6 +190,7 @@ describe.skipIf(!pgAvailable)("streamed pull over real HTTP codecs and SQLite", 
           expect(error._tag).toBe("ClientOutdated")
         }
         expect(yield* pg`SELECT client_id FROM echo_sync.clients WHERE client_id = ${request.clientId}`).toEqual([])
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- E2E test root owns the disposable database until all scoped clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     20_000
   )
@@ -212,6 +215,7 @@ it.live("an old unary server cannot make a streaming client certify completion o
     expect((yield* Effect.flip(replica.engine.pull))._tag).toBe("PullProtocolError")
     expect(yield* replica.storage.transaction(replica.storage.staged)).toEqual([staged])
     expect((yield* replica.storage.transaction(replica.storage.meta)).cursor).toBeNull()
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns one Reactivity instance for the scoped SQLite replica's lifetime.
   }).pipe(Effect.scoped, Effect.provide(Reactivity.layer))
 )
 

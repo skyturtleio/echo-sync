@@ -57,6 +57,7 @@ describe.skipIf(!pgAvailable)("scope delivery (SPEC §4, §7)", () => {
       assert.strictEqual(newReader.rows.get("items/a")?.["access_scope_id"], "s2")
       // The old-scope reader received the move as a tombstone, never the new payload.
       assert.isFalse(oldReader.received.some((c) => c._tag === "upsert" && c.row["access_scope_id"] === "s2"))
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test Postgres composition root; TestDatabase owns creation, migration and cleanup.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -82,6 +83,7 @@ describe.skipIf(!pgAvailable)("scope delivery (SPEC §4, §7)", () => {
       )
       assert.isFalse(after.some((c) => c._tag === "upsert" && c.row["access_scope_id"] === "s1"))
       assert.deepStrictEqual(replica.view(), yield* serverView("p"))
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test Postgres composition root; TestDatabase owns creation, migration and cleanup.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -120,6 +122,7 @@ describe.skipIf(!pgAvailable)("scope delivery (SPEC §4, §7)", () => {
         yield* Fiber.join(writer)
         yield* replica.sync(3)
         assert.deepStrictEqual(replica.view(), yield* serverView("p"))
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test Postgres composition root; TestDatabase owns creation, migration and cleanup.
       }).pipe(Effect.provide(TestDatabase)),
     30_000
   )
@@ -173,6 +176,7 @@ describe.skipIf(!pgAvailable)("scope delivery (SPEC §4, §7)", () => {
           yield* replica.sync(4)
           assert.deepStrictEqual(replica.view(), yield* serverView(replica.principalId), replica.principalId)
         }
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test seeded Postgres composition root; TestDatabase owns creation, migration and cleanup.
       }).pipe(Random.withSeed("echo-sync-scopes"), Effect.provide(TestDatabase)),
     60_000
   )
@@ -195,16 +199,17 @@ describe.skipIf(!pgAvailable)("scope delivery (SPEC §4, §7)", () => {
         yield* sql`INSERT INTO events (id, access_scope_id, at) VALUES ('logged', 's1', ${new Date(at + 1)})`
         yield* replica.sync()
 
-        const decode = Schema.decodeUnknownSync(Events.wire)
+        const decode = Schema.decodeUnknownEffect(Events.wire)
         for (const [id, ms] of [
           ["walked", at],
           ["logged", at + 1]
         ] as const) {
           const row = replica.rows.get(`events/${id}`)
           assert.deepStrictEqual(row, { id, access_scope_id: "s1", at: ms })
-          assert.strictEqual(decode(row).at.epochMilliseconds, ms)
+          assert.strictEqual((yield* decode(row)).at.epochMilliseconds, ms)
         }
         assert.isFalse(JSON.stringify(replica.received).includes("do not ship"))
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test Postgres composition root; TestDatabase owns creation, migration and cleanup.
       }).pipe(Effect.provide(TestDatabase))
   )
 })

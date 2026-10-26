@@ -69,6 +69,7 @@ const serve = Effect.fnUntraced(function* (tables: Registry.SyncRegistry, client
     },
     { preconnect: globalThis.fetch.preconnect }
   )
+  // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Connection fixture owns the HTTP transport in the enclosing test scope.
   const rpc = yield* Transport.make.pipe(Effect.provide(Transport.layerProtocolHttp("http://echo.test/sync")))
   const transport: Engine.Transport = {
     push: (request) => rpc.push(request).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)),
@@ -151,6 +152,7 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
         expect(yield* updated.storage.rows.scan(Notes)).toEqual([
           { id: "unknown", access_scope_id: "s1", body: "new table" }
         ])
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- E2E test root owns the disposable database until all scoped clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     20_000
   )
@@ -277,6 +279,7 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
         yield* clock.adjust("1 minute")
         expect(sent.length).toBe(refusedPull)
         yield* Fiber.interrupt(pulling)
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- E2E test root owns the disposable database until all scoped clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     20_000
   )
@@ -431,6 +434,7 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
         expect(yield* storage.rows.read(extendedItems, "null-is-present")).toEqual(
           Option.some({ id: "null-is-present", access_scope_id: "s1", body: "valid", extra_note: null })
         )
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- E2E test root owns the disposable database until all scoped clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     20_000
   )

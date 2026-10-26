@@ -112,6 +112,7 @@ it.effect("range returns exactly core's reference rows in core's reference order
         )
       }
     }
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
   }).pipe(Effect.provide(Db))
 )
 
@@ -119,7 +120,7 @@ it.effect("write/read round-trips every column kind; None deletes; scan orders i
   Effect.gen(function* () {
     const { store } = yield* storeFor
     const rows = randomRows(rng(9), 5)
-    const odd = Schema.encodeSync(Items.wire)({
+    const odd = yield* Schema.encodeEffect(Items.wire)({
       id: ItemId.make("😀"),
       accessScopeId: AccessScope.AccessScopeId.make("s1"),
       label: "\uFFFF",
@@ -136,6 +137,7 @@ it.effect("write/read round-trips every column kind; None deletes; scan orders i
     expect(yield* store.read(Items, "i000")).toEqual(Option.none())
     // "😀" (U+1F600) sorts after "i…" by code point and by UTF-16 alike; U+FFFF vs U+1F600 is covered by range.
     expect(ids(yield* store.scan(Items))).toEqual(["i001", "i002", "i003", "i004", "😀"])
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
   }).pipe(Effect.provide(Db))
 )
 
@@ -158,6 +160,7 @@ it.effect("clearAll and purgeScope touch only replicated rows; the outbox and me
     for (const table of registry.tables) expect(yield* store.scan(table)).toEqual([])
     expect(yield* pendingIds).toEqual(["m"])
     expect(yield* metaRows).toEqual(metaBefore)
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
   }).pipe(Effect.provide(Db))
 )
 
@@ -184,6 +187,7 @@ it.live("clearAll re-emits a live query on the cleared table, even when nothing 
     yield* Fiber.interrupt(live)
     expect(next).toEqual(Option.some([]))
   }).pipe(
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test reactive SQLite composition root; the test owns the connection and subscription lifetime.
     Effect.provide(
       Layer.effectDiscard(SqliteSyncStorage.migrate(registry)).pipe(
         Layer.provideMerge(SqliteClient.layerMemory({ installReactivityHooks: true }))
@@ -223,5 +227,6 @@ it.effect("a stored row that no longer decodes must die naming its table and row
       )
       for (const part of ["items", "i000", "doc"]) expect(message).toContain(part)
     }
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
   }).pipe(Effect.provide(Db))
 )

@@ -317,7 +317,7 @@ export const sharedPokes = (
         }
         const notifications = yield* PubSub.subscribe(live.value.pubsub)
         const heartbeats = yield* PubSub.subscribe(live.value.heartbeats)
-        if (yield* Deferred.isDone(live.value.lost)) yield* Deferred.await(live.value.lost)
+        if (yield* Deferred.isDone(live.value.lost)) return yield* Deferred.await(live.value.lost)
         const poke: typeof Protocol.PokesElement.Type = { _tag: "poke" }
         const heartbeat: typeof Protocol.PokesElement.Type = { _tag: "heartbeat" }
         return Stream.concat(

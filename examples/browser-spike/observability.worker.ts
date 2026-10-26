@@ -39,6 +39,7 @@ const fiber = Effect.runFork(
     mutations,
     syncUrl: `${self.location.origin}/fake-sync/rpc`,
     syncHeaders: (principal) => Effect.succeed({ authorization: principal })
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Worker-realm telemetry root owns this recording for the leader fiber's lifetime.
   }).pipe(Effect.provide(recording.layer))
 )
 
@@ -47,6 +48,7 @@ self.addEventListener("message", (event: MessageEvent) => {
   Effect.runFork(
     Effect.gen(function* () {
       yield* Fiber.interrupt(fiber)
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Worker-realm report runner reads the same recorder after the leader fiber closes.
       const metrics = yield* Metric.snapshot.pipe(Effect.provide(recording.layer))
       let held = yield* Effect.promise(() => navigator.locks.query())
       // Lock release resolves a browser promise; scope closure is not a browser-task completion barrier.
@@ -58,12 +60,8 @@ self.addEventListener("message", (event: MessageEvent) => {
         yield* Effect.sleep("20 millis")
         held = yield* Effect.promise(() => navigator.locks.query())
       }
-      self.postMessage(
-        {
-          telemetry: JSON.parse(serialized({ spans: recording.spans, logs: recording.logs, metrics, held }))
-        },
-        { transfer: [] }
-      )
+      const telemetry: unknown = JSON.parse(serialized({ spans: recording.spans, logs: recording.logs, metrics, held }))
+      self.postMessage({ telemetry }, { transfer: [] })
     })
   )
 })

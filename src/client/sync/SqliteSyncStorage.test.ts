@@ -88,6 +88,7 @@ it.effect("queued transactions, reads and pending counts progress before a relea
     expect(order).toEqual(["save", "read", "install", "late"])
     expect(yield* storage.admit(storage.revision)).toEqual({ epoch: before.epoch, offset: before.offset + 2 })
     expect(yield* Stream.runHead(storage.pendingCount)).toEqual(Option.some(0))
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
   }).pipe(Effect.provide(Db))
 )
 
@@ -127,6 +128,7 @@ it.effect("cancelling queued head, middle and tail work never runs it or release
     yield* Effect.exit(storage.admit(Effect.die("defect")))
     yield* Effect.exit(storage.admit(Effect.fail("failure")))
     expect(yield* storage.transaction(rows.ids)).toEqual(["owner"])
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
   }).pipe(Effect.provide(Db))
 )
 
@@ -237,6 +239,7 @@ it.live("a transaction failing on one fiber rolls back only its own writes while
     expect(pending.map((e) => [e.envelope.mutationId, e.envelope.seq])).toEqual([["kept", 1]])
     expect(pending[0]?.undo).toEqual([{ table: T, id: "kept", before: Option.none() }])
     expect(yield* storage.meta).toEqual({ cursor: null, pushedThrough: 0, resnapshot: false })
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
   }).pipe(Effect.provide(Db))
 )
 
@@ -259,6 +262,7 @@ it.effect("nextSeq starts at 1 and never reuses a seq, even after its released r
     yield* Effect.provideService(Outbox.pruneReleased(-1), SqlClient.SqlClient, yield* SqlClient.SqlClient)
     expect(yield* storage.lookup(mid("b"))).toEqual(Option.none())
     expect(yield* append("c")).toBe(3)
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
   }).pipe(Effect.provide(Db))
 )
 
@@ -293,6 +297,7 @@ it.effect("staged pages and meta round-trip with bigint positions", () =>
     expect(yield* storage.transaction(storage.stagedProgress)).toEqual({ continuation: Option.some("next"), count: 2 })
     yield* storage.clearStaged
     expect(yield* storage.staged).toEqual([])
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
   }).pipe(Effect.provide(Db))
 )
 
@@ -317,6 +322,7 @@ it.effect("resuming corrupt staged JSON or a non-string continuation dies naming
         ])
       }
     }
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
   }).pipe(Effect.provide(Db))
 )
 
@@ -342,6 +348,7 @@ it.live("an interrupted transaction rolls back rows, outbox, seq and meta togeth
     expect(yield* storage.meta).toEqual({ cursor: null, pushedThrough: 0, resnapshot: false })
     // The rolled-back seq is given back: the next allocation is still 1.
     expect(yield* storage.transaction(storage.nextSeq)).toBe(1)
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
   }).pipe(Effect.provide(Db))
 )
 
@@ -456,6 +463,7 @@ it.effect("an index-only change keeps rows and cursor; a data-shape change rebui
 
     expect(yield* SqliteSyncStorage.migrate(reshaped)).toEqual({ rebuilt: true })
     expect(yield* SqliteSyncStorage.migrate(reshaped)).toEqual({ rebuilt: false })
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
   }).pipe(Effect.provide(Db))
 )
 
@@ -517,7 +525,7 @@ it.effect("after a rebuild, installing the null-cursor set replays pending on to
         ctx.store.insert(reshapedT, { id: mutationId, accessScopeId: AccessScope.AccessScopeId.make("s"), n: 1 })
     })
     const actor = AccessScope.PrincipalId.make("me")
-    const grant = Schema.encodeSync(ScopeGrants.ScopeGrants.wire)({
+    const grant = yield* Schema.encodeEffect(ScopeGrants.ScopeGrants.wire)({
       id: ScopeGrants.grantId(AccessScope.AccessScopeId.make("s"), actor),
       accessScopeId: AccessScope.AccessScopeId.make("s"),
       principalId: actor,
@@ -547,6 +555,7 @@ it.effect("after a rebuild, installing the null-cursor set replays pending on to
       ["p", [{ table: tTable, id: "p", before: Option.none() }]]
     ])
     expect((yield* storage.meta).cursor).toBe(9n)
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
   }).pipe(Effect.provide(Db))
 )
 
@@ -582,6 +591,7 @@ it.effect("a database created by main's first outbox DDL migrates forward: undo 
     // Idempotent: running it again changes nothing.
     expect(yield* SqliteSyncStorage.migrate(registry)).toEqual({ rebuilt: false })
     expect((yield* storage.pending).map((e) => e.envelope.mutationId)).toEqual(["old1"])
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test legacy SQLite composition root; the test owns migration and connection lifetime.
   }).pipe(Effect.provide(SqliteClient.layerMemory({})))
 )
 
@@ -642,6 +652,7 @@ it.live(
       const pending = yield* storage.pending
       expect(pending.map((e) => e.envelope.mutationId).toSorted()).toEqual(["a", "b"])
       expect(pending.map((e) => e.envelope.seq)).toEqual([1, 2])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
     }).pipe(Effect.provide(Db))
 )
 
@@ -695,5 +706,6 @@ it.live("a mutate queued behind a long pull install can be interrupted while it 
     // The connection is free again: the next mutate runs and takes the next seq (nothing consumed by q).
     const r = yield* engine.mutate(mid("r"), "add", {})
     expect([r.seq, state.added]).toEqual([2, 1])
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
   }).pipe(Effect.provide(Db))
 )

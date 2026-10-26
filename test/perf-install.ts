@@ -93,6 +93,7 @@ if (import.meta.main) {
     { p: 5, c: 50 },
     { p: 500, c: 5000 }
   ]) {
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Benchmark runner owns one Reactivity instance for each scoped fixture execution.
     const result = await Effect.runPromise(installFixture(p, c).pipe(Effect.scoped, Effect.provide(Reactivity.layer)))
     // Validate outside the timed region; never quote timings for a broken install.
     assert.equal(result.statements.length, 8 + 9 * p + Math.ceil(c / 500))

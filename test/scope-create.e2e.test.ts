@@ -54,6 +54,7 @@ const setup = Effect.gen(function* () {
   const sqlite = Context.get(yield* Layer.build(SqliteClient.layerMemory({})), SqlClient)
   yield* SqliteSyncStorage.migrate(registry).pipe(Effect.provideService(SqlClient, sqlite))
   const storage = yield* SqliteSyncStorage.make(sqlite, registry)
+  // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Leader fixture owns its HTTP transport in the enclosing test scope.
   const transport = yield* Transport.make.pipe(Effect.provide(Transport.layerProtocolHttp("http://echo.test/sync")))
   const engine = yield* Engine.make({
     clientId: Ids.ClientId.make("b-device"),
@@ -111,6 +112,7 @@ describe.skipIf(!pgAvailable)("scope creation (SPEC §4) against the real server
         assert.deepStrictEqual(yield* sqlite`SELECT granted_at FROM scope_grants`, optimistic)
         assert.deepStrictEqual(yield* pending, [])
       }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- E2E test root owns the disposable database until all scoped leaders close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -143,6 +145,7 @@ describe.skipIf(!pgAvailable)("scope creation (SPEC §4) against the real server
         assert.isAtLeast(error.serverNow, beforePush)
         assert.isAtMost(error.serverNow, yield* Clock.currentTimeMillis)
       }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- E2E test root owns the disposable database until all scoped leaders close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -190,6 +193,7 @@ describe.skipIf(!pgAvailable)("scope creation (SPEC §4) against the real server
             { access_scope_id: "taken", principal_id: "someone-else", role: "reader" }
           ]
         )
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- E2E test root owns the disposable database until all scoped leaders close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     60_000
   )
@@ -228,6 +232,7 @@ describe.skipIf(!pgAvailable)("scope creation (SPEC §4) against the real server
           assert.deepStrictEqual(yield* pending, [])
           assert.deepStrictEqual(yield* replica, { grants: [], items: [] })
         }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- E2E test root owns the disposable database until all scoped leaders close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     60_000
   )

@@ -44,6 +44,7 @@ const pullOnce = (startupOptions: Startup.StartupOptions = options) =>
       { preconnect: globalThis.fetch.preconnect }
     )
     const client = yield* RpcClient.make(Protocol.SyncRpcs).pipe(
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Startup fixture owns this client's HTTP transport for the enclosing test scope.
       Effect.provide(
         RpcClient.layerProtocolHttp({ url: "http://echo.test/sync" }).pipe(
           Layer.provide([
@@ -76,6 +77,7 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
           host.spans.map((span) => span.name),
           ["echo.server.startup"]
         )
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -139,6 +141,7 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
         const refused = yield* push(cookie, origin, "session=http-secret", "https://app.test")
         assert.include(refused, '"_tag":"Unauthorized"')
       }
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -198,6 +201,7 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
           return assert.fail(`expected Drift, got ${String(started.cause)}`)
         }
         assert.isTrue(drift.mismatches.some((m) => m.table === "items" && m.problem.includes("extra_note")))
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -229,6 +233,7 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
       const served = yield* pullOnce()
       if (!Exit.isSuccess(served)) return assert.fail(`restored server did not serve: ${String(served.cause)}`)
       assert.strictEqual(served.value._tag, "PullDone")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -252,6 +257,7 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
           error.mismatches.filter((m) => m.table === "missing_table").map((m) => m.problem),
           ["not attached (no echo_sync capture trigger); run attach at startup", "table does not exist"]
         )
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -265,6 +271,7 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
         results.map((r) => r._tag),
         ["Success", "Success", "Success", "Success"]
       )
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until concurrent startup attempts finish.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -289,6 +296,7 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
       const failed = results.filter(Exit.isFailure).map((r) => String(r.cause))
       assert.deepStrictEqual(failed, [])
       assert.deepStrictEqual(yield* sql`SELECT n FROM app_migration_runs`, [{ n: 1 }])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until concurrent startup attempts finish.
     }).pipe(Effect.provide(EmptyDatabase))
   )
 
@@ -319,6 +327,7 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
         error.mismatches.some((m) => m.table === "notes" && m.problem.includes("body")),
         JSON.stringify(error.mismatches)
       )
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -335,6 +344,7 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
       const url = new URL(process.env["ECHO_PG_URL"] ?? "")
       url.pathname = `/${row.db}`
       const exit = yield* Effect.exit(Startup.prepare(options)).pipe(
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- This startup probe owns its alternate search_path pool only for this invocation.
         Effect.provide(PgClient.layer({ url: Redacted.make(url.toString()), maxConnections: 4 }))
       )
       if (Exit.isSuccess(exit)) return assert.fail("startup served while app SQL resolves to an uncaptured relation")
@@ -352,6 +362,7 @@ describe.skipIf(!pgAvailable)("server startup (SPEC §13)", () => {
         ),
         JSON.stringify(error.mismatches)
       )
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 })

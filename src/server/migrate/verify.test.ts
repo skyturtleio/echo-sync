@@ -2,6 +2,7 @@ import { assert, describe, it } from "@effect/vitest"
 import { Effect, Layer, Redacted, Schema } from "effect"
 import * as PgClient from "@effect/sql-pg/PgClient"
 import { SqlClient } from "effect/sql/SqlClient"
+import type { SqlError } from "effect/sql/SqlError"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { AccessScope, Migrate, Registry, SyncTable } from "echo-sync"
@@ -18,6 +19,7 @@ const EmptyDatabase = Layer.unwrap(
       Effect.gen(function* () {
         const sql = yield* SqlClient
         yield* sql.unsafe(statement)
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Administrative fixture runner owns a short-lived pool separate from the database it creates or drops.
       }).pipe(Effect.provide(PgClient.layer({ url: Redacted.make(adminUrl), maxConnections: 1 })))
     const name = `echo_migrate_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
     yield* admin(`CREATE DATABASE ${name}`)
@@ -65,7 +67,8 @@ const load = (generated: ReadonlyArray<Migrate.Generated>) =>
         Effect.promise(async () => {
           const file = join(dir, `${g.id}.ts`)
           writeFileSync(file, g.source)
-          const module: { readonly default: Effect.Effect<void, unknown, SqlClient> } = await import(file)
+          // oxlint-disable-next-line typescript/no-unsafe-assignment -- generated migration source has this module contract
+          const module: { readonly default: Effect.Effect<void, SqlError, SqlClient> } = await import(file)
           return [g.id, module.default] as const
         })
       )
@@ -76,7 +79,7 @@ const load = (generated: ReadonlyArray<Migrate.Generated>) =>
 /** Engine migrate, the app migrations, attach every table, as server startup does. */
 const startUp = (
   registry: Registry.SyncRegistry,
-  migrations: Record<string, Effect.Effect<void, unknown, SqlClient>>
+  migrations: Record<string, Effect.Effect<void, SqlError, SqlClient>>
 ) =>
   Effect.gen(function* () {
     yield* migrate
@@ -155,6 +158,7 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
         const todos = SyncTable.make("todos", { ...base, title: Schema.String, note: Schema.NullOr(Schema.String) })
         assert.strictEqual(todos.manifest.dataHash, "7b38fc8e9d381bf9")
         assert.strictEqual(todos.manifest.indexHash, "cd0e6abb0225ca58")
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test composition root owns the disposable database and drops it after this test.
       }).pipe(Effect.scoped, Effect.provide(EmptyDatabase))
   )
 

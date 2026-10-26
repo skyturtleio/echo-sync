@@ -119,7 +119,7 @@ describe("mutation args evolve without breaking queued intents (SPEC §5)", () =
 
   it("a v1 envelope still in an outbox decodes through the wire envelope and runs as v2", async () => {
     // Exactly what a v1 client persisted and later pushes, as JSON text.
-    const queued = JSON.parse(
+    const queued: unknown = JSON.parse(
       `{"clientId":"c1","mutationId":"m-1","seq":1,"name":"todos.setCompleted","args":{"id":"t1","completed":true}}`
     )
     const envelope = Schema.decodeUnknownSync(Schema.toCodecJson(Mutation.MutationEnvelope))(queued)
@@ -267,7 +267,7 @@ describe("mutation registry and identity", () => {
 })
 
 /** The NoticeMismatch the decode failed with; anything else (success, defect) fails the test. */
-const mismatchOf = async (effect: Effect.Effect<unknown, Mutation.NoticeMismatch>) => {
+const mismatchOf = async <A>(effect: Effect.Effect<A, Mutation.NoticeMismatch>) => {
   const exit = await Effect.runPromise(Effect.exit(effect))
   if (exit._tag === "Success") throw new Error(`decoded to ${JSON.stringify(exit.value)}`)
   expect(exit.cause.reasons.every(Cause.isFailReason)).toBe(true)

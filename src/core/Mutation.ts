@@ -32,16 +32,21 @@ export const seededRandom = (clientId: ClientId, mutationId: MutationId): Random
 // Rejections and outcomes (Schema-encodable: they travel in push results and acks)
 // ---------------------------------------------------------------------------------------------
 
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class UnknownMutation extends Schema.TaggedError<UnknownMutation>()("UnknownMutation", {
+  // oxlint-disable-next-line effecttsgo/error-payload-shadows-name -- name is identity payload; _tag is the discriminant. Preserve wire/durable compatibility.
   name: Schema.String
 }) {}
 
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class ArgsDecodeFailed extends Schema.TaggedError<ArgsDecodeFailed>()("ArgsDecodeFailed", {
+  // oxlint-disable-next-line effecttsgo/error-payload-shadows-name -- name is identity payload; _tag is the discriminant. Preserve wire/durable compatibility.
   name: Schema.String,
   message: Schema.String
 }) {}
 
 /** A domain error declared by the mutation, JSON-encoded with that mutation's `error` schema. */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class DomainError extends Schema.TaggedError<DomainError>()("DomainError", {
   mutation: Schema.String,
   error: Schema.Json
@@ -51,11 +56,13 @@ export class DomainError extends Schema.TaggedError<DomainError>()("DomainError"
  * Terminal (SPEC §11): the server answered a `seq ≤` its expiry floor for this client. The
  * mutation was processed at some point; its outcome is unknown, its effect (if any) is installed.
  */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class ClientExpired extends Schema.TaggedError<ClientExpired>()("ClientExpired", {
   mutationId: MutationId
 }) {}
 
 /** The writer clock is too far ahead; no handler writes were applied (SPEC §5). */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class ClockSkew extends Schema.TaggedError<ClockSkew>()("ClockSkew", {
   createdAt: Schema.Number,
   serverNow: Schema.Number
@@ -91,6 +98,7 @@ export const MutationEnvelope = Schema.Struct({
 export type MutationEnvelope = typeof MutationEnvelope.Type
 
 /** Client-only rejection after bounded short-prefix transient answers; never ledgered. */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class TransientExhausted extends Schema.TaggedError<TransientExhausted>()("TransientExhausted", {
   attempts: Schema.Number,
   message: Schema.String
@@ -249,10 +257,12 @@ export const run = (
 // ---------------------------------------------------------------------------------------------
 
 /** `decodeNotice` was given a notice of another mutation, or one its schemas cannot decode. */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class NoticeMismatch extends Schema.TaggedError<NoticeMismatch>()("NoticeMismatch", {
   /** The mutation decoded against. */
   mutation: Schema.String,
   /** The envelope's mutation name. */
+  // oxlint-disable-next-line effecttsgo/error-payload-shadows-name -- name is identity payload; _tag is the discriminant. Preserve wire/durable compatibility.
   name: Schema.String,
   message: Schema.String
 }) {}

@@ -11,22 +11,28 @@
     "./foldkit": "./src/foldkit/index.ts"
   },
   "scripts": {
-    "check": "bun scripts/registry.ts && bun run vectors --check && tsc --noEmit && oxlint --deny-warnings && oxfmt --check && vitest run",
+    "check": "bun scripts/registry.ts && bun run vectors --check && bun run typecheck && bun run typecheck:tsrs && bun run lint && oxfmt --check && vitest run",
+    "typecheck": "effect-tsgo tsc@7.1.0-beta --noEmit && effect-tsgo tsc@7.1.0-beta --noEmit -p examples/foldkit && effect-tsgo tsc@7.1.0-beta --noEmit -p examples/server && effect-tsgo tsc@7.1.0-beta --noEmit -p examples/browser-spike && effect-tsgo tsc@7.1.0-beta --noEmit -p examples/browser-spike/cdp && effect-tsgo tsc@7.1.0-beta --noEmit -p examples/browser-spike/webkit",
+    "typecheck:tsrs": "effect-tsgo tsrs@0.20.0-ts7.1.0-beta --noEmit && effect-tsgo tsrs@0.20.0-ts7.1.0-beta --noEmit -p examples/foldkit && effect-tsgo tsrs@0.20.0-ts7.1.0-beta --noEmit -p examples/server && effect-tsgo tsrs@0.20.0-ts7.1.0-beta --noEmit -p examples/browser-spike && effect-tsgo tsrs@0.20.0-ts7.1.0-beta --noEmit -p examples/browser-spike/cdp && effect-tsgo tsrs@0.20.0-ts7.1.0-beta --noEmit -p examples/browser-spike/webkit",
     "vectors": "bun scripts/vectors.ts",
     "test": "vitest run",
     "test:pg": "ECHO_PG_URL=${ECHO_PG_URL:-postgres://postgres:echo@localhost:5432/postgres} vitest run src/server test/",
-    "lint": "oxlint --deny-warnings",
+    "lint": "oxlint --deny-warnings && effect-tsgo oxlint --config .oxlintrc.type-aware.json --type-aware --deny-warnings",
+    "lsp": "effect-tsgo tsc@7.1.0-beta --lsp --stdio",
     "fmt": "oxfmt",
     "spike": "vite --config examples/browser-spike/vite.config.ts"
   },
   "devDependencies": {
+    "@effect/tsgo": "0.59.0",
     "@effect/vitest": "4.0.5",
     "@types/bun": "1.4.3",
     "foldkit": "0.169.0",
     "oxc-parser": "0.155.0",
     "oxfmt": "0.74.0",
     "oxlint": "1.89.0",
-    "typescript": "7.0.2",
+    "oxlint-tsgolint": "7.0.2005",
+    "tsrs": "0.20.0-ts7.1.0-beta",
+    "typescript": "7.1.0-beta",
     "vite": "8.3.4",
     "vitest": "5.0.5"
   },

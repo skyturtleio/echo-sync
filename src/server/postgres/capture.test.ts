@@ -37,6 +37,7 @@ describe.skipIf(!pgAvailable)("change capture (SPEC §6)", () => {
       yield* replica.sync()
       assert.deepStrictEqual(replica.view(), yield* serverView("p"))
       assert.isTrue(replica.rows.has("items/a"))
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -60,6 +61,7 @@ describe.skipIf(!pgAvailable)("change capture (SPEC §6)", () => {
       yield* replica.sync()
       assert.isFalse(replica.rows.has("children/c1") || replica.rows.has("children/c2"))
       assert.deepStrictEqual(replica.view(), yield* serverView("p", tables))
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -70,6 +72,7 @@ describe.skipIf(!pgAvailable)("change capture (SPEC §6)", () => {
       yield* sql`CREATE TABLE other.items (id text PRIMARY KEY, access_scope_id text NOT NULL)`
       const failure = yield* Effect.flip(attach(Items, { schema: "other" }))
       assert.strictEqual(failure._tag, "TableNameConflict")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -85,6 +88,7 @@ describe.skipIf(!pgAvailable)("change capture (SPEC §6)", () => {
         (yield* syncedTables).filter((t) => t.name === "items").map((t) => t.schema),
         ["public"]
       )
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -113,6 +117,7 @@ describe.skipIf(!pgAvailable)("change capture (SPEC §6)", () => {
       assert.deepStrictEqual(results.filter((r) => r._tag === "Success").length, 1)
       const captured = (yield* syncedTables).filter((t) => t.name === "dup")
       assert.strictEqual(captured.length, 1)
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -135,6 +140,7 @@ describe.skipIf(!pgAvailable)("change capture (SPEC §6)", () => {
       assert.strictEqual(failure._tag, "SqlError")
       const triggers = yield* sql<{ tgname: string }>`SELECT tgname FROM pg_trigger WHERE tgrelid = 'half'::regclass`
       assert.deepStrictEqual(triggers, [])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -170,6 +176,7 @@ describe.skipIf(!pgAvailable)("change capture (SPEC §6)", () => {
         const exit = yield* Fiber.join(t2)
         assert.isTrue(Exit.hasDies(exit))
         assert.strictEqual((yield* syncedTables).filter((t) => t.name === "dup").length, 1)
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 })

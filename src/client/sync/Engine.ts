@@ -119,7 +119,9 @@ export interface Transport {
 }
 
 /** The handler rejected the mutation against the local replica; nothing was saved. */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class LocallyRejected extends Schema.TaggedError<LocallyRejected>()("LocallyRejected", {
+  // oxlint-disable-next-line effecttsgo/error-payload-shadows-name -- name is identity payload; _tag is the discriminant. Preserve wire/durable compatibility.
   name: Schema.String,
   error: Mutation.MutationRejection
 }) {}

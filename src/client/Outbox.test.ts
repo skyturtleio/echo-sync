@@ -23,6 +23,7 @@ it.effect("an enqueue retried after its original was released returns the origin
     expect((yield* rowCount)[0]?.n).toBe(1)
     // and the retry consumed no seq: the next new intent is contiguous
     expect((yield* append("n")).seq).toBe(first.seq + 1)
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test composition root owns an isolated in-memory database for this test only.
   }).pipe(Effect.provide(Db))
 )
 
@@ -35,6 +36,7 @@ it.effect("an append whose transaction rolls back leaves no row and no gap in se
     const b = yield* append("b")
     expect(b.seq).toBe(a.seq + 1)
     expect((yield* Outbox.pending).map((e) => e.mutationId)).toEqual(["a", "b"])
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test composition root owns an isolated in-memory database for this test only.
   }).pipe(Effect.provide(Db))
 )
 
@@ -48,6 +50,7 @@ it.effect("pruning released rows keeps pending ones and never lets a seq be reus
     expect((yield* Outbox.pending).map((e) => e.seq)).toEqual([a.seq])
     expect((yield* rowCount)[0]?.n).toBe(1)
     expect((yield* append("c")).seq).toBe(b.seq + 1)
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test composition root owns an isolated in-memory database for this test only.
   }).pipe(Effect.provide(Db))
 )
 
@@ -58,5 +61,6 @@ it.effect("released rows inside the retention window are not pruned", () =>
     yield* TestClock.adjust(Outbox.defaultReleasedRetentionMillis - 1)
     yield* Outbox.pruneReleased()
     expect((yield* append("a")).seq).toBe(a.seq)
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test composition root owns an isolated in-memory database for this test only.
   }).pipe(Effect.provide(Db))
 )

@@ -27,6 +27,7 @@ const databaseNow = Effect.flatMap(SqlClient, (sql) =>
  */
 const gcAt = (offset: number) =>
   Effect.flatMap(databaseNow, (ms) =>
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- GC fixture owns a fresh clock for this single collection run without changing the caller's clock.
     Effect.andThen(TestClock.setTime(ms + offset), collectGarbage("1 hour")).pipe(Effect.provide(TestClock.layer()))
   )
 const twoHours = 2 * 60 * 60 * 1000
@@ -38,6 +39,7 @@ describe.skipIf(!pgAvailable)("log GC (SPEC §11)", () => {
       yield* insert("a")
       const result = yield* gcAt(0)
       assert.strictEqual(result.deleted, 0)
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -70,6 +72,7 @@ describe.skipIf(!pgAvailable)("log GC (SPEC §11)", () => {
       behind.resnapshot()
       yield* behind.sync()
       assert.deepStrictEqual(behind.view(), yield* serverView("p"))
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -91,6 +94,7 @@ describe.skipIf(!pgAvailable)("log GC (SPEC §11)", () => {
       const gc = yield* gcAt(twoHours)
       assert.isAbove(gc.deleted, 0)
       assert.deepStrictEqual(yield* snapshot, before)
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -106,6 +110,7 @@ describe.skipIf(!pgAvailable)("log GC (SPEC §11)", () => {
       yield* gcAt(twoHours)
       const failure = yield* Effect.flip(replica.pullOnce(1))
       assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "gcHorizon")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -121,6 +126,7 @@ describe.skipIf(!pgAvailable)("log GC (SPEC §11)", () => {
       yield* gcAt(twoHours)
       const failure = yield* Effect.flip(replica.pullOnce(1))
       assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "gcHorizon")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 })
@@ -133,6 +139,7 @@ const expireAt = (offset: number, retention?: Duration.Input) =>
     Effect.andThen(
       TestClock.setTime(ms + offset),
       expireLedger(retention === undefined ? undefined : { retention })
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Expiry fixture owns a fresh clock for this single job run without changing the caller's clock.
     ).pipe(Effect.provide(TestClock.layer()))
   )
 
@@ -200,6 +207,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (SPEC §11)", () => {
         assert.strictEqual(c.counter.executions, 1)
         const rows = yield* Effect.flatMap(SqlClient, (sql) => sql`SELECT id FROM items`)
         assert.deepStrictEqual(rows, [{ id: "a" }])
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -224,6 +232,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (SPEC §11)", () => {
         yield* c.replica.sync()
         yield* ageAcks(10)
         assert.deepStrictEqual(yield* expireAt(0), { clients: 0, expired: 0 })
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -255,6 +264,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (SPEC §11)", () => {
         assert.deepStrictEqual(yield* answer("never-seen", 1), ["ClientExpired", m2.position])
         assert.strictEqual(c.counter.executions, 2)
         assert.deepStrictEqual(yield* c.identities, [1, 2], "the retries recorded nothing")
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -278,6 +288,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (SPEC §11)", () => {
         yield* expireAt(365 * day)
         assert.deepStrictEqual(yield* c.seqs, [2])
         assert.strictEqual((yield* c.state).floor[0]?.expired_through, "1")
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -313,6 +324,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (SPEC §11)", () => {
         // A later job that expires nothing never lowers it.
         yield* expireAt(0)
         assert.strictEqual((yield* c.state).floor[0]?.expired_through, "2")
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -330,6 +342,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (SPEC §11)", () => {
         const exit = yield* Effect.exit(expireAt(0))
         assert.isTrue(Exit.isFailure(exit) && Cause.hasDies(exit.cause), "the job dies")
         assert.deepStrictEqual(yield* c.state, before)
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -355,6 +368,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (SPEC §11)", () => {
         const before = yield* snapshot
         assert.deepStrictEqual(yield* expireAt(0), { clients: 0, expired: 0 })
         assert.deepStrictEqual(yield* snapshot, before)
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -374,6 +388,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (SPEC §11)", () => {
         const retry = yield* c.submit("m1", 2, "a")
         assert.deepStrictEqual(retry, first)
         assert.strictEqual(c.counter.executions, 1)
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -401,6 +416,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (SPEC §11)", () => {
         yield* other.sync()
         assert.strictEqual(other.cursor, last.position)
         assert.deepStrictEqual(other.view(), yield* serverView("p"))
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -423,6 +439,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (SPEC §11)", () => {
         const rows = yield* sql<{ mutation_id: string; acked: boolean }>`
         SELECT mutation_id, acked_at IS NOT NULL AS acked FROM echo_sync.mutations`
         assert.deepStrictEqual(rows, [{ mutation_id: "m1", acked: false }])
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(EmptyDatabase))
   )
 
@@ -443,6 +460,7 @@ describe.skipIf(!pgAvailable)("ledger expiry (SPEC §11)", () => {
         assert.deepStrictEqual([failure.retentionMillis, failure.minimumMillis], [47 * 3_600_000, 48 * 3_600_000])
         assert.deepStrictEqual(yield* c.state, before, "nothing expired")
         assert.deepStrictEqual(yield* expireLedger({ retention: "48 hours" }), { clients: 1, expired: 1 })
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 })
@@ -506,6 +524,7 @@ describe.skipIf(!pgAvailable)("pull continuation (SPEC §7)", () => {
         )
         assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "staleContinuation")
       }
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -547,6 +566,7 @@ describe.skipIf(!pgAvailable)("pull continuation (SPEC §7)", () => {
         [{ _tag: "scopePurged", scopeId: "B" }]
       )
       assert.deepStrictEqual(replica.view(), yield* serverView("p"))
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -561,6 +581,7 @@ describe.skipIf(!pgAvailable)("pull continuation (SPEC §7)", () => {
         pull(registry, { principalId: "p", clientId: "d", cursor: 1n, continuation, limit: 10 })
       )
       assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "unknownCursor")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -572,6 +593,7 @@ describe.skipIf(!pgAvailable)("pull continuation (SPEC §7)", () => {
         pull(registry, { principalId: "p", clientId: "d", cursor: 1n, continuation: Option.none(), limit: 10 })
       )
       assert.deepStrictEqual(failure._tag === "ResnapshotRequired" && failure.reason, "unknownCursor")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -588,6 +610,7 @@ describe.skipIf(!pgAvailable)("pull continuation (SPEC §7)", () => {
       yield* insert("c")
       yield* replica.sync()
       assert.deepStrictEqual(replica.view(), yield* serverView("p"))
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 })

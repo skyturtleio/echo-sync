@@ -1,0 +1,10 @@
+#!/usr/bin/env node
+// The editor accepts an executable path; delegate to the same no-patch runner as bun run lint.
+import { spawnSync } from "node:child_process"
+import { fileURLToPath } from "node:url"
+
+process.chdir(fileURLToPath(new URL("../", import.meta.url)))
+const cli = fileURLToPath(new URL("../node_modules/.bin/effect-tsgo", import.meta.url))
+const result = spawnSync(process.execPath, [cli, "oxlint", ...process.argv.slice(2)], { stdio: "inherit" })
+if (result.error) throw result.error
+process.exit(result.status ?? 1)

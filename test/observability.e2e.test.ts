@@ -59,6 +59,7 @@ const device = Effect.fnUntraced(
     })
     return { engine, storage, sqlite }
   },
+  // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Scoped device fixture composition root; native SQLite tracing stays isolated from the host recorder.
   Effect.provide(Reactivity.layer),
   Effect.provideService(Tracer.Tracer, Tracer.nativeTracer)
 )
@@ -112,6 +113,7 @@ it.effect("request failures append no notices and ledgered rejections keep succe
     expect(outcomes("echo.enqueue")).toEqual(["rejected", "saved", "saved", "saved"])
     expect(outcomes("echo.push")).toEqual(["unauthorized", "ok"])
     expect(outcomes("echo.pull")).toEqual(["ok"])
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Scoped test telemetry root; the recorder covers the complete request scenario and cleanup.
   }).pipe(Effect.scoped, Effect.provide(recording.layer))
 })
 
@@ -173,6 +175,7 @@ it.live(
       expect(explicitRootParent?.parentTraceId).toBe(external.traceId)
       expect(explicitRootParent?.traceId).toBe(external.traceId)
       expect(explicitRootParent?.sampled).toBe(false)
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Scoped test telemetry root; parent propagation and cleanup run under this recorder.
     }).pipe(Effect.scoped, Effect.provide(recording.layer))
   }
 )
@@ -219,6 +222,7 @@ it.effect("batch telemetry agrees with the loop's whole-cause decision, not the 
           ).toBe(0)
         }
         yield* Fiber.interrupt(fiber)
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-scenario telemetry root; this recorder owns the batch loop and its cleanup observations.
       }).pipe(Effect.scoped, Effect.provide(recording.layer))
     }
   })
@@ -281,6 +285,7 @@ it.effect("the whole final push cause remains authoritative, including typed cle
             (yield* Metric.value(Metric.counter("echo.push.total", { attributes: { "echo.outcome": "halted" } }))).count
           ).toBe(0)
         }
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-scenario telemetry root; each final-cause scenario uses its own recorder.
       }).pipe(Effect.scoped, Effect.provide(recording.layer))
     }
   })
@@ -331,6 +336,7 @@ it.effect("throwing host sinks cannot change saved intent, retry deadlines, halt
             .length
         ).toBe(1)
         yield* Fiber.interrupt(fiber)
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Scoped throwing-sink fixture root; the recorder covers loop execution and interruption.
       }).pipe(Effect.scoped, Effect.provide(recording.layer))
       yield* run
       if (failure === "none" || failure === "logger") {
@@ -389,6 +395,7 @@ it.live("SQLite sync never exports a typed failure, defect, result or dependency
         .filter((span) => span.name === "echo.pull")
         .map((span) => new Map(span.attributes).get("echo.outcome"))
     ).toEqual(["ok", "defect"])
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Scoped test telemetry root; the recorder covers SQLite failures and cleanup.
   }).pipe(Effect.scoped, Effect.provide(recording.layer))
 })
 
@@ -412,6 +419,7 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
         )
         const db = yield* Effect.context<SqlClient>()
         const serve = yield* Protocol.SyncRpcs.accessHandler("pokes").pipe(
+          // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Scoped subscription fixture root; captured database and request context belong to this test.
           Effect.provide(
             handlers({ registry, mutations, principalFor: () => Effect.succeed(actor) }).pipe(
               Layer.provide([
@@ -454,12 +462,7 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
         expect(serialized(recording.spans)).not.toContain(secret)
         expect(serialized(recording.logs.filter((log) => !log.diagnostics))).not.toContain(secret)
         expect(serialized(recording.logs.filter((log) => log.diagnostics))).toContain(secret)
-      }).pipe(
-        Effect.withSpan("host.subscription"),
-        Effect.scoped,
-        Effect.provide(recording.layer),
-        Effect.provide(TestDatabase)
-      )
+      }).pipe(Effect.withSpan("host.subscription"), Effect.scoped, Effect.provide([recording.layer, TestDatabase]))
       return program.pipe(
         Effect.tap(() =>
           Effect.sync(() => {
@@ -492,8 +495,10 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
             expect(yield* expireLedger()).toEqual({ clients: 1, expired: 1 })
             expect((yield* collectGarbage("7 days")).deleted).toBe(0)
             expect(recording.spans).toEqual([])
+            // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-sink scenario telemetry root; keep database setup outside the throwing recorder.
           }).pipe(Effect.provide(recording.layer))
         }
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Scoped Postgres test root; database setup and cleanup stay outside per-sink recording.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -520,6 +525,7 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
         )
         const web = HttpRouter.toWebHandler(Layer.merge(sync, other), {
           disableLogger: true,
+          // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test HTTP request composition root; each request inherits the host recorder at the middleware boundary.
           middleware: (work) => Effect.provide(work, recording.layer)
         })
         yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
@@ -529,6 +535,7 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
         )
         let mode = "ok"
         const rpc = yield* Transport.make.pipe(
+          // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Scoped HTTP test client composition root; the surrounding test owns RPC cleanup.
           Effect.provide(
             Transport.layerProtocolHttp(
               "http://echo.test/sync",
@@ -602,7 +609,7 @@ describe.skipIf(!pgAvailable)("real HTTP route telemetry", () => {
             (span) => Exit.isSuccess(span.exit) && span.exit.value === undefined && span.events.length === 0
           )
         ).toBe(true)
-      }).pipe(Effect.scoped, Effect.provide(recording.layer), Effect.provide(TestDatabase))
+      }).pipe(Effect.scoped, Effect.provide([recording.layer, TestDatabase]))
     },
     30_000
   )

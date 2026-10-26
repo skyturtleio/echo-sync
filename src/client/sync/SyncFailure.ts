@@ -14,17 +14,20 @@ import { failureMeaning } from "../../internal/ErrorCatalog.ts"
  * `syncHeaders` raised (a defect: its error channel is `never`) while the leader was preparing a
  * request (INV-LOOP-8 Credentials). Local and transient, like a network failure: nothing was sent.
  */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class CredentialsUnavailable extends Schema.TaggedError<CredentialsUnavailable>()("CredentialsUnavailable", {
   message: Schema.String
 }) {}
 
 /** The push batch cannot be sent as is, or the server ended it with a defect. Fatal. */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class PushIntegrityError extends Schema.TaggedError<PushIntegrityError>()("PushIntegrityError", {
   reason: Schema.Literals(["invalidPayload", "serverDefect"]),
   message: Schema.String
 }) {}
 
 /** The pull call ended in a defect. Transient: nothing was installed. */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class PullProtocolError extends Schema.TaggedError<PullProtocolError>()("PullProtocolError", {
   message: Schema.String
 }) {}
@@ -34,12 +37,14 @@ export class PullProtocolError extends Schema.TaggedError<PullProtocolError>()("
  * install transaction fails as a whole (no rows, acks, cursor or staging change). Per INV-CLI-9
  * and SPEC §10 it is a transient pull failure: the sync loop retries with backoff, never halts.
  */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class MalformedChange extends Schema.TaggedError<MalformedChange>()("MalformedChange", {
   table: Schema.String,
   message: Schema.String
 }) {}
 
 /** A known table's server payload lacks a declared wire column. Retry, never rebuild. */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class ServerOutdated extends Schema.TaggedError<ServerOutdated>()("ServerOutdated", {
   table: Schema.String
 }) {}

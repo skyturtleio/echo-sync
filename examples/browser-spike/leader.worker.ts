@@ -14,7 +14,7 @@ if (flags.has("crashAfterCommit")) {
   // committed. For mutation ids starting with "crash-after-commit", end this worker instead of sending it.
   const post = MessagePort.prototype.postMessage
   Object.defineProperty(MessagePort.prototype, "postMessage", {
-    value: function (this: MessagePort, ...args: Array<unknown>) {
+    value: function (this: MessagePort, ...args: Array<unknown>): unknown {
       if (isCrashResponse(args[0])) return self.close()
       return Reflect.apply(post, this, args)
     }

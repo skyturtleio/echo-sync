@@ -210,14 +210,12 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
     let revision: Revision = { epoch: yield* randomUUIDv4, offset: 0 }
     let changed = false
     let appended = false
-    const advance = () => {
+    const advance = Effect.gen(function* () {
       revision =
         revision.offset === Number.MAX_SAFE_INTEGER
-          ? // Overflow is only reachable after Number.MAX_SAFE_INTEGER commits. Keeping this synchronous
-            // preserves the write path's existing shape without threading an Effect through every caller.
-            { epoch: Effect.runSync(randomUUIDv4), offset: 0 }
+          ? { epoch: yield* randomUUIDv4, offset: 0 }
           : { ...revision, offset: revision.offset + 1 }
-    }
+    })
     const touch = <A, E, R>(self: Effect.Effect<A, E, R>) =>
       Effect.tap(self, () =>
         Effect.sync(() => {
@@ -233,7 +231,7 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
             const before = revision
             // Keep publication masked with COMMIT, but the body (and admission above) cancellable.
             const value = yield* sql.withTransaction(restore(self))
-            if (changed) advance()
+            if (changed) yield* advance
             const change: LocalChange | null =
               local && appended && before.epoch === revision.epoch ? { before, after: revision } : null
             return { value, change }
@@ -270,7 +268,7 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
 
     return {
       revision: Effect.sync(() => revision),
-      invalidateRevision: Effect.sync(advance),
+      invalidateRevision: advance,
       admit,
       pendingCount: sql.reactive(
         ["echo_outbox"],

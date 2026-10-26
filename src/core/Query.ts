@@ -8,12 +8,16 @@ import type { EchoStore, ReadError, ReadStore } from "./Store.ts"
  * one read transaction and re-runs it when a table the latest run read changes.
  */
 
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class UnknownQuery extends Schema.TaggedError<UnknownQuery>()("UnknownQuery", {
+  // oxlint-disable-next-line effecttsgo/error-payload-shadows-name -- name is identity payload; _tag is the discriminant. Preserve wire/durable compatibility.
   name: Schema.String
 }) {}
 
 /** The args a tab sent do not decode with the query's `args` schema: a bug in the caller. */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class QueryArgsDecodeFailed extends Schema.TaggedError<QueryArgsDecodeFailed>()("QueryArgsDecodeFailed", {
+  // oxlint-disable-next-line effecttsgo/error-payload-shadows-name -- name is identity payload; _tag is the discriminant. Preserve wire/durable compatibility.
   name: Schema.String,
   message: Schema.String
 }) {}

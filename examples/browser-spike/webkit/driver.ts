@@ -114,7 +114,8 @@ const serve = async () => {
         // JSON-encoded in the page, as CDP's returnByValue does: Playwright's own serializer would turn an
         // Error subclass (a Schema.TaggedError notice) into { name, message, stack } and drop its fields.
         const encoded = await current().evaluate(`(async () => JSON.stringify(await (${stdin})) ?? "null")()`)
-        return { data: { result: typeof encoded === "string" ? JSON.parse(encoded) : null } }
+        const result: unknown = typeof encoded === "string" ? JSON.parse(encoded) : null
+        return { data: { result } }
       }
       case "reload":
         await current().reload()
@@ -134,6 +135,7 @@ const serve = async () => {
     idleTimeout: 0,
     fetch: async (request) => {
       if (request.method !== "POST") return new Response("webkit driver")
+      // oxlint-disable-next-line typescript/no-unsafe-assignment -- loopback-only driver receives its own CLI's JSON
       const { args, stdin }: { args: Array<string>; stdin: string } = await request.json()
       // A command that never settles (a hung page) fails after this long instead of stalling the run.
       const limit = Number(process.env["ECHO_WEBKIT_COMMAND_TIMEOUT_MS"] ?? "180000")

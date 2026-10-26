@@ -64,6 +64,7 @@ const setup = Effect.gen(function* () {
   const sqlite = Context.get(yield* Layer.build(SqliteClient.layerMemory({ installReactivityHooks: true })), SqlClient)
   yield* SqliteSyncStorage.migrate(registry).pipe(Effect.provideService(SqlClient, sqlite))
   const storage = yield* SqliteSyncStorage.make(sqlite, registry)
+  // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Scoped session fixture composition root; the caller owns the transport lifetime.
   const transport = yield* Transport.make.pipe(Effect.provide(Transport.layerProtocolHttp("http://echo.test/sync")))
   const clientId = Ids.ClientId.make("alice-device")
   const engine = yield* Engine.make({ clientId, actor: alice, storage, registry, mutations, transport })
@@ -127,7 +128,7 @@ describe.skipIf(!pgAvailable)("replica principal vs. session (SPEC §5) against 
         assert.deepStrictEqual((yield* serverRows).clients, [])
         assert.deepStrictEqual(
           before.local.pending.map((p) => p.envelope),
-          [Schema.encodeSync(Mutation.MutationEnvelope)(write)]
+          [yield* Schema.encodeEffect(Mutation.MutationEnvelope)(write)]
         )
         const loop = yield* SyncLoop.make({
           engine,
@@ -168,6 +169,7 @@ describe.skipIf(!pgAvailable)("replica principal vs. session (SPEC §5) against 
           items: ["alice-row"]
         })
         yield* Fiber.interrupt(running)
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test session-switch composition root; the scoped test owns replicas and TestDatabase cleanup.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     30_000
   )
@@ -191,7 +193,7 @@ describe.skipIf(!pgAvailable)("replica principal vs. session (SPEC §5) against 
         assert.deepStrictEqual((yield* serverRows).ledger, [])
         assert.deepStrictEqual(
           before.local.pending.map((p) => p.envelope),
-          [Schema.encodeSync(Mutation.MutationEnvelope)(write)]
+          [yield* Schema.encodeEffect(Mutation.MutationEnvelope)(write)]
         )
 
         // Back on alice's session the preserved write is delivered once.
@@ -201,6 +203,7 @@ describe.skipIf(!pgAvailable)("replica principal vs. session (SPEC §5) against 
         assert.deepStrictEqual(yield* storage.pending, [])
         assert.deepStrictEqual((yield* serverRows).ledger, ["pending-write"])
         assert.deepStrictEqual((yield* replica).items, ["alice-new", "alice-row"])
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test session-switch composition root; the scoped test owns replicas and TestDatabase cleanup.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     30_000
   )

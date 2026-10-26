@@ -101,6 +101,7 @@ export const tombstoneName = ({ profile }: ReplicaIdentity): Effect.Effect<strin
         })
     ),
     // Keep Web Crypto lazy: only tombstone operations need this service, not worker startup.
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- This environment-free platform operation acquires Web Crypto only on execution, not at worker startup.
     Effect.provide(BrowserCrypto.layer)
   )
 
@@ -145,7 +146,9 @@ export const storageCall = <A>(operation: string, run: () => Promise<A>): Effect
   Effect.tryPromise({ try: run, catch: (cause) => new BrowserStorageError({ operation, cause }) })
 
 /** The Web Locks API rejected a request for a reason other than our own cancellation. */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class LockError extends Schema.TaggedError<LockError>()("LockError", {
+  // oxlint-disable-next-line effecttsgo/error-payload-shadows-name -- name is identity payload; _tag is the discriminant. Preserve wire/durable compatibility.
   name: Schema.String,
   message: Schema.String
 }) {}

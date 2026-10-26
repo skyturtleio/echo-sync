@@ -101,10 +101,11 @@ export const sqlite = (): Dialect => {
 const pgParam = (table: AnySyncTable, column: string, value: PgValue): unknown =>
   table.columns.find((c) => c.name === column)?.kind === "json" && value !== null ? PgTypes.jsonb(value) : value
 
-const run = <A>(f: (sql: SqlClient) => Effect.Effect<A, unknown>) =>
+const run = <A, E>(f: (sql: SqlClient) => Effect.Effect<A, E>) =>
   Effect.runPromise(
     Effect.gen(function* () {
       return yield* f(yield* SqlClient)
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Promise fixture runner owns a fresh SQL pool for this operation and closes it on completion.
     }).pipe(Effect.provide(PgClient.layer({ url: Redacted.make(pgUrl), maxConnections: 1 })), Effect.orDie)
   )
 

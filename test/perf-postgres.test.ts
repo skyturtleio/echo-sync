@@ -74,7 +74,7 @@ describe.skipIf(!pgAvailable)("Postgres statement budgets", () => {
           expect(scan?.["Rows Removed by Filter"] ?? 0).toBe(0)
           expect(root?.["Shared Hit Blocks"]).toBeLessThan(100)
         }
-      }).pipe(Effect.scoped, Effect.provide(TestDatabase), Effect.provide(Reactivity.layer))
+      }).pipe(Effect.scoped, Effect.provide([TestDatabase, Reactivity.layer]))
   )
 
   it.live("a pushed mutation adds only its N reads and M writes to the fixed ledger cost", () =>
@@ -122,7 +122,7 @@ describe.skipIf(!pgAvailable)("Postgres statement budgets", () => {
         expect(counter.statements.reduce((sum, s) => sum + s.rows, 0)).toBe(5 + 2 * n + 2 * m)
       }
       expect((yield* source<{ body: string }>`SELECT body FROM items WHERE id = 'i'`)[0]?.body).toBe("write-2")
-    }).pipe(Effect.scoped, Effect.provide(TestDatabase), Effect.provide(Reactivity.layer))
+    }).pipe(Effect.scoped, Effect.provide([TestDatabase, Reactivity.layer]))
   )
 
   it.live("empty, log and scope-walk pages retain their derived statement and returned-row budgets", () =>
@@ -172,6 +172,6 @@ describe.skipIf(!pgAvailable)("Postgres statement budgets", () => {
       expect(counter.statements).toHaveLength(10)
       expect(counter.statements.reduce((sum, s) => sum + s.rows, 0)).toBe(6 + 3)
       expect(Option.isSome(paged.continuation)).toBe(true)
-    }).pipe(Effect.scoped, Effect.provide(TestDatabase), Effect.provide(Reactivity.layer))
+    }).pipe(Effect.scoped, Effect.provide([TestDatabase, Reactivity.layer]))
   )
 })

@@ -92,6 +92,7 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (INV-ACL-5)", () => {
         ids.map((r) => r.id),
         accepted.map(([scope, principal]) => derived(scope, principal)).toSorted()
       )
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -120,6 +121,7 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (INV-ACL-5)", () => {
         after.map((r) => r.name),
         ["engine", "grant_id_check", "ledger_acked_at", "engine_epoch", "scope_walk_index"]
       )
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(EmptyDatabase))
   )
 
@@ -152,6 +154,7 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (INV-ACL-5)", () => {
         assert.strictEqual(result.outcome._tag, "Applied")
         const rows = yield* sql<{ id: string }>`SELECT id FROM echo_sync.scope_grants WHERE access_scope_id = ${scope}`
         assert.deepStrictEqual(rows, [{ id: "6:team-\u{1F600}:q" }])
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -171,6 +174,7 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (INV-ACL-5)", () => {
           SELECT to_regclass('echo_sync.scope_grants') IS NOT NULL AS grants,
                  (SELECT count(*)::int FROM echo_sync.migrations) AS history`
         assert.deepStrictEqual(state, { grants: false, history: 0 })
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns this encoding-specific disposable database until test completion.
       }).pipe(Effect.provide(emptyDatabase("ENCODING 'SQL_ASCII' TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'")))
   )
 })
@@ -234,6 +238,7 @@ describe.skipIf(!pgAvailable)("self-revocation of a grant (SPEC §4)", () => {
         assert.deepStrictEqual(tombstones.toSorted(), [derived(scope, "r"), derived(scope, "w")].toSorted())
         assert.strictEqual(owner.rows.get("items/shared")?.["body"], "v1")
         assert.deepStrictEqual(owner.view(), yield* serverView("o"))
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 })

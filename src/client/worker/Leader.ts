@@ -274,6 +274,7 @@ const serveTab = (
   pending: Set<MessagePort>
 ) =>
   RpcServer.make(LeaderRpcs).pipe(
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Each tab RPC server owns its MessagePort transport until that tab's lifetime lock releases.
     Effect.provide(RpcServer.layerProtocolWorkerRunner.pipe(Layer.provide(BrowserWorkerRunner.layerMessagePort(port)))),
     Effect.provide(handlers),
     // Tabs never say goodbye reliably; their lifetime lock does.
@@ -611,7 +612,7 @@ const listen = (
   Effect.acquireRelease(
     Effect.sync(() => {
       let open = true
-      const listener = (event: MessageEvent) => {
+      const listener = (event: MessageEvent<unknown>) => {
         if (!open || !isToLeader(event.data)) {
           for (const port of event.ports) port.close()
           if (isToLeader(event.data) && (event.data._tag === "Connect" || event.data._tag === "RouterPort"))

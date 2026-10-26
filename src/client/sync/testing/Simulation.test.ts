@@ -149,7 +149,7 @@ const transientScenario = (scenario: {
         [id("next")]
       )
       assert.lengthOf(disk.notices, 1)
-      const notice = Schema.decodeUnknownSync(Mutation.Notice)(JSON.parse(JSON.stringify(disk.notices[0])))
+      const notice = yield* Schema.decodeUnknownEffect(Mutation.Notice)(JSON.parse(JSON.stringify(disk.notices[0])))
       assert.equal(notice.envelope.mutationId, id("blocked"))
       assert.equal(notice._tag, "Rejected")
       if (notice._tag === "Rejected")
@@ -761,7 +761,7 @@ describe("reconciliation simulation", () => {
       Effect.gen(function* () {
         const disk = installedDisk() // cursor 1
         const base = valueOf(disk, "x")
-        const response = Schema.decodeUnknownSync(Schema.toCodecJson(Protocol.PushResponse))({
+        const response = yield* Schema.decodeUnknownEffect(Schema.toCodecJson(Protocol.PushResponse))({
           results: [
             {
               mutationId: "m1",
@@ -830,8 +830,8 @@ describe("reconciliation simulation", () => {
         assert.strictEqual(valueOf(disk, "x"), Number(base) + 10)
         // These JSON-only fields use the same notice schema as durable SQLite and the tab RPC.
         const noticeJson = Schema.Array(Mutation.Notice)
-        const encoded = Schema.encodeSync(noticeJson)(disk.notices)
-        const decoded = Schema.decodeUnknownSync(noticeJson)(JSON.parse(JSON.stringify(encoded)))
+        const encoded = yield* Schema.encodeEffect(noticeJson)(disk.notices)
+        const decoded = yield* Schema.decodeUnknownEffect(noticeJson)(JSON.parse(JSON.stringify(encoded)))
         assert.deepStrictEqual(decoded, disk.notices)
         assert.deepStrictEqual(
           decoded.map((notice) => [notice._tag, notice.envelope.mutationId]),

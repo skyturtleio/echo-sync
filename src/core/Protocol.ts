@@ -117,6 +117,7 @@ export type PullResponse = typeof PullResponse.Type
 // ---------------------------------------------------------------------------------------------
 
 /** The client must discard staged pages and resync from a null cursor (INV-CLI-10). */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class ResnapshotRequired extends Schema.TaggedError<ResnapshotRequired>()("ResnapshotRequired", {
   /** Present for a history fence; discard old replica metadata and retry under this epoch. */
   epoch: Schema.optionalKey(Schema.String),
@@ -137,12 +138,14 @@ export type UnauthorizedReason = typeof UnauthorizedReason.Type
  * The request's principal could not be established, disagrees with the replica, or does not own
  * `clientId`. `reason` is optional on the wire so a new client can decode an old server's error.
  */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class Unauthorized extends Schema.TaggedError<Unauthorized>()("Unauthorized", {
   reason: Schema.optionalKey(UnauthorizedReason),
   message: Schema.String
 }) {}
 
 /** App policy refused this client. Stop sync until reload, without changing local storage. */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class ClientOutdated extends Schema.TaggedError<ClientOutdated>()("ClientOutdated", {
   message: Schema.String
 }) {}
@@ -151,6 +154,7 @@ export class ClientOutdated extends Schema.TaggedError<ClientOutdated>()("Client
  * Request-level push rejection (INV-MUT-7): an envelope in the batch is malformed (e.g.
  * `seq < 1`), so the whole push is refused; nothing is executed or ledgered.
  */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class MalformedEnvelope extends Schema.TaggedError<MalformedEnvelope>()("MalformedEnvelope", {
   clientId: ClientId,
   mutationId: MutationId,
@@ -161,6 +165,7 @@ export class MalformedEnvelope extends Schema.TaggedError<MalformedEnvelope>()("
  * Transient server infrastructure failure on `pull` or `pokes` (SPEC §10): retry with backoff.
  * A defect from the server is always a bug; push reports this case as a short result list.
  */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class ServerUnavailable extends Schema.TaggedError<ServerUnavailable>()("ServerUnavailable", {
   message: Schema.String
 }) {}
@@ -253,6 +258,7 @@ export const PresencePayload = Schema.Struct({
  * The principal holds no grant in the room's scope (SPEC §10.3 Presence). Unlike `Unauthorized` (a
  * credential failure, retried), this is a fact about access, and the only error that ends a presence stream.
  */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class Forbidden extends Schema.TaggedError<Forbidden>()("Forbidden", { room: AccessScopeId }) {}
 
 export const PresenceRpcs = RpcGroup.make(

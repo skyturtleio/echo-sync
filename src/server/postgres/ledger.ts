@@ -21,6 +21,7 @@ export interface Processed {
  * lost connection, unclassified database error, or a COMMIT whose reply was lost (in which case
  * it may in fact be recorded). The client resubmits from this mutation; dedup makes that safe.
  */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class MutationTransient extends Schema.TaggedError<MutationTransient>()("MutationTransient", {
   clientId: Schema.String,
   mutationId: Schema.String,
@@ -45,6 +46,7 @@ const checkEnvelope = (clientId: string, mutationId: string, seq: bigint) =>
     : Effect.void
 
 /** The client id is registered to a different principal. */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class ClientForbidden extends Schema.TaggedError<ClientForbidden>()("ClientForbidden", {
   clientId: Schema.String
 }) {}

@@ -106,6 +106,7 @@ export const run = async () => {
           client.enqueue({ envelope: { mutationId: Ids.MutationId.make("defect"), name: "die", args: secret } })
         )
         if (Exit.isSuccess(defect)) return yield* Effect.die("defect unexpectedly succeeded")
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Browser probe root owns this tab's RPC transport until the scoped probe ends.
       }).pipe(Effect.provide(protocol), Effect.scoped)
     )
     const report = () =>

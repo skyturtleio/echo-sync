@@ -114,6 +114,7 @@ it.live("an enqueue cancelled while its COMMIT runs still wakes the loop: the en
     expect(Option.isSome(push) ? "push observed" : "no push within 2 s").toBe("push observed")
     expect(pushed).toEqual(["m"])
     expect((yield* loop.status).lastError).toBeNull()
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test leader composition root; the test owns the SQLite and sync-loop lifetime.
   }).pipe(Effect.provide(Db))
 )
 
@@ -183,6 +184,7 @@ const flip = Query.make("flip", {
       const patch: unknown = Reflect.get(db, "patch")
       if (typeof patch !== "function") return Effect.die(new Error("no write method on the query store"))
       const written: unknown = Reflect.apply(patch, db, [Flags, RowId.make("f"), { body: "b" }])
+      // oxlint-disable-next-line effecttsgo/any-unknown-in-error-context -- Reflection preserves unknown errors: Effect.isEffect cannot validate an error type; orDie contains this test-only write.
       return isStoreWrite(written) ? Effect.as(Effect.orDie(written), "flipped") : Effect.succeed("flipped")
     })
 })
@@ -805,14 +807,11 @@ const replicaDb = Effect.gen(function* () {
     role: "owner" as const,
     grantedAt: DateTime.makeUnsafe(0)
   }
+  const encodedGrant = yield* Schema.encodeEffect(ScopeGrants.ScopeGrants.wire)(grant)
   // A replica that already installed a snapshot (cursor 1), so a pull is incremental and keeps the grant.
   yield* storage.transaction(
     Effect.andThen(
-      storage.rows.write(
-        ScopeGrants.ScopeGrants,
-        grant.id,
-        Option.some(Schema.encodeUnknownSync(ScopeGrants.ScopeGrants.wire)(grant))
-      ),
+      storage.rows.write(ScopeGrants.ScopeGrants, grant.id, Option.some(encodedGrant)),
       storage.setMeta({ cursor: position, pushedThrough: 0, resnapshot: false })
     )
   )
@@ -860,17 +859,8 @@ const syncLeader = (
   })
 
 /** Take emissions until one satisfies `p` (5 s budget); returns it. */
-const awaitStatus = (
-  emissions: Queue.Queue<SyncLoop.SyncStatus>,
-  p: (s: SyncLoop.SyncStatus) => boolean
-): Effect.Effect<SyncLoop.SyncStatus, unknown> =>
-  Queue.take(emissions).pipe(
-    Effect.repeat({ until: p }),
-    Effect.timeoutOrElse({
-      duration: "5 seconds",
-      orElse: () => Effect.fail(new Error("no matching syncStatus emission within 5 s"))
-    })
-  )
+const awaitStatus = (emissions: Queue.Queue<SyncLoop.SyncStatus>, p: (s: SyncLoop.SyncStatus) => boolean) =>
+  Queue.take(emissions).pipe(Effect.repeat({ until: p }), Effect.timeout("5 seconds"))
 
 it.live(
   "pendingMutations follows every append and release (not only cycle ends), and a new leader starts from the durable outbox",

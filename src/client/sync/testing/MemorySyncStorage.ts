@@ -32,7 +32,10 @@ export interface Disk {
 }
 
 /** A simulated process crash in the middle of a storage transaction. */
-export class SimulatedCrash extends Schema.TaggedError<SimulatedCrash>()("SimulatedCrash", {}) {}
+export class SimulatedCrash extends Schema.TaggedError<SimulatedCrash, { readonly SimulatedCrash: unique symbol }>()(
+  "SimulatedCrash",
+  {}
+) {}
 
 export const makeDisk = (): Disk => ({
   replica: MemoryStore.make(),

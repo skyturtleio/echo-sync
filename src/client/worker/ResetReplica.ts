@@ -28,12 +28,15 @@ import * as Platform from "./platform.ts"
  * A leader still held the identity's leader lock after `closeTimeout` (a tab that did not honour the reset
  * signal: an old build, a frozen tab); nothing was touched.
  */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class ReplicaInUse extends Schema.TaggedError<ReplicaInUse>()("ReplicaInUse", {}) {}
 
 /** The outbox holds `count` unreleased mutations and `discardPending` was not set; nothing was deleted. */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class PendingWrites extends Schema.TaggedError<PendingWrites>()("PendingWrites", { count: Schema.Int }) {}
 
 /** The reset could not run or did not finish (unsupported browser, invalid identity, an OPFS error). */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class ResetFailed extends Schema.TaggedError<ResetFailed>()("ResetFailed", { message: Schema.String }) {}
 
 export interface ResetReplicaConfig extends Platform.ReplicaIdentity {

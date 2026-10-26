@@ -1,4 +1,5 @@
 {
+  "$schema": "./node_modules/@effect/tsgo/schema.json",
   "compilerOptions": {
     "target": "ES2023",
     "lib": ["ES2023", "DOM", "DOM.Iterable", "WebWorker"],
@@ -22,7 +23,25 @@
     "noUncheckedSideEffectImports": true,
     "skipLibCheck": true,
     "types": ["bun"],
-    "erasableSyntaxOnly": true
+    "erasableSyntaxOnly": true,
+    "plugins": [
+      {
+        "name": "@effect/language-service",
+        "diagnostics": false,
+        "allowedUnstableApis": [
+          "effect/Crypto",
+          "effect/http",
+          "effect/reactivity",
+          "effect/rpc",
+          "effect/sql",
+          "effect/workers",
+          "@effect/platform-browser",
+          "@effect/sql-pg",
+          "@effect/sql-sqlite-wasm",
+          "@effect/vitest"
+        ]
+      }
+    ]
   },
   "include": ["src", "test", "scripts", "*.ts"]
 }

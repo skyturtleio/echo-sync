@@ -1,0 +1,10 @@
+#!/usr/bin/env node
+// VS Code's SDK discovery requires an executable named tsgo, not a command with arguments.
+import { spawnSync } from "node:child_process"
+import { fileURLToPath } from "node:url"
+import getExePath from "@effect/tsgo/lib/getExePath"
+
+process.chdir(fileURLToPath(new URL("../../", import.meta.url)))
+const result = spawnSync(getExePath(), process.argv.slice(2), { stdio: "inherit" })
+if (result.error) throw result.error
+process.exit(result.status ?? 1)

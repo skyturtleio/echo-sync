@@ -33,6 +33,7 @@ const ensureDatabase = Effect.gen(function* () {
   const sql = yield* SqlClient
   const found = yield* sql`SELECT 1 FROM pg_database WHERE datname = ${dbName}`
   if (found.length === 0) yield* sql.unsafe(`CREATE DATABASE "${dbName}"`)
+  // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Startup administrative runner owns a short-lived pool before the application database runtime exists.
 }).pipe(Effect.provide(PgClient.layer({ url: Redacted.make(adminUrl.toString()), maxConnections: 1 })))
 
 const Db = PgClient.layer({ url: Redacted.make(dbUrl.toString()), maxConnections: 40 })
@@ -104,7 +105,7 @@ const json = (value: unknown) =>
     }
   )
 
-const adminRoute = (url: URL): Effect.Effect<Response, unknown, SqlClient> =>
+const adminRoute = (url: URL) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient
     const q = (name: string) => url.searchParams.get(name) ?? ""
@@ -214,7 +215,9 @@ const shutdown = () => {
   // Each step runs even if the one before it rejects: the startup scope owns the shared build.
   void web
     .dispose()
+    // oxlint-disable-next-line typescript/no-misused-promises -- finally awaits these cleanup promises in order
     .finally(() => Effect.runPromise(Scope.close(startupScope, Exit.void)))
+    // oxlint-disable-next-line typescript/no-misused-promises -- finally awaits these cleanup promises in order
     .finally(() => admin.dispose())
     .finally(() => process.exit(0))
 }

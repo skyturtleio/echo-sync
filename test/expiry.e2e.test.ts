@@ -70,6 +70,7 @@ const device = Effect.gen(function* () {
   const sqlite = Context.get(yield* Layer.build(SqliteClient.layerMemory({})), SqlClient)
   yield* SqliteSyncStorage.migrate(registry).pipe(Effect.provideService(SqlClient, sqlite))
   const storage = yield* SqliteSyncStorage.make(sqlite, registry)
+  // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Leader fixture owns its HTTP transport in the enclosing test scope.
   const transport = yield* Transport.make.pipe(Effect.provide(Transport.layerProtocolHttp("http://echo.test/sync")))
   const engine = yield* Engine.make({
     clientId,
@@ -162,6 +163,7 @@ describe.skipIf(!pgAvailable)("expiry floor (SPEC §11) against the real server"
           assert.deepStrictEqual(yield* sqlite<{ body: string }>`SELECT body FROM items`, [{ body: "pu" }])
           assert.deepStrictEqual(yield* SqliteSyncStorage.notices(sqlite), [])
         }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- E2E test root owns the disposable database until all scoped leaders close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     60_000
   )
@@ -236,6 +238,7 @@ describe.skipIf(!pgAvailable)("expiry floor (SPEC §11) against the real server"
           assert.strictEqual((yield* SqliteSyncStorage.notices(sqlite)).length, 1)
           assert.isTrue(Option.isSome(yield* storage.transaction(storage.lookup(mid("m2")))))
         }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- E2E test root owns the disposable database until all scoped leaders close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     60_000
   )
@@ -286,6 +289,7 @@ describe.skipIf(!pgAvailable)("expiry floor (SPEC §11) against the real server"
           assert.strictEqual(sent.push, before)
           assert.deepStrictEqual(yield* executions, [{ n: 1 }])
         }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- E2E test root owns the disposable database until all scoped leaders close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     60_000
   )
@@ -323,6 +327,7 @@ describe.skipIf(!pgAvailable)("expiry floor (SPEC §11) against the real server"
 
           // 25 hours on, the leader prunes released rows; ten days on, the server expires the row.
           yield* Effect.andThen(TestClock.setTime(Date.now() + 25 * 60 * 60 * 1000), Outbox.pruneReleased()).pipe(
+            // oxlint-disable-next-line effecttsgo/strict-effect-provide -- This retention probe owns an advanced clock only while pruning, leaving server and transport clocks live.
             Effect.provide(TestClock.layer()),
             Effect.provideService(SqlClient, leader.sqlite)
           )
@@ -351,6 +356,7 @@ describe.skipIf(!pgAvailable)("expiry floor (SPEC §11) against the real server"
             "the replica converged on the single execution"
           )
         }).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch))
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- E2E test root owns the disposable database until all scoped leaders close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     60_000
   )

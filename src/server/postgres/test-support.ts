@@ -38,6 +38,7 @@ const admin = (statement: string) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient
     yield* sql.unsafe(statement)
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Administrative fixture runner owns a short-lived pool separate from the database it creates or drops.
   }).pipe(Effect.provide(PgClient.layer({ url: Redacted.make(adminUrl), maxConnections: 1 })))
 
 /** A fresh, empty database (no engine schema), dropped afterwards; `with` is appended to CREATE DATABASE. */

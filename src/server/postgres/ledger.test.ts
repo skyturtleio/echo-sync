@@ -16,6 +16,7 @@ const makeBarrier = (n: number) =>
   Effect.gen(function* () {
     const arrived = yield* Ref.make(0)
     const open = yield* Deferred.make<void>()
+    // oxlint-disable-next-line effecttsgo/return-effect-in-gen -- Deliberately allocate once and return the inner Effect for reuse by concurrent participants.
     return Effect.gen(function* () {
       if ((yield* Ref.updateAndGet(arrived, (k) => k + 1)) >= n) yield* Deferred.succeed(open, undefined)
       yield* Deferred.await(open)
@@ -171,6 +172,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
         fastRetry
       )
       assert.deepStrictEqual(raw.outcome, second.outcome)
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -212,6 +214,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
         outcome: rejected.outcome,
         position: rejected.position
       })
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -265,6 +268,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       assert.isTrue((result.processed[0]?.position ?? 0n) > 0n)
       assert.deepStrictEqual(yield* ledgerIds, ["racing"])
       assert.deepStrictEqual(yield* sql`SELECT id, body FROM items`, [{ id: "competitor", body: "shared" }])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -276,6 +280,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       const second = yield* runMutation(env("6f1c…uuid", 1n), reject("no"))
       assert.deepStrictEqual(second, first)
       assert.strictEqual(yield* counterBody, "x")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -292,6 +297,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       assert.strictEqual(executions, 1)
       for (const result of results) assert.deepStrictEqual(result, results[0])
       assert.strictEqual(yield* counterBody, "x")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -307,6 +313,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       // Committed effect, not handler invocations: an SSI retry may re-run a body that rolls back.
       assert.strictEqual(yield* counterBody, "x")
       assert.deepStrictEqual(yield* ledgerIds, ["first", "m"])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -324,6 +331,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       // Recorded: a retry returns the same rejection without running the (now succeeding) body.
       assert.deepStrictEqual(yield* runMutation(env("m", 1n), appendEffect("y")), rejected)
       assert.strictEqual(yield* counterBody, "")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -368,6 +376,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       const replica = new Replica("p", "c1")
       yield* replica.sync()
       assert.deepStrictEqual([...replica.acked], ["a", "b", "c", "d"])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -384,6 +393,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       const applied = yield* runMutation(env("m", 1n), appendEffect("x"))
       assert.deepStrictEqual(yield* runMutation(env("m", 1n), appendEffect("x")), applied)
       assert.strictEqual(yield* counterBody, "x")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -407,6 +417,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
         assert.strictEqual(result._tag, "MutationTransient")
         assert.deepStrictEqual(yield* ledgerIds, [])
         assert.strictEqual(yield* counterBody, "")
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -416,6 +427,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       const exit = yield* Effect.exit(sql.withTransaction(runMutation(env("m", 1n), appendEffect("x"))))
       assert.isTrue(Exit.hasDies(exit))
       assert.deepStrictEqual(yield* ledgerIds, [])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -426,6 +438,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       yield* runMutation(env("m", 1n), Effect.void)
       yield* replica.sync()
       assert.deepStrictEqual([...replica.acked], ["m"])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -448,6 +461,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       const replica = new Replica("p", "c1")
       const done = yield* replica.pullOnce(100)
       assert.deepStrictEqual(done._tag === "PullDone" && done.expiredThrough, Ids.SeqFloor.make(2))
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -458,6 +472,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
         runMutation({ principalId: "mallory", clientId: "c1", mutationId: "m", seq: 1n }, Effect.void)
       )
       assert.strictEqual(result._tag, "ClientForbidden")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -475,6 +490,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       }
       assert.deepStrictEqual(yield* ledgerIds, [])
       assert.strictEqual(yield* counterBody, "")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -485,6 +501,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       assert.isTrue(diedWithBug(exit))
       assert.deepStrictEqual(yield* ledgerIds, [])
       assert.strictEqual(yield* counterBody, "")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -508,6 +525,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       const ok = yield* runMutation(env("a", 1n), appendEffect("a"))
       assert.strictEqual(ok.outcome._tag, "Applied")
       assert.strictEqual(yield* counterBody, "a")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -525,6 +543,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
         assert.deepStrictEqual(result.outcome, { _tag: "Applied" })
         assert.deepStrictEqual(yield* ledgerIds, ["m"])
         assert.strictEqual(yield* counterBody, "x")
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -551,6 +570,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
         assert.strictEqual(result.stopped?.mutationId, "m")
         assert.deepStrictEqual(yield* ledgerIds, [])
         assert.strictEqual(yield* counterBody, "")
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -565,6 +585,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       assert.strictEqual(attempts, 1)
       assert.isTrue(diedWithBug(exit))
       assert.deepStrictEqual(yield* ledgerIds, [])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -592,6 +613,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       const [row] = yield* sql<{ body: string }>`SELECT body FROM items WHERE id = 'n'`
       assert.strictEqual(row?.body, "2")
       assert.strictEqual((yield* ledgerIds).length, 2)
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -621,6 +643,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       const winner = results[0]?.outcome._tag === "Applied" ? "c1" : "c2"
       const rows = yield* sql<{ body: string }>`SELECT body FROM items WHERE id = 'x'`
       assert.deepStrictEqual(rows, [{ body: winner }])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -641,6 +664,7 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       assert.isTrue(Exit.hasDies(exit))
       assert.deepStrictEqual(yield* ledgerIds, [])
       assert.deepStrictEqual(yield* sql`SELECT id FROM unattached`, [])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )
 })

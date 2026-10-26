@@ -3,8 +3,8 @@
  * any implementation of the storage ports. `MemoryStore` / `MemorySyncStorage` are the reference;
  * the SQLite replica (browser) and the Postgres `RowStore` (server) run the same checks.
  *
- * Runner-agnostic: every check is an `Effect` that fails with `ConformanceViolation` (seed and
- * case in the message) and otherwise returns how many cases it exercised. Register them with any
+ * Runner-agnostic: expectations fail with `ConformanceViolation` (seed and case in the message);
+ * setup and storage failures retain their typed errors. Success counts exercised cases. Register with any
  * test runner, e.g.
  *
  *   for (const check of Conformance.syncStorage(makeSubject))
@@ -50,21 +50,32 @@ export interface RowStoreSubject<S extends Store.RowStore = Store.RowStore> {
   readonly claimScope?: Store.StoreOptions["claimScope"] | undefined
 }
 
-export interface SyncStorageSubject {
+export interface SyncStorageSubject<E = never> {
   readonly storage: Engine.SyncStorage
   /** A new `SyncStorage` over the same durable state (a reload: nothing in memory survives). */
-  readonly reopen: Effect.Effect<Engine.SyncStorage, unknown>
+  readonly reopen: Effect.Effect<Engine.SyncStorage, E>
   /** The released-row retention window passes: released markers are pruned (SPEC §9). */
-  readonly pruneReleased: Effect.Effect<void, unknown>
+  readonly pruneReleased: Effect.Effect<void, E>
 }
 
-export interface Check<R> {
+// Negative query checks flip the result: an unexpectedly successful query fails with its rows.
+type CheckFailure =
+  | ConformanceViolation
+  | Store.ReadError
+  | Errors.ConstraintViolated
+  | Errors.RowAlreadyExists
+  | ReadonlyArray<Item>
+
+export interface Check<R, E = CheckFailure> {
   readonly name: string
-  /** Fails with `ConformanceViolation`; succeeds with the number of cases exercised. */
-  readonly run: Effect.Effect<number, unknown, Exclude<R, Scope.Scope>>
+  /** Preserves setup/storage errors; succeeds with the number of cases exercised. */
+  readonly run: Effect.Effect<number, E, Exclude<R, Scope.Scope>>
 }
 
-export class ConformanceViolation extends Schema.TaggedError<ConformanceViolation>()("ConformanceViolation", {
+export class ConformanceViolation extends Schema.TaggedError<
+  ConformanceViolation,
+  { readonly ConformanceViolation: unique symbol }
+>()("ConformanceViolation", {
   check: Schema.String,
   detail: Schema.String
 }) {
@@ -73,13 +84,13 @@ export class ConformanceViolation extends Schema.TaggedError<ConformanceViolatio
   }
 }
 
-const check = <R>(name: string, run: Effect.Effect<number, unknown, Exclude<R, Scope.Scope>>): Check<R> => ({
+const check = <R, E>(name: string, run: Effect.Effect<number, E, Exclude<R, Scope.Scope>>): Check<R, E> => ({
   name,
   run
 })
 
 /** One case: acquire a subject in a fresh scope, use it, close it. */
-const use = <S, R, A>(make: Effect.Effect<S, unknown, R>, f: (subject: S) => Effect.Effect<A, unknown>) =>
+const use = <S, R, A, E, E2>(make: Effect.Effect<S, E, R>, f: (subject: S) => Effect.Effect<A, E2>) =>
   Effect.scoped(Effect.flatMap(make, f))
 
 // ---------------------------------------------------------------------------------------------
@@ -245,19 +256,19 @@ const interruptAt = (k: number) => {
 }
 
 /** One transaction under test: a fixture `seed`, a `body`, and how the subject runs a transaction. */
-interface TransactionCase<S, R> {
+interface TransactionCase<S, R, E, E2> {
   readonly name: string
-  readonly make: Effect.Effect<S, unknown, R>
-  readonly seed: (subject: S) => Effect.Effect<unknown, unknown>
-  readonly body: (subject: S) => Effect.Effect<unknown, unknown>
-  readonly within: (subject: S, self: Effect.Effect<unknown, unknown>) => Effect.Effect<unknown, unknown>
+  readonly make: Effect.Effect<S, E, R>
+  readonly seed: (subject: S) => Effect.Effect<unknown, Errors.StoreUnavailable | Errors.ConstraintViolated>
+  readonly body: (subject: S) => Effect.Effect<unknown, Errors.StoreUnavailable | Errors.ConstraintViolated>
+  readonly within: <A, E3>(subject: S, self: Effect.Effect<A, E3>) => Effect.Effect<A, E3 | Errors.StoreUnavailable>
   /**
    * Reads the durable state through a reopened handle. Called only after the tested transaction
    * has finished: a reopen may close the subject's original handle.
    */
-  readonly observe: (subject: S) => Effect.Effect<string, unknown>
+  readonly observe: (subject: S) => Effect.Effect<string, E2>
   /** Reads the same state through the subject's live handle (no reopen). */
-  readonly observeLive: (subject: S) => Effect.Effect<string, unknown>
+  readonly observeLive: (subject: S) => Effect.Effect<string, Errors.StoreUnavailable>
   /** Durable state after `seed` alone, computed from the fixture. */
   readonly before: string
   /** Durable state after `seed` and a committed `body`, computed from the fixture. */
@@ -270,7 +281,7 @@ interface TransactionCase<S, R> {
  * Stops at the first k the run completes before reaching. Every observation must equal the
  * fixture's `before` or `after`, never a mixture, and both must occur.
  */
-const interruptSweep = <S, R>(options: TransactionCase<S, R>) =>
+const interruptSweep = <S, R, E, E2>(options: TransactionCase<S, R, E, E2>) =>
   Effect.gen(function* () {
     const fail = violation(options.name)
     const outcomes = new Set<string>()
@@ -305,7 +316,7 @@ const interruptSweep = <S, R>(options: TransactionCase<S, R>) =>
  * Atomicity of one transaction: the seed reads back as `before`; a body that fails or dies
  * inside the transaction leaves `before`; then the interrupt sweep. Each case has its own subject.
  */
-const atomicity = <S, R>(options: TransactionCase<S, R>) =>
+const atomicity = <S, R, E, E2>(options: TransactionCase<S, R, E, E2>) =>
   Effect.gen(function* () {
     const fail = violation(options.name)
     for (const ending of ["fail", "die"] as const) {
@@ -434,7 +445,7 @@ const describePlan = (plan: Store.IndexRangePlan) =>
   canonical({ index: plan.index.name, eq: plan.eq, lower: plan.lower, upper: plan.upper, order: plan.order })
 
 /** Public typed query contract, shared by memory, wasm SQLite and PostgreSQL. */
-export const search = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>) =>
+export const search = <R, E>(make: Effect.Effect<RowStoreSubject, E, R>) =>
   use(make, ({ rows, transaction }) =>
     transaction(
       Effect.gen(function* () {
@@ -561,7 +572,9 @@ export const search = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>) =>
     )
   )
 
-export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): ReadonlyArray<Check<R>> => [
+export const rowStore = <R, E>(
+  make: Effect.Effect<RowStoreSubject, E, R>
+): ReadonlyArray<Check<R, E | CheckFailure>> => [
   check(
     "keyset pages preserve ties, direction, nulls and cursor boundaries across intervening inserts",
     use(make, ({ rows, transaction }) =>
@@ -1052,9 +1065,9 @@ export const rowStore = <R>(make: Effect.Effect<RowStoreSubject, unknown, R>): R
 // ReplicaRowStore
 // ---------------------------------------------------------------------------------------------
 
-export const replicaRowStore = <R>(
-  make: Effect.Effect<RowStoreSubject<Store.ReplicaRowStore>, unknown, R>
-): ReadonlyArray<Check<R>> => [
+export const replicaRowStore = <R, E>(
+  make: Effect.Effect<RowStoreSubject<Store.ReplicaRowStore>, E, R>
+): ReadonlyArray<Check<R, E | CheckFailure>> => [
   ...rowStore(make),
   check(
     "purgeScope deletes exactly the rows of that scope, in every table",
@@ -1164,7 +1177,7 @@ const page = (continuation: string): typeof Protocol.PullPage.Type => ({
   continuation: Protocol.PullContinuation.make(continuation)
 })
 
-const syncSeed = ({ storage }: SyncStorageSubject) =>
+const syncSeed = ({ storage }: Pick<SyncStorageSubject, "storage">) =>
   storage.transaction(
     Effect.gen(function* () {
       yield* storage.rows.write(Items, "keep", Option.some(item("keep", { rank: 1 })))
@@ -1174,7 +1187,7 @@ const syncSeed = ({ storage }: SyncStorageSubject) =>
   )
 
 /** The body of the SyncStorage atomicity check: touches every kind of durable state. */
-const syncBody = ({ storage }: SyncStorageSubject) =>
+const syncBody = ({ storage }: Pick<SyncStorageSubject, "storage">) =>
   Effect.gen(function* () {
     const seq = yield* storage.nextSeq
     yield* storage.appendPending({ envelope: envelope(seq, "new"), createdAt: 0, undo: [] })
@@ -1206,9 +1219,11 @@ const syncAfter = canonical({
   next: 3
 } satisfies DurableState)
 
-const syncObserve = (subject: SyncStorageSubject) => Effect.flatMap(subject.reopen, (s) => durable(s, SYNC_IDS))
+const syncObserve = <E>(subject: SyncStorageSubject<E>) => Effect.flatMap(subject.reopen, (s) => durable(s, SYNC_IDS))
 
-export const syncStorage = <R>(make: Effect.Effect<SyncStorageSubject, unknown, R>): ReadonlyArray<Check<R>> => [
+export const syncStorage = <R, E, E2>(
+  make: Effect.Effect<SyncStorageSubject<E2>, E, R>
+): ReadonlyArray<Check<R, E | E2 | CheckFailure>> => [
   ...replicaRowStore(Effect.map(make, ({ storage }) => ({ rows: storage.rows, transaction: storage.transaction }))),
   check(
     "nextSeq allocates: two calls in one transaction, before any append, return 1 and 2; then meta, pending entries (args, undo), released markers and staged pages read back as written, before and after a reopen",

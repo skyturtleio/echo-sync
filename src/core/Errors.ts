@@ -2,21 +2,25 @@ import { Data, Schema } from "effect"
 import { AccessScopeId, Role } from "./AccessScope.ts"
 
 /** Transient storage failure (connection, busy, serialization). Never recorded; stops the batch. */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class StoreUnavailable extends Schema.TaggedError<StoreUnavailable>()("StoreUnavailable", {
   message: Schema.String
 }) {}
 
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class RowNotFound extends Schema.TaggedError<RowNotFound>()("RowNotFound", {
   table: Schema.String,
   id: Schema.String
 }) {}
 
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class RowAlreadyExists extends Schema.TaggedError<RowAlreadyExists>()("RowAlreadyExists", {
   table: Schema.String,
   id: Schema.String
 }) {}
 
 /** The actor lacks `required` on `scopeId` (`held` is its effective role, if any). */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class ScopeForbidden extends Schema.TaggedError<ScopeForbidden>()("ScopeForbidden", {
   scopeId: AccessScopeId,
   required: Role,
@@ -24,12 +28,14 @@ export class ScopeForbidden extends Schema.TaggedError<ScopeForbidden>()("ScopeF
 }) {}
 
 /** A row (or patch, or index bound) a handler supplied does not satisfy the table's schema. */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class InvalidRow extends Schema.TaggedError<InvalidRow>()("InvalidRow", {
   table: Schema.String,
   message: Schema.String
 }) {}
 
 /** An authoritative database write violated an app constraint (SPEC §5). */
+// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class ConstraintViolated extends Schema.TaggedError<ConstraintViolated>()("ConstraintViolated", {
   kind: Schema.Literals(["unique", "other"]),
   constraint: Schema.NullOr(Schema.String),

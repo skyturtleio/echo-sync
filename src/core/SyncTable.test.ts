@@ -152,6 +152,7 @@ describe("SyncTable codec round-trip", () => {
 
 const expectRejected = (make: () => unknown, message: RegExp) =>
   expect(make).toThrow(
+    // oxlint-disable-next-line typescript/no-unsafe-assignment -- Vitest's asymmetric matcher is typed any
     expect.objectContaining({ name: "SyncTableDeclarationError", message: expect.stringMatching(message) })
   )
 

@@ -10,11 +10,12 @@ addEventListener(
       close()
       return
     }
+    const path = event.data.directory
     void (async () => {
       try {
         const root = await navigator.storage.getDirectory()
         let directory = root
-        for (const part of event.data.directory.split("/")) directory = await directory.getDirectoryHandle(part)
+        for (const part of path.split("/")) directory = await directory.getDirectoryHandle(part)
         // `values()` is in the WHATWG spec and every engine that has OPFS, but not in TS's DOM lib yet.
         // oxlint-disable-next-line typescript/consistent-type-assertions -- platform edge, see above
         const iterable = directory as unknown as { values(): AsyncIterable<FileSystemHandle> }

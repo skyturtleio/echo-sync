@@ -59,7 +59,10 @@ export const pushLost = lost
 /** A lost pull request or response. */
 export const pullLost = lost
 
-export class InvariantViolated extends Schema.TaggedError<InvariantViolated>()("InvariantViolated", {
+export class InvariantViolated extends Schema.TaggedError<
+  InvariantViolated,
+  { readonly InvariantViolated: unique symbol }
+>()("InvariantViolated", {
   seed: Schema.Number,
   step: Schema.Number,
   invariant: Schema.String,

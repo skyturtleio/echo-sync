@@ -96,6 +96,7 @@ it.effect(
       expect(mutated).toEqual({ _tag: "Defect" })
       expect(JSON.stringify([fromSource, midStream, command, mutated])).not.toContain("secret")
       expect(logged).toEqual([])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test composition root owns the recording logger for this test's emissions only.
     }).pipe(Effect.provide(recording), Effect.provideService(References.MinimumLogLevel, "All"))
 )
 
@@ -124,6 +125,7 @@ it.effect(
       const afterEnd = yield* Effect.exit(Stream.runCollect(Echo.notices(dyingFinalizer(Stream.empty), h())))
       expect(afterEnd).toEqual(Exit.succeed([{ _tag: "Defect" }]))
       expect(logged).toEqual([])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test composition root owns the recording logger for this test's emissions only.
     }).pipe(Effect.provide(recording), Effect.provideService(References.MinimumLogLevel, "All"))
 )
 

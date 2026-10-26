@@ -47,7 +47,7 @@ if (params.has("ignoreReset")) {
   // frozen tab would not; its client keeps its leader. Only the engine's `echo:*:reset` channels are muted.
   const add = BroadcastChannel.prototype.addEventListener
   Object.defineProperty(BroadcastChannel.prototype, "addEventListener", {
-    value: function (this: BroadcastChannel, ...args: Parameters<typeof add>) {
+    value: function (this: BroadcastChannel, ...args: Parameters<typeof add>): unknown {
       if (this.name.startsWith("echo:") && this.name.endsWith(":reset")) return
       return Reflect.apply(add, this, args)
     }
@@ -61,7 +61,7 @@ if (params.has("closeOnReset")) {
   // while that topology close is still in progress.
   const add = BroadcastChannel.prototype.addEventListener
   Object.defineProperty(BroadcastChannel.prototype, "addEventListener", {
-    value: function (this: BroadcastChannel, type: string, listener: EventListener, ...rest: Array<unknown>) {
+    value: function (this: BroadcastChannel, type: string, listener: EventListener, ...rest: Array<unknown>): unknown {
       if (!(this.name.startsWith("echo:") && this.name.endsWith(":reset"))) {
         return Reflect.apply(add, this, [type, listener, ...rest])
       }
@@ -125,7 +125,7 @@ const spawnLeaderWith = (extra: Readonly<Record<string, string>>) => (name: stri
 }
 const spawnLeader = spawnLeaderWith({})
 
-const scope = Effect.runSync(Scope.make())
+const scope = Scope.makeUnsafe()
 const client = await Effect.runPromise(
   LeaderClientModule.make({
     appId,
@@ -274,7 +274,7 @@ const echo = {
   /** With `?closeOnReset`: resolves once the scope close forked by the reset completed, with this page's locks. */
   closedOnReset: async () => {
     const settled = await echo.until(() => closedOnReset)
-    return settled === undefined ? null : await settled
+    return settled === undefined ? null : settled
   },
   /** This page's own (not its workers') Web Locks of its identity, held or pending, as `mode:name`. */
   pageLocks: async () => {

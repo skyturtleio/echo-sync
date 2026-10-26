@@ -61,7 +61,7 @@ export const open = (
   config: OpfsSqliteConfig
 ): Effect.Effect<(port: MessagePort) => Effect.Effect<void>, Platform.BrowserStorageError, Scope.Scope> =>
   Effect.gen(function* () {
-    const module = yield* Effect.promise(() => SQLiteESMFactory())
+    const module: unknown = yield* Effect.promise(() => SQLiteESMFactory())
     const sqlite3 = WaSqlite.Factory(module)
     const vfs = yield* Effect.acquireRelease(
       Platform.storageCall("opening the OPFS pool", () => AccessHandlePoolVFS.create(config.poolDirectory, module)),

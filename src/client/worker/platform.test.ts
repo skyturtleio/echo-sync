@@ -42,7 +42,9 @@ it.live(
         const name = `test:${crypto.randomUUID()}`
         const holder = yield* Scope.make()
         yield* Platform.holdLock(name).pipe(Scope.provide(holder))
-        setTimeout(() => Effect.runFork(Scope.close(holder, Exit.void)), 20 + offset)
+        const release = yield* Effect.forkChild(
+          Effect.andThen(Effect.sleep(20 + offset), Scope.close(holder, Exit.void))
+        )
         const waiter = yield* Scope.make()
         const held = yield* Platform.holdLockWithin(name, 20).pipe(Scope.provide(waiter))
         // Let a grant that lost the race arrive, if one is coming.
@@ -52,6 +54,7 @@ it.live(
         // A lock it did get is released with its scope (asynchronously, once the lock manager sees it).
         yield* Scope.close(waiter, Exit.void)
         yield* waitUntil(Effect.map(Effect.orDie(Platform.isLockHeld(name)), (h) => !h))
+        yield* Fiber.join(release)
       }
     })
 )

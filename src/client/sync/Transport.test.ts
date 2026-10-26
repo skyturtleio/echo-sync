@@ -49,6 +49,7 @@ const harness = <A extends SyncFailure.PushReason | SyncFailure.PullReason, B>(
       Layer.provide([RpcSerialization.layerNdjson, FetchHttpClient.layer])
     )
     // `FetchHttpClient` reads `Fetch` from the fiber that sends each request.
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Scoped RPC harness composition root; its caller owns client and server cleanup.
     const exit = yield* Effect.exit(Effect.flatMap(Transport.make.pipe(Effect.provide(client)), body)).pipe(
       Effect.provideService(FetchHttpClient.Fetch, fetch)
     )
@@ -270,7 +271,7 @@ it.effect(
     Effect.gen(function* () {
       const request: Protocol.PullRequest = {
         clientId: Ids.ClientId.make("c"),
-        cursor: Schema.decodeUnknownSync(Ids.Position)("3"),
+        cursor: yield* Schema.decodeUnknownEffect(Ids.Position)("3"),
         continuation: Option.none()
       }
       const resnapshot = yield* harness(
@@ -346,6 +347,7 @@ it.effect("a transport built with headers sends them on push, pull and the pokes
     // `FetchHttpClient` reads `Fetch` from the fiber that sends each request.
     yield* Effect.gen(function* () {
       const t = yield* Transport.make.pipe(
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test RPC client composition root within the test's scope.
         Effect.provide(
           Transport.layerProtocolHttp("http://echo.test/rpc", Effect.succeed({ "x-echo-principal": "alice" }))
         )
@@ -455,6 +457,7 @@ it.effect("an older server serves principal-asserting RPCs but its unary pull fa
     )
     const clientId = Ids.ClientId.make("c")
     yield* Effect.gen(function* () {
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test previous-protocol client composition root within the test's scope.
       const t = yield* Transport.make.pipe(Effect.provide(Transport.layerProtocolHttp("http://echo.test/rpc")))
       const join = { room, tabId: Protocol.TabId.make("tab"), state: null, revision: 0 }
       expect((yield* t.push({ ...batch(1), principal: alice })).results).toHaveLength(1)
@@ -606,6 +609,7 @@ const credentials = Effect.gen(function* () {
     return Effect.succeed({ authorization: state.client })
   })
   const transport = yield* Transport.make.pipe(
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Scoped credential fixture composition root; the caller owns the RPC client lifetime.
     Effect.provide(Transport.layerProtocolHttp("http://echo.test/rpc", syncHeaders))
   )
   return { state, seen, transport, fetch }
@@ -727,6 +731,7 @@ it.effect(
         { preconnect: globalThis.fetch.preconnect }
       )
       const t = yield* Transport.make.pipe(
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test failing-header RPC client composition root within the test's scope.
         Effect.provide(
           Transport.layerProtocolHttp(
             "http://echo.test/rpc",
@@ -748,6 +753,7 @@ it.live(
       const { state, fetch } = yield* credentials
       // Slow headers (300 ms) on a short idleTimeout (100 ms): preparation is not stream silence.
       const slow = Transport.make.pipe(
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test slow-header RPC client composition root within the test's scope.
         Effect.provide(
           Transport.layerProtocolHttp(
             "http://echo.test/rpc",
@@ -812,6 +818,7 @@ it.live(
       // Nothing listens on port 1: the request carries the headers and fails before any response. A
       // custom header name, since Effect's HTTP headers already redact `authorization`.
       const refused = yield* Transport.make.pipe(
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test refused-connection RPC client composition root within the test's scope.
         Effect.provide(
           Transport.layerProtocolHttp("http://127.0.0.1:1/rpc", Effect.succeed({ "x-app-session": secret }))
         )
@@ -871,6 +878,7 @@ it.live(
             { preconnect: globalThis.fetch.preconnect }
           )
           const transport = yield* Transport.make.pipe(
+            // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-scenario middleware-refusal client composition root within the test's scope.
             Effect.provide(
               Transport.layerProtocolHttp("http://echo.test/sync", Effect.succeed({ authorization: "valid-token" }))
             )
@@ -969,6 +977,7 @@ it.live("no syncStatus string carries a secret from the failure: a token in the 
     const fixture = yield* credentials
     // Nothing listens on port 1; the transport error's text names the URL.
     const refused = yield* Transport.make.pipe(
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test refused-connection RPC client composition root within the test's scope.
       Effect.provide(Transport.layerProtocolHttp(`http://127.0.0.1:1/${sentinel}/rpc`, Effect.succeed({})))
     )
     const { text, statuses } = yield* statusText(fixture, hasError, refused)

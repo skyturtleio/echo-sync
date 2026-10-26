@@ -110,6 +110,7 @@ describe.skipIf(!pgAvailable)("log ordering (SPEC §6)", () => {
     () =>
       Effect.gen(function* () {
         assert.deepStrictEqual(yield* readerPullsBetweenOutOfOrderCommits, [])
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until all racing fibers finish.
       }).pipe(Effect.provide(TestDatabase)),
     30_000
   )
@@ -120,6 +121,7 @@ describe.skipIf(!pgAvailable)("log ordering (SPEC §6)", () => {
       Effect.gen(function* () {
         yield* withoutEngineLock
         assert.deepStrictEqual(yield* readerPullsBetweenOutOfOrderCommits, ["a"])
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until all racing fibers finish.
       }).pipe(Effect.provide(TestDatabase)),
     30_000
   )
@@ -130,6 +132,7 @@ describe.skipIf(!pgAvailable)("log ordering (SPEC §6)", () => {
       Effect.gen(function* () {
         const missed = yield* writersRaceAPullingReader
         assert.deepStrictEqual(missed, [])
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until all racing fibers finish.
       }).pipe(Effect.provide(TestDatabase)),
     30_000
   )

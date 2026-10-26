@@ -76,6 +76,7 @@ const connectTo = (
       { preconnect: globalThis.fetch.preconnect }
     )
     const client = yield* RpcClient.make(Protocol.SyncRpcs.merge(Protocol.PresenceRpcs)).pipe(
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- HTTP fixture owns a client transport in the enclosing test scope.
       Effect.provide(
         RpcClient.layerProtocolHttp({ url: "http://echo.test/sync" }).pipe(
           Layer.provide([
@@ -105,17 +106,12 @@ const connect = connectWith((sql) => sql)
  * injection at the transaction boundary (pull's REPEATABLE READ snapshot is its only one).
  */
 const aroundTransactions =
-  (
-    around: (
-      inner: Effect.Effect<unknown, unknown, unknown>,
-      sql: SqlClient
-    ) => Effect.Effect<unknown, unknown, unknown>
-  ) =>
+  (around: <A, E, R>(inner: Effect.Effect<A, E, R>, sql: SqlClient) => Effect.Effect<A, E | SqlError, R>) =>
   (sql: SqlClient): SqlClient =>
     new Proxy(sql, {
-      get: (target, key, receiver) =>
+      get: (target, key, receiver): unknown =>
         key === "withTransaction"
-          ? (inner: Effect.Effect<unknown, unknown, unknown>) => target.withTransaction(around(inner, target))
+          ? <A, E, R>(inner: Effect.Effect<A, E, R>) => target.withTransaction(around(inner, target))
           : Reflect.get(target, key, receiver)
     })
 
@@ -175,6 +171,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
         pages.flatMap((p) => p.acks.map((a) => a.mutationId)),
         ["large", "next"]
       )
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -201,6 +198,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
       assert.deepStrictEqual(yield* sql`SELECT * FROM items`, [])
       assert.deepStrictEqual(yield* client.push(invalid), result)
       assert.deepStrictEqual(yield* sql`SELECT count(*)::int AS n FROM echo_sync.mutations`, [{ n: 1 }])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -259,6 +257,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
       yield* clock.setTime(serverNow + 60_000)
       assert.deepStrictEqual(yield* run(future), rejected)
       assert.deepStrictEqual(yield* run(request("first", serverNow + 999_999)), first)
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -295,6 +294,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
       )
       const [receipt] = yield* sql<{ received_at: Date }>`SELECT received_at FROM echo_sync.mutations`
       assert.isTrue((receipt?.received_at.getTime() ?? 0) > serverNow)
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -368,6 +368,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
         assert.isTrue(
           Option.isSome(snapshot) && snapshot.value._tag === "snapshot" && snapshot.value.entries.length === 1
         )
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -389,6 +390,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
       assert.strictEqual(error._tag, "ResnapshotRequired")
       if (error._tag === "ResnapshotRequired") assert.strictEqual(error.epoch, initial.epoch)
       assert.deepStrictEqual(yield* sql`SELECT cursor FROM echo_sync.clients WHERE client_id = 'd'`, [{ cursor: null }])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -420,6 +422,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
         )
       assert.deepStrictEqual(yield* sql`SELECT * FROM echo_sync.clients WHERE client_id = 'legacy-after'`, [])
       assert.deepStrictEqual(yield* sql<{ body: string }>`SELECT body FROM items`, [{ body: "legacy" }])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -437,6 +440,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
         { mutationId: result.mutationId, position: result.position, outcome: result.outcome }
       ])
       assert.isTrue(pulled.changes.some((c) => c._tag === "upsert" && c.table === "items" && c.row["body"] === "hello"))
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -472,6 +476,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
         ledgered.map((r) => r.mutation_id),
         ["m1"]
       )
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -488,6 +493,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
       assert.deepStrictEqual(exit.value.results, [])
       const ledgered = yield* sql<{ mutation_id: string }>`SELECT mutation_id FROM echo_sync.mutations`
       assert.deepStrictEqual(ledgered, [])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -502,6 +508,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
         client.pull({ clientId: Ids.ClientId.make("d"), cursor: null, continuation: Option.none() })
       )
       assert.deepStrictEqual(failureTag(exit), "ServerUnavailable")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -519,6 +526,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
         client.pull({ clientId: Ids.ClientId.make("d"), cursor: Ids.Position.make(1n), continuation: Option.none() })
       )
       assert.deepStrictEqual(failureTag(exit), "ServerUnavailable")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -535,6 +543,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
         client.pull({ clientId: Ids.ClientId.make("d"), cursor: null, continuation: Option.none() })
       )
       assert.isTrue(Exit.hasDies(exit), failureTag(exit))
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -552,6 +561,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
       yield* sql`INSERT INTO items (id, access_scope_id) VALUES ('a', 's1')`
       const second = yield* Effect.timeoutOption(Queue.take(received), "3 seconds")
       assert.isTrue(Option.isSome(second), "no poke after a committed captured write")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -561,7 +571,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
       const pg = Context.get(db, PgClient.PgClient)
       const sqlError = new SqlError({ reason: new UnknownError({ cause: null, message: "listen refused" }) })
       const failingListen: PgClient.PgClient = new Proxy(pg, {
-        get: (target, key, receiver) =>
+        get: (target, key, receiver): unknown =>
           key === "listen" ? () => Effect.fail(sqlError) : Reflect.get(target, key, receiver)
       })
       const client = yield* connectTo(Context.add(db, PgClient.PgClient, failingListen))
@@ -571,6 +581,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
       )
       assert.deepStrictEqual(failureTag(exit), "ServerUnavailable")
       assert.strictEqual(yield* Ref.get(emitted), 0)
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -591,6 +602,7 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
       yield* killed
       const exit = yield* Fiber.join(stream)
       assert.deepStrictEqual(failureTag(exit), "ServerUnavailable")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 })
@@ -625,15 +637,16 @@ describe.skipIf(!pgAvailable)("the replica's principal against the authenticated
     yield* sql`INSERT INTO items (id, access_scope_id, body) VALUES ('bobs', 's1', 'bob only')`
     const counts = { statements: 0, policyCalls: 0 }
     const counting = new Proxy(sql, {
-      apply: (target, self, args) => {
+      apply: (target, self, args): unknown => {
         counts.statements++
         return Reflect.apply(target, self, args)
       },
-      get: (target, key, receiver) => {
-        const value = Reflect.get(target, key, receiver)
+      get: (target, key, receiver): unknown => {
+        const value: unknown = Reflect.get(target, key, receiver)
         return (key === "unsafe" || key === "withTransaction") && typeof value === "function"
-          ? (...args: ReadonlyArray<unknown>) => {
+          ? (...args: ReadonlyArray<unknown>): unknown => {
               counts.statements++
+              // oxlint-disable-next-line typescript/no-unsafe-argument -- proxy forwards the original callable unchanged
               return Reflect.apply(value, target, args)
             }
           : value
@@ -709,6 +722,7 @@ describe.skipIf(!pgAvailable)("the replica's principal against the authenticated
 
         // Every request is checked, not only the first: bob's bound client asserting alice is refused alike.
         yield* refuse
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -723,6 +737,7 @@ describe.skipIf(!pgAvailable)("the replica's principal against the authenticated
         { client_id: "old-pull", principal_id: bob },
         { client_id: "old-push", principal_id: bob }
       ])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -736,6 +751,7 @@ describe.skipIf(!pgAvailable)("the replica's principal against the authenticated
       assert.strictEqual(error?._tag, "Unauthorized")
       if (!(error instanceof Protocol.Unauthorized)) return assert.fail(`expected Unauthorized: ${String(error)}`)
       assert.strictEqual(error.reason, "authenticationRefused")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
@@ -749,6 +765,7 @@ describe.skipIf(!pgAvailable)("the replica's principal against the authenticated
       assert.strictEqual(error?._tag, "Unauthorized")
       if (!(error instanceof Protocol.Unauthorized)) return assert.fail(`expected Unauthorized: ${String(error)}`)
       assert.strictEqual(error.reason, "clientPrincipalMismatch")
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 })
@@ -760,15 +777,16 @@ describe.skipIf(!pgAvailable)("the everyone principal at the RPC boundary (SPEC 
       const sql = yield* SqlClient
       const counts = { statements: 0 }
       const counting = new Proxy(sql, {
-        apply: (target, self, args) => {
+        apply: (target, self, args): unknown => {
           counts.statements++
           return Reflect.apply(target, self, args)
         },
-        get: (target, key, receiver) => {
-          const value = Reflect.get(target, key, receiver)
+        get: (target, key, receiver): unknown => {
+          const value: unknown = Reflect.get(target, key, receiver)
           return (key === "unsafe" || key === "withTransaction") && typeof value === "function"
-            ? (...args: ReadonlyArray<unknown>) => {
+            ? (...args: ReadonlyArray<unknown>): unknown => {
                 counts.statements++
+                // oxlint-disable-next-line typescript/no-unsafe-argument -- proxy forwards the original callable unchanged
                 return Reflect.apply(value, target, args)
               }
             : value
@@ -798,6 +816,7 @@ describe.skipIf(!pgAvailable)("the everyone principal at the RPC boundary (SPEC 
           (SELECT count(*)::int FROM echo_sync.mutations) AS ledger`
       assert.deepStrictEqual(after, before)
       assert.strictEqual(counts.statements, 0)
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 })
@@ -858,6 +877,7 @@ describe.skipIf(!pgAvailable)("one LISTEN per server process (SPEC §10.1)", () 
         // The push's commit notifies every open stream through the one LISTEN.
         for (const received of streams) yield* nextPoke(received)
         assert.strictEqual(yield* listeners, 1)
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     60_000
   )
@@ -883,6 +903,7 @@ describe.skipIf(!pgAvailable)("one LISTEN per server process (SPEC §10.1)", () 
         )
         yield* sql`INSERT INTO items (id, access_scope_id) VALUES ('after', 's1')`
         yield* nextPoke(received)
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     60_000
   )
@@ -918,6 +939,7 @@ describe.skipIf(!pgAvailable)("one LISTEN per server process (SPEC §10.1)", () 
         yield* sql`INSERT INTO items (id, access_scope_id) VALUES ('a', 's1')`
         yield* nextPoke(reconnected)
         assert.strictEqual(yield* listeners, 1)
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     60_000
   )
@@ -956,6 +978,7 @@ describe.skipIf(!pgAvailable)("pokes liveness (SPEC §10.1)", () => {
           `gaps ${gaps.join(", ")} ms`
         )
         assert.strictEqual(pulls.n, 1) // the initial poke's pull only
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     60_000
   )
@@ -976,7 +999,7 @@ const steeredPool = (failing: () => boolean) =>
     const pg = Context.get(small, PgClient.PgClient)
     const calls = { attempts: 0 }
     const steered: PgClient.PgClient = new Proxy(pg, {
-      get: (target, key, receiver) =>
+      get: (target, key, receiver): unknown =>
         key === "listen"
           ? (channel: string) => {
               calls.attempts++
@@ -1024,6 +1047,7 @@ describe.skipIf(!pgAvailable)("re-establishing the shared LISTEN (SPEC §10.1)",
         assert.strictEqual(pushed.results[0]?.outcome._tag, "Applied")
         yield* nextPoke(received)
         assert.strictEqual(yield* listeners, 1)
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
       }).pipe(Effect.scoped, Effect.provide(TestDatabase)),
     60_000
   )
@@ -1038,10 +1062,13 @@ describe.skipIf(!pgAvailable)("re-establishing the shared LISTEN (SPEC §10.1)",
         // once the sleep it should release is about to be registered, never on an attempt count
         // (which moves before the attempt's asynchronous reservation has failed).
         const delays: Array<number> = []
-        yield* sharedPokes(pg, {
-          heartbeatInterval: "1 hour",
-          onBackoff: (d) => Effect.sync(() => void delays.push(Duration.toMillis(d)))
-        })
+        // Constructing the subscription owns LISTEN in this scope; this test observes its retry hook, not elements.
+        yield* Effect.asVoid(
+          sharedPokes(pg, {
+            heartbeatInterval: "1 hour",
+            onBackoff: (d) => Effect.sync(() => void delays.push(Duration.toMillis(d)))
+          })
+        )
         const backoffs = (n: number) =>
           eventually(
             Effect.sync(() => delays.length === n),
@@ -1094,6 +1121,7 @@ describe.skipIf(!pgAvailable)("re-establishing the shared LISTEN (SPEC §10.1)",
         yield* attemptsAre(5)
         yield* listening
         assert.deepStrictEqual(delays, [50, 50, 100, 200])
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.
       }).pipe(Effect.provide(TestDatabase)),
     60_000
   )

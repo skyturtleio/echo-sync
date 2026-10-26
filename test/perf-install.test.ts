@@ -58,6 +58,7 @@ it.live("batched replica upserts keep the last duplicate and split before SQLite
     expect(yield* storage.transaction(storage.rows.read(Counters, "i-1"))).toEqual(Option.some(rows.at(-1)))
     expect(yield* storage.transaction(storage.rows.scan(Counters))).toHaveLength(8192)
     expect(yield* storage.transaction(storage.revision)).toEqual({ ...revision, offset: revision.offset + 1 })
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns one Reactivity instance for the scoped SQLite fixture's lifetime.
   }).pipe(Effect.scoped, Effect.provide(Reactivity.layer))
 )
 
@@ -98,6 +99,7 @@ it.live("install batches never move upserts across a tombstone, scope purge, or 
     expect(yield* storage.transaction(storage.rows.scan(Counters))).toEqual([
       { id: "x", access_scope_id: "s", value: 7, updated_at: 0 }
     ])
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns one Reactivity instance for the scoped SQLite fixture's lifetime.
   }).pipe(Effect.scoped, Effect.provide(Reactivity.layer))
 )
 
@@ -178,6 +180,7 @@ it.live("a resumed K-page pull reads only linear staged rows and installs the wh
         count: 0
       })
     }
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns one Reactivity instance for the scoped SQLite fixture's lifetime.
   }).pipe(Effect.scoped, Effect.provide(Reactivity.layer))
 )
 
@@ -238,5 +241,6 @@ it.live("install undoes P entries, writes C changes and replays P handlers witho
       )
       expect(result.final.meta.cursor).toBe(2n)
     }
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns one Reactivity instance for the scoped SQLite fixture's lifetime.
   }).pipe(Effect.scoped, Effect.provide(Reactivity.layer))
 )

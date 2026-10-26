@@ -55,17 +55,22 @@ export interface LeaderConnection {
   readonly subscribeRaw: (input: {
     readonly query: LeaderRpcs.LiveQuery
   }) => Stream.Stream<LeaderRpcs.QueryResult, LeaderRpcs.SqlFailure | LeaderRpcs.RawExecDisabled | RpcClientError>
+  // oxlint-disable-next-line effecttsgo/lazy-effect -- Preserve the generated RPC client's zero-argument callable interface without an adapter.
   readonly leaderInfo: () => Effect.Effect<LeaderRpcs.LeaderInfo, RpcClientError>
+  // oxlint-disable-next-line effecttsgo/lazy-effect -- Preserve the generated RPC client's zero-argument callable interface without an adapter.
   readonly syncStatus: () => Stream.Stream<SyncStatus, LeaderRpcs.SyncDisabled | RpcClientError>
+  // oxlint-disable-next-line effecttsgo/lazy-effect -- Preserve the generated RPC client's zero-argument callable interface without an adapter.
   readonly requestSync: () => Effect.Effect<void, LeaderRpcs.SyncDisabled | RpcClientError>
   readonly presence: (
     input: PresencePayload
   ) => Stream.Stream<Protocol.RoomSnapshot, LeaderRpcs.SyncDisabled | Protocol.Forbidden | RpcClientError>
   readonly track: (input: PresencePayload) => Effect.Effect<void, LeaderRpcs.SyncDisabled | RpcClientError>
+  // oxlint-disable-next-line effecttsgo/lazy-effect -- Preserve the generated RPC client's zero-argument callable interface without an adapter.
   readonly notices: () => Stream.Stream<ReadonlyArray<LeaderRpcs.StoredNotice>, LeaderRpcs.SqlFailure | RpcClientError>
   readonly dismissNotices: (input: {
     readonly ids: ReadonlyArray<number>
   }) => Effect.Effect<void, LeaderRpcs.SqlFailure | RpcClientError>
+  // oxlint-disable-next-line effecttsgo/lazy-effect -- Preserve the generated RPC client's zero-argument callable interface without an adapter.
   readonly exportPending: () => Effect.Effect<
     ReadonlyArray<LeaderRpcs.PendingExport>,
     LeaderRpcs.SqlFailure | RpcClientError
