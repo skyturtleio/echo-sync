@@ -30,10 +30,14 @@ const register = (checks: ReadonlyArray<Conformance.Check<Scope.Scope>>) => {
 describe("SqliteRowStore conforms to ReplicaRowStore", () => {
   register(
     Conformance.replicaRowStore(
-      Effect.map(freshDatabase, (sql) => ({
-        rows: SqliteRowStore.make(sql, registry),
-        transaction: SqliteSyncStorage.make(sql, registry).transaction
-      }))
+      Effect.gen(function* () {
+        const sql = yield* freshDatabase
+        const storage = yield* SqliteSyncStorage.make(sql, registry)
+        return {
+          rows: SqliteRowStore.make(sql, registry),
+          transaction: storage.transaction
+        }
+      })
     )
   )
 })
@@ -41,15 +45,19 @@ describe("SqliteRowStore conforms to ReplicaRowStore", () => {
 describe("SqliteSyncStorage conforms to SyncStorage", () => {
   register(
     Conformance.syncStorage(
-      Effect.map(freshDatabase, (sql) => ({
-        storage: SqliteSyncStorage.make(sql, registry),
-        // Storage reconstruction (new permit, nothing cached) over the same live connection. This is not a
-        // connection or OPFS reload: memory-VFS checks do not prove persistence across processes or crashes
-        // (the Chromium scenarios cover reload and hard kill).
-        reopen: Effect.sync(() => SqliteSyncStorage.make(sql, registry)),
-        // The retention window has passed for every released row.
-        pruneReleased: Outbox.pruneReleased(-1).pipe(Effect.provideService(SqlClient.SqlClient, sql))
-      }))
+      Effect.gen(function* () {
+        const sql = yield* freshDatabase
+        const storage = yield* SqliteSyncStorage.make(sql, registry)
+        return {
+          storage,
+          // Storage reconstruction (new permit, nothing cached) over the same live connection. This is not a
+          // connection or OPFS reload: memory-VFS checks do not prove persistence across processes or crashes
+          // (the Chromium scenarios cover reload and hard kill).
+          reopen: SqliteSyncStorage.make(sql, registry),
+          // The retention window has passed for every released row.
+          pruneReleased: Outbox.pruneReleased(-1).pipe(Effect.provideService(SqlClient.SqlClient, sql))
+        }
+      })
     )
   )
 })

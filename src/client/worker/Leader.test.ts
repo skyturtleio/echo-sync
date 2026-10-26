@@ -41,7 +41,7 @@ const position = Schema.decodeUnknownSync(Ids.Position)("1")
 
 it.live("an enqueue cancelled while its COMMIT runs still wakes the loop: the entry is pushed with no other wake", () =>
   Effect.gen(function* () {
-    const real = SqliteSyncStorage.make(yield* SqlClient.SqlClient, registry)
+    const real = yield* SqliteSyncStorage.make(yield* SqlClient.SqlClient, registry)
     const committed = yield* Deferred.make<void>()
     const gate = yield* Deferred.make<void>()
     const state = { gateNext: false }
@@ -215,7 +215,7 @@ const leaderRpc = (options: { readonly allowRawExec: boolean; readonly transport
       Effect.provideService(Reactivity.Reactivity, reactivity)
     )
     yield* SqliteSyncStorage.migrate(queryRegistry).pipe(Effect.provideService(SqlClient.SqlClient, sql))
-    const storage = SqliteSyncStorage.make(sql, queryRegistry)
+    const storage = yield* SqliteSyncStorage.make(sql, queryRegistry)
     const put = <T extends SyncTable.AnySyncTable>(table: T, row: Store.RowOf<T>) =>
       storage.rows.write(table, row.id, Option.some(Schema.encodeUnknownSync(table.wire)(row)))
     const write = <T extends SyncTable.AnySyncTable>(table: T, row: Store.RowOf<T>) =>
@@ -797,7 +797,7 @@ const replicaDb = Effect.gen(function* () {
     Effect.provideService(Reactivity.Reactivity, reactivity)
   )
   yield* SqliteSyncStorage.migrate(queryRegistry).pipe(Effect.provideService(SqlClient.SqlClient, sql))
-  const storage = SqliteSyncStorage.make(sql, queryRegistry)
+  const storage = yield* SqliteSyncStorage.make(sql, queryRegistry)
   const grant = {
     id: ScopeGrants.grantId(scope, me),
     accessScopeId: scope,
@@ -828,7 +828,7 @@ const syncLeader = (
   countGate: Effect.Effect<void> = Effect.void
 ) =>
   Effect.gen(function* () {
-    const storage = SqliteSyncStorage.make(db.sql, queryRegistry)
+    const storage = yield* SqliteSyncStorage.make(db.sql, queryRegistry)
     const engine = yield* Engine.make({
       clientId: Ids.ClientId.make("c"),
       actor: me,

@@ -59,7 +59,7 @@ const connect = Effect.fnUntraced(function* (app: Layer.Layer<never, never, Http
 const device = Effect.fnUntraced(function* (transport: Engine.Transport, sqlite?: SqliteClient.SqliteClient) {
   const sql = sqlite ?? (yield* SqliteClient.makeMemory({}))
   yield* SqliteSyncStorage.migrate(registry).pipe(Effect.provideService(SqlClient, sql))
-  const storage = SqliteSyncStorage.make(sql, registry)
+  const storage = yield* SqliteSyncStorage.make(sql, registry)
   const engine = yield* Engine.make({ clientId: request.clientId, actor, registry, mutations, storage, transport })
   return { engine, storage, sqlite: sql }
 })

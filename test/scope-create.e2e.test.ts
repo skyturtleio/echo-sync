@@ -53,7 +53,7 @@ const setup = Effect.gen(function* () {
   )
   const sqlite = Context.get(yield* Layer.build(SqliteClient.layerMemory({})), SqlClient)
   yield* SqliteSyncStorage.migrate(registry).pipe(Effect.provideService(SqlClient, sqlite))
-  const storage = SqliteSyncStorage.make(sqlite, registry)
+  const storage = yield* SqliteSyncStorage.make(sqlite, registry)
   const transport = yield* Transport.make.pipe(Effect.provide(Transport.layerProtocolHttp("http://echo.test/sync")))
   const engine = yield* Engine.make({
     clientId: Ids.ClientId.make("b-device"),

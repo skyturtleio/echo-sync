@@ -22,7 +22,7 @@ const makeStorage = Effect.gen(function* () {
   const rows = {
     ids: Effect.orDie(sql<{ id: string }>`SELECT id FROM t ORDER BY id`).pipe(Effect.map((r) => r.map((x) => x.id)))
   }
-  return { storage: SqliteSyncStorage.make(sql, registry), rows }
+  return { storage: yield* SqliteSyncStorage.make(sql, registry), rows }
 })
 
 const mid = Ids.MutationId.make
@@ -299,7 +299,7 @@ it.effect("staged pages and meta round-trip with bigint positions", () =>
 it.effect("resuming corrupt staged JSON or a non-string continuation dies naming echo_staged", () =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient
-    const storage = SqliteSyncStorage.make(sql, registry)
+    const storage = yield* SqliteSyncStorage.make(sql, registry)
     for (const page of [
       "not json",
       '{"continuation":42}',
@@ -447,7 +447,7 @@ it.effect("an index-only change keeps rows and cursor; a data-shape change rebui
     ])
     expect(uniqueScope.dataHash).toBe(registry.dataHash)
     expect(yield* SqliteSyncStorage.migrate(uniqueScope)).toEqual({ rebuilt: true })
-    const unique = SqliteSyncStorage.make(sql, uniqueScope)
+    const unique = yield* SqliteSyncStorage.make(sql, uniqueScope)
     const uniqueT = Option.getOrThrow(uniqueScope.get("t"))
     yield* unique.rows.write(uniqueT, "u1", Option.some(row("u1")))
     const duplicate = yield* Effect.exit(unique.rows.write(uniqueT, "u2", Option.some(row("u2"))))
@@ -508,7 +508,7 @@ it.effect("after a rebuild, installing the null-cursor set replays pending on to
     yield* seedOldReplica
     expect(yield* SqliteSyncStorage.migrate(reshaped)).toEqual({ rebuilt: true })
     const sql = yield* SqlClient.SqlClient
-    const storage = SqliteSyncStorage.make(sql, reshaped)
+    const storage = yield* SqliteSyncStorage.make(sql, reshaped)
     const tTable = Option.getOrThrow(reshaped.get("t"))
     // The pending entries' handler: inserts row <mutationId> with n = 1 in scope "s".
     const insert = Mutation.make("t", {
@@ -648,7 +648,7 @@ it.live(
 it.live("a mutate queued behind a long pull install can be interrupted while it waits; its handler never runs", () =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient
-    const storage = SqliteSyncStorage.make(sql, registry)
+    const storage = yield* SqliteSyncStorage.make(sql, registry)
     const installing = yield* Deferred.make<void>()
     const gate = yield* Deferred.make<void>()
     const state = { blockReplay: false, added: 0 }

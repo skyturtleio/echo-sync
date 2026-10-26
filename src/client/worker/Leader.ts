@@ -517,7 +517,7 @@ const program = Effect.fn("Leader.program")(
       Effect.provideService(SqlClient.SqlClient, sql),
       Effect.flatMap(Schema.decodeUnknownEffect(Ids.ClientId))
     )
-    const storage = SqliteSyncStorage.make(sql, registry)
+    const storage = yield* SqliteSyncStorage.make(sql, registry)
     let loop: SyncLoop.SyncLoop | undefined
     let presence: Presence.Presence<Protocol.Forbidden> | undefined
     let engine: Engine.Engine

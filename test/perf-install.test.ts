@@ -23,7 +23,7 @@ it.live("batched replica upserts keep the last duplicate and split before SQLite
     const source = yield* SqliteClient.makeMemory({})
     yield* SqliteSyncStorage.migrate(clientRegistry).pipe(Effect.provideService(SqlClient, source))
     const counter = yield* countingClient(source, makeCompilerSqlite())
-    const storage = SqliteSyncStorage.make(counter.client, clientRegistry)
+    const storage = yield* SqliteSyncStorage.make(counter.client, clientRegistry)
     // Four columns: 8192 rows cross the pinned SQLite's 32766-bind limit.
     const rows = Array.from({ length: 8192 }, (_, i) => ({
       id: `i-${i}`,
@@ -65,7 +65,7 @@ it.live("install batches never move upserts across a tombstone, scope purge, or 
   Effect.gen(function* () {
     const source = yield* SqliteClient.makeMemory({})
     yield* SqliteSyncStorage.migrate(clientRegistry).pipe(Effect.provideService(SqlClient, source))
-    const storage = SqliteSyncStorage.make(source, clientRegistry)
+    const storage = yield* SqliteSyncStorage.make(source, clientRegistry)
     yield* storage.transaction(
       Engine.applyPageSet(
         { storage, registry: clientRegistry, mutations, actor: principal("alice") },
@@ -108,49 +108,50 @@ it.live("a resumed K-page pull reads only linear staged rows and installs the wh
     const counter = yield* countingClient(source, makeCompilerSqlite())
     for (const k of [8, 24]) {
       let requests = 0
-      const open = () => {
-        const storage = SqliteSyncStorage.make(counter.client, clientRegistry)
-        return Effect.map(
-          Engine.make({
-            storage,
-            registry: clientRegistry,
-            mutations,
-            actor: principal("alice"),
-            clientId: Ids.ClientId.make("linear"),
-            transport: {
-              push: () => Effect.succeed({ results: [] }),
-              pull: paginate((request) =>
-                Effect.sync(() => {
-                  const index = Option.isNone(request.continuation) ? 0 : Number(request.continuation.value)
-                  if (requests++ === k / 2) throw new Error("reload")
-                  expect(index).toBe(requests > k / 2 + 1 ? requests - 2 : requests - 1)
-                  return index === k
-                    ? {
-                        _tag: "PullDone",
-                        changes: [],
-                        acks: [],
-                        nextCursor: Ids.Position.make(BigInt(k)),
-                        expiredThrough: Ids.SeqFloor.make(0)
-                      }
-                    : {
-                        _tag: "PullPage",
-                        changes: [
-                          {
-                            _tag: "upsert",
-                            table: "counters",
-                            row: { id: `page-${index}`, access_scope_id: "s", value: index, updated_at: 0 }
-                          }
-                        ],
-                        acks: [],
-                        continuation: Protocol.PullContinuation.make(String(index + 1))
-                      }
-                })
-              )
-            }
-          }),
-          (engine) => ({ engine, storage })
-        )
-      }
+      const open = () =>
+        Effect.gen(function* () {
+          const storage = yield* SqliteSyncStorage.make(counter.client, clientRegistry)
+          return yield* Effect.map(
+            Engine.make({
+              storage,
+              registry: clientRegistry,
+              mutations,
+              actor: principal("alice"),
+              clientId: Ids.ClientId.make("linear"),
+              transport: {
+                push: () => Effect.succeed({ results: [] }),
+                pull: paginate((request) =>
+                  Effect.sync(() => {
+                    const index = Option.isNone(request.continuation) ? 0 : Number(request.continuation.value)
+                    if (requests++ === k / 2) throw new Error("reload")
+                    expect(index).toBe(requests > k / 2 + 1 ? requests - 2 : requests - 1)
+                    return index === k
+                      ? {
+                          _tag: "PullDone",
+                          changes: [],
+                          acks: [],
+                          nextCursor: Ids.Position.make(BigInt(k)),
+                          expiredThrough: Ids.SeqFloor.make(0)
+                        }
+                      : {
+                          _tag: "PullPage",
+                          changes: [
+                            {
+                              _tag: "upsert",
+                              table: "counters",
+                              row: { id: `page-${index}`, access_scope_id: "s", value: index, updated_at: 0 }
+                            }
+                          ],
+                          acks: [],
+                          continuation: Protocol.PullContinuation.make(String(index + 1))
+                        }
+                  })
+                )
+              }
+            }),
+            (engine) => ({ engine, storage })
+          )
+        })
       counter.reset()
       const first = yield* open()
       expect((yield* Effect.exit(first.engine.pull))._tag).toBe("Failure")

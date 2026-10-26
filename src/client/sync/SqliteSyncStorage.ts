@@ -181,202 +181,205 @@ export interface SqliteSyncStorage extends Engine.SyncStorage {
   readonly pendingCount: Stream.Stream<number, Errors.StoreUnavailable>
 }
 
-export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry): SqliteSyncStorage => {
-  const rows = SqliteRowStore.make(sql, registry)
-  // The head owns admission even before its fiber resumes. Keeping the owner in the
-  // insertion-ordered set prevents a releasing fiber from barging back in.
-  const admissions = new Set<Deferred.Deferred<void>>()
-  const admit: SqliteSyncStorage["admit"] = (self) =>
-    Effect.uninterruptibleMask((restore) =>
-      Effect.suspend(() => {
-        const ready = Deferred.makeUnsafe<void>()
-        admissions.add(ready)
-        if (admissions.size === 1) Deferred.doneUnsafe(ready, Effect.void)
-        // Install cleanup before restoring interruption, including while awaiting a
-        // grant. A cancelled head passes ownership on; a cancelled waiter just leaves.
-        return restore(Effect.andThen(Deferred.await(ready), self)).pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              const wasHead = admissions.values().next().value === ready
-              admissions.delete(ready)
-              const next = admissions.values().next().value
-              if (wasHead && next !== undefined) Deferred.doneUnsafe(next, Effect.void)
-            })
-          )
-        )
-      })
-    )
-  let revision: Revision = { epoch: Effect.runSync(randomUUIDv4), offset: 0 }
-  let changed = false
-  let appended = false
-  const advance = () => {
-    revision =
-      revision.offset === Number.MAX_SAFE_INTEGER
-        ? { epoch: Effect.runSync(randomUUIDv4), offset: 0 }
-        : { ...revision, offset: revision.offset + 1 }
-  }
-  const touch = <A, E, R>(self: Effect.Effect<A, E, R>) =>
-    Effect.tap(self, () =>
-      Effect.sync(() => {
-        changed = true
-      })
-    )
-  const commit = <A, E, R>(self: Effect.Effect<A, E, R>, local: boolean) =>
-    admit(
+export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry): Effect.Effect<SqliteSyncStorage> =>
+  Effect.gen(function* () {
+    const rows = SqliteRowStore.make(sql, registry)
+    // The head owns admission even before its fiber resumes. Keeping the owner in the
+    // insertion-ordered set prevents a releasing fiber from barging back in.
+    const admissions = new Set<Deferred.Deferred<void>>()
+    const admit: SqliteSyncStorage["admit"] = (self) =>
       Effect.uninterruptibleMask((restore) =>
-        Effect.gen(function* () {
-          changed = false
-          appended = false
-          const before = revision
-          // Keep publication masked with COMMIT, but the body (and admission above) cancellable.
-          const value = yield* sql.withTransaction(restore(self))
-          if (changed) advance()
-          const change: LocalChange | null =
-            local && appended && before.epoch === revision.epoch ? { before, after: revision } : null
-          return { value, change }
+        Effect.suspend(() => {
+          const ready = Deferred.makeUnsafe<void>()
+          admissions.add(ready)
+          if (admissions.size === 1) Deferred.doneUnsafe(ready, Effect.void)
+          // Install cleanup before restoring interruption, including while awaiting a
+          // grant. A cancelled head passes ownership on; a cancelled waiter just leaves.
+          return restore(Effect.andThen(Deferred.await(ready), self)).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                const wasHead = admissions.values().next().value === ready
+                admissions.delete(ready)
+                const next = admissions.values().next().value
+                if (wasHead && next !== undefined) Deferred.doneUnsafe(next, Effect.void)
+              })
+            )
+          )
         })
       )
-    ).pipe(Effect.catchIf(isSqlError, (error) => SqliteRowStore.unavailable(Effect.fail(error))))
-  const run = <A>(effect: Effect.Effect<A, SqlError, SqlClient.SqlClient>) =>
-    SqliteRowStore.unavailable(Effect.provideService(effect, SqlClient.SqlClient, sql))
-
-  const decodeUndoImages = (text: string) =>
-    Effect.flatMap(decodeUndo(text), (images) =>
-      Effect.forEach(images, (image) =>
-        Option.match(registry.get(image.table), {
-          onNone: () => Effect.die(new Error(`echo_outbox: undo image for unregistered table ${image.table}`)),
-          onSome: (table): Effect.Effect<Store.UndoImage> => Effect.succeed({ ...image, table })
-        })
-      )
-    )
-
-  const pending = Effect.gen(function* () {
-    const result: Array<Engine.PendingMutation> = []
-    const undo = yield* run(sql<{ readonly seq: number; readonly undo: string }>`
-      SELECT seq, undo FROM echo_outbox WHERE released_at IS NULL ORDER BY seq`)
-    const undoBySeq = new Map(undo.map((r) => [r.seq, r.undo]))
-    for (const entry of yield* run(Outbox.pending)) {
-      result.push({
-        envelope: yield* toEnvelope(entry),
-        createdAt: entry.createdAt,
-        undo: yield* decodeUndoImages(undoBySeq.get(entry.seq) ?? "[]")
-      })
+    let revision: Revision = { epoch: yield* randomUUIDv4, offset: 0 }
+    let changed = false
+    let appended = false
+    const advance = () => {
+      revision =
+        revision.offset === Number.MAX_SAFE_INTEGER
+          ? // Overflow is only reachable after Number.MAX_SAFE_INTEGER commits. Keeping this synchronous
+            // preserves the write path's existing shape without threading an Effect through every caller.
+            { epoch: Effect.runSync(randomUUIDv4), offset: 0 }
+          : { ...revision, offset: revision.offset + 1 }
     }
-    return result
-  })
-
-  return {
-    revision: Effect.sync(() => revision),
-    invalidateRevision: Effect.sync(advance),
-    admit,
-    pendingCount: sql.reactive(
-      ["echo_outbox"],
-      admit(
-        Effect.map(
-          run(sql<{ readonly n: number }>`SELECT count(*) AS n FROM echo_outbox WHERE released_at IS NULL`),
-          (counted) => counted[0]?.n ?? 0
-        )
-      )
-    ),
-    // BEGIN/COMMIT failures map like any statement's; the body's own errors pass through unchanged.
-    // `withTransaction` waits for the connection lease uninterruptibly; waiting for admission first makes
-    // a transaction queued behind a long one (e.g. a pull install) cancellable while it waits. Admission
-    // is FIFO (INV-CLI-15) and held through commit/rollback and revision publication. Both transaction
-    // paths share this gate with `admit` and pending counts, so local receipts cannot bypass waiters.
-    transaction: (self) => Effect.map(commit(self, false), ({ value }) => value),
-    localCommit: (self) => commit(self, true),
-    rows: {
-      ...rows,
-      write: (table, id, row) => touch(rows.write(table, id, row)),
-      writeMany: (table, batch) => touch(rows.writeMany(table, batch)),
-      purgeScope: (scope) => touch(rows.purgeScope(scope)),
-      clearAll: touch(rows.clearAll)
-    },
-    meta: Effect.gen(function* () {
-      const stored = yield* run(sql<{ readonly value: string }>`SELECT value FROM echo_meta WHERE key = 'sync_meta'`)
-      const text = stored[0]?.value
-      return text === undefined ? initialMeta : yield* decodeMeta(text)
-    }),
-    setMeta: (meta) =>
-      touch(
-        Effect.gen(function* () {
-          const value = yield* encodeMeta(meta)
-          yield* run(sql`INSERT INTO echo_meta (key, value) VALUES ('sync_meta', ${value})
-          ON CONFLICT (key) DO UPDATE SET value = excluded.value`)
+    const touch = <A, E, R>(self: Effect.Effect<A, E, R>) =>
+      Effect.tap(self, () =>
+        Effect.sync(() => {
+          changed = true
         })
-      ),
-    pending,
-    lookup: (mutationId) =>
-      Effect.flatMap(run(Outbox.lookup(mutationId)), (entry) =>
-        Option.isNone(entry) ? Effect.succeedNone : Effect.asSome(toEnvelope(entry.value))
-      ),
-    nextSeq: Effect.flatMap(run(Outbox.nextSeq), (seq) => Store.decodeStored(Ids.Seq, "sqlite_sequence", seq)),
-    appendPending: (entry) =>
-      Effect.gen(function* () {
-        const undo = yield* encodeUndoImages(entry.undo)
-        yield* run(
-          Outbox.insert({
-            seq: entry.envelope.seq,
-            clientId: entry.envelope.clientId,
-            mutationId: entry.envelope.mutationId,
-            name: entry.envelope.name,
-            args: entry.envelope.args,
-            createdAt: entry.createdAt,
-            undo
+      )
+    const commit = <A, E, R>(self: Effect.Effect<A, E, R>, local: boolean) =>
+      admit(
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            changed = false
+            appended = false
+            const before = revision
+            // Keep publication masked with COMMIT, but the body (and admission above) cancellable.
+            const value = yield* sql.withTransaction(restore(self))
+            if (changed) advance()
+            const change: LocalChange | null =
+              local && appended && before.epoch === revision.epoch ? { before, after: revision } : null
+            return { value, change }
           })
         )
-        changed = true
-        appended = true
+      ).pipe(Effect.catchIf(isSqlError, (error) => SqliteRowStore.unavailable(Effect.fail(error))))
+    const run = <A>(effect: Effect.Effect<A, SqlError, SqlClient.SqlClient>) =>
+      SqliteRowStore.unavailable(Effect.provideService(effect, SqlClient.SqlClient, sql))
+
+    const decodeUndoImages = (text: string) =>
+      Effect.flatMap(decodeUndo(text), (images) =>
+        Effect.forEach(images, (image) =>
+          Option.match(registry.get(image.table), {
+            onNone: () => Effect.die(new Error(`echo_outbox: undo image for unregistered table ${image.table}`)),
+            onSome: (table): Effect.Effect<Store.UndoImage> => Effect.succeed({ ...image, table })
+          })
+        )
+      )
+
+    const pending = Effect.gen(function* () {
+      const result: Array<Engine.PendingMutation> = []
+      const undo = yield* run(sql<{ readonly seq: number; readonly undo: string }>`
+      SELECT seq, undo FROM echo_outbox WHERE released_at IS NULL ORDER BY seq`)
+      const undoBySeq = new Map(undo.map((r) => [r.seq, r.undo]))
+      for (const entry of yield* run(Outbox.pending)) {
+        result.push({
+          envelope: yield* toEnvelope(entry),
+          createdAt: entry.createdAt,
+          undo: yield* decodeUndoImages(undoBySeq.get(entry.seq) ?? "[]")
+        })
+      }
+      return result
+    })
+
+    return {
+      revision: Effect.sync(() => revision),
+      invalidateRevision: Effect.sync(advance),
+      admit,
+      pendingCount: sql.reactive(
+        ["echo_outbox"],
+        admit(
+          Effect.map(
+            run(sql<{ readonly n: number }>`SELECT count(*) AS n FROM echo_outbox WHERE released_at IS NULL`),
+            (counted) => counted[0]?.n ?? 0
+          )
+        )
+      ),
+      // BEGIN/COMMIT failures map like any statement's; the body's own errors pass through unchanged.
+      // `withTransaction` waits for the connection lease uninterruptibly; waiting for admission first makes
+      // a transaction queued behind a long one (e.g. a pull install) cancellable while it waits. Admission
+      // is FIFO (INV-CLI-15) and held through commit/rollback and revision publication. Both transaction
+      // paths share this gate with `admit` and pending counts, so local receipts cannot bypass waiters.
+      transaction: (self) => Effect.map(commit(self, false), ({ value }) => value),
+      localCommit: (self) => commit(self, true),
+      rows: {
+        ...rows,
+        write: (table, id, row) => touch(rows.write(table, id, row)),
+        writeMany: (table, batch) => touch(rows.writeMany(table, batch)),
+        purgeScope: (scope) => touch(rows.purgeScope(scope)),
+        clearAll: touch(rows.clearAll)
+      },
+      meta: Effect.gen(function* () {
+        const stored = yield* run(sql<{ readonly value: string }>`SELECT value FROM echo_meta WHERE key = 'sync_meta'`)
+        const text = stored[0]?.value
+        return text === undefined ? initialMeta : yield* decodeMeta(text)
       }),
-    setUndo: (seq, undo) =>
-      Effect.gen(function* () {
-        const text = yield* encodeUndoImages(undo)
-        yield* run(sql`UPDATE echo_outbox SET undo = ${text} WHERE seq = ${seq}`)
+      setMeta: (meta) =>
+        touch(
+          Effect.gen(function* () {
+            const value = yield* encodeMeta(meta)
+            yield* run(sql`INSERT INTO echo_meta (key, value) VALUES ('sync_meta', ${value})
+          ON CONFLICT (key) DO UPDATE SET value = excluded.value`)
+          })
+        ),
+      pending,
+      lookup: (mutationId) =>
+        Effect.flatMap(run(Outbox.lookup(mutationId)), (entry) =>
+          Option.isNone(entry) ? Effect.succeedNone : Effect.asSome(toEnvelope(entry.value))
+        ),
+      nextSeq: Effect.flatMap(run(Outbox.nextSeq), (seq) => Store.decodeStored(Ids.Seq, "sqlite_sequence", seq)),
+      appendPending: (entry) =>
+        Effect.gen(function* () {
+          const undo = yield* encodeUndoImages(entry.undo)
+          yield* run(
+            Outbox.insert({
+              seq: entry.envelope.seq,
+              clientId: entry.envelope.clientId,
+              mutationId: entry.envelope.mutationId,
+              name: entry.envelope.name,
+              args: entry.envelope.args,
+              createdAt: entry.createdAt,
+              undo
+            })
+          )
+          changed = true
+          appended = true
+        }),
+      setUndo: (seq, undo) =>
+        Effect.gen(function* () {
+          const text = yield* encodeUndoImages(undo)
+          yield* run(sql`UPDATE echo_outbox SET undo = ${text} WHERE seq = ${seq}`)
+        }),
+      release: (seqs) => touch(run(Outbox.markReleased(seqs))),
+      staged: Effect.gen(function* () {
+        const stored = yield* run(sql<{ readonly page: string }>`SELECT page FROM echo_staged ORDER BY ord`)
+        return yield* Effect.forEach(stored, (r) => decodePage(r.page))
       }),
-    release: (seqs) => touch(run(Outbox.markReleased(seqs))),
-    staged: Effect.gen(function* () {
-      const stored = yield* run(sql<{ readonly page: string }>`SELECT page FROM echo_staged ORDER BY ord`)
-      return yield* Effect.forEach(stored, (r) => decodePage(r.page))
-    }),
-    stagedProgress: Effect.gen(function* () {
-      // stage only appends and clearStaged deletes the whole set: committed ords are contiguous
-      // within a set (including after rollback), but AUTOINCREMENT does not restart on clear.
-      // Two primary-key end seeks avoid a count(*) scan and returning accumulated page JSON.
-      const stored = yield* run(sql<{ readonly continuation: string | null; readonly count: number }>`
+      stagedProgress: Effect.gen(function* () {
+        // stage only appends and clearStaged deletes the whole set: committed ords are contiguous
+        // within a set (including after rollback), but AUTOINCREMENT does not restart on clear.
+        // Two primary-key end seeks avoid a count(*) scan and returning accumulated page JSON.
+        const stored = yield* run(sql<{ readonly continuation: string | null; readonly count: number }>`
         SELECT CASE WHEN json_valid(page) THEN
                  CASE WHEN json_type(page, '$.continuation') = 'text'
                    THEN json_extract(page, '$.continuation') END
                END AS continuation,
                ord - (SELECT min(ord) FROM echo_staged) + 1 AS count
         FROM echo_staged ORDER BY ord DESC LIMIT 1`)
-      const last = stored[0]
-      return last === undefined
-        ? { continuation: Option.none(), count: 0 }
-        : {
-            continuation: Option.some(
-              yield* Store.decodeStored(Protocol.PullContinuation, "echo_staged", last.continuation)
-            ),
-            count: last.count
-          }
-    }),
-    stage: (page) =>
-      Effect.gen(function* () {
-        const text = yield* encodePage(page)
-        yield* run(sql`INSERT INTO echo_staged (page) VALUES (${text})`)
+        const last = stored[0]
+        return last === undefined
+          ? { continuation: Option.none(), count: 0 }
+          : {
+              continuation: Option.some(
+                yield* Store.decodeStored(Protocol.PullContinuation, "echo_staged", last.continuation)
+              ),
+              count: last.count
+            }
       }),
-    clearStaged: Effect.asVoid(run(sql`DELETE FROM echo_staged`)),
-    addNotices: (notices) =>
-      Effect.forEach(
-        notices,
-        (notice) =>
-          Effect.gen(function* () {
-            const text = yield* encodeNotice(notice)
-            yield* run(sql`INSERT INTO echo_notices (notice) VALUES (${text})`)
-          }),
-        { discard: true }
-      )
-  }
-}
+      stage: (page) =>
+        Effect.gen(function* () {
+          const text = yield* encodePage(page)
+          yield* run(sql`INSERT INTO echo_staged (page) VALUES (${text})`)
+        }),
+      clearStaged: Effect.asVoid(run(sql`DELETE FROM echo_staged`)),
+      addNotices: (notices) =>
+        Effect.forEach(
+          notices,
+          (notice) =>
+            Effect.gen(function* () {
+              const text = yield* encodeNotice(notice)
+              yield* run(sql`INSERT INTO echo_notices (notice) VALUES (${text})`)
+            }),
+          { discard: true }
+        )
+    }
+  })
 
 /** Delete the notices with these ids; the only way a notice is ever removed (SPEC §9.5). */
 export const dismissNotices = (

@@ -22,7 +22,7 @@ export const installFixture = Effect.fnUntraced(function* (p: number, c: number,
   const source = yield* SqliteClient.makeMemory({})
   yield* SqliteSyncStorage.migrate(clientRegistry).pipe(Effect.provideService(SqlClient, source))
   const counter = yield* countingClient(source, makeCompilerSqlite())
-  const storage = SqliteSyncStorage.make(counter.client, clientRegistry)
+  const storage = yield* SqliteSyncStorage.make(counter.client, clientRegistry)
   const actor = principal("alice")
   const context = { storage, registry: clientRegistry, mutations, actor }
   const engine = yield* Engine.make({
