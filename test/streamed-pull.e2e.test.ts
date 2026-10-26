@@ -122,7 +122,9 @@ describe.skipIf(!pgAvailable)("streamed pull over real HTTP codecs and SQLite", 
         const db = yield* Effect.context<SqlClient | PgClient.PgClient>()
         const pg = Context.get(db, SqlClient)
         yield* grant("p", "s")
-        yield* pg`INSERT INTO items (id, access_scope_id, body) VALUES ('a','s','one'), ('b','s','two'), ('c','s','three')`
+        // An indivisible row above the page target must survive staging, disconnect and install.
+        const large = "水".repeat(400_000)
+        yield* pg`INSERT INTO items (id, access_scope_id, body) VALUES ('a','s',${large}), ('b','s','two'), ('c','s','three')`
         const connection = yield* connect(
           layerHttp({
             registry,
@@ -152,7 +154,7 @@ describe.skipIf(!pgAvailable)("streamed pull over real HTTP codecs and SQLite", 
         yield* resumed.engine.pull
         expect(connection.requests()).toBe(3) // epoch negotiation + interrupted stream + resume
         expect(yield* resumed.storage.transaction(resumed.storage.rows.scan(Items))).toEqual([
-          { id: "a", access_scope_id: "s", body: "one" },
+          { id: "a", access_scope_id: "s", body: large },
           { id: "b", access_scope_id: "s", body: "two" },
           { id: "c", access_scope_id: "s", body: "three" }
         ])

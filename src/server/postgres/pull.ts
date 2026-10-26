@@ -60,7 +60,7 @@ export interface PullRequest {
 
 const MutationOutcomeJson = Schema.toCodecJson(Mutation.MutationOutcome)
 
-/** Maximum UTF-8 bytes of the encoded PullResponse JSON (excluding transport framing). */
+/** Target UTF-8 bytes of encoded PullResponse JSON; indivisible candidates may exceed it. */
 export const maxPullPageBytes = 1_048_576
 // A configured row budget is an upper bound, not a target. Bound candidate construction even
 // for very large limits; this does not bound individual rows, acks or membership metadata.
@@ -304,8 +304,8 @@ export const pull = Effect.fnUntraced(function* (
         return { result, held: Arr.sort(readable, compare) }
       })
       // Rebuild from the original continuation in the SAME snapshot. Truncating changes alone
-      // would skip rows/acks because its continuation has already advanced past them. No cursor
-      // bookkeeping happens until an entire encoded candidate fits.
+      // would skip rows/acks because its continuation has already advanced past them. Persisted
+      // atomic data has no matching write-size limit, so the minimum candidate must make progress.
       while (true) {
         const page = yield* candidate
         if (utf8.encode(JSON.stringify(encodeResponse(page.result))).byteLength <= maxPullPageBytes) return page
@@ -316,7 +316,7 @@ export const pull = Effect.fnUntraced(function* (
             deferAcks = true
             continue
           }
-          return yield* new Protocol.ServerUnavailable({ message: "Pull page exceeds the byte limit" })
+          return page
         }
         limit = Math.max(1, Math.floor(limit / 2))
       }

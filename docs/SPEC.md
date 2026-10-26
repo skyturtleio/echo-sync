@@ -750,22 +750,28 @@ rest. Payloads are always the current row.
   stream backpressure. The producer is lazy, emits one page per RPC chunk, and both server and
   client RPC queues have capacity one. HTTP pull MUST refuse absent/v1 wire versions with
   `ClientOutdated` before client registration or page production.
-- INV-PULL-18: Encoded `PullResponse` JSON MUST be at most 1,048,576 UTF-8 bytes, excluding RPC
-  framing. An oversized candidate is rebuilt with a halved row budget in the same snapshot,
+- INV-PULL-18: Encoded `PullResponse` JSON targets 1,048,576 UTF-8 bytes, excluding RPC
+  framing. An oversized candidate MUST be rebuilt with a halved row budget in the same snapshot,
   from its original continuation. Nothing may be truncated or skipped to fit. A minimum mixed
   candidate may defer all acks without advancing their position; it cannot complete until those
-  acks are delivered. If the resulting candidate still exceeds the cap (individual row, individual
-  ack or metadata), fail `ServerUnavailable` without cursor
-  bookkeeping; registration/last-seen may already have occurred.
+  acks are delivered. At row budget one, after deferring mixed acks, the resulting candidate MUST
+  be delivered even if an individual row, ack or required metadata exceeds the target. The target
+  MUST NOT strand data already accepted by the engine. Purges and metadata are not counted rows,
+  so this minimum candidate can contain multiple purges and arbitrarily large membership state.
 
 **Rationale (2026-10-26):** A streamed page set removes the HTTP round trip per 500 rows while
 retaining per-page authorization, snapshots and durable continuations. Capacity-one RPC queues
 already overlap network and staging; another `Stream.buffer` would add redundant buffering.
-The 1 MiB wire bound is a safety limit, not a localhost throughput tuning result. Candidate
+The 1 MiB wire target is not a localhost throughput tuning result. Candidate
 construction caps counted changes at the existing 500-row default even for larger configured
-limits; halving avoids complex continuation surgery. Oversized atomic data fails closed rather
-than silently losing rows or acknowledgments. Applications must keep individual rows, individual acks
-and membership metadata within this limit.
+limits; halving avoids complex continuation surgery.
+
+**Rationale (2026-10-26):** SkyTime reproduced an accepted 1,049,909-byte row that synced before
+streaming but retried forever under the new hard cap. Keep byte-based splitting, but let the minimum
+candidate exceed the target: write limits cannot repair existing rows, outcomes or membership state,
+and fragmentation would require a new wire protocol. This is not a total-memory bound. The pinned
+Effect NDJSON decoder's separate default limit (16,777,216 JavaScript string code units per encoded
+line/buffer, including RPC framing) remains unchanged; arbitrary-size transport delivery is not promised.
 
 **Rationale (2026-10-26):** A long-offline client's many small outcomes must not become an
 indivisible oversized page. Track acknowledgment progress separately from change progress and
@@ -2222,6 +2228,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 
 ### Retired rules
 
+- **Retired (2026-10-26):** Hard 1 MiB rejection of indivisible pull data (former INV-PULL-18); minimum candidates now exceed the target rather than strand accepted data.
 - **Retired (2026-10-25):** One SQLite statement per installed upsert (former INV-PERF-4 cost); consecutive same-table runs now use parameter-bounded multi-row upserts (§9.4), with unchanged atomicity and row order.
 
 - **Retired (2026-10-25):** Implicit mutation-args excess-key stripping and defects for tab args encoding failures; strict-by-default typed rejections supersede them (INV-MUT-18, §5).
@@ -2295,7 +2302,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PULL-15 | covered | `rpc.test` "a stale epoch reaches no ledger, cursor, client registration or presence write on any sync entry point", "a cursor above head is resnapshotted even when its held-scope record survived" |
 | INV-PULL-16 | covered | `rpc.test` "an omitted epoch works during rollout but is refused ClientOutdated after restore fencing" |
 | INV-PULL-17 | covered | `streamed-pull.e2e` "one HTTP pull stages incrementally, reads a fresh snapshot per page, and exposes nothing before done", "a legacy unary client receives ClientOutdated before a streaming server registers or serves it" |
-| INV-PULL-18 | covered | `pull-size.test` "UTF-8 oversized walks split without losing or duplicating rows or recording an unfinished cursor", "byte-split log pages deliver every change and intervening ack exactly once (INV-PULL-7/10/11)", "an oversized single row fails before cursor pruning, cursor advancement or ack stamping", "ack-only backlogs split within the byte cap and resume without dropping or repeating outcomes", "oversized continuation metadata fails without recording or advancing the cursor", "a huge configured row budget still constructs at most 500 changes per candidate" |
+| INV-PULL-18 | covered | `pull-size.test` "UTF-8 oversized walks split without losing or duplicating rows or recording an unfinished cursor", "byte-split log pages deliver every change and intervening ack exactly once (INV-PULL-7/10/11)", "oversized rows and mixed acks complete initial and incremental pulls without losing progress", "ack-only backlogs split within the byte cap and resume without dropping or repeating outcomes", "oversized continuation metadata still resumes without recording an unfinished cursor", "a huge configured row budget still constructs at most 500 changes per candidate"; `rpc.test` "an accepted oversized row crosses streamed HTTP pull intact without hiding later rows or acks" |
 | INV-PUSH-1 | partial | `Transport.test` "push failures are fatal exactly when SPEC §10 says so, classified by real tags over a real RPC server" (includes the cap); the 50 default and the `min(…, 100)` clamp have no test |
 | INV-PUSH-2 | covered | `ledger.test` "a batch stops at a transient failure without recording it, and its resubmission continues in order"; `Transport.test` "a push batch the server stopped is reported as kind server" |
 | INV-PUSH-3 | covered | `rpc.test` "a connection lost mid-batch is a short results list, never a defect the client would halt on", "an infrastructure defect in principalFor is a transient stop (empty results), not a push failure" |
@@ -2394,7 +2401,8 @@ machine-verifiable literal test-title citations.
 | `PushRequest.mutations` | 1 … 100 | `Protocol.ts` | no |
 | `pageLimit` (upserts + tombstones per page) | default 500; positive safe-integer configuration; effective candidate ceiling 500 (INV-PULL-8/14) | `rpc.ts`, `pull.ts` | `pageLimit` may lower it |
 | server scope-walk index | one `table__echo-scope` per synced table; `(access_scope_id, id)`, `"C"` collation (INV-SCH-9) | `SyncTable.ts`, engine migration 005 | no |
-| pull page JSON | ≤ 1,048,576 UTF-8 bytes, excluding RPC framing; oversized atomic data fails (INV-PULL-18) | `pull.ts` | no |
+| pull page JSON | target 1,048,576 UTF-8 bytes, excluding RPC framing; minimum indivisible candidates may exceed it (INV-PULL-18) | `pull.ts` | no |
+| NDJSON decoder | default 16,777,216 JavaScript string code units per line/buffer including RPC framing; distinct from pull byte target | pinned Effect `RpcSerialization` | no engine option |
 | streaming RPC queues | server: 1 encoded message; pull client: 1 decoded page; one page per chunk; excludes HTTP/runtime/parser buffers | `rpc.ts`, `Transport.ts` | no |
 | staged resume read | at most 1 metadata row per request; full payload set read once at install (INV-PERF-8) | `SqliteSyncStorage.ts`, `Engine.ts` | no |
 | SQLite upsert batch | at most `floor(32766 / columnCount)` rows, never across page/table/delete/purge boundaries at install | `SqliteRowStore.ts`, `Engine.ts` | pinned wasm parameter limit, not a tuning option |

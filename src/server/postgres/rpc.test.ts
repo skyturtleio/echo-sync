@@ -87,6 +87,7 @@ const connectTo = (
     )
     return {
       ...client,
+      pullPages: client.pull,
       pull: (request: Protocol.PullRequest) =>
         last(
           client.pull({
@@ -136,6 +137,47 @@ const writer = Effect.gen(function* () {
 })
 
 describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
+  it.live("an accepted oversized row crosses streamed HTTP pull intact without hiding later rows or acks", () =>
+    Effect.gen(function* () {
+      yield* writer
+      const client = yield* connect
+      const body = "水".repeat(400_000)
+      const pushed = yield* client.push(
+        push([
+          ["large", body],
+          ["next", "small"]
+        ])
+      )
+      assert.deepStrictEqual(
+        pushed.results.map((r) => r.outcome._tag),
+        ["Applied", "Applied"]
+      )
+      const pages = yield* Stream.runCollect(
+        client.pullPages({
+          clientId: Ids.ClientId.make("d"),
+          cursor: null,
+          continuation: Option.none(),
+          clientVersion: { dataHash: registry.dataHash, wireVersion: Protocol.wireVersion }
+        })
+      )
+      assert.strictEqual(pages.at(-1)?._tag, "PullDone")
+      const rows = pages.flatMap((p) =>
+        p.changes.flatMap((c) => (c._tag === "upsert" && c.table === "items" ? [c.row] : []))
+      )
+      assert.deepStrictEqual(
+        rows.map((r) => [r["id"], r["body"]]),
+        [
+          ["large", body],
+          ["next", "small"]
+        ]
+      )
+      assert.deepStrictEqual(
+        pages.flatMap((p) => p.acks.map((a) => a.mutationId)),
+        ["large", "next"]
+      )
+    }).pipe(Effect.scoped, Effect.provide(TestDatabase))
+  )
+
   it.live("excess mutation args return a ledgered rejection over HTTP without writing the row", () =>
     Effect.gen(function* () {
       yield* writer

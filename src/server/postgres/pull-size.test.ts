@@ -15,18 +15,6 @@ const records = Effect.gen(function* () {
   return yield* sql`SELECT position, scope_ids FROM echo_sync.client_scopes WHERE client_id = 'd' ORDER BY position`
 })
 
-const unavailable = (effect: ReturnType<typeof pull>) =>
-  Effect.gen(function* () {
-    const result = yield* Effect.result(effect)
-    assert.isTrue(result._tag === "Failure")
-    if (result._tag === "Failure") {
-      assert.instanceOf(result.failure, Protocol.ServerUnavailable)
-      if (result.failure._tag === "ServerUnavailable") {
-        assert.strictEqual(result.failure.message, "Pull page exceeds the byte limit")
-      }
-    }
-  })
-
 describe.skipIf(!pgAvailable)("pull byte safety", () => {
   it.live("UTF-8 oversized walks split without losing or duplicating rows or recording an unfinished cursor", () =>
     Effect.gen(function* () {
@@ -97,27 +85,46 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
     }).pipe(Effect.provide(TestDatabase))
   )
 
-  it.live("an oversized single row fails before cursor pruning, cursor advancement or ack stamping", () =>
+  it.live("oversized rows and mixed acks complete initial and incremental pulls without losing progress", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient
       yield* grant("p", "s")
       yield* registerClient("p", "d")
-      yield* sql`INSERT INTO echo_sync.mutations (client_id, mutation_id, seq, position, outcome)
-                VALUES ('d', 'ack', 1, echo_sync.next_position(), '{"_tag":"Applied"}'::jsonb)`
       const initial = yield* pull(registry, request)
       if (initial._tag !== "PullDone") return assert.fail("expected initial snapshot")
-      yield* sql`INSERT INTO echo_sync.client_scopes (client_id, position, scope_ids) VALUES ('d', 0, '{}')`
-      const before = yield* records
-      yield* sql`INSERT INTO items (id, access_scope_id, body) VALUES ('large', 's', ${"水".repeat(400_000)})`
-      yield* unavailable(pull(registry, { ...request, cursor: initial.nextCursor }))
-      assert.deepStrictEqual(yield* records, before)
-      assert.deepStrictEqual(yield* sql`SELECT cursor FROM echo_sync.clients WHERE client_id = 'd'`, [{ cursor: null }])
+      const body = "水".repeat(400_000)
+      yield* sql`INSERT INTO items (id, access_scope_id, body) VALUES ('large', 's', ${body}), ('next', 's', 'small')`
+      const outcome = { _tag: "Rejected", error: { _tag: "UnknownMutation", name: "x".repeat(maxPullPageBytes) } }
+      yield* sql`INSERT INTO echo_sync.mutations (client_id, mutation_id, seq, position, outcome)
+                VALUES ('d', 'ack', 1, echo_sync.next_position(), ${JSON.stringify(outcome)}::jsonb)`
+      for (const cursor of [null, initial.nextCursor]) {
+        let continuation = Option.none<string>()
+        const ids: Array<string> = []
+        const acks: Array<string> = []
+        let pages = 0
+        while (true) {
+          assert.isBelow(pages++, 10)
+          const page = yield* pull(registry, { ...request, cursor, continuation })
+          for (const change of page.changes) {
+            if (change._tag !== "upsert" || change.table !== "items") continue
+            ids.push(String(change.row["id"]))
+            if (change.row["id"] === "large") {
+              assert.strictEqual(change.row["body"], body)
+              assert.isAbove(bytes(page), maxPullPageBytes)
+              assert.deepStrictEqual(page.acks, [])
+            }
+          }
+          acks.push(...page.acks.map((ack) => ack.mutationId))
+          if (page._tag === "PullDone") break
+          assert.strictEqual((yield* records).length, cursor === null ? 1 : 2)
+          continuation = Option.some(page.continuation)
+        }
+        assert.deepStrictEqual(ids, ["large", "next"])
+        assert.deepStrictEqual(acks, ["ack"])
+      }
       assert.deepStrictEqual(yield* sql`SELECT acked_at FROM echo_sync.mutations WHERE client_id = 'd'`, [
         { acked_at: null }
       ])
-      // Initial walks must fail closed as well, without recording a completed snapshot.
-      yield* unavailable(pull(registry, { ...request, clientId: "fresh" }))
-      assert.deepStrictEqual(yield* sql`SELECT * FROM echo_sync.client_scopes WHERE client_id = 'fresh'`, [])
     }).pipe(Effect.provide(TestDatabase))
   )
 
@@ -165,7 +172,6 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
         assert.strictEqual(pages, 3)
         assert.deepStrictEqual(seen, ["ack-1", "ack-2", "ack-3"])
       }
-      const before = yield* records
       const outcome = { _tag: "Rejected", error: { _tag: "UnknownMutation", name: "x".repeat(maxPullPageBytes) } }
       yield* sql`INSERT INTO echo_sync.mutations (client_id, mutation_id, seq, position, outcome)
                 VALUES ('d', 'too-large', 4, echo_sync.next_position(), ${JSON.stringify(outcome)}::jsonb)`
@@ -177,12 +183,22 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
         if (page._tag !== "PullPage") return assert.fail("must not complete before oversized ack")
         continuation = Option.some(page.continuation)
       }
-      yield* unavailable(pull(registry, { ...request, continuation }))
-      assert.deepStrictEqual(yield* records, before)
+      const final = yield* pull(registry, { ...request, continuation })
+      assert.strictEqual(final._tag, "PullDone")
+      assert.isAbove(bytes(final), maxPullPageBytes)
+      assert.deepStrictEqual(
+        final.acks.map((ack) => ack.mutationId),
+        ["too-large"]
+      )
+      const delivered = final.acks[0]?.outcome
+      if (delivered?._tag !== "Rejected" || delivered.error._tag !== "UnknownMutation") {
+        return assert.fail("expected UnknownMutation outcome")
+      }
+      assert.strictEqual(delivered.error.name, outcome.error.name)
     }).pipe(Effect.provide(TestDatabase))
   )
 
-  it.live("oversized continuation metadata fails without recording or advancing the cursor", () =>
+  it.live("oversized continuation metadata still resumes without recording an unfinished cursor", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient
       yield* grant("p", "s")
@@ -200,11 +216,26 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
         walking: []
       })
       const before = yield* records
-      yield* unavailable(
-        pull(registry, { ...request, cursor: initial.nextCursor, continuation: Option.some(continuation), limit: 1 })
-      )
+      const page = yield* pull(registry, {
+        ...request,
+        cursor: initial.nextCursor,
+        continuation: Option.some(continuation),
+        limit: 1
+      })
+      if (page._tag !== "PullPage") return assert.fail("expected continuation")
+      assert.isAbove(bytes(page), maxPullPageBytes)
       assert.deepStrictEqual(yield* records, before)
-      assert.deepStrictEqual(yield* sql`SELECT cursor FROM echo_sync.clients WHERE client_id = 'd'`, [{ cursor: null }])
+      const final = yield* pull(registry, {
+        ...request,
+        cursor: initial.nextCursor,
+        continuation: Option.some(page.continuation),
+        limit: 1
+      })
+      assert.strictEqual(final._tag, "PullDone")
+      assert.deepStrictEqual(
+        [...page.changes, ...final.changes].map((c) => (c._tag === "upsert" ? c.row["id"] : "")),
+        ["a", "b"]
+      )
     }).pipe(Effect.provide(TestDatabase))
   )
 
