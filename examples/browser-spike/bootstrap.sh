@@ -13,6 +13,8 @@
 # on permit hold, not a direct measurement of it, and includes failed/interrupted attempts.
 # Full row validation and reset are outside both metrics. Each trial has empty OPFS but
 # browser HTTP/module caches and PostgreSQL buffers are NOT cleared between trials.
+# ECHO_BENCH_RTT_MS=0|75 asserts the proxy's advertised added RTT (default 0).
+# Restart server, proxy and Vite from the recorded clean revision before each campaign.
 set -euo pipefail
 if [ -n "$(git status --porcelain)" ]; then
   echo 'benchmark receipts require a clean committed source tree' >&2
@@ -26,7 +28,23 @@ SESSION="boot-$$"
 ab() { agent-browser --session "$SESSION" "$@"; }
 cleanup() { ab close >/dev/null 2>&1 || true; }
 trap cleanup EXIT
-curl -fsS "$BASE/admin/stats" >/dev/null
+revision=$(git rev-parse HEAD)
+harness_tree=$(git rev-parse HEAD:examples/browser-spike)
+expected_rtt=${ECHO_BENCH_RTT_MS:-0}
+[[ "$expected_rtt" = 0 || "$expected_rtt" = 75 ]] || { echo 'invalid ECHO_BENCH_RTT_MS' >&2; exit 2; }
+response_headers=$(curl -fsS -D - -o /dev/null "$BASE/admin/stats")
+proxy_rtt=$(awk 'tolower($1) == "x-echo-benchmark-rtt-ms:" {gsub("\r", "", $2); print $2}' <<<"$response_headers")
+proxy_sha256=$(awk 'tolower($1) == "x-echo-benchmark-proxy-sha256:" {gsub("\r", "", $2); print $2}' <<<"$response_headers")
+[[ "${proxy_rtt:-0}" = "$expected_rtt" ]] || { echo 'proxy RTT differs from ECHO_BENCH_RTT_MS' >&2; exit 2; }
+if [ -n "$proxy_rtt" ]; then
+  local_proxy_sha256=$(sha256sum examples/browser-spike/delay-proxy.ts | cut -d ' ' -f 1)
+  [[ "$proxy_sha256" = "$local_proxy_sha256" ]] || { echo 'running proxy differs from clean source' >&2; exit 2; }
+fi
+metadata=$(jq -cn --arg revision "$revision" --arg harnessTree "$harness_tree" \
+  --argjson addedRttMs "$expected_rtt" --arg proxySha256 "$proxy_sha256" \
+  '{sourceRevision: $revision, harnessTree: $harnessTree, cleanSource: true, addedRttMs: $addedRttMs,
+    proxySha256: (if $proxySha256 == "" then null else $proxySha256 end),
+    delayModel: "half before upstream dispatch, half before response headers; no body delay"}')
 ab open "$BASE/bootstrap.html" >/dev/null
 ab set viewport 1280 720 2 >/dev/null
 for _ in $(seq 1 120); do
@@ -45,8 +63,14 @@ while [ "$SECONDS" -lt "$deadline" ]; do
   result=$(ab eval --json 'window.bootstrapBenchmark' | jq -c '.data.result')
   state=$(jq -r '.state' <<<"$result")
   case "$state" in
-    done) echo "$result"; cleanup; trap - EXIT; exit 0 ;;
-    failed) echo "$result"; exit 1 ;;
+    done)
+      if [ -n "$(git status --porcelain)" ] || [ "$(git rev-parse HEAD)" != "$revision" ]; then
+        echo 'source changed during benchmark; receipt refused' >&2
+        exit 2
+      fi
+      jq -c --argjson metadata "$metadata" '. + {metadata: $metadata}' <<<"$result"
+      cleanup; trap - EXIT; exit 0 ;;
+    failed) jq -c --argjson metadata "$metadata" '. + {metadata: $metadata}' <<<"$result"; exit 1 ;;
     running) sleep 2 ;;
     *) echo "page reloaded or benchmark lost: $result" >&2; exit 1 ;;
   esac
