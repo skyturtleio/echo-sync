@@ -31,14 +31,24 @@ export const selectList = (table: SyncTable.AnySyncTable, alias?: string) =>
 
 /** Postgres row → wire row through the table's own codec. Stored rows are trusted: a failure is a defect. */
 export const decodeRow = (table: SyncTable.AnySyncTable, row: unknown) =>
-  Store.decodeStored(table.postgres.row, table.name, row)
+  Effect.suspend(() => Store.decodeStored(table.postgres.row, table.name, row))
 
-/** Wire value → bind parameter for one column (JSON columns are bound explicitly as jsonb). */
-const bindColumn = (column: SyncTable.Column, value: Schema.Json) => {
-  // oxlint-disable-next-line effecttsgo/schema-sync -- SQL/Keyset statement builders require synchronous pure binding; invalid trusted wire values remain defects.
-  const pg = Schema.encodeSync(column.postgres)(value)
-  return column.kind === "json" && pg !== null ? PgTypes.jsonb(pg) : pg
-}
+/** Driver wrappers apply after encoding, once per column, without running another codec. */
+const parameter = (column: SyncTable.Column, value: SyncTable.PgValue) =>
+  column.kind === "json" && value !== null ? PgTypes.jsonb(value) : value
+
+const bindColumn = Effect.fnUntraced(function* (
+  table: SyncTable.AnySyncTable,
+  column: SyncTable.Column,
+  value: Schema.Json
+) {
+  const stored = yield* Schema.encodeEffect(column.postgres)(value).pipe(
+    Effect.catch((cause) =>
+      Effect.die(new Error(`RowStore.range: cannot encode "${table.name}" column "${column.name}"`, { cause }))
+    )
+  )
+  return parameter(column, stored)
+})
 
 /**
  * Postgres `RowStore` (SPEC §4) over the relations of `schemaOf` (SyncTable name → schema).
@@ -82,7 +92,12 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
         Effect.gen(function* () {
           if (Option.isNone(row))
             return yield* Effect.asVoid(query(table, (rel) => `DELETE FROM ${rel} WHERE "id" = $1`, [id]))
-          const params = Arr.map(table.columns, (c) => bindColumn(c, row.value[c.name] ?? null))
+          const stored = yield* Schema.encodeEffect(table.postgres.row)(row.value).pipe(
+            Effect.catch((cause) =>
+              Effect.die(new Error(`RowStore.write: cannot encode "${table.name}" row "${id}"`, { cause }))
+            )
+          )
+          const params = Arr.map(table.columns, (c) => parameter(c, stored[c.name] ?? null))
           const names = Arr.map(table.columns, (c) => q(c.name))
           yield* query(
             table,
@@ -107,34 +122,37 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
               : unavailable(error)
           )
         ),
-      range: (table, plan) => {
+      range: Effect.fnUntraced(function* (table, plan) {
+        yield* Store.checkLimit(plan.limit)
         const where: Array<string> = []
         const params: Array<unknown> = []
-        Arr.forEach(plan.eq, (value, i) => {
+        for (const [i, value] of plan.eq.entries()) {
           const c = plan.index.key[i]
-          if (c === undefined) return
+          if (c === undefined) return yield* Effect.die(new Error(`range: eq longer than index ${plan.index.name}`))
           if (value === null) where.push(`${q(c.name)} IS NULL`)
           else {
-            params.push(bindColumn(c, value))
+            params.push(yield* bindColumn(table, c, value))
             where.push(`${q(c.name)} = $${params.length}`)
           }
-        })
+        }
         const ranged = plan.index.key[plan.eq.length]
         for (const [bound, strict, loose] of [
           [plan.lower, ">", ">="],
           [plan.upper, "<", "<="]
         ] as const) {
           if (Option.isSome(bound) && ranged !== undefined) {
-            params.push(bindColumn(ranged, bound.value.value))
+            params.push(yield* bindColumn(table, ranged, bound.value.value))
             where.push(`${q(ranged.name)} ${bound.value.inclusive ? loose : strict} $${params.length}`)
           }
         }
+        const bindings: Array<{ readonly column: SyncTable.Column; readonly value: Store.KeyValue }> = []
         where.push(
           ...Keyset.predicates(plan, (column, value) => {
-            params.push(bindColumn(column, value))
-            return `$${params.length}`
+            bindings.push({ column, value })
+            return `$${params.length + bindings.length}`
           })
         )
+        for (const { column, value } of bindings) params.push(yield* bindColumn(table, column, value))
         if (plan.text !== undefined) {
           params.push(plan.text.needle)
           where.push(`strpos(t.${q(plan.text.column.name)}, $${params.length}) > 0`)
@@ -143,7 +161,7 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
           // Readable: a grant for one of the principals on the row's scope (any role satisfies
           // reader), through scope_grants' unique (access_scope_id, principal_id), in this snapshot.
           const grants = relation(ScopeGrants.ScopeGrants)
-          if (grants === undefined) return Effect.die("RowStore: scope_grants is not mapped to a schema")
+          if (grants === undefined) return yield* Effect.die("RowStore: scope_grants is not mapped to a schema")
           params.push([...plan.readableBy.value])
           where.push(
             `EXISTS (SELECT 1 FROM ${grants} AS g WHERE g."access_scope_id" = t."access_scope_id" AND g."principal_id" = ANY($${params.length}::text[]))`
@@ -160,18 +178,14 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
           Arr.map(plan.index.key, (c) => `t.${q(c.name)} ${dir}`),
           ", "
         )
-        return Effect.andThen(Store.checkLimit(plan.limit), () =>
-          Effect.flatMap(
-            query(
-              table,
-              (rel) =>
-                `SELECT ${selectList(table, "t")} FROM ${rel} AS t${where.length > 0 ? ` WHERE ${Arr.join(where, " AND ")}` : ""} ORDER BY ${order}${limit}`,
-              params
-            ).pipe(Effect.mapError(unavailable)),
-            (rows) => decodeAll(table, rows)
-          )
-        )
-      },
+        const rows = yield* query(
+          table,
+          (rel) =>
+            `SELECT ${selectList(table, "t")} FROM ${rel} AS t${where.length > 0 ? ` WHERE ${Arr.join(where, " AND ")}` : ""} ORDER BY ${order}${limit}`,
+          params
+        ).pipe(Effect.mapError(unavailable))
+        return yield* decodeAll(table, rows)
+      }),
       scan: (table) =>
         Effect.flatMap(
           query(table, (rel) => `SELECT ${selectList(table)} FROM ${rel} ORDER BY "id"`, []).pipe(

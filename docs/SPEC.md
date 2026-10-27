@@ -303,6 +303,19 @@ synced table is `scope_grants` (§4).
   field values encoded by their column codecs, preserve NULL/code-point ordering, and do not
   require the boundary row to exist. Even empty pages MUST record table and grant dependencies
   under INV-BRW-6. Separate pages are separate snapshots, not a historical snapshot.
+- INV-TBL-10: SQL RowStore operations MUST invoke row and index-value codecs only when their
+  returned Effect executes, and MUST invoke them afresh on each execution. A range MUST validate
+  its limit before invoking codecs. Writes MUST supply every declared column, using explicit
+  null for nullable values; a missing column is not a default. Trusted encoding failures MUST
+  remain defects, retain the original schema cause, and identify the operation, table and row
+  or column; a batched failure identifies its starting row offset and retains the schema issue's
+  within-batch path. These failures MUST NOT widen RowStore's typed error channel.
+
+**Rationale (2026-10-27):** Effect 4's schema Effect adapters can parse synchronously when
+called, so parser invocation belongs inside the operation, not merely its returned Effect.
+Pure keyset placeholder collection and row/bounded-batch encoding preserve SQL ordering and
+cost without per-scalar Effect traversal over whole pages; whole-row validation rejects missing
+fields instead of silently inventing null.
 
 **Rationale (2026-10-25):** Full indexed-field objects accept returned rows directly and keep
 cursor types independent of equality/range builder stages. The implicit id already exists in
@@ -1890,7 +1903,9 @@ the count keys. Changes to these lists must also update the corresponding prose 
   `Unsupported` the offending identity segment, storage failures the driver's message. A message
   never carries a header value, cookie, URL or credential. Error messages are for the app's
   diagnostics, not for `SyncStatus` (INV-LOOP-6), which is the only engine string meant for a
-  screen.
+  screen. Trusted SQL row-encoding defects retain their original schema cause and operation,
+  table and row/column context; bounded-batch failures retain the starting offset and original
+  within-batch issue path (INV-TBL-10), without introducing a typed store error.
 
   **Rationale (2026-10-23):** Typed wrappers retain the original cause and location because
   a bare `SchemaError` did not identify the stored table or row, while
@@ -2280,6 +2295,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-TBL-7 | covered | `Conformance.test` "literal search filters before limits and prefix ranges preserve Unicode boundaries"; compile-errors.typecheck checks field selection |
 | INV-TBL-8 | covered | `Search.test` "search text normalizes case and whitespace without removing accents or interpreting punctuation" |
 | INV-TBL-9 | covered | `Conformance.test` "keyset pages preserve ties, direction, nulls and cursor boundaries across intervening inserts" (shared memory/SQLite/Postgres fixture); `Leader.test` "an empty cursor page re-emits on inserts, refills after deletes and observes key moves and revocation" |
+| INV-TBL-10 | covered | `rowstore-codecs.test` "range codecs run only on execution, validate limits first, and retain contextual defects without SQL", "reexecuted ranges bind nullable cursors afresh and row writes round-trip JSON and scalar values", "writes encode current rows on each execution and reject missing nullable fields before SQL"; `perf-install.test` "batched replica upserts keep the last duplicate and split before SQLite's parameter limit" |
 | INV-ACL-1 | covered | `Store.test` "queries return the first n rows the actor can read (own or * grant), skipping unreadable ones in index order", "writes need writer on the row's scope, and a scope move needs it on both scopes" |
 | INV-ACL-2 | covered | `Store.test` "writes need writer on the row's scope, and a scope move needs it on both scopes"; `scopes.test` "a scope move deletes the row for old-scope readers and delivers it to new-scope readers" |
 | INV-ACL-3 | covered | `Store.test` "a non-owner can delete only its own grant, and a write after relinquishing it is ScopeForbidden" |
@@ -2398,7 +2414,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-TEL-5 | partial | `observability.e2e` "RPC request context cannot bypass sanitization for typed failures, defects, SQL spans or tracerLogger events" (the Debug downgrade of interrupted causes is untested) |
 | INV-TEL-6 | covered | `vocabularies.test` "telemetry, wire errors and client failure or notice vocabularies cannot drift from SPEC §14–15" |
 | INV-ERR-1 | covered | `Transport.test` "Unauthorized reason schema matches the closed catalog in SPEC §15", "a server Unauthorized surfaces its diagnostic reason without changing the unauthorized verdict", "HTTP auth refusals before RPC decoding report unauthorized, retry without halting, and keep the pending mutation; other statuses stay network"; `rpc.test` "push, pull and pokes asserting another principal than the session's run no statement or policy and change no row, even for a bound client", "an app authentication refusal carries authenticationRefused through the public RPC surface", "a client bound to another principal carries clientPrincipalMismatch through the public RPC surface", "push, pull and pokes authenticated as * are Unauthorized before they bind or ledger" |
-| INV-ERR-2 | partial | `SqliteRowStore.test` "a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError"; OPFS diagnostic coverage is in browser scenarios only |
+| INV-ERR-2 | partial | `SqliteRowStore.test` "a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError"; `rowstore-codecs.test` "range codecs run only on execution, validate limits first, and retain contextual defects without SQL", "writes encode current rows on each execution and reject missing nullable fields before SQL"; `perf-install.test` "batched replica upserts keep the last duplicate and split before SQLite's parameter limit"; OPFS diagnostic coverage is in browser scenarios only |
 | INV-ERR-3 | covered | `vocabularies.test` "telemetry, wire errors and client failure or notice vocabularies cannot drift from SPEC §14–15", "a wire error without a catalog mapping cannot compile" (also checked by `tsc --noEmit`) |
 | INV-ERR-4 | covered | `observability.e2e` "request failures append no notices and ledgered rejections keep successful batch outcomes", "batch telemetry agrees with the loop's whole-cause decision, not the first failure" |
 | INV-PERF-1 | covered | `ordering.test` "without the trigger's advisory lock that reader skips the earlier writer (the ordering check can fail)" (the lock is held; its throughput consequence is not measured) |

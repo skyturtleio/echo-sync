@@ -33,8 +33,13 @@ export const unavailable = <A, R>(
 const decodeRows = (table: Table, rows: ReadonlyArray<unknown>) =>
   Effect.forEach(rows, (row) => Store.decodeStored(table.sqlite.row, table.name, row))
 
-const bind = (column: SyncTable.Column, value: Schema.Json): Effect.Effect<Value> =>
-  Effect.orDie(Schema.encodeEffect(column.sqlite)(value))
+const bind = Effect.fnUntraced(function* (table: Table, column: SyncTable.Column, value: Schema.Json) {
+  return yield* Schema.encodeEffect(column.sqlite)(value).pipe(
+    Effect.catch((cause) =>
+      Effect.die(new Error(`SqliteRowStore.range: cannot encode "${table.name}" column "${column.name}"`, { cause }))
+    )
+  )
+})
 
 // MAX_VARIABLE_NUMBER in the pinned wa-sqlite build (PRAGMA compile_options), also used by OPFS.
 const maxParameters = 32766
@@ -101,7 +106,13 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
         ? Effect.asVoid(unavailable(sql.unsafe(`DELETE FROM ${q(table.name)} WHERE "id" = ?`, [id])))
         : Effect.gen(function* () {
             const plan = upsertFor(table)
-            const stored = yield* Effect.orDie(plan.encode({ ...row.value, id }))
+            const stored = yield* plan
+              .encode({ ...row.value, id })
+              .pipe(
+                Effect.catch((cause) =>
+                  Effect.die(new Error(`SqliteRowStore.write: cannot encode "${table.name}" row "${id}"`, { cause }))
+                )
+              )
             yield* unavailable(
               sql.unsafe(
                 plan.statement(1),
@@ -113,7 +124,15 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
     writeMany: Effect.fnUntraced(function* (table, rows) {
       const plan = upsertFor(table)
       for (let offset = 0; offset < rows.length; offset += plan.batchSize) {
-        const stored = yield* Effect.orDie(plan.encodeMany(rows.slice(offset, offset + plan.batchSize)))
+        const stored = yield* plan.encodeMany(rows.slice(offset, offset + plan.batchSize)).pipe(
+          Effect.catch((cause) =>
+            Effect.die(
+              new Error(`SqliteRowStore.writeMany: cannot encode "${table.name}" batch starting at row ${offset}`, {
+                cause
+              })
+            )
+          )
+        )
         yield* unavailable(
           sql.unsafe(
             plan.statement(stored.length),
@@ -135,7 +154,7 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
             return yield* Effect.die(new Error(`range: eq longer than index ${plan.index.name}`))
           if (value === null) where.push(`${q(column.name)} IS NULL`)
           else {
-            params.push(yield* bind(column, value))
+            params.push(yield* bind(table, column, value))
             where.push(`${q(column.name)} = ?`)
           }
         }
@@ -146,18 +165,19 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
             [plan.upper, "<", "<="]
           ] as const) {
             if (Option.isNone(bound)) continue
-            params.push(yield* bind(ranged, bound.value.value))
+            params.push(yield* bind(table, ranged, bound.value.value))
             // A comparison against a bound never matches NULL, as `planMatches` requires.
             where.push(`${q(ranged.name)} ${bound.value.inclusive ? loose : strict} ?`)
           }
         }
+        const bindings: Array<{ readonly column: SyncTable.Column; readonly value: Store.KeyValue }> = []
         where.push(
           ...Keyset.predicates(plan, (column, value) => {
-            // oxlint-disable-next-line effecttsgo/schema-sync -- Keyset's placeholder callback is synchronous; sqlite scalar codecs are synchronous.
-            params.push(Schema.encodeSync(column.sqlite)(value))
-            return `?${params.length}`
+            bindings.push({ column, value })
+            return `?${params.length + bindings.length}`
           })
         )
+        for (const { column, value } of bindings) params.push(yield* bind(table, column, value))
         if (plan.text !== undefined) {
           params.push(plan.text.needle)
           where.push(`instr(t.${q(plan.text.column.name)}, ?) > 0`)

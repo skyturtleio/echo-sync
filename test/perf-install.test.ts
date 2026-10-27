@@ -1,6 +1,6 @@
 import { expect, it } from "@effect/vitest"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
-import { Array as Arr, Effect, Number as Num, Option, String as Str } from "effect"
+import { Array as Arr, Cause, Effect, Exit, Number as Num, Option, Schema, String as Str } from "effect"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import { SqlClient } from "effect/sql/SqlClient"
 import { makeCompilerSqlite } from "effect/sql/Statement"
@@ -37,13 +37,20 @@ it.live("batched replica upserts keep the last duplicate and split before SQLite
     const revision = yield* storage.transaction(storage.revision)
     // The first chunk really writes; a bad integer in chunk two must roll it back,
     // including the new provenance wrapper's revision publication.
-    expect(
-      (yield* Effect.exit(
-        storage.transaction(
-          storage.rows.writeMany(Counters, [...rows, { id: "bad", access_scope_id: "s", value: 0.5, updated_at: 0 }])
-        )
-      ))._tag
-    ).toBe("Failure")
+    const failed = yield* Effect.exit(
+      storage.transaction(
+        storage.rows.writeMany(Counters, [...rows, { id: "bad", access_scope_id: "s", value: 0.5, updated_at: 0 }])
+      )
+    )
+    expect(Exit.isFailure(failed)).toBe(true)
+    if (Exit.isSuccess(failed)) return yield* Effect.die("invalid row unexpectedly encoded")
+    const reason = failed.cause.reasons[0]
+    if (reason === undefined || !Cause.isDieReason(reason) || !(reason.defect instanceof Error))
+      return yield* Effect.die("encoding failure must remain a contextual defect")
+    expect(reason.defect.message).toContain('writeMany: cannot encode "counters" batch starting at row 8191')
+    expect(Schema.isSchemaError(reason.defect.cause)).toBe(true)
+    // Three added duplicates put the malformed row at offset 4 within the second chunk.
+    expect(String(reason.defect.cause)).toContain('[4]["value"]')
     expect(yield* storage.transaction(storage.rows.scan(Counters))).toEqual([])
     expect(yield* storage.transaction(storage.revision)).toEqual(revision)
     counter.reset()
