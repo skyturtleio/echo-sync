@@ -4,9 +4,33 @@ import { afterAll, beforeAll } from "vitest"
 import { AccessScopeId } from "./AccessScope.ts"
 import * as Registry from "./Registry.ts"
 import * as SyncTable from "./SyncTable.ts"
+import type { MutationStore } from "./Store.ts"
 import { type Dialect, pgAvailable, postgres, sqlite } from "./test/dialects.ts"
 
 const ItemId = Schema.String.pipe(Schema.brand("ItemId"))
+it("catalog shape changes leave scoped hashes unchanged and catalog mutations cannot compile", () => {
+  const airports = SyncTable.catalog(
+    "airports",
+    { id: ItemId, name: Schema.String },
+    { indexes: { by_name: ["name"] } }
+  )
+  const changed = SyncTable.catalog("airports", { id: ItemId, name: Schema.String, code: Schema.String })
+  expect(airports.manifest.dataHash).not.toBe(changed.manifest.dataHash)
+  expect(Registry.make([airports]).dataHash).toBe(Registry.make([changed]).dataHash)
+  expect(Registry.make([airports]).dataHash).toBe(Registry.make([]).dataHash)
+  expect(Registry.make([airports]).get("airports")).toEqual(Option.none())
+  expect(Arr.some(airports.columns, (column) => column.name === "access_scope_id")).toBe(false)
+  expect(() => Registry.make([airports, SyncTable.catalog("airports__next", { id: ItemId })])).toThrow("reserved")
+  const rejects = (store: MutationStore) => [
+    // @ts-expect-error Catalogs cannot be written by mutation handlers.
+    store.insert(airports, { id: ItemId.make("a"), name: "Airport" }),
+    // @ts-expect-error Catalogs cannot be patched by mutation handlers.
+    store.patch(airports, ItemId.make("a"), { name: "Changed" }),
+    // @ts-expect-error Catalogs cannot be deleted by mutation handlers.
+    store.delete(airports, ItemId.make("a"))
+  ]
+  expect(rejects).toBeTypeOf("function")
+})
 const Status = Schema.Literals(["open", "done"])
 const Priority = Schema.Literals([1, 2, 3])
 const Shape = Schema.Union([

@@ -7,6 +7,7 @@ import grantIdCheck from "./migrations/002_grant_id_check.ts"
 import ledgerAckedAt from "./migrations/003_ledger_acked_at.ts"
 import engineEpoch from "./migrations/004_engine_epoch.ts"
 import scopeWalkIndex from "./migrations/005_scope_walk_index.ts"
+import catalogs from "./migrations/006_catalogs.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
 /** Migrator history table (SPEC §13.1). */
@@ -35,7 +36,8 @@ export const migrate = Effect.gen(function* () {
       "002_grant_id_check": grantIdCheck,
       "003_ledger_acked_at": ledgerAckedAt,
       "004_engine_epoch": engineEpoch,
-      "005_scope_walk_index": scopeWalkIndex
+      "005_scope_walk_index": scopeWalkIndex,
+      "006_catalogs": catalogs
     }),
     table: migrationsTable
   })
@@ -94,6 +96,13 @@ export const attach = (table: SyncTable.AnySyncTable, options?: { readonly schem
         if (clash !== undefined) {
           return yield* new TableNameConflict({ table: clash.name, existingSchema: clash.schema })
         }
+        if (table.kind === "catalog") {
+          yield* sql`INSERT INTO echo_sync.catalog_generations (table_name) VALUES (${table.name}) ON CONFLICT DO NOTHING`
+          yield* sql`CREATE OR REPLACE TRIGGER echo_sync_catalog
+            AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON ${relation}
+            FOR EACH STATEMENT EXECUTE FUNCTION echo_sync.catalog_changed()`
+          return
+        }
         yield* sql`
           CREATE OR REPLACE TRIGGER echo_sync_capture
           AFTER INSERT OR UPDATE OR DELETE ON ${relation}
@@ -120,7 +129,7 @@ export const syncedTables = Effect.gen(function* () {
     FROM pg_trigger t
     JOIN pg_class c ON c.oid = t.tgrelid
     JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE t.tgfoid = 'echo_sync.echo_sync_capture_changes'::regproc
+    WHERE t.tgfoid IN ('echo_sync.echo_sync_capture_changes'::regproc, 'echo_sync.catalog_changed'::regproc)
     ORDER BY c.relname`
 }).pipe(Telemetry.boundary)
 

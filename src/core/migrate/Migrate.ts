@@ -50,7 +50,7 @@ export const emptySnapshot: Snapshot = { version: 1, tables: [] }
 /** The app tables of a registry (everything but the engine's `scope_grants`), sorted by name. */
 const appTables = (registry: SyncRegistry): ReadonlyArray<AnySyncTable> =>
   Arr.sort(
-    Arr.filter(registry.tables, (t) => t.name !== ScopeGrants.name),
+    Arr.filter([...registry.tables, ...registry.catalogs], (t) => t.name !== ScopeGrants.name),
     (a: AnySyncTable, b: AnySyncTable) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
   )
 
@@ -328,7 +328,8 @@ export const plan = (
         }
       )
     }
-    if (was.scopeWalkIndex !== true) emit(createFor("echo-scope"), ["access_scope_id", "id"])
+    if (table.manifest.scopeWalkIndex === true && was.scopeWalkIndex !== true)
+      emit(createFor("echo-scope"), ["access_scope_id", "id"])
     for (const prior of was.indexes) {
       const next = newIndexes.get(prior.name)
       if (next !== undefined && sameList(next.columns, prior.columns)) continue

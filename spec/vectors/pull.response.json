@@ -842,6 +842,30 @@
     }
   },
   {
+    "json": "{\"_tag\":\"PullDone\",\"catalogs\":{},\"changes\":[],\"acks\":[],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "catalogs": {},
+      "changes": [],
+      "acks": [],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
+    "json": "{\"_tag\":\"PullDone\",\"catalogs\":{\"example\":\"9007199254740993\"},\"changes\":[],\"acks\":[],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
+    "value": {
+      "_tag": "PullDone",
+      "catalogs": {
+        "example": "9007199254740993"
+      },
+      "changes": [],
+      "acks": [],
+      "nextCursor": "9007199254740993",
+      "expiredThrough": 1
+    }
+  },
+  {
     "json": "{\"_tag\":\"PullDone\",\"changes\":[{\"_tag\":\"upsert\",\"table\":\"9007199254740993\",\"row\":{}}],\"acks\":[],\"nextCursor\":\"9007199254740993\",\"expiredThrough\":1}",
     "value": {
       "_tag": "PullDone",

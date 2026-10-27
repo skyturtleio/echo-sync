@@ -102,12 +102,19 @@ export interface TableManifest {
 /** The type-erased view of a table that stores and substrates work with. */
 export interface AnySyncTable {
   readonly name: string
-  readonly wire: Schema.Codec<{ readonly id: string; readonly accessScopeId: AccessScopeId }, EncodedRow>
+  readonly kind: "sync" | "catalog"
+  readonly wire: Schema.Codec<{ readonly id: string; readonly accessScopeId?: AccessScopeId }, EncodedRow>
   readonly columns: ReadonlyArray<Column>
   readonly indexes: { readonly [name: string]: Index }
   readonly manifest: TableManifest
   readonly postgres: Dialect<PgValue>
   readonly sqlite: Dialect<SqliteValue>
+}
+
+/** Only scoped tables may be written by mutation handlers. */
+export interface WritableTable extends AnySyncTable {
+  readonly kind: "sync"
+  readonly wire: Schema.Codec<{ readonly id: string; readonly accessScopeId: AccessScopeId }, EncodedRow>
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -173,6 +180,7 @@ export type ValidateFields<F extends TableFields> = {
 /** A declared table. Concrete instances are assignable to `AnySyncTable`. */
 export interface SyncTable<Name extends string, F extends TableFields, I extends IndexMap<F>> {
   readonly name: Name
+  readonly kind: "sync"
   readonly fields: F
   /** The decoded row schema. Use it for query `success` schemas etc. */
   readonly Row: Schema.Struct<F>
@@ -183,6 +191,13 @@ export interface SyncTable<Name extends string, F extends TableFields, I extends
   readonly manifest: TableManifest
   readonly postgres: Dialect<PgValue>
   readonly sqlite: Dialect<SqliteValue>
+}
+
+export interface CatalogTable<Name extends string, F extends TableFields, I extends IndexMap<F>> extends Omit<
+  SyncTable<Name, F, I>,
+  "kind"
+> {
+  readonly kind: "catalog"
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -455,7 +470,28 @@ export const make = <
     /** Column sets that must be unique (both dialects' DDL carry the constraint). */
     readonly unique?: ReadonlyArray<readonly [keyof F & string, ...ReadonlyArray<keyof F & string>]>
   }
-): SyncTable<Name, F, I> => {
+): SyncTable<Name, F, I> => declare<Name, F, I, "sync">(name, fields, "sync", options)
+
+/** A global, client-read-only reference table, independently versioned and downloaded. */
+export const catalog = <
+  const Name extends string,
+  const F extends Pick<RequiredFields, "id"> & TableFields,
+  const I extends IndexMap<F> = Record<never, never>
+>(
+  name: Name,
+  fields: F & ValidateFields<F> & { readonly accessScopeId?: never },
+  options?: { readonly indexes?: I }
+): CatalogTable<Name, F, I> => declare<Name, F, I, "catalog">(name, fields, "catalog", options)
+
+const declare = <Name extends string, F extends TableFields, I extends IndexMap<F>, Kind extends "sync" | "catalog">(
+  name: Name,
+  fields: F,
+  kind: Kind,
+  options?: {
+    readonly indexes?: I
+    readonly unique?: ReadonlyArray<readonly [keyof F & string, ...ReadonlyArray<keyof F & string>]>
+  }
+): Omit<SyncTable<Name, F, I>, "kind"> & { readonly kind: Kind } => {
   const fail = (message: string): never => {
     throw new SyncTableDeclarationError(`SyncTable "${name}": ${message}`)
   }
@@ -502,9 +538,13 @@ export const make = <
       () => fail(`unknown field "${field}"`)
     )
   const idColumn = columnOf("id")
-  const scopeColumn = columnOf("accessScopeId")
   if (idColumn.kind !== "text" || idColumn.nullable) fail(`"id" must be a non-null string schema`)
-  if (scopeColumn.kind !== "text" || scopeColumn.nullable) fail(`"accessScopeId" must be AccessScopeId`)
+  if (kind === "sync") {
+    const scopeColumn = columnOf("accessScopeId")
+    if (scopeColumn.kind !== "text" || scopeColumn.nullable) fail(`"accessScopeId" must be AccessScopeId`)
+  } else if (Arr.some(columns, (c) => c.field === "accessScopeId")) {
+    fail("catalogs must not declare accessScopeId")
+  }
 
   const declared: { readonly [index: string]: ReadonlyArray<string> } = options?.indexes ?? {}
   const indexes: { [index: string]: Index } = {}
@@ -561,7 +601,7 @@ export const make = <
     name,
     columns: sortedColumns,
     indexes: indexManifest,
-    scopeWalkIndex: true,
+    ...(kind === "sync" ? { scopeWalkIndex: true as const } : {}),
     unique: uniqueSets,
     dataHash: hash(
       canonicalJson({
@@ -581,6 +621,7 @@ export const make = <
   const typedIndexes: { readonly [K in keyof I]: Index<I[K]> } = derivedIndexes(indexes)
   return {
     name,
+    kind,
     fields,
     Row: Schema.Struct<F>(fields),
     wire: derived(wire),
@@ -591,7 +632,11 @@ export const make = <
       createTable: `CREATE TABLE ${quote(name)} (\n${Arr.join(pgColumns, ",\n")}\n)`,
       createIndexes: [
         ...indexDdl("pg"),
-        `CREATE INDEX ${quote(`${name}__echo-scope`)} ON ${quote(name)} ("access_scope_id" ASC NULLS FIRST, "id" ASC)`
+        ...(kind === "sync"
+          ? [
+              `CREATE INDEX ${quote(`${name}__echo-scope`)} ON ${quote(name)} ("access_scope_id" ASC NULLS FIRST, "id" ASC)`
+            ]
+          : [])
       ],
       row: derived(Schema.Struct(pgFields))
     },

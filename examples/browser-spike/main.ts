@@ -514,6 +514,25 @@ const echo = {
     channel.postMessage("go")
     channel.close()
   },
+  /** Runs the real OPFS catalog installer in an isolated worker for timing and hard-kill probes. */
+  catalogBenchmark: (version: string, mode = "bench", id = String(Effect.runSync(Clock.currentTimeMillis))) => {
+    const url = new URL("./catalog-benchmark.worker.ts", import.meta.url)
+    url.searchParams.set("version", version)
+    url.searchParams.set("id", id)
+    url.searchParams.set("mode", mode)
+    const worker = new Worker(url, { type: "module" })
+    // oxlint-disable-next-line effecttsgo/new-promise -- Browser host receives the benchmark worker's single terminal message.
+    return new Promise<unknown>((resolve) => {
+      worker.addEventListener("message", (event: MessageEvent<unknown>) => {
+        worker.terminate()
+        resolve(event.data)
+      })
+      worker.addEventListener("error", (event) => {
+        worker.terminate()
+        resolve({ ok: false, error: event.message })
+      })
+    })
+  },
   /** Live query over `statements` (all read in one transaction per emission); collects emissions. */
   subscribe: (statements: ReadonlyArray<string>, tables: ReadonlyArray<string>): Subscription => {
     const sub: Subscription = { emissions: [], ended: undefined, cancel: () => Effect.runFork(Fiber.interrupt(fiber)) }

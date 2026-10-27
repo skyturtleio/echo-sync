@@ -20,6 +20,7 @@ import {
 import type { Headers } from "effect/http/Headers"
 import * as HttpRouter from "effect/http/HttpRouter"
 import * as HttpServerRequest from "effect/http/HttpServerRequest"
+import * as HttpServerResponse from "effect/http/HttpServerResponse"
 import { RpcSerialization, RpcServer } from "effect/rpc"
 import { SqlClient } from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
@@ -29,10 +30,11 @@ import * as Presence from "./presence.ts"
 import { type ClientPolicy, pull } from "./pull.ts"
 import { checkEpoch } from "./epoch.ts"
 import * as RowStore from "./rowStore.ts"
-import { resolveTables } from "./schema.ts"
+import { syncedTables } from "./schema.ts"
 import { isCleanupFailure } from "./transaction.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 import { failureOutcome } from "../../internal/ErrorCatalog.ts"
+import * as Catalog from "./catalogs.ts"
 
 export interface SyncServerOptions {
   readonly registry: Registry.SyncRegistry
@@ -382,8 +384,9 @@ export const executeBatch = (
     if (options.clientPolicy !== undefined) yield* options.clientPolicy(request.clientVersion)
     yield* checkEpoch(request.epoch)
     const sql = yield* SqlClient
-    const tables = yield* resolveTables(options.registry)
-    const rowStore = yield* RowStore.make(new Map(Arr.map(tables, (t) => [t.table.name, t.schema])))
+    const declared = new Set(Arr.map([...options.registry.tables, ...options.registry.catalogs], (t) => t.name))
+    const tables = Arr.filter(yield* syncedTables, (t) => declared.has(t.name))
+    const rowStore = yield* RowStore.make(new Map(Arr.map(tables, (t) => [t.name, t.schema])))
     const items = Arr.map(request.mutations, (m) => ({
       mutationId: m.mutationId,
       seq: BigInt(m.seq),
@@ -443,7 +446,7 @@ const requestHeaders = Effect.gen(function* () {
  * after the bounded retry) stops the batch as a short results list, so the client only ever sees
  * a defect for a server bug (the client halts push on any defect, INV-LOOP-3).
  */
-export const handlers = (options: SyncServerOptions) =>
+export const handlers = (options: SyncServerOptions, catalogLayer = Catalog.layer(options.registry)) =>
   Layer.unwrap(
     Effect.as(
       checkPageLimit(options.pageLimit),
@@ -451,6 +454,7 @@ export const handlers = (options: SyncServerOptions) =>
         Effect.gen(function* () {
           const sql = yield* SqlClient
           const pokes = yield* Notifications
+          const catalogs = yield* Catalog.Catalogs
           return Protocol.SyncRpcs.of({
             push: (request) =>
               Effect.gen(function* () {
@@ -483,7 +487,7 @@ export const handlers = (options: SyncServerOptions) =>
                         return yield* new Protocol.ClientOutdated({ message: "streamed pull requires wire version 2" })
                       }
                     }
-                    return yield* pull(
+                    const response = yield* pull(
                       options.registry,
                       {
                         principalId,
@@ -497,6 +501,9 @@ export const handlers = (options: SyncServerOptions) =>
                       },
                       options.clientPolicy
                     )
+                    return response._tag === "PullDone" && options.registry.catalogs.length > 0
+                      ? { ...response, catalogs: yield* catalogs.versions }
+                      : response
                   }).pipe(
                     serverFailures,
                     Effect.tap((response) =>
@@ -542,7 +549,7 @@ export const handlers = (options: SyncServerOptions) =>
         })
       )
     )
-  )
+  ).pipe(Layer.provide(catalogLayer))
 
 /**
  * Handlers for `Protocol.PresenceRpcs` (SPEC §10): process-local presence, authorized like
@@ -632,8 +639,43 @@ export const presenceHandlers = (options: Pick<SyncServerOptions, "principalFor"
  * HTTP POST with NDJSON framing, which is what the browser's transport speaks (SPEC §10).
  * Each group's handlers are provided, not merged, so neither leaks into the app's context.
  */
-export const layerHttp = (options: SyncServerOptions & { readonly path?: HttpRouter.PathInput | undefined }) =>
-  RpcServer.layerHttp({
+export const layerHttp = (options: SyncServerOptions & { readonly path?: HttpRouter.PathInput | undefined }) => {
+  const cache = Catalog.layer(options.registry)
+  const path = options.path === "*" ? "/sync" : (options.path ?? "/sync")
+  const downloads = Layer.unwrap(
+    Effect.map(Catalog.Catalogs, (catalogs) =>
+      HttpRouter.add(
+        "GET",
+        `${path}/catalog/:table/:version`,
+        Effect.gen(function* () {
+          yield* authenticate(options.principalFor)
+          const params = yield* HttpRouter.params
+          const table = Option.getOrUndefined(
+            Arr.findFirst(options.registry.catalogs, (t) => t.name === params["table"])
+          )
+          if (table === undefined) return HttpServerResponse.empty({ status: 404 })
+          const snapshot = yield* catalogs.get(table)
+          if (snapshot.version !== params["version"]) return HttpServerResponse.empty({ status: 404 })
+          const etag = `"${snapshot.version}"`
+          const headers = {
+            etag: etag,
+            "cache-control": "private, max-age=31536000, immutable",
+            "content-encoding": "gzip",
+            vary: "Cookie, Authorization"
+          }
+          const request = yield* HttpServerRequest.HttpServerRequest
+          return request.headers["if-none-match"] === etag
+            ? HttpServerResponse.empty({ status: 304, headers })
+            : HttpServerResponse.uint8Array(snapshot.bytes, { contentType: "application/json", headers })
+        }).pipe(
+          Effect.catchTag("Unauthorized", () => Effect.succeed(HttpServerResponse.empty({ status: 401 }))),
+          Effect.catchTag("SqlError", () => Effect.succeed(HttpServerResponse.empty({ status: 503 }))),
+          Telemetry.boundary
+        )
+      )
+    )
+  ).pipe(Layer.provide(cache))
+  return RpcServer.layerHttp({
     group: Protocol.SyncRpcs.merge(Protocol.PresenceRpcs),
     path: options.path ?? "/sync",
     protocol: "http",
@@ -641,6 +683,8 @@ export const layerHttp = (options: SyncServerOptions & { readonly path?: HttpRou
   }).pipe(
     // Route-scoped, before RpcServer constructs its automatic span and handler context.
     Layer.provide(HttpRouter.middleware((work) => Telemetry.boundary(work)).layer),
-    Layer.provide([handlers(options), presenceHandlers(options), RpcSerialization.layerNdjson]),
-    Layer.provide(layerNotifications(options))
+    Layer.provide([handlers(options, cache), presenceHandlers(options), RpcSerialization.layerNdjson]),
+    Layer.provide(layerNotifications(options)),
+    Layer.merge(downloads)
   )
+}

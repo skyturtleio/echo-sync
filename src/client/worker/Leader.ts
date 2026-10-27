@@ -32,6 +32,7 @@ import * as Str from "effect/String"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Scope from "effect/Scope"
 import * as SqlClient from "effect/sql/SqlClient"
+import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import type { Row } from "effect/sql/SqlConnection"
 import type { SqlError } from "effect/sql/SqlError"
 import { type Rpc, type RpcGroup, RpcServer } from "effect/rpc"
@@ -42,6 +43,7 @@ import * as Presence from "../sync/Presence.ts"
 import * as SqliteSyncStorage from "../sync/SqliteSyncStorage.ts"
 import * as SyncLoop from "../sync/SyncLoop.ts"
 import * as Transport from "../sync/Transport.ts"
+import * as Catalogs from "../sync/Catalogs.ts"
 import { LeaderRpcs, RawExecDisabled, SqlFailure, SyncDisabled } from "./LeaderRpcs.ts"
 import { type Endpoint, type FromLeader, isToLeader, type ResetOutcome, type ToLeader } from "./messages.ts"
 import * as OpfsSqlite from "./OpfsSqlite.ts"
@@ -98,6 +100,7 @@ const openDatabase = Effect.fn("Leader.openDatabase")(function* (
   yield* Effect.andThen(SqliteSyncStorage.migrate(registry), Outbox.pruneReleased()).pipe(
     Effect.provideService(SqlClient.SqlClient, sql)
   )
+  yield* Catalogs.open(sql, registry)
   return { sql, reactivity }
 })
 
@@ -530,10 +533,38 @@ const program = Effect.fn("Leader.program")(
       // The RPC protocol lives in this scope: it closes with the leader.
       const protocol = yield* Layer.build(Transport.layerProtocolHttp(syncUrl, options.syncHeaders?.(actor)))
       const transport = yield* Transport.make.pipe(Effect.provide(protocol))
+      const catalogHttp = yield* Layer.build(FetchHttpClient.layer)
+      const catalogUpdate = yield* Catalogs.make(
+        sql,
+        storage,
+        reactivity,
+        registry,
+        syncUrl,
+        options.syncHeaders?.(actor) ?? Effect.succeed({})
+      ).pipe(Effect.provide(catalogHttp))
       const epoch = storage
         .transaction(Effect.map(storage.meta, (meta) => ({ epoch: meta.epoch ?? null })))
         .pipe(Effect.orDie)
-      engine = yield* Engine.make({ clientId, actor, storage, registry, mutations, transport })
+      engine = yield* Engine.make({
+        clientId,
+        actor,
+        storage,
+        registry,
+        mutations,
+        transport: {
+          ...transport,
+          pull: (request) =>
+            transport
+              .pull(request)
+              .pipe(
+                Stream.tap((response) =>
+                  response._tag === "PullDone" && response.catalogs !== undefined
+                    ? catalogUpdate(response.catalogs)
+                    : Effect.void
+                )
+              )
+        }
+      })
       const sync = yield* SyncLoop.make({
         engine,
         pendingMutations: storage.pendingCount

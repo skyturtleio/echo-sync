@@ -153,7 +153,10 @@ describe.skipIf(adminUrl === "")("generated migrations and the startup verifier 
         assert.deepStrictEqual(Migrate.plan(current, v1), Result.succeed([]))
         // Existing engine databases also need the grants index; 001 cannot be edited/replayed.
         yield* sql`DROP INDEX echo_sync."scope_grants__echo-scope"`
-        yield* sql`DELETE FROM echo_sync.migrations WHERE migration_id = 5`
+        // Restore the pre-005 prefix, including removal of later engine objects.
+        yield* sql`DROP FUNCTION echo_sync.catalog_changed()`
+        yield* sql`DROP TABLE echo_sync.catalog_generations`
+        yield* sql`DELETE FROM echo_sync.migrations WHERE migration_id >= 5`
         yield* migrate
         assert.deepStrictEqual(yield* driftOf(v1), [])
         // These names were already legal. The implicit index must not take either name.

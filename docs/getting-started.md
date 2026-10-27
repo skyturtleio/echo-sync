@@ -40,6 +40,42 @@ export const registry = Registry.make([Todos]) // adds the engine's scope_grants
 SPEC §3 lists the field types that map to columns. A table's Postgres DDL is
 `table.postgres.createTable` / `createIndexes`, and you never write it by hand (see §3).
 
+### Global read-only reference data
+
+Declare a catalog once and include it in the same client/server registry. No scope, grants,
+stream configuration or manual snapshot publishing is needed:
+
+```ts
+export const Airports = SyncTable.catalog("airport_reference", {
+  id: Schema.String.pipe(Schema.brand("AirportId")),
+  ident: Schema.String,
+  name: Schema.String
+}, { indexes: { by_ident: ["ident"], by_name: ["name"] } })
+export const registry = Registry.make([Todos, Airports])
+```
+
+Generate/apply the normal app migration and deploy the **server first**, then bump the client
+pin. Startup attaches a statement trigger; importing rows directly into Postgres bumps the
+catalog generation and wakes clients. The server lazily builds a gzip wire snapshot. Identical
+reimports retain its content version. Keep an import's truncate and replacement inserts in one
+transaction so clients never download a deliberately intermediate empty catalog.
+
+Every authenticated principal can download every catalog: never put private or tenant-specific
+data in one. Catalogs are read-only through Store/mutations, including on the server; write
+imports through your server SQL/admin job. Use ordinary `Query.make` and indexed queries to
+search them offline. Run separate queries for user-created rows and catalog rows (no UNION API).
+
+The leader downloads in the background; first-install queries are empty until publication.
+Later imports leave the old catalog readable until the full replacement is ready and then
+re-emit live queries. Unrelated user-table migrations do not download it again. Incompatible
+payloads retain the last installed catalog and retry; local index-only changes need no download.
+After a local catalog shape upgrade, the preserved table may not decode under the new declaration:
+those queries need a successful download first, even when the server was deployed first. Plan
+an online first load for incompatible catalog schema upgrades; ordinary data refreshes keep
+the existing query shape readable throughout.
+Catalog data is stored per replica identity in the main OPFS database, not in a cross-user cache.
+Whole snapshots are buffered in memory; the 500-row transaction size is not a memory bound.
+
 ### Local text search
 
 Declare ordinary normalized text columns. The app recomputes them on every source edit,

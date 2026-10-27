@@ -22,7 +22,22 @@ export const Todos = SyncTable.make("todos", {
   note: Schema.NullOr(Schema.String)
 })
 
-export const registry = Registry.make([Todos])
+export const Airports = SyncTable.catalog(
+  "airport_reference",
+  {
+    id: Schema.String.pipe(Schema.brand("harness/AirportId")),
+    ident: Schema.String,
+    name: Schema.String,
+    latitude: Schema.Finite,
+    longitude: Schema.Finite,
+    country: Schema.String,
+    municipality: Schema.NullOr(Schema.String),
+    elevation: Schema.NullOr(Schema.Int)
+  },
+  { indexes: { by_ident: ["ident"], by_name: ["name"] } }
+)
+
+export const registry = Registry.make([Todos, Airports])
 
 const AddArgs = Schema.Struct({ id: Schema.String, scope: Schema.String, title: Schema.String })
 const UpdateArgs = Schema.Struct({

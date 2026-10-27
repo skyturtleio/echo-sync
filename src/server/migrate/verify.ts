@@ -139,6 +139,25 @@ const checkRelation = Effect.fn("verify.checkRelation")(function* (
 ) {
   const sql = yield* SqlClient
 
+  if (table.kind === "catalog") {
+    const triggers = yield* sql<TriggerRow>`SELECT tgname AS name, true AS capture,
+      tgenabled::text AS enabled, tgtype::int AS type, tgqual IS NOT NULL AS "when",
+      cardinality(tgattr::int2[]) > 0 AS "columnList" FROM pg_trigger
+      WHERE tgrelid = ${relation.oid}::oid AND tgfoid = 'echo_sync.catalog_changed'::regproc`
+    if (
+      triggers.length !== 1 ||
+      Arr.some(
+        triggers,
+        (t) =>
+          !FIRES.has(t.enabled) ||
+          t.type !== (TRIGGER_INSERT | TRIGGER_UPDATE | TRIGGER_DELETE | TRIGGER_TRUNCATE) ||
+          t.when ||
+          t.columnList
+      )
+    ) {
+      drift("missing or invalid echo_sync catalog generation trigger")
+    }
+  }
   // Both echo_sync triggers must exist, fire for ordinary writes, and have attach's shape.
   // Every trigger carrying either function is checked: a second, partial capture trigger
   // would double-log, and a disabled one beside a working one is still drift.
@@ -150,10 +169,13 @@ const checkRelation = Effect.fn("verify.checkRelation")(function* (
       WHERE tgrelid = ${relation.oid}::oid AND NOT tgisinternal
         AND tgfoid IN ('echo_sync.echo_sync_capture_changes'::regproc, 'echo_sync.reject_truncate'::regproc)
       ORDER BY tgname`
+  if (table.kind === "catalog" && triggers.length > 0)
+    drift("catalog must not have scoped change capture or truncate guard")
   for (const [capture, label, type, shape] of [
     [true, "capture", CAPTURE_TYPE, "AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW"],
     [false, "truncate guard", GUARD_TYPE, "BEFORE TRUNCATE FOR EACH STATEMENT"]
   ] as const) {
+    if (table.kind === "catalog") break
     const found = Arr.filter(triggers, (t) => t.capture === capture)
     if (found.length === 0) drift(`missing the echo_sync ${label} trigger`)
     if (capture && found.length > 1) drift(`has ${found.length} echo_sync capture triggers, expected one`)
@@ -225,10 +247,14 @@ const checkRelation = Effect.fn("verify.checkRelation")(function* (
 
   for (const index of [
     ...Rec.values(table.indexes),
-    {
-      name: "echo-scope",
-      key: Arr.flatMap(["access_scope_id", "id"], (name) => Arr.filter(table.columns, (c) => c.name === name))
-    }
+    ...(table.kind === "catalog"
+      ? []
+      : [
+          {
+            name: "echo-scope",
+            key: Arr.flatMap(["access_scope_id", "id"], (name) => Arr.filter(table.columns, (c) => c.name === name))
+          }
+        ])
   ]) {
     const name = `${table.name}__${index.name}`
     const rows = byIndex.get(name)
@@ -289,14 +315,15 @@ export const verify = (registry: Registry.SyncRegistry) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient
     const mismatches: Array<Mismatch> = []
-    for (const table of registry.tables) {
+    for (const table of [...registry.tables, ...registry.catalogs]) {
       // Every relation attach mapped this name to (capture trigger, enabled or not); attach
       // refuses same-name tables across schemas, so more than one is itself suspicious, and each
       // is checked. Fall back to search_path so an unattached table is still checked.
       const attached = yield* sql<Relation>`
         SELECT DISTINCT c.oid::int AS oid, n.nspname AS schema FROM pg_trigger t
         JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE t.tgfoid = 'echo_sync.echo_sync_capture_changes'::regproc AND c.relname = ${table.name}
+        WHERE t.tgfoid = (CASE WHEN ${table.kind} = 'catalog' THEN 'echo_sync.catalog_changed'
+          ELSE 'echo_sync.echo_sync_capture_changes' END)::regproc AND c.relname = ${table.name}
         ORDER BY n.nspname`
       let relations: ReadonlyArray<Relation> = attached
       if (attached.length > 1) {

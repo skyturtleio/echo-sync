@@ -124,7 +124,7 @@ describe.skipIf(!pgAvailable)("scope_grants id derivation (INV-ACL-5)", () => {
       const after = yield* sql<{ name: string }>`SELECT name FROM echo_sync.migrations ORDER BY migration_id`
       assert.deepStrictEqual(
         Arr.map(after, (r) => r.name),
-        ["engine", "grant_id_check", "ledger_acked_at", "engine_epoch", "scope_walk_index"]
+        ["engine", "grant_id_check", "ledger_acked_at", "engine_epoch", "scope_walk_index", "catalogs"]
       )
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(EmptyDatabase))

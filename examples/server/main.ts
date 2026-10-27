@@ -35,6 +35,7 @@ import { Postgres, Startup } from "../../src/server/index.ts"
 import createTodos from "./migrations/001_create_todos.ts"
 import addTodoNote from "./migrations/002_add_todo_note.ts"
 import scopeWalkIndex from "./migrations/003_scope_walk_index.ts"
+import airportCatalog from "./migrations/004_airport_catalog.ts"
 import { principalHeader, registry, serverHooks, serverMutations, Todos } from "../browser-spike/app.ts"
 
 const port = Number(Effect.runSync(Config.String("ECHO_SLICE_PORT").pipe(Config.withDefault("5200"))))
@@ -64,7 +65,8 @@ const Db = Layer.merge(PgClient.layer({ url: Redacted.make(dbUrl.toString()), ma
 const appMigrations = {
   "001_create_todos": createTodos,
   "002_add_todo_note": addTodoNote,
-  "003_scope_walk_index": scopeWalkIndex
+  "003_scope_walk_index": scopeWalkIndex,
+  "004_airport_catalog": airportCatalog
 }
 
 /** migrate → app migrations → attach → verify, then `/sync`. On `Drift` the layer fails and nothing serves. */
@@ -128,6 +130,25 @@ const adminRoute = (url: URL) =>
     const sql = yield* SqlClient
     const q = (name: string) => url.searchParams.get(name) ?? ""
     switch (url.pathname) {
+      case "/admin/catalog-seed": {
+        const count = Number(q("count"))
+        if (!Number.isSafeInteger(count) || count < 0 || count > 100_000)
+          return new Response("invalid count", { status: 400 })
+        yield* sql.withTransaction(
+          Effect.gen(function* () {
+            yield* sql`TRUNCATE airport_reference`
+            yield* sql`INSERT INTO airport_reference (id, ident, name, latitude, longitude, country, municipality, elevation)
+            SELECT lpad(i::text, 6, '0'), 'A' || lpad(i::text, 6, '0'),
+              'Airport ' || i::text || ' International café',
+              (i % 18000)::float8 / 100 - 90, (i % 36000)::float8 / 100 - 180,
+              CASE WHEN i % 2 = 0 THEN 'US' ELSE 'CA' END,
+              CASE WHEN i % 3 = 0 THEN NULL ELSE 'City ' || (i % 1000)::text END,
+              CASE WHEN i % 5 = 0 THEN NULL ELSE i % 5000 END
+            FROM generate_series(1, ${count}::integer) g(i)`
+          })
+        )
+        return json({ count })
+      }
       case "/admin/bootstrap-seed": {
         const count = Number(q("count"))
         if (!Number.isSafeInteger(count) || count < 1 || count > 100_000) {

@@ -103,6 +103,7 @@ export const PullPage = Schema.TaggedStruct("PullPage", {
 /** Page set complete: apply the staged set (acks included) atomically, persist `nextCursor`. */
 export const PullDone = Schema.TaggedStruct("PullDone", {
   epoch: Schema.optionalKey(Schema.String),
+  catalogs: Schema.optionalKey(Schema.Record(Schema.String, Schema.String)),
   changes: Schema.Array(Change),
   acks: Schema.Array(Ack),
   nextCursor: Position,

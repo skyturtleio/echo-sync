@@ -151,7 +151,8 @@ Echo Sync replicates rows of declared tables from one PostgreSQL database to one
 per browser profile, and ships mutations the other way through a per-client outbox. The server is
 authoritative; the client applies mutations optimistically and rebases them on every
 authoritative install. Readability is decided per row by the row's access scope and the
-principal's grants; grants are themselves a synced table.
+principal's grants; grants are themselves a synced table. Global read-only catalogs instead
+replicate independent whole-table versions to every authenticated principal (§3, §7, §9).
 
 ### Non-goals
 
@@ -161,7 +162,7 @@ The engine does not and, at this pin, will not:
   are process-local; a second instance sees neither);
 - serve a client whose principal differs from the one its replica was first registered under
   (INV-MUT-10: the binding is permanent per `clientId`);
-- order pulls across clients, provide a global catalog snapshot format, or offer a conformance
+- order pulls across clients or offer a conformance
   suite for a non-TypeScript client;
 - forget idle clients (`echo_sync.clients`, `client_scopes`, ledger identities and floors are
   kept forever: a forgotten floor turns a lost-ack resubmission into a double apply);
@@ -171,8 +172,11 @@ The engine does not and, at this pin, will not:
 - ship a UI adapter other than FoldKit (`echo-sync/foldkit`), or carry any UI-framework
   knowledge in `src/core`, `src/client` or `src/server`.
 
-**Rationale (2026-10-21):** A packaged global catalog snapshot (NDJSON+gzip was considered)
-was deferred past the v1 vertical slice in favor of row-by-row scope walks (§7).
+**Rationale (2026-10-27):** Global catalogs now use content-addressed gzip JSON snapshots,
+declared once with `SyncTable.catalog`. This supersedes the 2026-10-21 deferral: large, rarely
+changing reference data must not ride scope walks or redownload for unrelated scoped schema
+changes. Server-built SQLite files were rejected because they add a server SQLite dependency,
+OPFS files and unverified WebKit attachment behavior; shadow fills reuse the existing row codec.
 
 **Rationale (2026-10-22):** A non-TypeScript protocol conformance suite was deferred
 indefinitely because TypeScript is the only planned client language; revisit only when a
@@ -263,9 +267,15 @@ None.
 A `SyncTable` (`src/core/SyncTable.ts`) is declared once from an Effect `Schema.Struct` and
 yields the wire codec, the Postgres DDL, the SQLite DDL, the manifest and the two hashes. Every
 synced table has a text primary key `id` and a non-null text `accessScopeId`. The engine's own
-synced table is `scope_grants` (§4).
+synced table is `scope_grants` (§4). A `CatalogTable` has a branded string `id` and MUST NOT
+declare `accessScopeId`; its fields and indexes use the same codecs and query API.
 
 ### Invariant digest
+
+- INV-TBL-11: `SyncTable.catalog` declarations MUST be excluded from scoped registry hashes,
+  scope walks and row change capture. Store writes MUST reject catalogs at the type boundary
+  and defect if bypassed at runtime; reads require no grant. Catalog names and their reserved
+  `<name>__next` shadow names MUST NOT collide with other declared tables.
 
 - INV-TBL-1: Every column kind MUST map to exactly one Postgres type, one SQLite type and one
   wire form (table below); a field that cannot be mapped unambiguously MUST be refused at
@@ -796,6 +806,20 @@ rest. Payloads are always the current row.
   MUST NOT strand data already accepted by the engine. Purges and metadata are not counted rows,
   so this minimum candidate can contain multiple purges and arbitrarily large membership state.
 
+- INV-PULL-19: HTTP `PullDone` MAY include additive `catalogs: {table: version}` discovery.
+  Each version MUST hash the catalog's data shape and canonical wire rows ordered by id, read
+  with its generation in one REPEATABLE READ snapshot. Identical reimports MUST retain the
+  version. Builds MUST be single-flight per table and cache only the current compressed snapshot.
+  GET `{path}/catalog/{table}/{version}` MUST use the RPC principal authenticator, refuse
+  anonymous and wildcard actors, return 404 for unknown/stale versions, and serve gzip JSON
+  with ETag and private immutable caching. No scope grant is needed; all signed-in users see
+  the same declared columns. Deploy the server before clients using catalogs.
+
+**Rationale (2026-10-27):** Content identity avoids redownloads after identical monthly imports;
+generation identity alone would download needlessly. Whole JSON snapshots reuse existing wire
+codecs and bypass scoped page limits; they materialize in memory, so this is not bounded-memory
+streaming. A newer incompatible payload keeps the client's last published catalog.
+
 **Rationale (2026-10-26):** A streamed page set removes the HTTP round trip per 500 rows while
 retaining per-page authorization, snapshots and durable continuations. Capacity-one RPC queues
 already overlap network and staging; another `Stream.buffer` would add redundant buffering.
@@ -1027,7 +1051,8 @@ None.
 `src/client/sync/Engine.ts` owns one replica (`SqliteSyncStorage` over wa-sqlite in OPFS, or
 `MemorySyncStorage` in tests) and the three operations on it: `mutate` (optimistic apply and
 durable append), `push`, and `pull` (stage pages, install at `PullDone`). Every change to the
-replay set goes through one function, `rebase`.
+replay set goes through one function, `rebase`. These replay/cursor rules describe scoped
+tables; catalogs are independently published read-only snapshots, outside the replay set.
 
 ### Invariant digest
 
@@ -1107,13 +1132,29 @@ replay set goes through one function, `rebase`.
   the set or advance the cursor. Reopening storage resumes from the last durable continuation;
   clean premature EOF is `PullProtocolError`, not success.
 
+- INV-CLI-17: Catalog fills MUST preserve the published table and version until a complete,
+  decoded shadow is swapped atomically with its version metadata. Fills use at most 500 rows
+  per FIFO-admitted transaction. A failed or interrupted fill MUST preserve the old table and
+  version; reads remain usable when the current client declaration is compatible with that
+  installed shape. A local shape upgrade may require a successful download before queries work,
+  even with server-first deployment. Open drops abandoned shadows. Scoped rebuilds, purges and history resets MUST NOT clear
+  catalogs. Index-only local changes MUST preserve catalog rows and download version. A stored
+  download version is reusable only with the installed local data shape. Failure of one catalog
+  MUST NOT prevent other discovered catalogs from updating.
+
+  **Rationale (2026-10-27):** Independent snapshots avoid coupling reference data to user-table
+  migrations. Shadow publication keeps offline reads available during replacement; mutating
+  the published table chunk by chunk would expose partial imports. An old decoder can ignore
+  added server columns, so version equality alone cannot certify the upgraded local shape.
+
 ### Details
 
 #### 9.1 Storage
 
 SQLite tables, all `STRICT` except the outbox: `echo_meta(key, value)` with keys `sync_meta`
 (one JSON value `{cursor, pushedThrough, resnapshot, epoch?}`), `client_id`, `engine_schema_version`,
-`replica_tables`, `replica_data_hash`, `replica_table_ddl`, `replica_index_hash`;
+`replica_tables`, `replica_data_hash`, `replica_table_ddl`, `replica_index_hash`, plus
+`catalog:<name>` (download version), `catalog:<name>:shape` and `catalog:<name>:indexes`;
 `echo_outbox(seq AUTOINCREMENT PK, client_id, mutation_id UNIQUE, name, args, created_at,
 released_at, undo TEXT NOT NULL DEFAULT '[]')` (`undo` is engine schema step 2; a stored
 `engine_schema_version` above the engine's own step count is a defect, not a rebuild), `echo_staged(ord, page)` (the
@@ -1597,6 +1638,13 @@ conservative refresh is preferable, including for own mutations later reconciled
   and reclaiming late results at native completion avoids both leaked handles and indefinitely
   masked waits; constructor-only wrapping/subclassing cannot repair private acquisition boundaries.
 
+- INV-BRW-16: Catalog publication MUST explicitly invalidate that table's live queries and
+  publish a replica revision after commit, while still holding FIFO admission. Rename-based
+  publication MUST NOT rely on row-write hooks to announce the replacement.
+
+  **Rationale (2026-10-27):** SQLite DROP/RENAME bypass row-write hooks. Explicit publication
+  makes existing subscriptions observe the complete replacement without a tab reload.
+
 ### Details
 
 #### 12.1 State machine (tab client)
@@ -1753,12 +1801,21 @@ because app DDL remains reviewable migration work.
   outside the generator was rejected because pinned parsers execute synchronous transforms
   eagerly; adding parallel throwing APIs would retain two contracts for the same operation.
 
+- INV-SCH-11: `attach` MUST install a catalog AFTER STATEMENT INSERT/UPDATE/DELETE/TRUNCATE
+  trigger that increments `echo_sync.catalog_generations` and notifies the existing poke channel
+  in the writer's transaction. `verify` MUST report Drift for a missing, disabled or malformed
+  trigger and for scoped capture/truncate guards on a catalog. Catalog imports require no deploy.
+
+  **Rationale (2026-10-27):** Statement-level generations observe imports and scripts without
+  one log record per reference row. Discovery checks durable generations; notifications are
+  only wakeups, not a separate correctness source.
+
 ### Details
 
 #### 13.1 Startup order
 
 `Startup.prepare`: `migrate` (engine migrations `001_engine`, `002_grant_id_check`,
-`003_ledger_acked_at`, `004_engine_epoch`, `005_scope_walk_index` in `echo_sync.migrations`) → `migrateApp` (the app's record of
+`003_ledger_acked_at`, `004_engine_epoch`, `005_scope_walk_index`, `006_catalogs` in `echo_sync.migrations`) → `migrateApp` (the app's record of
 `NNN_name` → Effect, in `echo_sync.app_migrations`) → for every registry table except
 `scope_grants` that exists (`to_regclass(quote_ident(name))`, i.e. resolved through
 `search_path`): `attach`, with `TableNameConflict` left for `verify` → `verify`. A table the app
@@ -2360,6 +2417,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 
 ### Retired rules
 
+- **Retired (2026-10-27):** Global catalog snapshot deferral (2026-10-21); independently versioned catalogs now ship under INV-TBL-11, INV-PULL-19, INV-CLI-17, INV-BRW-16 and INV-SCH-11.
 - **Retired (2026-10-27):** Constructor-based handler provenance, message-prefix conflict retries and blanket SQL-defect transient handling; stage-owned boundaries supersede them (INV-MUT-3/5, INV-PUSH-3).
 - **Retired (2026-10-26):** Hard 1 MiB rejection of indivisible pull data (former INV-PULL-18); minimum candidates now exceed the target rather than strand accepted data.
 - **Retired (2026-10-25):** One SQLite statement per installed upsert (former INV-PERF-4 cost); consecutive same-table runs now use parameter-bounded multi-row upserts (§9.4), with unchanged atomicity and row order.
@@ -2373,6 +2431,11 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 
 | ID | status | covering test(s) |
 |---|---|---|
+| INV-TBL-11 | covered | `SyncTable.test` "catalog shape changes leave scoped hashes unchanged and catalog mutations cannot compile"; `Catalogs.test` "catalog swaps reemit global queries without grants and survive scoped replica rebuilds and purges" |
+| INV-PULL-19 | covered | `catalogs.test` "identical catalog reimports keep their version; committed imports change discovery without capture or redeploy", "catalog HTTP refuses anonymous and wildcard actors, serves immutable authenticated bytes and rejects stale versions"; supplementary `catalogs.sh` poke-driven replacement |
+| INV-CLI-17 | covered | `Catalogs.test` "an interrupted or undecodable catalog fill keeps the published table and version across reopen", "catalog swaps reemit global queries without grants and survive scoped replica rebuilds and purges", "catalog discovery upgrades a previously stripped shape at the same version despite another catalog failing"; supplementary `catalogs.sh` hard-kill OPFS recovery |
+| INV-BRW-16 | covered | `Catalogs.test` "catalog swaps reemit global queries without grants and survive scoped replica rebuilds and purges"; supplementary `catalogs.sh` open-query publication |
+| INV-SCH-11 | covered | `catalogs.test` "identical catalog reimports keep their version; committed imports change discovery without capture or redeploy" |
 | INV-ID-1 | covered | `Mutation.test` "the wire rejects seq < 1 and keeps Position exact beyond 2^53"; `SqliteSyncStorage.test` "staged pages and meta round-trip with bigint positions" |
 | INV-ID-2 | covered | `Mutation.test` (same); `ledger.test` "seq < 1 is a malformed envelope: not executed, not recorded, not answered as clientExpired" |
 | INV-ID-3 | untested | — |
@@ -2531,6 +2594,10 @@ machine-verifiable literal test-title citations.
 
 | name | value | where | tunable |
 |---|---|---|---|
+| catalog shadow fill | ≤ 500 rows per admitted transaction, additionally parameter-bounded by RowStore | `Catalogs.ts` | no |
+| catalog download deadline / retry | 45 s / 5 s; newest discovery supersedes failed versions | client `Catalogs.ts` | no |
+| catalog snapshots | whole canonical JSON array, gzip; one current compressed snapshot per table in server memory; no row/byte cap | server `catalogs.ts` | no |
+| catalog HTTP cache | private, max-age 31536000 s, immutable, version ETag | `rpc.ts` | no |
 | `wireVersion` | 2; HTTP pull requires ≥ 2 | `Protocol.ts`, `rpc.ts` | no; app policy may be stricter |
 | mutation future-clock skew bound | 30,000 ms (strictly greater rejects) | `Protocol.maxMutationFutureSkewMillis`, `rpc.ts` | no |
 | mutation args excess keys | reject, including nested keys | `Mutation.make`, `LeaderClient.ts` | `onExcessProperty: "ignore"` opts into stripping |
@@ -2679,6 +2746,22 @@ the outbox guards deletion. The tombstone uses Web Crypto SHA-256 and an identit
 `~` prefix. Sibling directories and tombstones are independent.
 
 ### C.2 Browser evidence and limits
+
+Catalog probe (2026-10-27, `CATALOG_BENCH=1 examples/browser-spike/catalogs.sh`, plus `WEBKIT=1`):
+85,000 synthetic airport-shaped rows with code/name indexes, 15,333,583 decoded JSON bytes and
+1,659,158 gzip bytes. On this Linux orb, Chromium took 49 ms to download and 3,526 ms to fill;
+Linux GTK WebKit took 137 ms and 2,833 ms. Largest 500-row write chunk: 27.5 / 25 ms; largest
+transaction hold: 182 / 166 ms; atomic swap including index creation: 182 / 166 ms. A saturated
+indexed 20-row query loop completed 173 reads per run with maxima 183 / 167 ms, including the
+swap wait. Timings are single-run observations, not latency budgets or iPhone measurements.
+Both browsers passed global discovery, catalog-only poke/live-query replacement, offline reload,
+and hard worker termination after one committed 500-row shadow chunk: reopening kept the old
+three rows/version and removed the abandoned shadow. The hard-kill probe runs the real installer
+on a separate OPFS database, not the elected leader's complete lifecycle.
+
+The earlier owner-supplied Chromium ATTACH probe measured about 10 ms to attach a 9.5 MB SQLite
+file for 85k synthetic rows; it is not this snapshot's download/fill measurement. ATTACH remains
+a fallback to evaluate if real iPhone shadow-fill latency is unacceptable, not a shipped path.
 
 The API support figures below are documentation-derived unless a run is explicitly named.
 Runtime capability checks, not browser detection, select the mode (§12).

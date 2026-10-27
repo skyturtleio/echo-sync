@@ -26,7 +26,7 @@ export const prepare = (options: Pick<StartupOptions, "registry" | "appMigration
     yield* migrate
     yield* migrateApp(options.appMigrations ?? {})
     const sql = yield* SqlClient
-    for (const table of options.registry.tables) {
+    for (const table of [...options.registry.tables, ...options.registry.catalogs]) {
       if (table === ScopeGrants.ScopeGrants) continue
       // A table the app migrations did not create is not attached here: attach would fail with a
       // bare SqlError. verify then reports it as "table does not exist" in the same Drift as

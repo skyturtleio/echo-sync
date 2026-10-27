@@ -21,7 +21,7 @@ import {
 } from "./Errors.ts"
 import { grantId, ScopeGrants } from "./ScopeGrants.ts"
 import * as Search from "./Search.ts"
-import type { AnySyncTable, Column, EncodedRow, Index } from "./SyncTable.ts"
+import type { AnySyncTable, Column, EncodedRow, Index, WritableTable } from "./SyncTable.ts"
 
 // ---------------------------------------------------------------------------------------------
 // Ordering: the one definition every RowStore must agree with (INV-TBL-2)
@@ -358,16 +358,16 @@ export interface EchoStore {
     table: T,
     id: RowOf<T>["id"]
   ) => Effect.Effect<RowOf<T>, RowNotFound | ScopeForbidden | StoreUnavailable>
-  readonly insert: <T extends AnySyncTable>(
+  readonly insert: <T extends WritableTable>(
     table: T,
     row: RowOf<T>
   ) => Effect.Effect<void, RowAlreadyExists | ScopeForbidden | InvalidRow | StoreUnavailable | ConstraintViolated>
-  readonly patch: <T extends AnySyncTable>(
+  readonly patch: <T extends WritableTable>(
     table: T,
     id: RowOf<T>["id"],
     patch: Partial<Omit<RowOf<T>, "id">>
   ) => Effect.Effect<void, RowNotFound | ScopeForbidden | InvalidRow | StoreUnavailable | ConstraintViolated>
-  readonly delete: <T extends AnySyncTable>(
+  readonly delete: <T extends WritableTable>(
     table: T,
     id: RowOf<T>["id"]
   ) => Effect.Effect<void, RowNotFound | ScopeForbidden | StoreUnavailable | ConstraintViolated>
@@ -407,13 +407,13 @@ export const isOperationFailure = (error: unknown): error is StoreOperationFailu
 /** Mutation handlers recover with catchReason("StoreOperationFailure", "RowNotFound", …). */
 export interface MutationStore {
   readonly get: <T extends AnySyncTable>(table: T, id: RowOf<T>["id"]) => Effect.Effect<RowOf<T>, StoreOperationFailure>
-  readonly insert: <T extends AnySyncTable>(table: T, row: RowOf<T>) => Effect.Effect<void, StoreOperationFailure>
-  readonly patch: <T extends AnySyncTable>(
+  readonly insert: <T extends WritableTable>(table: T, row: RowOf<T>) => Effect.Effect<void, StoreOperationFailure>
+  readonly patch: <T extends WritableTable>(
     table: T,
     id: RowOf<T>["id"],
     patch: Partial<Omit<RowOf<T>, "id">>
   ) => Effect.Effect<void, StoreOperationFailure>
-  readonly delete: <T extends AnySyncTable>(table: T, id: RowOf<T>["id"]) => Effect.Effect<void, StoreOperationFailure>
+  readonly delete: <T extends WritableTable>(table: T, id: RowOf<T>["id"]) => Effect.Effect<void, StoreOperationFailure>
   readonly query: <T extends AnySyncTable>(table: T) => TableQuery<T, StoreOperationFailure>
   readonly scan: <T extends AnySyncTable>(table: T) => Effect.Effect<ReadonlyArray<RowOf<T>>, StoreOperationFailure>
   readonly createScope: (scopeId: AccessScopeId) => Effect.Effect<void, StoreOperationFailure>
@@ -607,7 +607,11 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
       const out: Array<RowOf<T>> = []
       for (const row of encoded) {
         const decoded = yield* decode(table, row)
-        if (yield* readable(scopes, decoded.accessScopeId)) out.push(decoded)
+        if (
+          table.kind === "catalog" ||
+          (yield* readable(scopes, yield* decodeStored(AccessScopeIdSchema, table.name, row["access_scope_id"])))
+        )
+          out.push(decoded)
       }
       return out
     })
@@ -619,12 +623,17 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
         const found = yield* rows.read(table, id)
         if (Option.isNone(found)) return yield* new RowNotFound({ table: table.name, id })
         const row = yield* decode(table, found.value)
-        yield* authorize(row.accessScopeId, "reader")
+        if (table.kind !== "catalog")
+          yield* authorize(
+            yield* decodeStored(AccessScopeIdSchema, table.name, found.value["access_scope_id"]),
+            "reader"
+          )
         return row
       }),
 
     insert: (table, row) =>
       Effect.gen(function* () {
+        if (table.kind !== "sync") return yield* Effect.die("catalog tables are read-only")
         const encoded = yield* encode(table, row)
         yield* checkGrantIdentity(table, encoded)
         yield* authorize(row.accessScopeId, requiredRole(table))
@@ -635,6 +644,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
 
     patch: (table, id, patch) =>
       Effect.gen(function* () {
+        if (table.kind !== "sync") return yield* Effect.die("catalog tables are read-only")
         const found = yield* rows.read(table, id)
         if (Option.isNone(found)) return yield* new RowNotFound({ table: table.name, id })
         const current = yield* decode(table, found.value)
@@ -649,6 +659,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
 
     delete: (table, id) =>
       Effect.gen(function* () {
+        if (table.kind !== "sync") return yield* Effect.die("catalog tables are read-only")
         const found = yield* rows.read(table, id)
         if (Option.isNone(found)) return yield* new RowNotFound({ table: table.name, id })
         const current = yield* decode(table, found.value)
@@ -765,7 +776,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
               lower: yield* bound(built.lower),
               upper: yield* bound(built.upper),
               order,
-              readableBy: Option.some([options.actor, Everyone]),
+              readableBy: table.kind === "catalog" ? Option.none() : Option.some([options.actor, Everyone]),
               limit
             }
             let selected = plan
