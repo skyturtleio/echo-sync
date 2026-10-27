@@ -13,7 +13,6 @@ import {
   PubSub,
   Queue,
   Ref,
-  Result,
   Schedule,
   Schema,
   Stream
@@ -31,6 +30,7 @@ import { type ClientPolicy, pull } from "./pull.ts"
 import { checkEpoch } from "./epoch.ts"
 import * as RowStore from "./rowStore.ts"
 import { resolveTables } from "./schema.ts"
+import { isCleanupFailure } from "./transaction.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 import { failureOutcome } from "../../internal/ErrorCatalog.ts"
 
@@ -93,10 +93,8 @@ const isNotSql = <E>(error: E | SqlError): error is Exclude<E, SqlError> => !isS
 
 /**
  * Whole-cause classification of a handler failure, precedence defect > transient > typed
- * (SPEC §5, §8). A `SqlError` may arrive as a failure or, from the pinned client's `orDie` rollback on a
- * dead connection, as a defect; both are infrastructure. Any other defect keeps the whole cause
- * as defects, so a programmer bug is never reported as retryable. Without either, the typed
- * failures (and any interruption) pass through.
+ * (SPEC §5, §8). Only stage-identified transaction cleanup defects are infrastructure.
+ * Interruption or any other defect preserves the whole cause, never a successful short push.
  */
 const classifyCause = <E>(
   cause: Cause.Cause<E>
@@ -104,7 +102,10 @@ const classifyCause = <E>(
   | { readonly _tag: "defect"; readonly cause: Cause.Cause<never> }
   | { readonly _tag: "unavailable"; readonly error: SqlError }
   | { readonly _tag: "typed"; readonly cause: Cause.Cause<Exclude<E, SqlError>> } => {
-  if (Arr.some(cause.reasons, (r) => Cause.isDieReason(r) && !isSqlError(r.defect))) {
+  if (
+    Cause.hasInterrupts(cause) ||
+    Arr.some(cause.reasons, (r) => Cause.isDieReason(r) && !isCleanupFailure(r.defect))
+  ) {
     return {
       _tag: "defect",
       cause: Cause.fromReasons(
@@ -113,7 +114,11 @@ const classifyCause = <E>(
     }
   }
   for (const r of cause.reasons) {
-    const error = Cause.isFailReason(r) ? r.error : Cause.isDieReason(r) ? r.defect : undefined
+    const error = Cause.isFailReason(r)
+      ? r.error
+      : Cause.isDieReason(r) && isCleanupFailure(r.defect)
+        ? r.defect.cause
+        : undefined
     if (isSqlError(error)) return { _tag: "unavailable", error }
   }
   return {
@@ -140,18 +145,17 @@ const toServerFailure = <E>(
 const isClientForbidden = <E>(e: E | ClientForbidden): e is ClientForbidden => Predicate.isTagged(e, "ClientForbidden")
 
 /**
- * `ClientForbidden` ⇒ `Unauthorized` with `catchTag`'s semantics (the first failure; any other
- * cause passes whole). `catchTag` itself does not typecheck over a generic `E`, so this is
- * `catchFilter` with a tag filter that names the remainder.
+ * `ClientForbidden` ⇒ `Unauthorized` without discarding adjacent failures, defects or interruption.
  */
 const mapForbidden = <A, E, R>(
   self: Effect.Effect<A, E | ClientForbidden, R>
 ): Effect.Effect<A, E | Protocol.Unauthorized, R> =>
-  Effect.catchFilter<A, E | ClientForbidden, R, ClientForbidden, never, Protocol.Unauthorized, never, E>(
-    self,
-    (e: E | ClientForbidden): Result.Result<ClientForbidden, E> =>
-      isClientForbidden(e) ? Result.succeed(e) : Result.fail(e),
-    (e: ClientForbidden) => Effect.fail(forbidden(e))
+  Effect.catchCause(self, (cause) =>
+    Effect.failCause(
+      Cause.map(cause, (error: E | ClientForbidden): E | Protocol.Unauthorized =>
+        isClientForbidden(error) ? forbidden(error) : error
+      )
+    )
   )
 
 /**
@@ -169,8 +173,8 @@ export const serverFailures = <A, E, R>(
 
 /**
  * The push failure mapping (SPEC §8), for any transport, applied over authentication and the
- * batch together: infrastructure anywhere (a `SqlError` failure or defect, e.g. a session lookup
- * in `principalFor`) is an empty results list, a transient stop; `ClientForbidden` ⇒
+ * batch together: a typed SQL failure or trusted transaction cleanup defect is an empty results
+ * list, a transient stop; `ClientForbidden` ⇒
  * `Unauthorized`; any other defect stays a defect (the client halts push on it). Idempotent, so
  * it may wrap `executeBatch`, which already applies it.
  */

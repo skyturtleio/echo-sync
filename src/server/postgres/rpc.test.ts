@@ -28,7 +28,8 @@ import { AccessScope, Ids, Mutation, Protocol } from "echo-sync"
 import * as TestClock from "effect/testing/TestClock"
 import * as SyncLoop from "../../client/sync/SyncLoop.ts"
 import type { ClientPolicy } from "./pull.ts"
-import { executeBatch, handlers, layerHttp, Notifications, sharedPokes } from "./rpc.ts"
+import { executeBatch, handlers, layerHttp, Notifications, pushFailures, serverFailures, sharedPokes } from "./rpc.ts"
+import { ClientForbidden } from "./ledger.ts"
 import { grant, Items, pgAvailable, registry, RowId, TestDatabase } from "./test-support.ts"
 import { last } from "../../client/sync/testing/Pull.ts"
 
@@ -42,6 +43,38 @@ const addItem = Mutation.make("items.add", {
     })
 })
 const mutations = Mutation.makeRegistry([addItem])
+
+it.effect("RPC failure mapping never erases interruption or defects beside SQL and binding failures", () =>
+  Effect.gen(function* () {
+    const sql = new SqlError({ reason: new UnknownError({ cause: "canary" }) })
+    for (const failure of [
+      Cause.makeFailReason(sql),
+      Cause.makeDieReason(sql),
+      Cause.makeFailReason(new ClientForbidden({ clientId: "c" }))
+    ]) {
+      for (const other of [Cause.makeInterruptReason(123), Cause.makeDieReason("bug")]) {
+        for (const reasons of [
+          [failure, other],
+          [other, failure]
+        ]) {
+          const cause = Cause.fromReasons<SqlError | ClientForbidden>(reasons)
+          const exits = [
+            yield* Effect.exit(pushFailures(Effect.failCause(cause))),
+            yield* Effect.exit(serverFailures(Effect.failCause(cause)))
+          ]
+          for (const exit of exits) {
+            assert.isTrue(Exit.isFailure(exit))
+            if (exit._tag === "Failure") {
+              assert.strictEqual(exit.cause.reasons.length, 2)
+              assert.isTrue(exit.cause.reasons.includes(other))
+              assert.strictEqual(Cause.hasInterrupts(exit.cause), Cause.isInterruptReason(other))
+            }
+          }
+        }
+      }
+    }
+  })
+)
 
 /**
  * A real RpcClient (HTTP POST, NDJSON) against the mounted router, as the browser transport
@@ -484,17 +517,15 @@ describe.skipIf(!pgAvailable)("sync RPC over HTTP (SPEC §8, §7)", () => {
     }).pipe(Effect.scoped, Effect.provide(TestDatabase))
   )
 
-  it.live("an infrastructure defect in principalFor is a transient stop (empty results), not a push failure", () =>
+  it.live("principalFor throwing the actual SqlError class remains a defect", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient
       yield* writer
       const db = yield* Effect.context<SqlClient | PgClient.PgClient>()
-      // A session lookup in Postgres whose connection is lost: the pinned client's orDie raises it as a defect.
       const lost = new SqlError({ reason: new UnknownError({ cause: "session store unreachable" }) })
-      const client = yield* connectTo(db, undefined, () => Effect.die(lost))
-      const exit = yield* Effect.exit(client.push(push([["m1", "ok"]])))
-      if (!Exit.isSuccess(exit)) return assert.fail(`push failed: ${String(exit.cause)}`)
-      assert.deepStrictEqual(exit.value.results, [])
+      const broken = yield* connectTo(db, undefined, () => Effect.die(lost))
+      const exit = yield* Effect.exit(broken.push(push([["m1", "ok"]])))
+      assert.isTrue(Exit.hasDies(exit))
       const ledgered = yield* sql<{ mutation_id: string }>`SELECT mutation_id FROM echo_sync.mutations`
       assert.deepStrictEqual(ledgered, [])
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until scoped clients close.

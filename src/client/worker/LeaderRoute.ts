@@ -10,8 +10,18 @@ import * as Effect from "effect/Effect"
 import * as Stream from "effect/Stream"
 import { RpcClientError } from "effect/rpc/RpcClientError"
 import * as Telemetry from "../../internal/Telemetry.ts"
-import { LeaderUnavailable } from "./LeaderRpcs.ts"
+import { type LeaderInfo, LeaderUnavailable } from "./LeaderRpcs.ts"
 import type { LeaderConnection } from "./TabPlatform.ts"
+
+type RoutedConnection = {
+  readonly [K in keyof LeaderConnection]: LeaderConnection[K] extends (
+    ...args: infer P
+  ) => Effect.Effect<infer A, infer E>
+    ? (...args: P) => Effect.Effect<A, Exclude<E, RpcClientError> | LeaderUnavailable>
+    : LeaderConnection[K] extends (...args: infer P) => Stream.Stream<infer A, infer E>
+      ? (...args: P) => Stream.Stream<A, Exclude<E, RpcClientError> | LeaderUnavailable>
+      : never
+}
 
 export interface Connected {
   readonly _tag: "Connected"
@@ -41,11 +51,11 @@ export interface LeaderRoute {
   /** The next published connection: the current one if any, otherwise the next `publish`. */
   readonly awaitConnection: Effect.Effect<Connection>
   readonly withLeader: <A, E>(
-    f: (client: LeaderConnection) => Effect.Effect<A, E | RpcClientError>
-  ) => Effect.Effect<A, Exclude<E, RpcClientError> | LeaderUnavailable>
+    f: (client: RoutedConnection) => Effect.Effect<A, E>
+  ) => Effect.Effect<A, E | LeaderUnavailable>
   /** A stream from the current leader that ends with its `lost` error when that leader goes away. */
   readonly streamWithLeader: <A, E>(
-    f: (client: LeaderConnection) => Stream.Stream<A, E | RpcClientError>
+    f: (client: RoutedConnection) => Stream.Stream<A, E>
   ) => Stream.Stream<A, E | LeaderUnavailable>
 }
 
@@ -55,8 +65,33 @@ export const lostError = (leaderId: string, detail?: string) =>
     message: `leader ${leaderId} went away${detail === undefined ? "" : `: ${detail}`}`
   })
 
-// oxlint-disable-next-line effecttsgo/instance-of-schema -- Only the connected RPC implementation's failures signal connection loss, not same-identifier domain classes.
-const isRpcClientError = (u: unknown): u is RpcClientError => u instanceof RpcClientError
+const routeClient = (
+  client: LeaderConnection,
+  unavailable: (error: RpcClientError) => LeaderUnavailable
+): RoutedConnection => {
+  const normalize = <E>(error: E | RpcClientError): E | LeaderUnavailable =>
+    // oxlint-disable-next-line effecttsgo/instance-of-schema -- Only the concrete RPC method channel is inspected, never application callback errors.
+    error instanceof RpcClientError ? unavailable(error) : error
+  const call = <A, E>(self: Effect.Effect<A, E | RpcClientError>) =>
+    Effect.catchCause(self, (cause) => Effect.failCause(Cause.map(cause, normalize<E>)))
+  const stream = <A, E>(self: Stream.Stream<A, E | RpcClientError>) =>
+    Stream.catchCause(self, (cause) => Stream.failCause(Cause.map(cause, normalize<E>)))
+  return {
+    exec: (input) => call(client.exec(input)),
+    enqueue: (input) => call(client.enqueue(input)),
+    subscribe: (input) => stream(client.subscribe(input)),
+    subscribeSnapshot: (input) => stream(client.subscribeSnapshot(input)),
+    subscribeRaw: (input) => stream(client.subscribeRaw(input)),
+    leaderInfo: () => call<LeaderInfo, never>(client.leaderInfo()),
+    syncStatus: () => stream(client.syncStatus()),
+    requestSync: () => call(client.requestSync()),
+    presence: (input) => stream(client.presence(input)),
+    track: (input) => call(client.track(input)),
+    notices: () => stream(client.notices()),
+    dismissNotices: (input) => call(client.dismissNotices(input)),
+    exportPending: () => call(client.exportPending())
+  }
+}
 
 export const makeUnsafe = (): LeaderRoute => {
   // Pending while no leader is connected; requests wait on it. After a reset it stays the `Reset` failure.
@@ -101,15 +136,13 @@ export const makeUnsafe = (): LeaderRoute => {
                     // reason at once, and the RPC on a closed client is never started.
                     Effect.raceFirst(
                       Effect.flatMap(Deferred.await(connection.lost), Effect.fail),
-                      f(connection.client).pipe(
-                        Effect.catchIf(isRpcClientError, (e) => Effect.fail(transportError(connection.leaderId, e)))
-                      )
+                      f(routeClient(connection.client, (error) => transportError(connection.leaderId, error)))
                     )
               ).pipe(Effect.catchCauseIf(isResetTeardown, () => Effect.fail(resetError)))
         ),
         Telemetry.boundary
       ),
-    streamWithLeader: <A, E>(f: (client: LeaderConnection) => Stream.Stream<A, E | RpcClientError>) =>
+    streamWithLeader: <A, E>(f: (client: RoutedConnection) => Stream.Stream<A, E>) =>
       Stream.unwrap(
         Effect.suspend(() => Deferred.await(current)).pipe(
           Effect.map((connection) =>
@@ -119,16 +152,7 @@ export const makeUnsafe = (): LeaderRoute => {
                   // Checked when the stream starts, not only when `current` was read (INV-BRW-7).
                   isReset
                     ? Stream.fail(resetError)
-                    : f(connection.client).pipe(
-                        // Maps only the transport failures, keeping every other reason (a defect included): a
-                        // `Stream.catchIf` would re-fail any other error bare (INV-BRW-4).
-                        Stream.catchCause((cause) =>
-                          Stream.failCause(
-                            Cause.map(cause, (e: E | RpcClientError): E | LeaderUnavailable =>
-                              isRpcClientError(e) ? transportError(connection.leaderId, e) : e
-                            )
-                          )
-                        ),
+                    : f(routeClient(connection.client, (error) => transportError(connection.leaderId, error))).pipe(
                         Stream.interruptWhen(Effect.flatMap(Deferred.await(connection.lost), Effect.fail))
                       )
                 ).pipe(Stream.catchCauseIf(isResetTeardown, () => Stream.fail(resetError)))

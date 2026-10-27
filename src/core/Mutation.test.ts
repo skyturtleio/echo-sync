@@ -69,7 +69,7 @@ describe("mutation args evolve without breaking queued intents (SPEC §5)", () =
         customTimes: Schema.Record(Schema.String, Schema.Struct({ minutes: Schema.Int }))
       })
       const seen: Array<typeof args.Type> = []
-      const handler = (_: Mutation.MutationContext, value: typeof args.Type) =>
+      const handler = (_: Mutation.HandlerContext, value: typeof args.Type) =>
         Effect.sync(() => {
           seen.push(value)
         })
@@ -183,13 +183,82 @@ const ctx = () => ({
   store: makeStore()
 })
 const Nope = Schema.Struct({ _tag: Schema.Literal("Nope") })
-const failing = (body: Effect.Effect<void, { readonly _tag: "Nope" } | StoreUnavailable>) =>
+const failing = (body: Effect.Effect<void, { readonly _tag: "Nope" } | Store.StoreOperationFailure>) =>
   Mutation.makeRegistry([Mutation.make("x", { args: Schema.Struct({}), error: Nope, handler: () => body })])
 /** A cause holding a declared domain failure plus `other`, as a parallel handler can produce. */
-const compound = (other: Cause.Reason<{ readonly _tag: "Nope" } | StoreUnavailable>) =>
+const compound = (other: Cause.Reason<{ readonly _tag: "Nope" } | Store.StoreOperationFailure>) =>
   Effect.failCause(Cause.fromReasons([Cause.makeFailReason({ _tag: "Nope" as const }), other]))
 
 describe("mutation outcome classification over the whole cause (SPEC §5)", () => {
+  it.effect("engine error instances declared by a handler remain domain errors, not store or argument failures", () =>
+    Effect.gen(function* () {
+      const schema = Schema.Union([StoreUnavailable, RowNotFound, Mutation.ArgsDecodeFailed])
+      for (const error of [
+        new StoreUnavailable({ message: "SerializationError: domain" }),
+        new RowNotFound({ table: "domain", id: "x" }),
+        new Mutation.ArgsDecodeFailed({ name: "domain", message: "domain" })
+      ]) {
+        const mutation = Mutation.make("domain", {
+          args: Schema.Struct({}),
+          error: schema,
+          handler: () => Effect.fail(error)
+        })
+        const result = yield* Effect.flip(mutation.execute(ctx(), {}))
+        expect(result).toMatchObject({ _tag: "DomainError", mutation: "domain", error: { _tag: error._tag } })
+      }
+      const marker = { _tag: "StoreUnavailable", message: "not storage", "~effect/Schema/Class/StoreUnavailable": true }
+      expect(Schema.is(StoreUnavailable)(marker)).toBe(true)
+      const structural = Mutation.make("structural", {
+        args: Schema.Struct({}),
+        error: Schema.Unknown,
+        handler: () => Effect.fail(marker)
+      })
+      expect(yield* Effect.flip(structural.execute(ctx(), {}))).toMatchObject({ _tag: "DomainError", error: marker })
+    })
+  )
+
+  it.effect("store-origin failures retain adjacent defects and interruption in either cause order", () =>
+    Effect.gen(function* () {
+      const failure = Cause.makeFailReason(new StoreUnavailable({ message: "down" }))
+      const mutation = Mutation.make("read", {
+        args: Schema.Struct({}),
+        handler: ({ store }) => store.get(Todos, TodoId.make("x")).pipe(Effect.asVoid)
+      })
+      for (const other of [Cause.makeDieReason("store bug"), Cause.makeInterruptReason(123)]) {
+        for (const reasons of [
+          [failure, other],
+          [other, failure]
+        ]) {
+          const context = {
+            ...ctx(),
+            store: { ...makeStore(), get: () => Effect.failCause(Cause.fromReasons(reasons)) }
+          }
+          const exit = yield* Effect.exit(mutation.execute(context, {}))
+          expect(exit._tag).toBe("Failure")
+          if (exit._tag === "Failure") {
+            expect(Cause.hasFails(exit.cause)).toBe(false)
+            expect(exit.cause.reasons).toContain(other)
+            expect(exit.cause.reasons).toHaveLength(2)
+          }
+        }
+      }
+    })
+  )
+
+  it.effect("handlers can recover a store reason without treating a domain lookalike as store-origin", () =>
+    Effect.gen(function* () {
+      const recover = Mutation.make("recover", {
+        args: Schema.Struct({}),
+        handler: ({ store }) =>
+          store.get(Todos, TodoId.make("absent")).pipe(
+            Effect.catchReason("StoreOperationFailure", "RowNotFound", () => Effect.void),
+            Effect.asVoid
+          )
+      })
+      expect(yield* recover.execute(ctx(), {})).toBeUndefined()
+    })
+  )
+
   it.effect(
     "a domain failure combined with a defect dies with the defect, never a Rejected outcome",
     Effect.fnUntraced(function* () {
@@ -207,19 +276,20 @@ describe("mutation outcome classification over the whole cause (SPEC §5)", () =
   it.effect(
     "StoreUnavailable alongside a domain failure stays transient, never a permanent rejection",
     Effect.fnUntraced(function* () {
+      const store = Store.forMutation({
+        ...makeStore(),
+        get: () => Effect.fail(new StoreUnavailable({ message: "down" }))
+      })
+      const failure = yield* Effect.flip(store.get(Todos, TodoId.make("missing")))
       const err = yield* Effect.flip(
-        Mutation.run(
-          failing(compound(Cause.makeFailReason(new StoreUnavailable({ message: "down" })))),
-          { name: "x", args: {} },
-          ctx()
-        )
+        Mutation.run(failing(compound(Cause.makeFailReason(failure))), { name: "x", args: {} }, ctx())
       )
       expect(err._tag).toBe("StoreUnavailable")
     })
   )
 })
 
-const strict = (reasons: ReadonlyArray<Cause.Reason<string | RowNotFound>>) =>
+const strict = (reasons: ReadonlyArray<Cause.Reason<string | Store.StoreOperationFailure>>) =>
   Mutation.makeRegistry([
     Mutation.make("strict", {
       args: Schema.Struct({}),
@@ -227,7 +297,7 @@ const strict = (reasons: ReadonlyArray<Cause.Reason<string | RowNotFound>>) =>
       handler: () => Effect.failCause(Cause.fromReasons(reasons))
     })
   ])
-const outcome = (reasons: ReadonlyArray<Cause.Reason<string | RowNotFound>>) =>
+const outcome = (reasons: ReadonlyArray<Cause.Reason<string | Store.StoreOperationFailure>>) =>
   Effect.exit(Mutation.run(strict(reasons), { name: "strict", args: {} }, ctx()))
 describe("every domain failure in a cause must encode before any is reported (SPEC §5)", () => {
   const valid = Cause.makeFailReason("valid")
@@ -236,10 +306,11 @@ describe("every domain failure in a cause must encode before any is reported (SP
   it.effect(
     "an unencodable domain failure next to a valid one dies, in either order, never a DomainError",
     Effect.fnUntraced(function* () {
+      const missing = yield* Effect.flip(Store.forMutation(makeStore()).get(Todos, TodoId.make("missing")))
       for (const reasons of [
         [valid, unencodable],
         [unencodable, valid],
-        [Cause.makeFailReason(new RowNotFound({ table: "t", id: "1" })), unencodable]
+        [Cause.makeFailReason(missing), unencodable]
       ]) {
         const exit = yield* outcome(reasons)
         const cause = exit._tag === "Failure" ? exit.cause : Cause.empty

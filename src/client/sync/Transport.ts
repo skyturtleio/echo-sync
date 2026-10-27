@@ -1,8 +1,8 @@
 /**
  * The engine's `Transport` over core's `SyncRpcs` (SPEC §8, §7, §10), on the leader.
  *
- * This module owns the RPC client and lifts credential failures and HTTP 401/403 out of an
- * `RpcClientError`. Other failures retain their original tag without transport wrappers.
+ * This module owns credential preparation and the RPC client. Only HTTP 401/403 are lifted
+ * out of an `RpcClientError`; arbitrary fetch rejections are always network failures.
  * What an error means (its status kind, whether a
  * push halts) is decided in `SyncFailure`. A push halts (INV-LOOP-3) on:
  * - core's `MalformedEnvelope`: the server refused the batch;
@@ -20,7 +20,7 @@
  * `PullProtocolError`, so a bad page never kills the loop's fiber; core's `ResnapshotRequired` passes
  * through unwrapped for the engine to handle.
  */
-import { Cause, Context, Effect, Layer, Predicate, Schema, type Scope, Stream } from "effect"
+import { Array as Arr, Cause, Context, Effect, Layer, Predicate, Schema, type Scope, Stream } from "effect"
 import { FetchHttpClient, type Headers, HttpClient, HttpClientError, HttpClientRequest } from "effect/http"
 import { RpcClient, RpcClientError, RpcSerialization } from "effect/rpc"
 import { type AccessScope, type Ids, Protocol } from "echo-sync"
@@ -29,18 +29,15 @@ import type * as Engine from "./Engine.ts"
 import { CredentialsUnavailable, PullProtocolError, PushIntegrityError, type PullReason } from "./SyncFailure.ts"
 
 /**
- * `error`, or the more specific evidence an `RpcClientError` wraps (SPEC §10): the
- * `CredentialsUnavailable` that `layerProtocolHttp` puts inside the HTTP `TransportError`, or the HTTP
- * 401/403 that its status filter raises.
+ * Lift only an actual HTTP status failure. Fetch rejections are nested in TransportError,
+ * never inspected for engine-shaped causes.
  */
 const lift = <E extends { readonly _tag: string }>(
   error: E | RpcClientError.RpcClientError
-): E | RpcClientError.RpcClientError | CredentialsUnavailable | Protocol.Unauthorized => {
+): E | RpcClientError.RpcClientError | Protocol.Unauthorized => {
   // oxlint-disable-next-line effecttsgo/instance-of-schema -- Only this RPC implementation's errors cross the infrastructure boundary, not same-identifier classes.
   if (!(error instanceof RpcClientError.RpcClientError) || error.reason._tag !== "HttpError") return error
   const http = error.reason.cause
-  // oxlint-disable-next-line effecttsgo/instance-of-schema -- A custom fetch may reject with a same-identifier class; that is still a network failure, not engine credentials.
-  if (http instanceof HttpClientError.TransportError && http.cause instanceof CredentialsUnavailable) return http.cause
   if (
     http instanceof HttpClientError.StatusCodeError &&
     (http.response.status === 401 || http.response.status === 403)
@@ -70,8 +67,7 @@ const SyncHeaders = Context.Reference<Effect.Effect<Headers.Input> | undefined>(
 )
 
 /**
- * Headers a stream (re)connect already resolved before its request (INV-LOOP-8): the HTTP
- * layer uses them instead of evaluating `syncHeaders` again. Unset for push and pull.
+ * Headers this request already resolved before entering RPC (INV-LOOP-8).
  */
 const PreparedHeaders = Context.Reference<Headers.Input | undefined>("echo-sync/client/Transport/PreparedHeaders", {
   defaultValue: () => undefined
@@ -124,6 +120,15 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
   const client = yield* RpcClient.make(Protocol.SyncRpcs)
   const headers = yield* SyncHeaders
   const presenceClient = yield* RpcClient.make(Protocol.PresenceRpcs)
+  const prepared = headers === undefined ? Effect.succeed(undefined) : acquire(headers)
+  const prepareEffect = <A, E, R>(self: Effect.Effect<A, E, R>) =>
+    Effect.flatMap(prepared, (current) =>
+      current === undefined ? self : Effect.provideService(self, PreparedHeaders, current)
+    )
+  const prepareStream = <A, E, R>(self: Stream.Stream<A, E, R>) =>
+    Effect.map(prepared, (current) =>
+      current === undefined ? self : Stream.provideService(self, PreparedHeaders, current)
+    )
   return {
     push: (request) =>
       Effect.gen(function* () {
@@ -133,49 +138,55 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
         return yield* client.push(payload)
       }).pipe(
         defectsAs((message) => new PushIntegrityError({ reason: "serverDefect", message })),
-        Effect.mapError(lift)
+        Effect.catchCause((cause) => Effect.failCause(Cause.map(cause, lift))),
+        prepareEffect
       ),
 
     // The request is built by the engine from core types; the response is decoded by the RPC client.
     pull: (request) =>
-      client.pull(request, { streamBufferSize: 1 }).pipe(
-        Stream.catchCause((cause): Stream.Stream<never, PullReason> =>
-          Cause.hasInterrupts(cause) || !Cause.hasDies(cause)
-            ? Stream.failCause(cause)
-            : Stream.fail(new PullProtocolError({ message: Cause.pretty(cause) }))
-        ),
-        Stream.mapError(lift)
+      Stream.unwrap(
+        prepareStream(
+          client.pull(request, { streamBufferSize: 1 }).pipe(
+            Stream.catchCause((cause): Stream.Stream<never, PullReason> =>
+              Cause.hasInterrupts(cause) || !Cause.hasDies(cause)
+                ? Stream.failCause(cause)
+                : Stream.fail(new PullProtocolError({ message: Cause.pretty(cause) }))
+            ),
+            Stream.catchCause((cause) => Stream.failCause(Cause.map(cause, lift)))
+          )
+        )
       ),
 
     // Any end of this stream (failure, defect, completion) is handled by reconnecting (followPokes).
-    pokes: (clientId, principal, epoch = Effect.succeed({})) => {
-      const open = (prepared: Headers.Input | undefined) => {
-        const stream = Stream.unwrap(
-          Effect.map(epoch, (fence) => client.pokes({ clientId, principal, ...fence }))
-        ).pipe(
+    pokes: (clientId, principal, epoch = Effect.succeed({})) =>
+      prepareStream(
+        Stream.unwrap(Effect.map(epoch, (fence) => client.pokes({ clientId, principal, ...fence }))).pipe(
           // A restored server may be otherwise quiet. Wake pull to negotiate its timeline.
-          Stream.catchTag("ResnapshotRequired", () => Stream.succeed(Protocol.Poke.make({}))),
-          Stream.mapError(lift)
+          Stream.catchCause((cause) =>
+            cause.reasons.length > 0 &&
+            Arr.every(cause.reasons, (r) => Cause.isFailReason(r) && r.error._tag === "ResnapshotRequired")
+              ? Stream.succeed(Protocol.Poke.make({}))
+              : Stream.failCause(Cause.map(cause, lift))
+          )
         )
-        return prepared === undefined ? stream : stream.pipe(Stream.provideService(PreparedHeaders, prepared))
-      }
-      return headers === undefined ? Effect.succeed(open(undefined)) : acquire(headers).pipe(Effect.map(open))
-    },
+      ),
 
     presence: (clientId, principal, epoch = Effect.succeed({})) => ({
       // Prepare-then-stream like `pokes`, so the leader's `idleTimeout` starts at send.
       room: (payload) =>
         Effect.flatMap(epoch, (fence) =>
-          headers === undefined
-            ? Effect.succeed(presenceClient.room({ clientId, principal, ...payload, ...fence }))
-            : Effect.map(acquire(headers), (prepared) =>
-                presenceClient
-                  .room({ clientId, principal, ...payload, ...fence })
-                  .pipe(Stream.provideService(PreparedHeaders, prepared))
-              )
+          prepareStream(
+            presenceClient
+              .room({ clientId, principal, ...payload, ...fence })
+              .pipe(Stream.catchCause((cause) => Stream.failCause(Cause.map(cause, lift))))
+          )
         ),
       track: (payload) =>
-        Effect.flatMap(epoch, (fence) => presenceClient.track({ clientId, principal, ...payload, ...fence }))
+        prepareEffect(
+          Effect.flatMap(epoch, (fence) => presenceClient.track({ clientId, principal, ...payload, ...fence })).pipe(
+            Effect.catchCause((cause) => Effect.failCause(Cause.map(cause, lift)))
+          )
+        )
     })
   }
 })
@@ -185,22 +196,17 @@ export const make: Effect.Effect<SyncTransport, never, RpcClient.Protocol | Scop
  * `Protocol.SyncRpcs` with `RpcServer.layerHttp({ protocol: "http" })` and `RpcSerialization.layerNdjson`.
  *
  * `headers` (INV-LOOP-8 Credentials) is evaluated on every outgoing HTTP request: each push, each
- * pull, and each (re)connect of a stream. It is applied to the HTTP client under the RPC protocol, so
- * every RPC on this protocol (including streams added later, such as presence `room`) carries the
- * credential current at the moment it is sent; nothing is cached across requests. A stream's
- * (re)connect resolves them first (`SyncTransport.pokes`, presence `room`) and its request uses that
- * result.
+ * pull, and each (re)connect of a stream. Transport.make resolves them before RPC, then the HTTP
+ * client applies the prepared value. Nothing is cached across requests.
  *
  * Anything `headers` raises is a local acquisition failure (SPEC §10): the request is not sent
- * and the call fails with a transport `RpcClientError` (an HTTP `TransportError` carrying
- * `CredentialsUnavailable`), retried like a network failure and never a server defect.
+ * and the call fails with `CredentialsUnavailable`, never an error inferred from a fetch rejection.
  */
 export const layerProtocolHttp = (
   url: string,
   headers?: Effect.Effect<Headers.Input>
 ): Layer.Layer<RpcClient.Protocol> => {
-  // `RpcClient.layerProtocolHttp` with the request transform inlined: its `transformClient` option
-  // cannot add the HTTP error the credential step may raise.
+  // Credential execution belongs to make, before the RPC boundary, not to this HTTP transform.
   const protocol = Layer.effect(RpcClient.Protocol)(
     Effect.flatMap(HttpClient.HttpClient, (base) => {
       // Refuse authentication statuses before RPC reads the body; leave all other statuses alone.
@@ -212,17 +218,7 @@ export const layerProtocolHttp = (
         HttpClient.mapRequestEffect(client, (request) =>
           Effect.gen(function* () {
             const prepared = yield* PreparedHeaders
-            const current =
-              prepared ??
-              (yield* acquire(headers).pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new HttpClientError.HttpClientError({
-                      reason: new HttpClientError.TransportError({ request, cause, description: cause.message })
-                    })
-                )
-              ))
-            return HttpClientRequest.setHeaders(request, current)
+            return prepared === undefined ? request : HttpClientRequest.setHeaders(request, prepared)
           })
         )
       )

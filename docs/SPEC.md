@@ -499,18 +499,26 @@ was recorded at. The ledger is what makes a push idempotent and what a pull acks
   `UnknownMutation | ArgsDecodeFailed | RowNotFound | RowAlreadyExists | ScopeForbidden |
   InvalidRow | DomainError | ConstraintViolated | ClientExpired | ClockSkew`. Every outcome carries a
   `Position`.
-- INV-MUT-3: Classification is over the whole cause of a handler run: a defect anywhere is a
-  defect (the request dies; nothing is ledgered); otherwise a `StoreUnavailable` or a `SqlError`
-  other than an integrity violation (INV-MUT-6) anywhere is transient (`MutationTransient`; nothing is ledgered); otherwise the first domain
-  failure in cause order is the rejection, and every domain failure in the cause MUST encode or
-  the run dies. An error the mutation did not declare is a defect, never a `DomainError`.
+- INV-MUT-3: Classification is over the whole cause of a handler run: interruption or any
+  application defect preserves the whole cause (nothing is ledgered). Handler store failures
+  MUST carry the stage-owned `StoreOperationFailure{reason: StoreError}` envelope; only these
+  failures are classified as store-origin. A store-origin `StoreUnavailable` is transient
+  (`MutationTransient`; nothing is ledgered); otherwise the first rejection in cause order is
+  recorded, and every domain failure in the cause MUST encode or the run dies. Declared domain
+  values, including actual engine error instances, MUST follow domain encoding, not constructor
+  inference. An error the mutation did not declare is a defect, never a `DomainError`.
 - INV-MUT-4: A rejected mutation MUST leave none of its writes behind (body in a savepoint) and
   MUST be ledgered with its outcome and a position.
-- INV-MUT-5: Retry on conflict: an attempt whose cause holds no defect and holds a conflict
-  anywhere (SQLSTATE `40001`, a deadlock, a unique violation, or a `StoreUnavailable` prefixed
-  `SerializationError:`/`DeadlockError:`, or `ConstraintViolated{unique}`) is retried under
+- INV-MUT-5: Retry on conflict: an attempt whose cause holds no defect or interruption and holds
+  a conflict anywhere (SQLSTATE `40001`, a deadlock, a unique violation, or a store-origin
+  `StoreUnavailable{reason: SerializationConflict | Deadlock}`, or `ConstraintViolated{unique}`) is retried under
   `Schedule.exponential("10 millis")` up to 4 times (5 attempts). The body MUST NOT be rerun once
-  a permanent unique violation is being recorded.
+  a permanent unique violation is being recorded. Missing `StoreUnavailable.reason` means
+  generic unavailability; diagnostic message prefixes MUST NOT determine retry eligibility.
+
+  **Rationale (2026-10-27):** Constructors and schema identifiers identify representations,
+  not execution origin; stage-owned envelopes preserve application defects and retry safety
+  while keeping wire and durable codes unchanged. Diagnostic text is not a retry protocol.
 - INV-MUT-6: A unique violation that survives the retries is a permanent
   `Rejected{ConstraintViolated{unique, constraint}}`, recorded in a fresh transaction with the
   same identity check and the same conflict retry but with the body replaced by the rejection;
@@ -955,10 +963,16 @@ omitting it receive legacy server-time behavior, subject to the same `clientPoli
 - INV-PUSH-2: The server MUST answer with the processed prefix in order; fewer results than
   mutations means a transient stop at the first missing one, never an error, and the client
   retries from there.
-- INV-PUSH-3: A `SqlError`, failed or died, anywhere in authentication or the batch (lost
-  connection, pool exhausted) MUST reach the client as a short or empty `results` list, never as
-  a defect the client would halt on; any other defect, from `principalFor` or a handler, is a
-  server defect and halts the client's push (INV-LOOP-3).
+- INV-PUSH-3: Typed SQL failures and SQL defects identified at the transaction lifecycle
+  boundary, outside its protected body, MUST reach the client as a short or empty `results`
+  list (lost connection, pool exhausted). Application/authentication defects, including
+  `die(SqlError)`, MUST remain defects and halt the client's push (INV-LOOP-3). Any other
+  defect or interruption anywhere retains precedence and the whole cause; interruption MUST
+  NOT become a successful short push.
+
+  **Rationale (2026-10-27):** Protecting the body's cause distinguishes SQL introduced by
+  transaction cleanup from application defects; classifying every SQL-shaped defect as
+  infrastructure concealed bugs and could discard adjacent interruption.
 - INV-PUSH-4: Request-level refusals are `Unauthorized`, `MalformedEnvelope`, `ClientOutdated`
   and the epoch-carrying `ResnapshotRequired` (INV-PULL-15, INV-CLI-14); `MalformedEnvelope`
   and the epoch refusal execute and record nothing.
@@ -1254,7 +1268,10 @@ a leader-owned, server-fenced room membership with process-local state on the se
 - INV-LOOP-5: Classification is over the whole cause: for push, a defect beats a halting failure
   beats the first failure; for pull, a defect is transient `server`. When push and pull both fail
   transiently in one cycle, `lastError` is push's, unless pull's kind is `server-outdated`, which
-  overrides.
+  overrides. Typed transport-error lifting MUST retain adjacent reasons and interruption.
+  The explicit RPC defect conversion remains: a non-interrupted cause containing a defect
+  becomes one `PushIntegrityError{serverDefect}` or `PullProtocolError`, preserving its verdict
+  rather than its individual reasons. Interrupted causes MUST pass through without conversion.
 
   **Rationale (2026-10-23):** One typed `SyncFailure` union is classified once so status kind,
   halt reason and telemetry agree; separate walks of transport `reason` strings in the engine,
@@ -1269,7 +1286,13 @@ a leader-owned, server-fenced room membership with process-local state on the se
   Reconnecting does not wake the loop; the server's first poke on every stream, emitted right
   after `LISTEN` is in place, covers anything missed while disconnected.
 - INV-LOOP-8: `syncHeaders` is evaluated once per outgoing request (push, pull, every stream
-  (re)connect); its evaluation is not counted against `idleTimeout`.
+  (re)connect), before entering the RPC request; its evaluation is not counted against
+  `idleTimeout`. Only this preparation stage produces `credentials`; an arbitrary fetch
+  rejection, even an actual `CredentialsUnavailable` instance, remains `network`.
+
+  **Rationale (2026-10-27):** Preparing credentials before RPC preserves stage provenance
+  without inspecting arbitrary fetch exceptions; constructor identity cannot establish where
+  a failure occurred.
 
   **Rationale (2026-10-21):** Credential refresh belongs to the app and runs through an Effect
   per request rather than frozen transport-construction headers; `Unauthorized` is retried
@@ -1456,7 +1479,11 @@ replica.
   lands on INV-CLI-4: one outbox row); `subscribe`, `subscribeSnapshot`, `notices`, `syncStatus` and `presence`
   resubscribe on a defect-free all-`LeaderLost` cause and emit nothing in between;
   `subscribeRaw` ends. A cause with a defect beside `LeaderLost` is not a handover and passes
-  through.
+  through. RPC failure normalization MUST wrap concrete connection methods, preserving their
+  compound causes, never infer transport provenance from arbitrary routing callback failures.
+
+  **Rationale (2026-10-27):** Concrete RPC methods own transport failures; callback-wide
+  classification incorrectly reinterpreted application errors with the same constructor.
 
   **Rationale (2026-10-22):** Cause-preserving recovery was chosen because `Stream.catchIf`
   re-fails nonmatching errors bare and could drop a defect beside `LeaderLost`; resubscription
@@ -1959,6 +1986,12 @@ underlying error tags, status kinds and safe status messages are preserved. Opt-
 causes now contain the underlying error directly, not the removed wrapper's tag, nesting or
 rendered stack. Raw diagnostic representation is not the stable app-facing status contract.
 
+`StoreOperationFailure` is a handler-local provenance envelope, not a wire, durable or status
+code: its `reason` projects to the existing store codes below. Recover through
+`Effect.catchReason("StoreOperationFailure", "RowNotFound", ...)`; rethrow the envelope to
+retain provenance. PostgreSQL `StoreUnavailable` retains the original SQL error as a
+non-schema diagnostic cause, never as a retry discriminator.
+
 | code (`_tag` unless marked `name`) | fields | raised by | push halt / recovery | retained notice or app failure/status | telemetry outcome at observation point |
 |---|---|---|---|---|---|
 | `ResnapshotRequired` | `reason: gcHorizon \| unknownCursor \| staleContinuation, epoch?: string` | all sync RPCs (history fence); pull (retention/continuation) | no; with epoch: reset history and resnapshot preserving intent (INV-CLI-14); without: INV-CLI-10; pokes wakes pull, presence retries | —; unhandled initial pull failure: status(server); history refusal never exhausts intent | `resnapshot` on failed sync RPC/pull and successful client pull recovery; handled client push refusal `stopped` |
@@ -1978,7 +2011,7 @@ rendered stack. Raw diagnostic representation is not the stable app-facing statu
 | `ClientExpired` | `mutationId` | server ledger | no; settle immediately on push receipt | OutcomeUnknown | batch result |
 | `ClockSkew` | `createdAt, serverNow` | server ledger | no; settle on covering ack | Rejected | batch result |
 | `TransientExhausted` | `attempts, message` | client after 8 short-prefix answers | no; release through rebase and continue | Rejected; message `the server stopped the push batch at a transient failure` | exhausting batch `stopped`; not a server outcome |
-| `StoreUnavailable` | `message` | core storage | no; retry | —; status(server) or failed enqueue | `server` on client sync/enqueue; server batch stops |
+| `StoreUnavailable` | `message, reason?: SerializationConflict \| Deadlock \| Unavailable` | core storage | no; retry | —; status(server) or failed enqueue | `server` on client sync/enqueue; server batch stops |
 | `CorruptStorage` | `table, id, cause` | core stored-data decode | halt if push defect; pull retries | —; defect | `defect` |
 | `UnknownQuery` | `name` | client query lookup | no | —; method/stream failure | — |
 | `QueryArgsDecodeFailed` | `name, message` | client query decode | no | —; method/stream failure | — |
@@ -2282,6 +2315,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 
 ### Retired rules
 
+- **Retired (2026-10-27):** Constructor-based handler provenance, message-prefix conflict retries and blanket SQL-defect transient handling; stage-owned boundaries supersede them (INV-MUT-3/5, INV-PUSH-3).
 - **Retired (2026-10-26):** Hard 1 MiB rejection of indivisible pull data (former INV-PULL-18); minimum candidates now exceed the target rather than strand accepted data.
 - **Retired (2026-10-25):** One SQLite statement per installed upsert (former INV-PERF-4 cost); consecutive same-table runs now use parameter-bounded multi-row upserts (§9.4), with unchanged atomicity and row order.
 
@@ -2319,9 +2353,9 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-ACL-8 | covered | `rpc.test` "push, pull and pokes authenticated as * are Unauthorized before they bind or ledger"; `presence.test` "room and track authenticated as * are Unauthorized and install no presence entry" |
 | INV-MUT-1 | covered | `ledger.test` "a resubmitted envelope (lost response) returns the recorded outcome and position without re-executing", "concurrent submissions of one envelope run the body once and agree on outcome and position", "concurrent duplicates from an already-registered client commit one effect and one ledger row" |
 | INV-MUT-2 | partial | `Transport.test` "a processed push returns core's result; a rejection keeps its class and fields" (closedness of the set is type-level only) |
-| INV-MUT-3 | covered | `Mutation.test` "a domain failure combined with a defect dies with the defect, never a Rejected outcome", "StoreUnavailable alongside a domain failure stays transient, never a permanent rejection", "an unencodable domain failure next to a valid one dies, in either order, never a DomainError"; `ledger.test` "a rejection combined with a defect is not ledgered as an ordinary rejection" |
-| INV-MUT-4 | covered | `ledger.test` "a rejected mutation records its outcome and leaves none of its writes behind" |
-| INV-MUT-5 | covered | `ledger.test` "a unique violation from a stale snapshot retries to Applied instead of stopping the batch transient", "a conflict combined with a rejection is retried, and the retry's outcome is ledgered (transient beats rejection)", "a conflict combined with a programmer defect dies without retry (defect beats transient)" |
+| INV-MUT-3 | covered | `Mutation.test` "a domain failure combined with a defect dies with the defect, never a Rejected outcome", "StoreUnavailable alongside a domain failure stays transient, never a permanent rejection", "an unencodable domain failure next to a valid one dies, in either order, never a DomainError", "engine error instances declared by a handler remain domain errors, not store or argument failures", "store-origin failures retain adjacent defects and interruption in either cause order", "handlers can recover a store reason without treating a domain lookalike as store-origin"; `ledger.test` "a rejection combined with a defect is not ledgered as an ordinary rejection", "a mutation body dying with the actual SqlError class remains a defect and rolls back", "failed rollback cannot ledger a rejection or hide an application SqlError defect"; `rpc.test` "RPC failure mapping never erases interruption or defects beside SQL and binding failures" |
+| INV-MUT-4 | covered | `ledger.test` "a rejected mutation records its outcome and leaves none of its writes behind", "a mutation body dying with the actual SqlError class remains a defect and rolls back", "failed rollback cannot ledger a rejection or hide an application SqlError defect" |
+| INV-MUT-5 | covered | `ledger.test` "a unique violation from a stale snapshot retries to Applied instead of stopping the batch transient", "a conflict combined with a rejection is retried, and the retry's outcome is ledgered (transient beats rejection)", "a conflict combined with a programmer defect dies without retry (defect beats transient)", "conflict retries use structured store reasons, never diagnostic prefixes" |
 | INV-MUT-6 | covered | `ledger.test` "a persistent unique violation is ledgered with a position instead of blocking later mutations", "a check constraint is rejected immediately without retries or partial writes" |
 | INV-MUT-7 | covered | `ledger.test` "seq < 1 is a malformed envelope: not executed, not recorded, not answered as clientExpired" |
 | INV-MUT-8 | covered | `Mutation.test` "the seeded random is a function of (clientId, mutationId), so a rebase replays identically"; `scope-create.e2e` "pull must not replace the writer timestamp with push time" |
@@ -2360,7 +2394,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-PULL-18 | covered | `pull-size.test` "UTF-8 oversized walks split without losing or duplicating rows or recording an unfinished cursor", "byte-split log pages deliver every change and intervening ack exactly once (INV-PULL-7/10/11)", "oversized rows and mixed acks complete initial and incremental pulls without losing progress", "ack-only backlogs split within the byte cap and resume without dropping or repeating outcomes", "oversized continuation metadata still resumes without recording an unfinished cursor", "a huge configured row budget still constructs at most 500 changes per candidate"; `rpc.test` "an accepted oversized row crosses streamed HTTP pull intact without hiding later rows or acks" |
 | INV-PUSH-1 | partial | `Transport.test` "push failures are fatal exactly when SPEC §10 says so, classified by real tags over a real RPC server" (includes the cap); the 50 default and the `min(…, 100)` clamp have no test |
 | INV-PUSH-2 | covered | `ledger.test` "a batch stops at a transient failure without recording it, and its resubmission continues in order"; `Transport.test` "a push batch the server stopped is reported as kind server" |
-| INV-PUSH-3 | covered | `rpc.test` "a connection lost mid-batch is a short results list, never a defect the client would halt on", "an infrastructure defect in principalFor is a transient stop (empty results), not a push failure" |
+| INV-PUSH-3 | covered | `rpc.test` "a connection lost mid-batch is a short results list, never a defect the client would halt on", "principalFor throwing the actual SqlError class remains a defect", "RPC failure mapping never erases interruption or defects beside SQL and binding failures" |
 | INV-PUSH-4 | covered | `ledger.test` "seq < 1 is a malformed envelope: not executed, not recorded, not answered as clientExpired"; `version-gate.e2e` "a client below the generated floor stops retrying, can mutate offline, and delivers the original intents after update" |
 | INV-PUSH-5 | covered | `startup.test` "body-supplied cookie and origin headers cannot change a push's HTTP principal or origin policy" |
 | INV-PUSH-6 | covered | `Leader.test` "a push whose response is lost keeps the entry pending until the pull installs its ack, and that cycle sets no lastSyncedAt"; `Simulation.test` "constraint rejections neither release before covering acks nor lose fields in retained notices; ClientExpired still releases on receipt" |
@@ -2383,11 +2417,11 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-LOOP-1 | covered | `SyncLoop.test` "a transient push failure is retried with backoff and clears once a cycle succeeds"; `Leader.test` "requestSync during backoff runs the next cycle at once and leaves a halted push halted" |
 | INV-LOOP-2 | covered | `SyncLoop.test` "lastSyncedAt stays null after a cycle whose pull failed, and is set by the first cycle that installs", "a stopped push that processed later entries cannot advance lastSyncedAt or halt push"; `Leader.test` "a push whose response is lost keeps the entry pending until the pull installs its ack, and that cycle sets no lastSyncedAt" |
 | INV-LOOP-3 | covered | `SyncLoop.test` "an integrity error halts push for good while pull keeps running"; supplementary browser scenarios cover handover and pending export |
-| INV-LOOP-4 | covered | `version-gate.e2e` "a client below the generated floor stops retrying, can mutate offline, and delivers the original intents after update"; `Transport.test` "a syncHeaders that dies is reported as kind credentials", "a fetch failure with a same-identifier foreign schema class stays network, not credentials", "a refused connection is reported as kind network, and the request's headers never reach the message", "a server Unauthorized surfaces its diagnostic reason without changing the unauthorized verdict", "HTTP auth refusals before RPC decoding report unauthorized, retry without halting, and keep the pending mutation; other statuses stay network", "a server ServerUnavailable is reported as kind unavailable" |
+| INV-LOOP-4 | covered | `version-gate.e2e` "a client below the generated floor stops retrying, can mutate offline, and delivers the original intents after update"; `Transport.test` "a syncHeaders that dies is reported as kind credentials", "a fetch failure with a same-identifier foreign schema class stays network, not credentials", "a refused connection is reported as kind network, and the request's headers never reach the message", "a server Unauthorized surfaces its diagnostic reason without changing the unauthorized verdict", "HTTP auth refusals before RPC decoding report unauthorized, retry without halting, and keep the pending mutation; other statuses stay network", "a server ServerUnavailable is reported as kind unavailable", "a fetch rejection with the actual credentials class stays network for push, pull and pokes" |
 | INV-LOOP-5 | covered | `SyncLoop.test` "a defect beside a transient failure halts push (whole-cause classification); a pull defect is transient"; `observability.e2e` "the whole final push cause remains authoritative, including typed cleanup failures" |
 | INV-LOOP-6 | covered | `Transport.test` "no syncStatus string carries a secret from the failure: syncHeaders dying with an Error or a string", "no syncStatus string carries a secret from the failure: a server Unauthorized echoing the token", "no syncStatus string carries a secret from the failure: a pull defect carrying a request body", "no syncStatus string carries a secret from the failure: a token in the request URL", "no syncStatus string carries a secret from the failure: the Halted reason of a server push defect" |
 | INV-LOOP-7 | covered | `SyncLoop.test` "the pokes stream is reconnected with backoff after a clean end, a failure and a defect; every poke wakes", "only stream elements wake: a stream with no initial poke wakes nothing until it delivers one", "a pokes stream silent past idleTimeout is ended and reconnected, and the new stream's initial poke wakes; heartbeats keep it open without waking"; `rpc.test` "an idle pokes stream carries a heartbeat at least every heartbeatInterval, and no heartbeat makes the client pull" |
-| INV-LOOP-8 | covered | `Transport.test` "a token renewed after the transport was built is used by the next push, pull and pokes reconnect, and syncHeaders runs once per request", "a pokes reconnect whose syncHeaders takes longer than idleTimeout evaluates them once, then sends once; silence after the send still ends the stream" |
+| INV-LOOP-8 | covered | `Transport.test` "a token renewed after the transport was built is used by the next push, pull and pokes reconnect, and syncHeaders runs once per request", "a pokes reconnect whose syncHeaders takes longer than idleTimeout evaluates them once, then sends once; silence after the send still ends the stream", "a fetch rejection with the actual credentials class stays network for push, pull and pokes" |
 | INV-LOOP-9 | covered | `SyncLoop.test` "status and changes wait for the first real pending count; a failed first count emits nothing until a retry counts", "a delayed first pending count holds back status and changes until it arrives; no seed 0 leaks" |
 | INV-GC-1 | covered | `gc.test` "entries younger than the retention window survive GC", "log GC never deletes ledger rows or held-scope records (would cause double apply after resnapshot)" |
 | INV-GC-2 | covered | `gc.test` "a client whose cursor GC passed must resnapshot and then converges; a client at head is unaffected", "a page set interrupted mid row walk whose position GC passed must resnapshot instead of resuming", "an unfinished page set whose log position GC passed must resnapshot instead of resuming" |
@@ -2399,7 +2433,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-BRW-1 | covered | `platform.test` "identities with all-dot segments are rejected", "an appId or profile over 255 UTF-8 bytes is refused even when the whole path fits; 255 bytes is accepted", "the longest identity whose journal path fits the pool's 512-byte path header is accepted; one more character is not"; supplementary browser path round-trip scenario |
 | INV-BRW-2 | partial | Browser single-owner, handover and OPFS-startup scenarios; no literal test-title citation |
 | INV-BRW-3 | partial | `platform.test` "a name held only in shared mode does not count as held (a dead leader's watchers)"; stale-announcement coverage is in browser scenarios only |
-| INV-BRW-4 | covered | `LeaderRoute.test` "a request issued before any leader connects must wait for one, not fail or use a stale connection", "a displaced connection must fail its in-flight request and stream with its LeaderLost, not hang", "a transport failure must surface as LeaderLost naming the leader, never as a raw RpcClientError"; `Leader.test` "mutate retried across LeaderLost after the lost leader committed leaves exactly one outbox row"; supplementary browser handover scenario |
+| INV-BRW-4 | covered | `LeaderRoute.test` "a request issued before any leader connects must wait for one, not fail or use a stale connection", "a displaced connection must fail its in-flight request and stream with its LeaderLost, not hang", "a transport failure must surface as LeaderLost naming the leader, never as a raw RpcClientError", "leader transport mapping preserves compound causes and never classifies arbitrary callback failures"; `Leader.test` "mutate retried across LeaderLost after the lost leader committed leaves exactly one outbox row"; supplementary browser handover scenario |
 | INV-BRW-5 | partial | Browser router-restart scenarios; no literal test-title citation |
 | INV-BRW-6 | covered | `Leader.test` "a query re-emits after a write to a table only its latest run read, and not after one it stopped reading", "every emission of a query is one snapshot: two tables written together never disagree", "a registered query that writes fails, commits nothing, and leaves the next mutation writable", "raw exec is refused, and writes nothing, on a leader started without allowRawExec", "raw subscribe is refused before any SQL runs on a leader started without allowRawExec" |
 | INV-BRW-7 | partial | `LeaderRoute.test` "after reset every request fails Reset: waiting, in flight (even as interruption) and later, never LeaderLost"; pending/timeout/removal coverage is in browser scenarios only |

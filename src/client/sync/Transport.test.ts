@@ -840,6 +840,40 @@ it.live("a fetch failure with a same-identifier foreign schema class stays netwo
   }).pipe(Effect.scoped)
 )
 
+it.live("a fetch rejection with the actual credentials class stays network for push, pull and pokes", () =>
+  Effect.gen(function* () {
+    const fixture = yield* credentials
+    const rejection = new SyncFailure.CredentialsUnavailable({ message: secret })
+    const fetch = Object.assign(() => Promise.reject(rejection), { preconnect: globalThis.fetch.preconnect })
+    const transport = fixture.transport
+    const exits = [
+      yield* Effect.exit(transport.push(batch(1))),
+      yield* Effect.exit(
+        Stream.runDrain(transport.pull({ clientId: Ids.ClientId.make("c"), cursor: null, continuation: Option.none() }))
+      ),
+      yield* Effect.exit(
+        Effect.flatMap(transport.pokes(Ids.ClientId.make("c"), AccessScope.PrincipalId.make("p")), Stream.runDrain)
+      )
+    ]
+    for (const exit of exits) {
+      expect(exit._tag).toBe("Failure")
+      if (exit._tag === "Failure")
+        expect(
+          Option.map(Cause.findErrorOption<SyncFailure.PushReason | SyncFailure.PullReason>(exit.cause), (e) => e._tag)
+        ).toEqual(Option.some("RpcClientError"))
+    }
+    expect((yield* errorOf({ ...fixture, fetch }))?.kind).toBe("network")
+  }).pipe(
+    Effect.provideService(
+      FetchHttpClient.Fetch,
+      Object.assign(() => Promise.reject(new SyncFailure.CredentialsUnavailable({ message: secret })), {
+        preconnect: globalThis.fetch.preconnect
+      })
+    ),
+    Effect.scoped
+  )
+)
+
 it.live(
   "a refused connection is reported as kind network, and the request's headers never reach the message",
   () =>

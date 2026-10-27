@@ -6,15 +6,24 @@ import { Errors, ScopeGrants, Store, type SyncTable } from "echo-sync"
 import * as Keyset from "../../internal/Keyset.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
-/**
- * The transient store failure for a SQL error. The reason tag leads the message so the ledger
- * can tell a conflict (retried) from other transients without a second error channel.
- */
-export const unavailable = (error: SqlError) =>
-  new Errors.StoreUnavailable({ message: `${error.reason._tag}: ${error.message}` })
+/** The adapter, not diagnostic text, decides whether an unavailable store is a conflict. */
+export const unavailable = (error: SqlError) => {
+  const failure = new Errors.StoreUnavailable({
+    message: `${error.reason._tag}: ${error.message}`,
+    reason:
+      error.reason._tag === "SerializationError"
+        ? "SerializationConflict"
+        : error.reason._tag === "DeadlockError"
+          ? "Deadlock"
+          : "Unavailable"
+  })
+  // Diagnostic only: not a schema field, so driver details cannot cross a wire codec.
+  Object.defineProperty(failure, "cause", { value: error })
+  return failure
+}
 
 export const isConflictUnavailable = (error: Errors.StoreUnavailable) =>
-  Str.startsWith("SerializationError:")(error.message) || Str.startsWith("DeadlockError:")(error.message)
+  error.reason === "SerializationConflict" || error.reason === "Deadlock"
 
 /** Quoted SQL identifier. */
 export const q = (name: string) => `"${Str.replaceAll('"', '""')(name)}"`

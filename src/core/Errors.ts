@@ -4,7 +4,9 @@ import { AccessScopeId, Role } from "./AccessScope.ts"
 /** Transient storage failure (connection, busy, serialization). Never recorded; stops the batch. */
 // oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
 export class StoreUnavailable extends Schema.TaggedError<StoreUnavailable>()("StoreUnavailable", {
-  message: Schema.String
+  message: Schema.String,
+  /** Absent on legacy/custom adapters means unavailable, never a conflict inferred from text. */
+  reason: Schema.optional(Schema.Literals(["SerializationConflict", "Deadlock", "Unavailable"]))
 }) {}
 
 // oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.

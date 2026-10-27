@@ -5,6 +5,7 @@ import { assertPrincipal, registerClient } from "./ledger.ts"
 import { checkEpoch } from "./epoch.ts"
 import { decodeRow, q, selectList } from "./rowStore.ts"
 import { type Resolved, resolveTables } from "./schema.ts"
+import { withTransaction } from "./transaction.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
 /** Keyset position of a scope row walk: rows are walked in `(table, id)` code-point order. */
@@ -129,7 +130,8 @@ export const pull = Effect.fnUntraced(function* (
     return yield* stale
   }
 
-  const response = yield* sql.withTransaction(
+  const response = yield* withTransaction(
+    sql,
     Effect.gen(function* () {
       yield* sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`
 

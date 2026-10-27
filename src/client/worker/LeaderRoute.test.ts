@@ -1,5 +1,5 @@
 import { expect, it } from "@effect/vitest"
-import { Deferred, Effect, Exit, Fiber, Option, Schema, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Option, Schema, Stream } from "effect"
 import { RpcClientDefect, RpcClientError } from "effect/rpc/RpcClientError"
 import * as LeaderRoute from "./LeaderRoute.ts"
 import { type LeaderInfo, LeaderUnavailable } from "./LeaderRpcs.ts"
@@ -107,6 +107,49 @@ it.effect("a transport failure must surface as LeaderLost naming the leader, nev
     expect(Option.map(unavailable(exit), (e) => [e.reason, e.message])).toEqual(
       Option.some(["LeaderLost", "leader a went away: RpcClientDefect: port closed"])
     )
+  })
+)
+
+it.effect("leader transport mapping preserves compound causes and never classifies arbitrary callback failures", () =>
+  Effect.gen(function* () {
+    const transport = new RpcClientError({ reason: new RpcClientDefect({ message: "closed", cause: null }) })
+    const failure = Cause.makeFailReason(transport)
+    for (const other of [Cause.makeDieReason("bug"), Cause.makeInterruptReason(123)]) {
+      for (const reasons of [
+        [failure, other],
+        [other, failure]
+      ]) {
+        const route = LeaderRoute.makeUnsafe()
+        const cause = Cause.fromReasons(reasons)
+        route.publish(
+          yield* connected(
+            "a",
+            leader(
+              () => Effect.failCause(cause),
+              () => Stream.failCause(cause)
+            )
+          )
+        )
+        const exits = [
+          yield* Effect.exit(route.withLeader((client) => client.leaderInfo())),
+          yield* Effect.exit(Stream.runDrain(route.streamWithLeader((client) => client.syncStatus())))
+        ]
+        for (const exit of exits) {
+          expect(exit._tag).toBe("Failure")
+          if (exit._tag === "Failure") {
+            expect(exit.cause.reasons).toContain(other)
+            expect(exit.cause.reasons).toHaveLength(2)
+            expect(reasonOf(exit)).toBe("LeaderLost")
+          }
+        }
+        const callback = yield* Effect.exit(route.withLeader(() => Effect.failCause(cause)))
+        expect(callback).toEqual(Exit.failCause(cause))
+        const callbackStream = yield* Effect.exit(
+          Stream.runDrain(route.streamWithLeader(() => Stream.failCause(cause)))
+        )
+        expect(callbackStream).toEqual(Exit.failCause(cause))
+      }
+    }
   })
 )
 

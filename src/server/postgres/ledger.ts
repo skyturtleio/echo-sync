@@ -4,6 +4,7 @@ import { SqlClient } from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
 import { Errors, Ids, Mutation, Protocol, Store } from "echo-sync"
 import { isConflictUnavailable } from "./rowStore.ts"
+import { isCleanupFailure, withTransaction } from "./transaction.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
 type MutationOutcome = Mutation.MutationOutcome
@@ -94,9 +95,9 @@ const isConflict = (error: unknown) =>
 /** A reason that makes the attempt a defect (INV-MUT-3 precedence: defect > transient > rejection). */
 const isDefectReason = (r: Cause.Reason<unknown>) =>
   Cause.isInterruptReason(r) ||
-  // The pinned SqlClient raises savepoint/rollback cleanup failures on a dead connection as
-  // defects carrying a SqlError; those are connection failures, i.e. transient.
-  (Cause.isDieReason(r) && !isSqlError(r.defect))
+  // Only the transaction boundary can identify a cleanup failure. A body dying with the
+  // actual SqlError class is still a programmer defect.
+  (Cause.isDieReason(r) && !isCleanupFailure(r.defect))
 
 /**
  * A failed attempt with its whole cause. `Effect.retry` looks only at the first typed failure,
@@ -185,7 +186,13 @@ const classify = (
   if (Arr.some(cause.reasons, isDefectReason)) return die
   const failure = Option.getOrUndefined(
     Arr.findFirst(
-      Arr.map(cause.reasons, (r) => (Cause.isFailReason(r) ? r.error : Cause.isDieReason(r) ? r.defect : undefined)),
+      Arr.map(cause.reasons, (r) =>
+        Cause.isFailReason(r)
+          ? r.error
+          : Cause.isDieReason(r) && isCleanupFailure(r.defect)
+            ? r.defect.cause
+            : undefined
+      ),
       // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve the nominal infrastructure/domain failure boundary.
       (e) => isSqlError(e) || e instanceof Errors.StoreUnavailable
     )
@@ -288,7 +295,8 @@ export const runMutation = <R>(
 
     let bodyUniqueRejection = false
     let rejectionToRecord: Mutation.MutationRejection | undefined
-    const execute = sql.withTransaction(
+    const execute = withTransaction(
+      sql,
       Effect.gen(function* () {
         bodyUniqueRejection = false
         // SERIALIZABLE, first statement of every attempt: handlers read-modify-write through the
@@ -341,7 +349,7 @@ export const runMutation = <R>(
         }
 
         const attemptBody = rejectionToRecord === undefined ? body : Effect.fail(rejectionToRecord)
-        const outcome: MutationOutcome = yield* sql.withTransaction(attemptBody).pipe(
+        const outcome: MutationOutcome = yield* withTransaction(sql, attemptBody).pipe(
           Effect.as<MutationOutcome>({ _tag: "Applied" }),
           // A rejection combined with anything else (e.g. a defect in a finalizer) is not a
           // rejection: it must not be ledgered as one.

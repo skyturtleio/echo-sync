@@ -15,7 +15,7 @@ import {
 } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { SqlError, UnknownError } from "effect/sql/SqlError"
-import { AccessScope, Ids, Mutation, Registry, Store, SyncTable } from "echo-sync"
+import { AccessScope, Errors, Ids, Mutation, Registry, Store, SyncTable } from "echo-sync"
 import { runBatch, runMutation } from "./ledger.ts"
 import * as RowStore from "./rowStore.ts"
 import { resolveTables } from "./schema.ts"
@@ -119,6 +119,63 @@ const storedBody = (mutation: Mutation.AnyMutation, args: Schema.Json) =>
   })
 
 describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
+  it.live("conflict retries use structured store reasons, never diagnostic prefixes", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient
+      const serialization = RowStore.unavailable(yield* Effect.flip(serializationFailure))
+      const deadlock = RowStore.unavailable(
+        yield* Effect.flip(sql`DO $$ BEGIN RAISE EXCEPTION 'deadlock' USING ERRCODE = '40P01'; END $$`)
+      )
+      assert.strictEqual(serialization.reason, "SerializationConflict")
+      assert.strictEqual(deadlock.reason, "Deadlock")
+      assert.isDefined(serialization.cause)
+      const encoded = yield* Schema.encodeEffect(Schema.toCodecJson(Errors.StoreUnavailable))(serialization)
+      assert.deepStrictEqual(encoded, {
+        _tag: "StoreUnavailable",
+        message: serialization.message,
+        reason: "SerializationConflict"
+      })
+      for (const [error, expected] of [
+        [new Errors.StoreUnavailable({ message: "SerializationError: ordinary outage" }), 1],
+        [new Errors.StoreUnavailable({ message: "localized", reason: "SerializationConflict" }), 3],
+        [new Errors.StoreUnavailable({ message: "localized", reason: "Deadlock" }), 3],
+        [new Errors.StoreUnavailable({ message: "DeadlockError: ordinary outage", reason: "Unavailable" }), 1]
+      ] as const) {
+        let attempts = 0
+        const body = Effect.suspend(() => {
+          attempts++
+          return Effect.andThen(appendEffect("x"), Effect.fail(error))
+        })
+        const result = yield* Effect.flip(runMutation(env("retry", 1n), body, fastRetry))
+        assert.strictEqual(result._tag, "MutationTransient")
+        assert.strictEqual(attempts, expected)
+        assert.strictEqual(yield* counterBody, "")
+        assert.deepStrictEqual(yield* ledgerIds, [])
+      }
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Disposable database test root.
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("a mutation body dying with the actual SqlError class remains a defect and rolls back", () =>
+    Effect.gen(function* () {
+      let attempts = 0
+      const body = Effect.suspend(() => {
+        attempts++
+        return Effect.andThen(appendEffect("x"), Effect.die(sqlDefect))
+      })
+      const exit = yield* Effect.exit(runMutation(env("die", 1n), body, fastRetry))
+      assert.isTrue(Exit.hasDies(exit))
+      if (exit._tag === "Failure") {
+        assert.isFalse(Cause.hasFails(exit.cause))
+        assert.isTrue(Arr.some(exit.cause.reasons, (r) => Cause.isDieReason(r) && r.defect === sqlDefect))
+      }
+      assert.strictEqual(attempts, 1)
+      assert.strictEqual(yield* counterBody, "")
+      assert.deepStrictEqual(yield* ledgerIds, [])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Disposable database test root.
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
   it.live("a persistent unique violation is ledgered with a position instead of blocking later mutations", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient
@@ -255,9 +312,9 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
               })
             }
           }).pipe(
-            Effect.catchTag("ConstraintViolated", (error) => {
+            Effect.catchReason("StoreOperationFailure", "ConstraintViolated", (error, failure) => {
               if (error.kind === "unique") uniqueFailures++
-              return Effect.fail(error)
+              return Effect.fail(failure)
             })
           )
       })
@@ -432,6 +489,42 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
         assert.strictEqual(yield* counterBody, "")
         // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
       }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("failed rollback cannot ledger a rejection or hide an application SqlError defect", () =>
+    Effect.gen(function* () {
+      for (const defect of [false, true]) {
+        let attempts = 0
+        const body = Effect.gen(function* () {
+          attempts++
+          const sql = yield* SqlClient
+          yield* appendEffect("x")
+          const [self] = yield* sql<{ pid: number }>`SELECT pg_backend_pid() AS pid`
+          yield* Effect.scoped(
+            Effect.flatMap(sql.reserve, (other) =>
+              other.execute("SELECT pg_terminate_backend($1)", [self?.pid], undefined)
+            )
+          )
+          return yield* defect ? Effect.die(sqlDefect) : Effect.fail(rejection)
+        })
+        const exit = yield* Effect.exit(runMutation(env("failed-cleanup", 1n), body, fastRetry))
+        assert.isTrue(Exit.isFailure(exit))
+        if (exit._tag === "Failure") {
+          if (defect) {
+            assert.isFalse(Cause.hasFails(exit.cause))
+            assert.isTrue(Arr.some(exit.cause.reasons, (r) => Cause.isDieReason(r) && r.defect === sqlDefect))
+            assert.isAbove(exit.cause.reasons.length, 1)
+          } else {
+            assert.isFalse(Cause.hasDies(exit.cause))
+            assert.strictEqual(Option.getOrUndefined(Cause.findErrorOption(exit.cause))?._tag, "MutationTransient")
+          }
+        }
+        assert.strictEqual(attempts, 1)
+        assert.deepStrictEqual(yield* ledgerIds, [])
+        assert.strictEqual(yield* counterBody, "")
+      }
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Disposable database test root.
+    }).pipe(Effect.provide(TestDatabase))
   )
 
   it.live("runMutation inside a caller's transaction is refused (its outcome would not be committed)", () =>

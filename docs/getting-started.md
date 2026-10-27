@@ -132,6 +132,14 @@ titles with a declared domain error, which the client receives as a ledger outco
 row needs `owner`. Owners grant and revoke through ordinary mutations on `ScopeGrants.ScopeGrants`,
 with `id: ScopeGrants.grantId(scope, principal)`.
 
+Handler helpers that explicitly annotate their context must use `Mutation.HandlerContext`, not
+the engine-facing `Mutation.MutationContext`. Handler store failures now carry
+`StoreOperationFailure { reason: StoreError }`: recover a missing row with
+`Effect.catchReason("StoreOperationFailure", "RowNotFound", ...)`, rather than
+`Effect.catchTag("RowNotFound", ...)`. If inspecting with `Store.isOperationFailure`, rethrow
+the envelope, not its `reason`, to preserve store provenance. Declared domain errors can use
+engine error classes without being mistaken for infrastructure failures.
+
 A handler creates a scope with `ctx.store.createScope(scopeId)` (SPEC §4). The scope id must be
 fresh, and the actor becomes its first `owner`. A second creator gets
 `ScopeForbidden { required: "owner" }`: "already exists" reads as "not yours". So does anyone

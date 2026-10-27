@@ -1,4 +1,4 @@
-import { Array as Arr, type DateTime, Effect, Option, Schema, String as Str } from "effect"
+import { Array as Arr, Cause, Data, type DateTime, Effect, Option, Schema, String as Str } from "effect"
 import {
   type AccessScopeId,
   AccessScopeId as AccessScopeIdSchema,
@@ -16,6 +16,7 @@ import {
   RowAlreadyExists,
   RowNotFound,
   ScopeForbidden,
+  type StoreError,
   type StoreUnavailable
 } from "./Errors.ts"
 import { grantId, ScopeGrants } from "./ScopeGrants.ts"
@@ -393,6 +394,60 @@ export interface EchoStore {
 
 /** The read half of `EchoStore`: what a registered query's handler gets (SPEC §12.3). */
 export type ReadStore = Pick<EchoStore, "get" | "query" | "scan">
+
+/** Issued only by the mutation store boundary, not constructed from a domain error's shape. */
+class StoreOperationFailure extends Data.TaggedError("StoreOperationFailure")<{
+  readonly reason: StoreError
+}> {}
+export type { StoreOperationFailure }
+
+export const isOperationFailure = (error: unknown): error is StoreOperationFailure =>
+  error instanceof StoreOperationFailure
+
+/** Mutation handlers recover with catchReason("StoreOperationFailure", "RowNotFound", …). */
+export interface MutationStore {
+  readonly get: <T extends AnySyncTable>(table: T, id: RowOf<T>["id"]) => Effect.Effect<RowOf<T>, StoreOperationFailure>
+  readonly insert: <T extends AnySyncTable>(table: T, row: RowOf<T>) => Effect.Effect<void, StoreOperationFailure>
+  readonly patch: <T extends AnySyncTable>(
+    table: T,
+    id: RowOf<T>["id"],
+    patch: Partial<Omit<RowOf<T>, "id">>
+  ) => Effect.Effect<void, StoreOperationFailure>
+  readonly delete: <T extends AnySyncTable>(table: T, id: RowOf<T>["id"]) => Effect.Effect<void, StoreOperationFailure>
+  readonly query: <T extends AnySyncTable>(table: T) => TableQuery<T, StoreOperationFailure>
+  readonly scan: <T extends AnySyncTable>(table: T) => Effect.Effect<ReadonlyArray<RowOf<T>>, StoreOperationFailure>
+  readonly createScope: (scopeId: AccessScopeId) => Effect.Effect<void, StoreOperationFailure>
+}
+
+/** Wrap only store execution failures; defects and interruptions retain their complete cause. */
+const wrap = <A, E extends StoreError>(effect: Effect.Effect<A, E>) =>
+  Effect.catchCause(effect, (cause) =>
+    Effect.failCause(Cause.map(cause, (reason) => new StoreOperationFailure({ reason })))
+  )
+
+const mutationQuery = <Row, E extends StoreError, Cursor>(
+  query: OrderedQuery<Row, E, Cursor>
+): OrderedQuery<Row, StoreOperationFailure, Cursor> => ({
+  contains: (field, needle) => mutationQuery(query.contains(field, needle)),
+  order: (order) => mutationQuery(query.order(order)),
+  after: (cursor) => mutationQuery(query.after(cursor)),
+  before: (cursor) => mutationQuery(query.before(cursor)),
+  take: (n) => wrap(query.take(n)),
+  first: wrap(query.first),
+  collect: wrap(query.collect)
+})
+
+export const forMutation = (store: EchoStore): MutationStore => {
+  return {
+    get: (table, id) => wrap(store.get(table, id)),
+    insert: (table, row) => wrap(store.insert(table, row)),
+    patch: (table, id, patch) => wrap(store.patch(table, id, patch)),
+    delete: (table, id) => wrap(store.delete(table, id)),
+    query: (table) => ({ withIndex: (index, range) => mutationQuery(store.query(table).withIndex(index, range)) }),
+    scan: (table) => wrap(store.scan(table)),
+    createScope: (scopeId) => wrap(store.createScope(scopeId))
+  }
+}
 
 /** Pre-image of a row, captured before the first write to it in one store instance. */
 export interface UndoImage {

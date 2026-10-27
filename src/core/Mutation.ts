@@ -6,8 +6,7 @@ import {
   RowAlreadyExists,
   RowNotFound,
   ScopeForbidden,
-  StoreUnavailable,
-  type StoreError
+  StoreUnavailable
 } from "./Errors.ts"
 import { ClientId, MutationId, Seq } from "./Ids.ts"
 import * as Store from "./Store.ts"
@@ -19,6 +18,11 @@ export interface MutationContext {
   readonly now: DateTime.Utc
   readonly random: Random.Random
   readonly store: EchoStore
+}
+
+/** Handler boundary: store failures carry explicit provenance, separate from declared domain errors. */
+export interface HandlerContext extends Omit<MutationContext, "store"> {
+  readonly store: Store.MutationStore
 }
 
 /**
@@ -142,24 +146,11 @@ export interface Mutation<Name extends string, A extends PureSchema, E extends P
   readonly args: A
   readonly error: E | Schema.Never
   readonly onExcessProperty: "error" | "ignore"
-  readonly handler: (ctx: MutationContext, args: A["Type"]) => Effect.Effect<void, E["Type"] | StoreError>
+  readonly handler: (
+    ctx: HandlerContext,
+    args: A["Type"]
+  ) => Effect.Effect<void, E["Type"] | Store.StoreOperationFailure>
 }
-
-const isStoreFailure = (e: unknown): e is StoreError | ArgsDecodeFailed =>
-  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Only engine-created errors are store failures; structural domain lookalikes must still be encoded.
-  e instanceof RowNotFound ||
-  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve nominal store/domain failure classification.
-  e instanceof RowAlreadyExists ||
-  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve nominal store/domain failure classification.
-  e instanceof ScopeForbidden ||
-  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve nominal store/domain failure classification.
-  e instanceof InvalidRow ||
-  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve nominal store/domain failure classification.
-  e instanceof ConstraintViolated ||
-  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve nominal store/domain failure classification.
-  e instanceof StoreUnavailable ||
-  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve nominal store/domain failure classification.
-  e instanceof ArgsDecodeFailed
 
 /** Turns every failure in `cause` into a defect, keeping dies and interrupts. */
 const asDefects = (cause: Cause.Cause<unknown>): Cause.Cause<never> =>
@@ -172,7 +163,10 @@ export const make = <const Name extends string, A extends PureSchema, E extends 
     readonly error?: E
     /** Reject unknown args keys by default, including nested objects. `ignore` strips them. */
     readonly onExcessProperty?: "error" | "ignore"
-    readonly handler: (ctx: MutationContext, args: A["Type"]) => Effect.Effect<void, E["Type"] | StoreError>
+    readonly handler: (
+      ctx: HandlerContext,
+      args: A["Type"]
+    ) => Effect.Effect<void, E["Type"] | Store.StoreOperationFailure>
   }
 ): Mutation<Name, A, E> => {
   const error = options.error ?? Schema.Never
@@ -194,21 +188,23 @@ export const make = <const Name extends string, A extends PureSchema, E extends 
     if (first === undefined || failures.length !== cause.reasons.length) {
       return Effect.failCause(asDefects(cause))
     }
-    // oxlint-disable-next-line effecttsgo/instance-of-schema -- A structural domain error is not an infrastructure failure.
-    const transient = Arr.findFirst(failures, (e) => e instanceof StoreUnavailable)
-    if (Option.isSome(transient)) return Effect.fail(transient.value)
+    for (const failure of failures) {
+      if (Store.isOperationFailure(failure) && failure.reason._tag === "StoreUnavailable") {
+        return Effect.fail(failure.reason)
+      }
+    }
     // Every domain failure must be declared and encodable, not only the one reported (INV-MUT-3):
     // an undeclared or unencodable domain error anywhere is a bug in the mutation, so the
     // mutation dies with the full cause. Otherwise the first failure in cause order is reported.
     return Effect.gen(function* () {
       const encoded: Array<Schema.Json> = []
       for (const e of failures) {
-        if (isStoreFailure(e)) continue
+        if (Store.isOperationFailure(e)) continue
         const result = yield* Effect.exit(encodeError(e))
         if (result._tag === "Failure") return yield* Effect.failCause(asDefects(cause))
         encoded.push(result.value)
       }
-      if (isStoreFailure(first)) return yield* Effect.fail(first)
+      if (Store.isOperationFailure(first)) return yield* Effect.fail(first.reason)
       // `first` is a domain failure, so it was encoded first.
       return yield* new DomainError({ mutation: name, error: encoded[0] ?? null })
     })
@@ -222,8 +218,11 @@ export const make = <const Name extends string, A extends PureSchema, E extends 
     execute: (ctx, args) =>
       decodeArgs(args).pipe(
         Effect.mapError((e) => new ArgsDecodeFailed({ name, message: e.message })),
-        Effect.flatMap((decoded) => options.handler(ctx, decoded)),
-        Effect.catchCause((cause) => classify(cause))
+        Effect.flatMap((decoded) =>
+          Effect.suspend(() => options.handler({ ...ctx, store: Store.forMutation(ctx.store) }, decoded)).pipe(
+            Effect.catchCause(classify)
+          )
+        )
       )
   }
 }
