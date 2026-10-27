@@ -1534,6 +1534,19 @@ conservative refresh is preferable, including for own mutations later reconciled
   interrupted fibers completed. A pre-registered ownership cell closes the grant-to-finalizer
   gap without masking native waits; assuming synchronous continuation scheduling was rejected.
 
+- INV-BRW-15: OPFS pool initialization and growth MUST register each acquired synchronous
+  access handle before yielding it to further initialization. Failure MUST release partial
+  acquisitions. Pool closure MUST be terminal: a native acquisition completing after closure
+  MUST close its handle without admitting it to the pool or continuing growth. Initialization
+  and growth waits MUST remain interruptible; closure MUST NOT wait for pending native
+  acquisitions. Native directory/file requests already in flight can still finish; this is not
+  a native-call deadline.
+
+  **Rationale (2026-10-27):** Pinned VFS creation can reject before parallel acquisitions
+  settle, and growth can finish after closure. Owning the pool before interruptible initialization
+  and reclaiming late results at native completion avoids both leaked handles and indefinitely
+  masked waits; constructor-only wrapping/subclassing cannot repair private acquisition boundaries.
+
 ### Details
 
 #### 12.1 State machine (tab client)
@@ -2397,6 +2410,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-BRW-12 | covered | `Leader.test` "snapshot provenance requires every incorporated local receipt and never certifies a rollback or an unknown gap", "every emission of a query is one snapshot: two tables written together never disagree" |
 | INV-BRW-13 | covered | `Leader.test` "snapshot provenance requires every incorporated local receipt and never certifies a rollback or an unknown gap", "reconnecting pull and rejection remain refresh-required between local commits even when their notifications coalesce", "snapshot resubscription after leader loss cannot reuse the old lifetime's local receipts" |
 | INV-BRW-14 | covered | `platform.test` "a granted lock stays owned by its scope or cancelled attempt despite scheduler delays", "a deadline after native grant releases the lock while its caller scope remains open", "interrupting a caller after lock acquisition cannot revoke ownership from its still-open scope", "an interrupted lock wait leaves the queue and never acquires the lock afterwards", "a lock wait that reaches its deadline as the holder lets go either holds the lock or leaves nothing held or queued" |
+| INV-BRW-15 | covered | `OpfsSqlite.test` "a failed OPFS pool open releases partial handles and late siblings without waiting for them", "interrupting OPFS startup finishes before native acquisition and closes its late handle", "closing an OPFS pool during growth closes late handles and never grows the closed pool", "an OPFS header initialization failure closes its handle and earlier pool files"; supplementary Chromium controls in `examples/browser-spike/opfs-lifetime.sh` |
 | INV-SCH-1 | partial | `Migrate.test` "a NOT NULL column without a default is added nullable with the SPEC §13 TODO, never SET NOT NULL", "nullable literal unions generate TEXT and an old JSON manifest requires a manual kind migration"; destructive and safe DDL groups need individual citations |
 | INV-SCH-2 | covered | `Migrate.test` "an intent naming something the diff does not contain is refused, not ignored", "a combined table and column rename is one table TODO and one column TODO, no DDL, no intent error", "an index on a renamed column is a TODO; unrelated changes in the same table stay DDL" |
 | INV-SCH-3 | covered | `Migrate.test` "migrations are numbered after the highest existing one", "scope_grants is the engine's table and is never planned; no change plans nothing"; `version-gate.e2e` "a client below the generated floor stops retrying, can mutate offline, and delivers the original intents after update" (history) |
@@ -2540,6 +2554,17 @@ uninterruptible, so an open failure must be raised before it. The pool is topped
 files even when nonempty; the VFS otherwise grows only an empty pool, and interrupted creation
 can leave too little capacity for the next write. Access handles can outlive the dead
 worker's locks briefly; the bounded `awaitOpfsPoolFree` handover wait in §12 covers that lag.
+
+The pool is scope-owned immediately after synchronous construction, before interruptible
+initialization starts. `vendor/AccessHandlePoolVFS.js` is the pinned dependency's example with
+localized ownership repairs: private acquisition loops register each native result before
+resuming header initialization, release partial failures, and close late results after terminal
+closure (INV-BRW-15). An outer wrapper/subclass cannot intercept those private completion
+boundaries. Cleanup does not rely on worker death or wait for pending native acquisitions;
+already-running native calls may still finish, with late handles reclaimed on delivery.
+`opfs-lifetime.sh` supplements the regression tests with real Chromium OPFS exclusivity and
+controlled Promise delivery; it does not prove Safari/WebKit behavior or force cancellation
+of browser-internal native operations.
 
 Lock waits register an ownership cell and scope finalizer before starting the native request.
 The grant callback either stores release in that live cell before resuming, or returns at once

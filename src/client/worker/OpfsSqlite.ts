@@ -11,18 +11,15 @@
  * The protocol (`OpfsWorkerMessage` in `@effect/sql-sqlite-wasm/src/internal/opfsWorker.ts`) is
  * internal to that package: re-verify this file on every `@effect/sql-sqlite-wasm` bump.
  */
-// Consumers type-check this file from source, so the ambient types it needs must travel with it.
-// oxlint-disable-next-line typescript/triple-slash-reference -- ambient module for an untyped JS file
-/// <reference path="./wa-sqlite-vfs.d.ts" />
 /// <reference lib="webworker" />
 // oxlint-disable-next-line import/no-namespace -- wa-sqlite's API is a namespace of functions and constants
 import * as WaSqlite from "@effect/wa-sqlite"
 import SQLiteESMFactory from "@effect/wa-sqlite/dist/wa-sqlite.mjs"
-import { AccessHandlePoolVFS } from "@effect/wa-sqlite/src/examples/AccessHandlePoolVFS.js"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Platform from "./platform.ts"
+import { AccessHandlePoolVFS } from "./vendor/AccessHandlePoolVFS.js"
 
 const Param = Schema.Union([Schema.String, Schema.Number, Schema.Null, Schema.BigInt, Schema.Uint8Array])
 const Message = Schema.Union([
@@ -63,10 +60,13 @@ export const open = (
   Effect.gen(function* () {
     const module: unknown = yield* Effect.promise(() => SQLiteESMFactory())
     const sqlite3 = WaSqlite.Factory(module)
+    // Only construction is masked: the scope owns the pool before any native acquisition.
+    // Initialization stays interruptible; the VFS closes late handles at their native completion.
     const vfs = yield* Effect.acquireRelease(
-      Platform.storageCall("opening the OPFS pool", () => AccessHandlePoolVFS.create(config.poolDirectory, module)),
+      Effect.sync(() => new AccessHandlePoolVFS(config.poolDirectory, module)),
       (pool) => Effect.promise(() => pool.close())
     )
+    yield* Platform.storageCall("opening the OPFS pool", () => vfs.isReady())
     // The VFS only adds capacity when the directory is empty. A candidate that died mid-way through
     // creating its pool leaves fewer files than SQLite needs (db + journal + temp files), and the next
     // leader would fail with SQLITE_CANTOPEN on its first write. Top the pool up instead.
@@ -77,7 +77,10 @@ export const open = (
     // Platform edge: wa-sqlite reads `mxPathname` (a plain field on its VFS base class, default 64) when
     // the VFS is registered. The pool's own header holds far longer paths; see `Platform.vfsMaxPathname`.
     vfs.mxPathname = Platform.vfsMaxPathname
-    sqlite3.vfs_register(vfs, false)
+    // The dependency declares isReady(): boolean although its OPFS example returns a Promise.
+    // Registration does not call isReady; initialization has already completed above.
+    // oxlint-disable-next-line typescript/consistent-type-assertions -- pinned wa-sqlite platform declaration mismatch
+    sqlite3.vfs_register(vfs as unknown as SQLiteVFS, false)
     const db = yield* Effect.acquireRelease(
       Effect.try({
         try: () => sqlite3.open_v2(config.dbName, undefined, config.poolDirectory),
