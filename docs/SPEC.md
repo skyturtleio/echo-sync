@@ -1325,6 +1325,11 @@ The next pull uses a null cursor while retained rows keep serving offline reads.
 and the existing atomic resnapshot install (INV-CLI-10) handle the download and replacement.
 The legacy fallback still empties every replica table and resets the cursor to null.
 
+Rollout: first ship this engine pin without changing scoped table shapes, and let clients open
+once to record manifests. A client that skips that release and first upgrades alongside a shape
+change still takes the one-time legacy fallback. No application configuration or wire revision
+is required. Incompatible tables still empty independently; this is not a general codec migration.
+
 ### Open Questions
 
 - OQ-CLI-1: A full rebase per install (Q3) has no incremental path. Whether an install should
@@ -2799,6 +2804,42 @@ the outbox guards deletion. The tombstone uses Web Crypto SHA-256 and an identit
 `~` prefix. Sibling directories and tombstones are independent.
 
 ### C.2 Browser evidence and limits
+
+Scoped shape probe (2026-10-27), clean source
+[`3882c53`](https://github.com/skyturtleio/echo-sync/commit/3882c53cdcd28905073bbe205d2a356d6859e29b):
+`examples/browser-spike/shape-migration.sh`, and `WEBKIT=1` against the WebKit driver.
+Three trials per size/path/browser, real OPFS reopen and engine, 2,377-byte synthetic flight
+JSON rows: 30 nullable minute columns, two nested airport snapshots, eight events and remarks;
+one index and one queued no-op intent. The deploy adds nullable `blockMinutes`. The before
+control removes manifests to run the unchanged former full-rebuild path. Transport is synthetic
+JSON, 400 rows/page, paced 75 ms/page (not measured network RTT); server work, worker download
+and leader election are excluded. First visibility is reopen-start through a verified count query.
+
+Medians in milliseconds, before → after:
+
+| browser / flights | first visible | refresh duration | longest refresh/push transaction upper bound | first push from reopen |
+|---|---|---|---|---|
+| Chromium 156 / 2,400 | 1,257 → 50 | 1,205 → 1,267 | 452 → 542 | 40 → 1,328 |
+| Chromium 156 / 17,000 | 8,229 → 196 | 8,071 → 8,962 | 3,021 → 3,771 | 91 → 9,215 |
+| Linux WebKit 27.2 / 2,400 | 1,244 → 123 | 1,136 → 1,186 | 395 → 437 | 89 → 1,310 |
+| Linux WebKit 27.2 / 17,000 | 7,659 → 254 | 7,456 → 7,919 | 2,538 → 2,949 | 134 → 8,225 |
+
+After-migration first-visible ranges were 49.7–50.8 / 189.2–197.2 ms in Chromium and
+99–141 / 247–259 ms in WebKit (2,400 / 17,000 rows). Whole local migration medians, an upper
+bound on its transaction hold, were 28 / 129 ms and 61 / 157 ms respectively. Refresh lock
+instrumentation brackets body-through-commit and admission-through-commit, with no competing
+requests; the reported upper bound includes admission overhead. After-change upper-bound
+ranges were 506–544 / 3,652–3,889 ms in Chromium and 432–442 / 2,895–3,063 ms in WebKit.
+All after trials retained every row offline; all before controls had zero rows until refresh
+(indefinitely if offline). Every trial checked all refreshed columns and full row payloads.
+
+Retaining rows removes the blank replica, not the long atomic-install lock. Refresh remains
+slightly more expensive because it replaces retained data, and push remains deferred for the
+whole resnapshot: roughly 1.3 s / 8–9.3 s here rather than the old immediate push. These are
+orb observations, not latency guarantees or real Safari/iPhone measurements. Chromium passed
+63/63 scenarios, 12/12 slice checks and 4/4 catalog checks; WebKit passed 12/12 slice and 4/4
+catalog checks, but 56/58 scenarios. The same two leader-handover/stale-route failures reproduced
+in the unchanged handover section on parent `2382077` (5/7), independently of this migration.
 
 Catalog probe (2026-10-27, `CATALOG_BENCH=1 examples/browser-spike/catalogs.sh`, plus `WEBKIT=1`):
 85,000 synthetic airport-shaped rows with code/name indexes, 15,333,583 decoded JSON bytes and
