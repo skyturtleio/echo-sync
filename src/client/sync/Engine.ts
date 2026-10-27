@@ -16,8 +16,8 @@
  * already contains it.
  */
 import { Array as Arr, Clock, Effect, Match, Option, Record, Schema, Semaphore, Stream } from "effect"
-import { Mutation, Protocol, Store } from "../../core/index.ts"
-import type { AccessScope, Errors, Ids, Registry, SyncTable } from "../../core/index.ts"
+import { Errors, Mutation, Protocol, Store } from "../../core/index.ts"
+import type { AccessScope, Ids, Registry, SyncTable } from "../../core/index.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 import { failureOutcome } from "../../internal/ErrorCatalog.ts"
 import type { LocalChange } from "../Provenance.ts"
@@ -161,6 +161,42 @@ const replay = (context: Context, entry: PendingMutation) =>
       yield* storage.setUndo(entry.envelope.seq, [])
     } else {
       yield* storage.setUndo(entry.envelope.seq, run.undo)
+    }
+  })
+
+/**
+ * Replay inside migration's outer SQL transaction, before any reader is admitted. Each inner
+ * transaction is a savepoint: newly introduced constraints can reject a formerly valid handler,
+ * and undoing its partial writes statement-by-statement may itself violate those constraints.
+ */
+export const replayMigrated = (context: Context) => (incompatibleCatalogs: ReadonlySet<string>) =>
+  Effect.gen(function* () {
+    const { storage, mutations, actor } = context
+    // Only this exact source-owned failure defers replay: real storage failures still abort.
+    const catalogPending = new Errors.StoreUnavailable({ message: "catalog shape awaits replacement" })
+    const guard = <A>(table: SyncTable.AnySyncTable, read: Effect.Effect<A, StoreUnavailable>) =>
+      incompatibleCatalogs.has(table.name) ? Effect.fail(catalogPending) : read
+    const rows: Store.RowStore = {
+      ...storage.rows,
+      read: (table, id) => guard(table, storage.rows.read(table, id)),
+      scan: (table) => guard(table, storage.rows.scan(table)),
+      range: (table, plan) => guard(table, storage.rows.range(table, plan))
+    }
+    for (const entry of yield* storage.pending) {
+      const undo = yield* storage
+        .transaction(
+          Effect.gen(function* () {
+            const run = yield* runHandler(rows, mutations, actor, entry.envelope, entry.createdAt)
+            if (Option.isSome(run.rejection)) return yield* Effect.fail(run.rejection.value)
+            return run.undo
+          })
+        )
+        .pipe(
+          Effect.catch((error): Effect.Effect<ReadonlyArray<Store.UndoImage>, StoreUnavailable> =>
+            error._tag === "StoreUnavailable" && error !== catalogPending ? Effect.fail(error) : Effect.succeed([])
+          )
+        )
+      yield* storage.setUndo(entry.envelope.seq, undo)
     }
   })
 

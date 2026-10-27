@@ -558,7 +558,18 @@ export const roleFromGrants =
 
 /** Restores pre-images in reverse write order. */
 export const restore = (rows: RowStore, undo: ReadonlyArray<UndoImage>) =>
-  Effect.forEach(Arr.reverse(undo), (image) => rows.write(image.table, image.id, image.before), { discard: true })
+  Effect.gen(function* () {
+    // A handler can swap unique values by using a temporary value. Its first preimages
+    // cannot be restored one at a time while the other swapped rows still exist.
+    for (const image of undo) {
+      if (image.table.manifest.unique.length > 0) yield* rows.write(image.table, image.id, Option.none())
+    }
+    for (const image of Arr.reverse(undo)) {
+      if (image.table.manifest.unique.length === 0 || Option.isSome(image.before)) {
+        yield* rows.write(image.table, image.id, image.before)
+      }
+    }
+  })
 
 /** Build the typed store over `rows`. Create one instance per handler run. */
 export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {

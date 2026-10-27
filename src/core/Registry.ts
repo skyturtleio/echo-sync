@@ -12,7 +12,7 @@ export interface SyncRegistry {
   /** Independently versioned global reference tables; never part of scope replication. */
   readonly catalogs: ReadonlyArray<AnySyncTable>
   readonly get: (name: string) => Option.Option<AnySyncTable>
-  /** Combined hashes; a `dataHash` change means "rebuild replica, keep outbox" (INV-CLI-12). */
+  /** Combined hashes; a `dataHash` change migrates locally and refreshes in the background (INV-CLI-18). */
   readonly dataHash: string
   readonly indexHash: string
 }

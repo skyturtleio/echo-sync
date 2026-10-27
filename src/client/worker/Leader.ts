@@ -93,15 +93,18 @@ const openConnection = Effect.fn("Leader.openConnection")(function* (identity: P
 /** The leader's database: `openConnection`, then the engine tables and the replica schema. */
 const openDatabase = Effect.fn("Leader.openDatabase")(function* (
   identity: Platform.ReplicaIdentity,
-  registry: Registry.SyncRegistry
+  registry: Registry.SyncRegistry,
+  mutations: Mutation.MutationRegistry,
+  actor: AccessScope.PrincipalId
 ) {
   const { sql, reactivity } = yield* openConnection(identity)
-  // Engine tables and the replica schema in one transaction (a manifest change rebuilds the replica).
-  yield* Effect.andThen(SqliteSyncStorage.migrate(registry), Outbox.pruneReleased()).pipe(
-    Effect.provideService(SqlClient.SqlClient, sql)
-  )
-  yield* Catalogs.open(sql, registry)
-  return { sql, reactivity }
+  const storage = yield* SqliteSyncStorage.make(sql, registry)
+  // Schema, restored base and replayed pending intent become visible together.
+  yield* Effect.andThen(
+    SqliteSyncStorage.migrate(registry, Engine.replayMigrated({ storage, mutations, actor })),
+    Outbox.pruneReleased()
+  ).pipe(Effect.provideService(SqlClient.SqlClient, sql))
+  return { sql, reactivity, storage }
 })
 
 /** A replica without `syncUrl`: the engine never calls its transport, because no loop runs. */
@@ -518,12 +521,11 @@ const program = Effect.fn("Leader.program")(
     }
     const dbName = Platform.dbName(identity)
     const { registry, mutations, syncUrl } = options
-    const { sql, reactivity } = yield* openDatabase(identity, registry)
+    const { sql, reactivity, storage } = yield* openDatabase(identity, registry, mutations, actor)
     const clientId = yield* Outbox.clientId.pipe(
       Effect.provideService(SqlClient.SqlClient, sql),
       Effect.flatMap(Schema.decodeUnknownEffect(Ids.ClientId))
     )
-    const storage = yield* SqliteSyncStorage.make(sql, registry)
     let loop: SyncLoop.SyncLoop | undefined
     let presence: Presence.Presence<Protocol.Forbidden> | undefined
     let engine: Engine.Engine

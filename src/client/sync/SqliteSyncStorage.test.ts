@@ -18,10 +18,12 @@ import {
   Stream
 } from "effect"
 import type { Scheduler } from "effect/Scheduler"
+import * as Reactivity from "effect/reactivity/Reactivity"
 import * as SqlClient from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation, Protocol, Registry, ScopeGrants, SyncTable } from "echo-sync"
 import * as Outbox from "../Outbox.ts"
 import * as Engine from "./Engine.ts"
+import * as Catalogs from "./Catalogs.ts"
 import * as SqliteSyncStorage from "./SqliteSyncStorage.ts"
 
 const TId = Schema.String.pipe(Schema.brand("TId"))
@@ -385,6 +387,20 @@ const reshapedT = SyncTable.make("t", {
 })
 const reshaped = Registry.make([reshapedT, SyncTable.make("u", { id: TId, accessScopeId: AccessScope.AccessScopeId })])
 
+const migrate = (next: Registry.SyncRegistry, mutations = Mutation.makeRegistry([])) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const storage = yield* SqliteSyncStorage.make(sql, next)
+    return yield* SqliteSyncStorage.migrate(
+      next,
+      Engine.replayMigrated({
+        storage,
+        mutations,
+        actor: AccessScope.PrincipalId.make("me")
+      })
+    )
+  })
+
 const page = decodePage({
   _tag: "PullPage",
   changes: [{ _tag: "upsert", table: "t", row: { id: "b", access_scope_id: "s" } }],
@@ -398,7 +414,15 @@ const seedOldReplica = Effect.gen(function* () {
   yield* storage.transaction(
     Effect.gen(function* () {
       yield* storage.rows.write(T, "a", Option.some(row("a")))
-      yield* storage.appendPending(entry(yield* storage.nextSeq, "p"))
+      yield* storage.rows.write(
+        ScopeGrants.ScopeGrants,
+        "1:s:me",
+        Option.some({ id: "1:s:me", access_scope_id: "s", principal_id: "me", role: "writer", granted_at: 0 })
+      )
+      yield* storage.appendPending({
+        ...entry(yield* storage.nextSeq, "p"),
+        undo: [{ table: T, id: "a", before: Option.some(row("a")) }]
+      })
       yield* storage.appendPending(entry(yield* storage.nextSeq, "r"))
       yield* storage.release([seqOf(2)])
       yield* storage.stage(yield* page)
@@ -441,18 +465,23 @@ const classify = Effect.gen(function* () {
     hash[0]?.value === reshaped.dataHash,
     columns.length === 3,
     hasU,
-    rowIds.length === 0,
-    meta.cursor === null,
-    !meta.resnapshot,
+    Arr.join(rowIds, ",") === "a",
+    meta.cursor === 7n,
+    meta.resnapshot,
     staged === 0,
-    undo === 0
+    undo === 1,
+    columns.length === 3 && (yield* sql<{ n: number }>`SELECT n FROM t WHERE id = 'a'`)[0]?.n === 23,
+    pending[0]?.undo[0]?.before.pipe(
+      Option.map((r) => r["n"]),
+      Option.getOrUndefined
+    ) === null
   ]
   if (kept && Arr.every(old, Boolean)) return "old"
   if (kept && Arr.every(fresh, Boolean)) return "new"
   return `mixed ${yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({ kept, old, fresh })}`
 })
 
-it.effect("an index-only change keeps rows and cursor; a data-shape change rebuilds and resets them together", () =>
+it.effect("index changes preserve rows and compatible shape changes preserve the offline base", () =>
   Effect.gen(function* () {
     yield* seedOldReplica
     expect(yield* SqliteSyncStorage.migrate(registry)).toEqual({ rebuilt: false })
@@ -473,17 +502,524 @@ it.effect("an index-only change keeps rows and cursor; a data-shape change rebui
       SyncTable.make("t", { id: TId, accessScopeId: AccessScope.AccessScopeId }, { unique: [["accessScopeId"]] })
     ])
     expect(uniqueScope.dataHash).toBe(registry.dataHash)
-    expect(yield* SqliteSyncStorage.migrate(uniqueScope)).toEqual({ rebuilt: true })
+    expect(yield* migrate(uniqueScope)).toEqual({ rebuilt: true })
     const unique = yield* SqliteSyncStorage.make(sql, uniqueScope)
     const uniqueT = Option.getOrThrow(uniqueScope.get("t"))
+    expect(yield* unique.rows.scan(uniqueT)).toEqual([row("a")])
+    yield* unique.rows.clearAll
     yield* unique.rows.write(uniqueT, "u1", Option.some(row("u1")))
     const duplicate = yield* Effect.exit(unique.rows.write(uniqueT, "u2", Option.some(row("u2"))))
     expect(duplicate._tag).toBe("Failure")
     yield* unique.rows.clearAll
 
-    expect(yield* SqliteSyncStorage.migrate(reshaped)).toEqual({ rebuilt: true })
+    expect(yield* migrate(reshaped)).toEqual({ rebuilt: true })
     expect(yield* SqliteSyncStorage.migrate(reshaped)).toEqual({ rebuilt: false })
     // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root; the test owns the database lifetime.
+  }).pipe(Effect.provide(Db))
+)
+
+it.effect("a nullable addition keeps stripped old-client rows offline and a null-cursor refresh repairs them", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const { storage } = yield* makeStorage
+    const actor = AccessScope.PrincipalId.make("me")
+    const mutations = Mutation.makeRegistry([])
+    const response = yield* decodeDone({
+      _tag: "PullDone",
+      changes: [{ _tag: "upsert", table: "t", row: { ...row("a"), n: 37 } }],
+      acks: [],
+      nextCursor: "7",
+      expiredThrough: 0
+    })
+    const old = yield* Engine.make({
+      storage,
+      registry,
+      actor,
+      mutations,
+      clientId: Ids.ClientId.make("c"),
+      transport: {
+        push: () => Effect.die("unexpected push"),
+        pull: () => Stream.make(response)
+      }
+    })
+    yield* old.pull
+    expect(yield* storage.rows.scan(T)).toEqual([row("a")]) // canonicalization stripped the backfill
+    yield* migrate(reshaped)
+    const next = yield* SqliteSyncStorage.make(sql, reshaped)
+    expect(yield* next.rows.scan(reshapedT)).toEqual([{ ...row("a"), n: null }])
+    expect(yield* next.meta).toMatchObject({ cursor: 7n, resnapshot: true })
+    const engine = yield* Engine.make({
+      storage: next,
+      registry: reshaped,
+      actor,
+      mutations,
+      clientId: Ids.ClientId.make("c"),
+      transport: {
+        push: () => Effect.die("unexpected push"),
+        pull: (request) => {
+          expect(request.cursor).toBeNull()
+          return Stream.make(response)
+        }
+      }
+    })
+    yield* engine.pull
+    expect(yield* next.rows.scan(reshapedT)).toEqual([{ ...row("a"), n: 37 }])
+    expect(yield* next.meta).toMatchObject({ cursor: 7n, resnapshot: false })
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root.
+  }).pipe(Effect.provide(Db))
+)
+
+it.effect("migration rebases offline edits with new handlers and rejection restores a new-shape undo image", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const before = SyncTable.make("edited", { id: TId, accessScopeId: AccessScope.AccessScopeId, label: Schema.String })
+    const after = SyncTable.make("edited", {
+      id: TId,
+      accessScopeId: AccessScope.AccessScopeId,
+      label: Schema.String,
+      n: Schema.NullOr(Schema.Int)
+    })
+    const airports = SyncTable.catalog("airports", { id: TId, name: Schema.String })
+    const oldRegistry = Registry.make([before])
+    const newRegistry = Registry.make([after, airports])
+    yield* migrate(oldRegistry)
+    const storage = yield* SqliteSyncStorage.make(sql, oldRegistry)
+    const actor = AccessScope.PrincipalId.make("me")
+    const scope = AccessScope.AccessScopeId.make("s")
+    const grant = yield* Schema.encodeEffect(ScopeGrants.ScopeGrants.wire)({
+      id: ScopeGrants.grantId(scope, actor),
+      accessScopeId: scope,
+      principalId: actor,
+      role: "writer",
+      grantedAt: DateTime.makeUnsafe(0)
+    })
+    yield* storage.rows.write(ScopeGrants.ScopeGrants, String(grant["id"]), Option.some(grant))
+    yield* storage.rows.write(before, "a", Option.some({ ...row("a"), label: "base" }))
+    yield* storage.setMeta({ cursor: pos(7n), pushedThrough: 0, resnapshot: false })
+    const oldMutations = Mutation.makeRegistry([
+      Mutation.make("edit", {
+        args: Schema.String,
+        handler: (ctx, label) => ctx.store.patch(before, TId.make("a"), { label })
+      })
+    ])
+    const newMutations = Mutation.makeRegistry([
+      Mutation.make("edit", {
+        args: Schema.String,
+        handler: (ctx, label) =>
+          Effect.gen(function* () {
+            // The same deploy introduces a catalog: startup must initialize it before replay.
+            const reference = yield* ctx.store.scan(airports)
+            yield* ctx.store.patch(after, TId.make("a"), { label: `${label}-new`, n: 41 + reference.length })
+          })
+      })
+    ])
+    let pushes = 0
+    const transport: Engine.Transport = {
+      pull: () => Stream.empty,
+      push: (request) => {
+        pushes++
+        return Effect.succeed({
+          results: Arr.map(request.mutations, (m) => ({
+            mutationId: m.mutationId,
+            seq: m.seq,
+            position: pos(7n),
+            outcome: { _tag: "Rejected", error: new Mutation.UnknownMutation({ mutationName: "edit" }) }
+          }))
+        })
+      }
+    }
+    const oldEngine = yield* Engine.make({
+      storage,
+      registry: oldRegistry,
+      actor,
+      mutations: oldMutations,
+      clientId: Ids.ClientId.make("c"),
+      transport
+    })
+    yield* oldEngine.mutate(mid("edit"), "edit", "local")
+    yield* migrate(newRegistry, newMutations)
+    const next = yield* SqliteSyncStorage.make(sql, newRegistry)
+    expect(yield* next.rows.scan(after)).toEqual([{ ...row("a"), label: "local-new", n: 41 }])
+    const pending = yield* next.pending
+    expect(pending[0]?.undo[0]?.before).toEqual(Option.some({ ...row("a"), label: "base", n: null }))
+    expect(yield* SqliteSyncStorage.notices(sql)).toEqual([])
+    const engine = yield* Engine.make({
+      storage: next,
+      registry: newRegistry,
+      actor,
+      mutations: newMutations,
+      clientId: Ids.ClientId.make("c"),
+      transport
+    })
+    expect(yield* engine.push).toEqual({ processed: 0, stopped: true })
+    expect(pushes).toBe(0)
+    // The real engine deliberately refuses push responses during resnapshot. Exercise its
+    // covered-rejection path after a refresh, which must undo using recaptured new-shape images.
+    yield* next.transaction(
+      Engine.applyPageSet(
+        { storage: next, registry: newRegistry, actor, mutations: newMutations },
+        [],
+        yield* decodeDone({
+          _tag: "PullDone",
+          changes: [
+            { _tag: "upsert", table: "scope_grants", row: grant },
+            { _tag: "upsert", table: "edited", row: { ...row("a"), label: "base", n: 53 } }
+          ],
+          acks: [],
+          nextCursor: "7",
+          expiredThrough: 0
+        })
+      )
+    )
+    yield* engine.push
+    expect(yield* next.rows.scan(after)).toEqual([{ ...row("a"), label: "base", n: 53 }])
+    expect(yield* next.pending).toEqual([])
+    expect((yield* SqliteSyncStorage.notices(sql)).length).toBe(1)
+    // The baseline fits the new unique set, but the queued edit does not. A partial
+    // write before its conflict must also disappear, without preventing offline open.
+    yield* next.rows.write(after, "b", Option.some({ ...row("b"), label: "base-new", n: 88 }))
+    yield* engine.mutate(mid("conflict"), "edit", "base")
+    const constrained = SyncTable.make(
+      "edited",
+      {
+        id: TId,
+        accessScopeId: AccessScope.AccessScopeId,
+        label: Schema.String,
+        n: Schema.NullOr(Schema.Int)
+      },
+      { unique: [["label"]] }
+    )
+    const conflicting = Mutation.makeRegistry([
+      Mutation.make("edit", {
+        args: Schema.String,
+        handler: (ctx, label) =>
+          Effect.gen(function* () {
+            yield* ctx.store.patch(constrained, TId.make("b"), { n: 999 })
+            yield* ctx.store.patch(constrained, TId.make("a"), { label: `${label}-new` })
+          })
+      })
+    ])
+    yield* migrate(Registry.make([constrained]), conflicting)
+    expect(yield* next.rows.scan(after)).toEqual([
+      { ...row("a"), label: "base", n: 53 },
+      { ...row("b"), label: "base-new", n: 88 }
+    ])
+    expect(Arr.map(yield* next.pending, (p) => [p.envelope.mutationId, p.undo])).toEqual([["conflict", []]])
+    expect((yield* SqliteSyncStorage.notices(sql)).length).toBe(1)
+    // Conversely, optimistic rows can fit while their baseline violates the new unique
+    // set. Restore under old constraints, then empty only the incompatible table.
+    yield* migrate(newRegistry)
+    yield* next.release(Arr.map(yield* next.pending, (p) => p.envelope.seq))
+    yield* next.rows.write(after, "a", Option.some({ ...row("a"), label: "duplicate", n: 1 }))
+    const duplicate = { ...row("b"), label: "duplicate", n: 2 }
+    yield* next.rows.write(after, "b", Option.some(duplicate))
+    yield* next.appendPending({
+      ...entry(yield* next.nextSeq, "separate"),
+      undo: [{ table: after, id: "b", before: Option.some(duplicate) }]
+    })
+    yield* next.rows.write(after, "b", Option.some({ ...duplicate, label: "distinct" }))
+    yield* migrate(Registry.make([constrained]))
+    expect(yield* next.rows.scan(after)).toEqual([])
+    expect(yield* next.rows.scan(ScopeGrants.ScopeGrants)).toEqual([grant])
+    expect((yield* next.pending)[0]?.envelope.mutationId).toBe("separate")
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root.
+  }).pipe(Effect.provide(Db))
+)
+
+it.effect("incompatible tables empty independently while drops and nullable relaxations retain exact rows", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const fixed = SyncTable.make("fixed", { id: TId, accessScopeId: AccessScope.AccessScopeId, n: Schema.Int })
+    yield* migrate(Registry.make([T, fixed]))
+    yield* sql`INSERT INTO t VALUES ('kept', 's')`
+    yield* sql`INSERT INTO fixed VALUES ('changed', 's', 19)`
+    const relaxed = SyncTable.make("fixed", {
+      id: TId,
+      accessScopeId: AccessScope.AccessScopeId,
+      n: Schema.NullOr(Schema.Int)
+    })
+    yield* migrate(Registry.make([T, relaxed]))
+    expect(yield* sql`SELECT n FROM fixed`).toEqual([{ n: 19 }])
+    const changed = SyncTable.make("fixed", {
+      id: TId,
+      accessScopeId: AccessScope.AccessScopeId,
+      n: Schema.NullOr(Schema.String)
+    })
+    yield* migrate(Registry.make([Option.getOrThrow(reindexed.get("t")), changed]))
+    expect(yield* sql`SELECT * FROM fixed`).toEqual([])
+    expect(yield* sql`SELECT id FROM t`).toEqual([{ id: "kept" }])
+    expect(
+      (yield* sql`SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 't' AND sql IS NOT NULL`).length
+    ).toBe(1)
+    yield* sql`INSERT INTO fixed VALUES ('drop', 's', 'text')`
+    const dropped = SyncTable.make("fixed", { id: TId, accessScopeId: AccessScope.AccessScopeId })
+    yield* migrate(Registry.make([T, dropped]))
+    expect(yield* sql`SELECT * FROM fixed`).toEqual([{ id: "drop", access_scope_id: "s" }])
+    // A new unique constraint incompatible with the base empties only its table.
+    yield* sql`INSERT INTO fixed VALUES ('duplicate', 's')`
+    const unique = SyncTable.make(
+      "fixed",
+      { id: TId, accessScopeId: AccessScope.AccessScopeId },
+      { unique: [["accessScopeId"]] }
+    )
+    yield* migrate(Registry.make([T, unique]))
+    expect(yield* sql`SELECT * FROM fixed`).toEqual([])
+    expect(yield* sql`SELECT id FROM t`).toEqual([{ id: "kept" }])
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root.
+  }).pipe(Effect.provide(Db))
+)
+
+it.effect("a pending unique-value swap survives migration, refresh and authoritative rejection", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const fields = { id: TId, accessScopeId: AccessScope.AccessScopeId, label: Schema.String }
+    const before = SyncTable.make("swaps", fields, { unique: [["label"]] })
+    const after = SyncTable.make("swaps", { ...fields, n: Schema.NullOr(Schema.Int) }, { unique: [["label"]] })
+    const swap = (table: typeof before | typeof after) =>
+      Mutation.makeRegistry([
+        Mutation.make("swap", {
+          args: Schema.Null,
+          handler: (ctx) =>
+            Effect.gen(function* () {
+              yield* ctx.store.patch(table, TId.make("a"), { label: "temporary" })
+              yield* ctx.store.patch(table, TId.make("b"), { label: "x" })
+              yield* ctx.store.patch(table, TId.make("a"), { label: "y" })
+            })
+        })
+      ])
+    const oldRegistry = Registry.make([before])
+    const nextRegistry = Registry.make([after])
+    yield* migrate(oldRegistry)
+    const storage = yield* SqliteSyncStorage.make(sql, oldRegistry)
+    const grant = { id: "1:s:me", access_scope_id: "s", principal_id: "me", role: "writer", granted_at: 0 }
+    yield* storage.rows.write(ScopeGrants.ScopeGrants, grant.id, Option.some(grant))
+    yield* storage.rows.write(before, "a", Option.some({ ...row("a"), label: "x" }))
+    yield* storage.rows.write(before, "b", Option.some({ ...row("b"), label: "y" }))
+    yield* storage.setMeta({ cursor: pos(7n), resnapshot: false, pushedThrough: 0 })
+    const transport: Engine.Transport = {
+      pull: () => Stream.empty,
+      push: (request) =>
+        Effect.succeed({
+          results: Arr.map(request.mutations, (m) => ({
+            mutationId: m.mutationId,
+            position: pos(7n),
+            outcome: { _tag: "Rejected", error: new Mutation.UnknownMutation({ mutationName: "swap" }) }
+          }))
+        })
+    }
+    const actor = AccessScope.PrincipalId.make("me")
+    const old = yield* Engine.make({
+      storage,
+      registry: oldRegistry,
+      actor,
+      clientId: Ids.ClientId.make("c"),
+      mutations: swap(before),
+      transport
+    })
+    yield* old.mutate(mid("swap"), "swap", null)
+    const envelope = (yield* storage.pending)[0]?.envelope
+    const mutations = swap(after)
+    yield* migrate(nextRegistry, mutations)
+    const next = yield* SqliteSyncStorage.make(sql, nextRegistry)
+    const optimistic = [
+      { ...row("a"), label: "y", n: null },
+      { ...row("b"), label: "x", n: null }
+    ]
+    expect(yield* next.rows.scan(after)).toEqual(optimistic)
+    expect((yield* next.pending)[0]?.envelope).toEqual(envelope)
+    expect((yield* next.pending)[0]?.undo.length).toBe(2)
+    const base = [
+      { ...row("a"), label: "x", n: 11 },
+      { ...row("b"), label: "y", n: 29 }
+    ]
+    yield* next.transaction(
+      Engine.applyPageSet(
+        { storage: next, registry: nextRegistry, actor, mutations },
+        [],
+        yield* decodeDone({
+          _tag: "PullDone",
+          changes: [
+            { _tag: "upsert", table: "scope_grants", row: grant },
+            ...Arr.map(base, (value) => ({ _tag: "upsert", table: "swaps", row: value }))
+          ],
+          acks: [],
+          nextCursor: "7",
+          expiredThrough: 0
+        })
+      )
+    )
+    expect(yield* next.rows.scan(after)).toEqual([
+      { ...row("a"), label: "y", n: 11 },
+      { ...row("b"), label: "x", n: 29 }
+    ])
+    const engine = yield* Engine.make({
+      storage: next,
+      registry: nextRegistry,
+      actor,
+      clientId: Ids.ClientId.make("c"),
+      mutations,
+      transport
+    })
+    yield* engine.push
+    expect(yield* next.rows.scan(after)).toEqual(base)
+    expect(yield* next.pending).toEqual([])
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root.
+  }).pipe(Effect.provide(Db))
+)
+
+it.effect("incompatible catalog reads defer only dependent migration replay and never swallow handler defects", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const reactivity = yield* Reactivity.make
+    const before = SyncTable.make("edits", { id: TId, accessScopeId: AccessScope.AccessScopeId, label: Schema.String })
+    const after = SyncTable.make("edits", { ...before.fields, n: Schema.NullOr(Schema.Int) })
+    const airport = SyncTable.catalog("airports", { id: TId, name: Schema.String })
+    const expanded = SyncTable.catalog(
+      "airports",
+      { ...airport.fields, code: Schema.String },
+      { indexes: { by_code: ["code"] } }
+    )
+    const oldRegistry = Registry.make([before, airport])
+    const nextRegistry = Registry.make([after, expanded])
+    yield* migrate(oldRegistry)
+    const storage = yield* SqliteSyncStorage.make(sql, oldRegistry)
+    const grant = { id: "1:s:me", access_scope_id: "s", principal_id: "me", role: "writer", granted_at: 0 }
+    yield* storage.rows.write(ScopeGrants.ScopeGrants, grant.id, Option.some(grant))
+    const ids = ["read", "scan", "range", "other"]
+    for (const id of ids) yield* storage.rows.write(before, id, Option.some({ ...row(id), label: "base" }))
+    yield* Catalogs.install(sql, storage, reactivity, airport, "v1", [{ id: "airport", name: "Old" }])
+    const old = yield* Engine.make({
+      storage,
+      registry: oldRegistry,
+      actor: AccessScope.PrincipalId.make("me"),
+      clientId: Ids.ClientId.make("c"),
+      mutations: Mutation.makeRegistry([
+        Mutation.make("edit", {
+          args: Schema.String,
+          handler: (ctx, id) => ctx.store.patch(before, TId.make(id), { label: "old-optimistic" })
+        })
+      ]),
+      transport: { pull: () => Stream.empty, push: () => Effect.die("unused") }
+    })
+    for (const id of ids) yield* old.mutate(mid(id), "edit", id)
+    const envelopes = Arr.map(yield* storage.pending, (pending) => pending.envelope)
+    const defect = new Error("unrelated handler defect")
+    const failed = yield* Effect.exit(
+      migrate(
+        nextRegistry,
+        Mutation.makeRegistry([Mutation.make("edit", { args: Schema.String, handler: () => Effect.die(defect) })])
+      )
+    )
+    expect(Exit.isFailure(failed)).toBe(true)
+    if (Exit.isFailure(failed))
+      expect(Arr.map(Arr.filter(failed.cause.reasons, Cause.isDieReason), (reason) => reason.defect)).toContain(defect)
+    expect(yield* storage.rows.scan(before)).toEqual(
+      Arr.map(["other", "range", "read", "scan"], (id) => ({ ...row(id), label: "old-optimistic" }))
+    )
+    const mutations = Mutation.makeRegistry([
+      Mutation.make("edit", {
+        args: Schema.String,
+        handler: (ctx, id) =>
+          Effect.gen(function* () {
+            yield* ctx.store.patch(after, TId.make(id), { label: "partial" })
+            if (id === "read") yield* ctx.store.get(expanded, TId.make("airport"))
+            if (id === "scan") yield* ctx.store.scan(expanded)
+            if (id === "range") yield* ctx.store.query(expanded).withIndex("by_code").collect
+            yield* ctx.store.patch(after, TId.make(id), { label: "new", n: 99 })
+          })
+      })
+    ])
+    yield* migrate(nextRegistry, mutations)
+    const next = yield* SqliteSyncStorage.make(sql, nextRegistry)
+    expect(Arr.map(yield* next.pending, (pending) => pending.envelope)).toEqual(envelopes)
+    expect(Arr.map(yield* next.pending, (pending) => pending.undo.length)).toEqual([0, 0, 0, 1])
+    expect(yield* sql`SELECT id, label, n FROM edits ORDER BY id`).toEqual([
+      { id: "other", label: "new", n: 99 },
+      { id: "range", label: "base", n: null },
+      { id: "read", label: "base", n: null },
+      { id: "scan", label: "base", n: null }
+    ])
+    expect(yield* sql`SELECT * FROM airports`).toEqual([{ id: "airport", name: "Old" }])
+    expect(yield* sql`SELECT value FROM echo_meta WHERE key = 'catalog:airports'`).toEqual([{ value: "v1" }])
+    expect(yield* sql`SELECT * FROM echo_notices`).toEqual([])
+    yield* Catalogs.install(sql, next, reactivity, expanded, "v2", [{ id: "airport", name: "New", code: "NEW" }])
+    yield* next.transaction(
+      Engine.applyPageSet(
+        { storage: next, registry: nextRegistry, actor: AccessScope.PrincipalId.make("me"), mutations },
+        [],
+        yield* decodeDone({
+          _tag: "PullDone",
+          changes: [
+            { _tag: "upsert", table: "scope_grants", row: grant },
+            ...Arr.map(ids, (id) => ({ _tag: "upsert", table: "edits", row: { ...row(id), label: "server", n: 12 } }))
+          ],
+          acks: [],
+          nextCursor: "7",
+          expiredThrough: 0
+        })
+      )
+    )
+    expect(yield* sql`SELECT count(*) AS n FROM edits WHERE label = 'new' AND n = 99`).toEqual([{ n: 4 }])
+    expect(Arr.map(yield* next.pending, (pending) => pending.undo.length)).toEqual([1, 1, 1, 1])
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root.
+  }).pipe(Effect.provide(Db))
+)
+
+it.effect("stored physical undo survives codec changes and legacy replicas adopt manifests or rebuild once", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const fields = {
+      id: TId,
+      accessScopeId: AccessScope.AccessScopeId,
+      flag: Schema.Boolean,
+      at: Schema.DateTimeUtc,
+      object: Schema.Struct({ nested: Schema.Array(Schema.Json) }),
+      list: Schema.Array(Schema.Int),
+      note: Schema.NullOr(Schema.String)
+    }
+    const old = SyncTable.make("physical", fields)
+    const next = SyncTable.make("physical", { ...fields, n: Schema.NullOr(Schema.Int) })
+    const oldRegistry = Registry.make([old, T])
+    yield* migrate(oldRegistry)
+    const storage = yield* SqliteSyncStorage.make(sql, oldRegistry)
+    const base = {
+      ...row("a"),
+      flag: true,
+      at: -123456,
+      object: { nested: [false, null, "café"] },
+      list: [3, -7],
+      note: null
+    }
+    yield* storage.rows.write(old, "a", Option.some(base))
+    yield* storage.rows.write(T, "kept", Option.some(row("kept")))
+    yield* storage.setMeta({ cursor: pos(7n), pushedThrough: 0, resnapshot: false })
+    yield* sql`DELETE FROM echo_meta WHERE key = 'replica_manifests'`
+    yield* migrate(oldRegistry) // unchanged legacy open adopts manifests without emptying data
+    expect(yield* storage.rows.scan(old)).toEqual([base])
+    expect((yield* sql`SELECT 1 FROM echo_meta WHERE key = 'replica_manifests'`).length).toBe(1)
+    yield* storage.appendPending({
+      ...entry(yield* storage.nextSeq, "physical"),
+      undo: [{ table: old, id: "a", before: Option.some(base) }]
+    })
+    yield* storage.rows.write(
+      old,
+      "a",
+      Option.some({ ...base, flag: false, at: 98765, object: { nested: [] }, list: [], note: "optimistic" })
+    )
+    const nextRegistry = Registry.make([next, T])
+    yield* migrate(nextRegistry)
+    const after = yield* SqliteSyncStorage.make(sql, nextRegistry)
+    expect(yield* after.rows.scan(next)).toEqual([{ ...base, n: null }])
+    expect((yield* after.pending)[0]?.undo).toEqual([]) // unknown new handler retains intent only
+    // A pre-manifest replica encountering a changed shape still uses the documented old fallback.
+    yield* sql`DELETE FROM echo_meta WHERE key = 'replica_manifests'`
+    yield* migrate(oldRegistry)
+    expect(yield* storage.rows.scan(old)).toEqual([])
+    expect(yield* storage.rows.scan(T)).toEqual([])
+    expect(yield* storage.meta).toMatchObject({ cursor: null, resnapshot: false })
+    expect((yield* storage.pending).length).toBe(1)
+    expect(yield* migrate(oldRegistry)).toEqual({ rebuilt: false })
+    // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root.
   }).pipe(Effect.provide(Db))
 )
 
@@ -513,7 +1049,13 @@ it("a data-shape migration interrupted at any scheduler boundary leaves the old 
       })
     }
     const state = { settled: false }
-    const migrating = run(SqliteSyncStorage.migrate(reshaped), { scheduler, signal: controller.signal }).finally(
+    const mutations = Mutation.makeRegistry([
+      Mutation.make("t", {
+        args: Schema.Json,
+        handler: (ctx) => ctx.store.patch(reshapedT, TId.make("a"), { n: 23 })
+      })
+    ])
+    const migrating = run(migrate(reshaped, mutations), { scheduler, signal: controller.signal }).finally(
       () => (state.settled = true)
     )
     if (yielded) controller.abort()
@@ -535,7 +1077,7 @@ it("a data-shape migration interrupted at any scheduler boundary leaves the old 
 it.effect("after a rebuild, installing the null-cursor set replays pending on top of it and recaptures undo", () =>
   Effect.gen(function* () {
     yield* seedOldReplica
-    expect(yield* SqliteSyncStorage.migrate(reshaped)).toEqual({ rebuilt: true })
+    expect(yield* migrate(reshaped)).toEqual({ rebuilt: true })
     const sql = yield* SqlClient.SqlClient
     const storage = yield* SqliteSyncStorage.make(sql, reshaped)
     const tTable = Option.getOrThrow(reshaped.get("t"))

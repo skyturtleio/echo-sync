@@ -2,9 +2,9 @@
  * The SQLite `ReplicaRowStore` (SPEC §4, §9, §3) over the leader's single connection.
  *
  * Contract (core `Store.RowStore`): every method runs inside a transaction the caller owns and never
- * begins or commits one; no authorization; the only typed failure is the transient `StoreUnavailable`.
- * A SQL error the driver marks retryable maps to `StoreUnavailable`; any other SQL error (a constraint
- * violation, a syntax error) or a stored row that does not decode is a bug or corruption, so a defect.
+ * begins or commits one; no authorization. Retryable SQL errors map to `StoreUnavailable`;
+ * write constraints map to `ConstraintViolated` for local rejection/undo. Other SQL errors and
+ * stored rows that do not decode are bugs or corruption, so defects.
  *
  * Values cross into SQL only through the derived codecs: rows through `table.sqlite.row`, index plan
  * values (wire values) through their key column's `column.sqlite`, so booleans bind as 0/1 and
@@ -28,6 +28,21 @@ export const unavailable = <A, R>(
 ): Effect.Effect<A, Errors.StoreUnavailable, R> =>
   Effect.catch(effect, (error) =>
     error.isRetryable ? Effect.fail(new Errors.StoreUnavailable({ message: error.message })) : Effect.die(error)
+  )
+
+// A declared constraint may reject optimistic replay after a schema deploy. Classify at the
+// write boundary so Mutation.runHandler restores partial writes without swallowing app defects.
+const writeStatement = <A, R>(effect: Effect.Effect<A, SqlError, R>) =>
+  Effect.catch(effect, (error): Effect.Effect<never, Errors.ConstraintViolated | Errors.StoreUnavailable> =>
+    error.reason._tag === "UniqueViolation" || error.reason._tag === "ConstraintError"
+      ? Effect.fail(
+          new Errors.ConstraintViolated({
+            kind: error.reason._tag === "UniqueViolation" ? "unique" : "other",
+            constraint: error.reason._tag === "UniqueViolation" ? error.reason.constraint : null,
+            message: error.message
+          })
+        )
+      : unavailable(Effect.fail(error))
   )
 
 const decodeRows = (table: Table, rows: ReadonlyArray<unknown>) =>
@@ -113,7 +128,7 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
                   Effect.die(new Error(`SqliteRowStore.write: cannot encode "${table.name}" row "${id}"`, { cause }))
                 )
               )
-            yield* unavailable(
+            yield* writeStatement(
               sql.unsafe(
                 plan.statement(1),
                 Arr.map(plan.names, (n) => stored[n] ?? null)
@@ -133,7 +148,7 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
             )
           )
         )
-        yield* unavailable(
+        yield* writeStatement(
           sql.unsafe(
             plan.statement(stored.length),
             Arr.flatMap(stored, (row) => Arr.map(plan.names, (n) => row[n] ?? null))

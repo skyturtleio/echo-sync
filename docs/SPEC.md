@@ -375,8 +375,8 @@ Domain Date/DateTime types, PostgreSQL Date bindings, millisecond precision and 
 **Hashes.** `dataHash` and `indexHash` are FNV-1a 64 over the canonical JSON of the manifest's
 data part (name, sorted columns with kind and nullability) and index part (indexes, unique
 sets). The
-registry's combined `dataHash` is the client's `clientVersion.dataHash`; a change of it rebuilds
-the replica (§9.6).
+registry's combined `dataHash` is the client's `clientVersion.dataHash`; a change of it migrates
+the replica locally and requests a background replacement snapshot (§9.6).
 
 **Indexes.** `CREATE INDEX "${table}__${index}" ON "${table}" (k1 ASC NULLS FIRST, …, id ASC)` in
 Postgres; the same without `NULLS FIRST` in SQLite, where NULL already sorts first. Declared
@@ -1059,7 +1059,9 @@ tables; catalogs are independently published read-only snapshots, outside the re
 - INV-CLI-1: `replica = replay(pending, server@cursor restricted to readable scopes)` after
   every step, where `pending` is the unreleased outbox in `seq` order. This single equation
   rules out flicker, double optimistic application, torn page sets and stale rows (it is the
-  simulation's main check).
+  simulation's main check). During manifest-guided shape refresh (§9.6), the base is instead
+  the locally representable projection of the pre-deploy base, including NULL placeholders;
+  the replacement snapshot restores new-schema authority.
 - INV-CLI-2: A page set MUST be installed in one storage transaction at `PullDone`, never page
   by page; a set that started from a null cursor MUST replace the replica (`clearAll` first).
 - INV-CLI-3: Rebase is undo-all, install, settle, replay-all: every pending entry's undo images
@@ -1067,7 +1069,13 @@ tables; catalogs are independently published read-only snapshots, outside the re
   the base settles it (its ack is in the set, or `seq ≤ expiredThrough`), else its handler is
   re-run and its fresh undo images stored. A replay that is rejected locally keeps the entry
   queued with no optimistic effect (empty undo); only the server's verdict or transient
-  exhaustion (INV-MUT-15) removes it.
+  exhaustion (INV-MUT-15) removes it. Before restoring an entry, its touched rows in tables
+  with unique constraints MUST be removed together, so an intermediate unique conflict cannot
+  reject a valid baseline (for example, a two-row unique-value swap).
+
+  **Rationale (2026-10-27):** First preimages do not record the temporary values a handler
+  used to swap unique keys. Preclearing those rows makes both migration and later refresh or
+  rejection safe; ordinary tables retain their one-write-per-image cost.
 - INV-CLI-4: `mutate` is one storage transaction: lookup by `mutationId` (a known id, pending or
   released, returns the original `seq` and runs nothing), `nextSeq`, run the handler with
   `createdAt = now`, store undo images, append. A `LocallyRejected` run saves nothing. The
@@ -1094,15 +1102,10 @@ tables; catalogs are independently published read-only snapshots, outside the re
   initial request it is a pull failure, except for a history fence carrying `epoch` (INV-CLI-14).
 - INV-CLI-11: A stored row that no longer decodes, or stored engine data that does not decode,
   is `CorruptStorage` (a defect naming the table and row id), never a bare schema error.
-- INV-CLI-12: A registry whose `dataHash` or table DDL differs from the stored one rebuilds the
-  replica in one transaction: replica tables dropped and recreated, cursor set to null, staging
-  cleared, pending undo images emptied; the outbox, `pushedThrough` and notices survive. An
-  `indexHash`-only change recreates indexes and keeps rows and cursor. A rebuild interrupted at
-  any scheduler boundary leaves the old replica or the new one, never a mix.
 - INV-CLI-13: An install MUST skip a change whose table is absent from the registry at Debug,
   without preventing the rest of the page set from installing or its cursor from advancing. A
-  later `dataHash` rebuild for a registry that gains that table MUST reset the cursor so the
-  replacement snapshot delivers its rows.
+  later `dataHash` migration for a registry that gains that table MUST request a null-cursor
+  replacement snapshot that delivers its rows.
 - INV-CLI-14: A history resnapshot carrying `epoch`, on push or pull including initial sync,
   MUST reset the replica, cursor, staging and `pushedThrough` atomically, preserving identity,
   all pending intent, released markers and notices. Pending is replayed on the empty base and
@@ -1147,13 +1150,54 @@ tables; catalogs are independently published read-only snapshots, outside the re
   the published table chunk by chunk would expose partial imports. An old decoder can ignore
   added server columns, so version equality alone cannot certify the upgraded local shape.
 
+- INV-CLI-18: On a `dataHash` or table-DDL change, per-table stored manifests MUST preserve
+  unchanged tables, add nullable columns with NULL placeholders, and copy rows exactly for
+  column drops and NOT NULL→nullable changes. New tables, new NOT NULL columns, kind changes,
+  nullable→NOT NULL changes, and combined column removal/addition (including renames) MUST
+  start that table empty. Constraint/DDL-only changes MUST copy the base, or empty only that
+  table if the new constraints reject it. Removed tables MUST be dropped. The migration MUST
+  keep the cursor, set `resnapshot`, and clear staging; the normal atomic snapshot install
+  replaces retained rows and placeholders. Index-only changes MUST preserve rows and cursor
+  without requesting a snapshot. A replica without stored per-table manifests falls back to
+  the former full rebuild once when its shape changes; an unchanged open records manifests.
+
+  **Rationale (2026-10-27):** Preserve every locally representable table instead of blanking
+  the whole replica across frequent deploys, including offline opens. Always refresh after a
+  shape change because old clients may already have stripped backfilled columns at wire
+  canonicalization. Without rename configuration, simultaneous removal/addition is conservative.
+
+- INV-CLI-19: Manifest-guided shape migration MUST undo pending entries in reverse order under the old stored
+  shape, migrate that base, clear obsolete undo images, then immediately replay pending with
+  the new handlers and recapture new-shape undo images. All schema, rows, undo, staging and
+  metadata changes MUST commit in one transaction: interruption at any scheduler boundary
+  leaves the old or new state, never a mix. Identity, pending envelopes, released markers,
+  `pushedThrough` and notices MUST survive unchanged. Replay rejection keeps intent without
+  optimistic effects or a notice. SQLite write constraint failures MUST be store-origin local
+  rejections, not defects; partial handler writes MUST be restored. Other defects and interruption
+  MUST still abort migration. Push remains deferred until the replacement snapshot installs.
+  Catalogs MUST be initialized before replay. An entry reading an installed catalog with a
+  different local data shape MUST defer that local replay, rolling back its partial writes and
+  keeping intent with empty undo and no notice; unrelated entries MUST still replay. The published
+  catalog remains unchanged until its independent replacement, after which normal sync can replay
+  or settle the deferred intent. Other storage failures MUST still abort migration.
+
+  **Rationale (2026-10-27):** Restore/migrate/replay projects the base before installing new
+  constraints, rather than restoring projected undo through constraints it may violate, and
+  needs neither a second replica nor application configuration. Per-intent replay savepoints
+  roll back partial writes when a newly rejected handler cannot be undone statement by statement.
+
+  **Rationale (2026-10-27):** A handler may read catalog data. Failing startup on an incompatible
+  catalog would prevent the downloader from ever repairing it; only the migration's known
+  incompatible-catalog reads defer, rather than hiding arbitrary decode defects or changing
+  the published catalog. Newly initialized empty catalogs already match the current declaration.
+
 ### Details
 
 #### 9.1 Storage
 
 SQLite tables, all `STRICT` except the outbox: `echo_meta(key, value)` with keys `sync_meta`
 (one JSON value `{cursor, pushedThrough, resnapshot, epoch?}`), `client_id`, `engine_schema_version`,
-`replica_tables`, `replica_data_hash`, `replica_table_ddl`, `replica_index_hash`, plus
+`replica_tables`, `replica_data_hash`, `replica_table_ddl`, `replica_index_hash`, `replica_manifests`, plus
 `catalog:<name>` (download version), `catalog:<name>:shape` and `catalog:<name>:indexes`;
 `echo_outbox(seq AUTOINCREMENT PK, client_id, mutation_id UNIQUE, name, args, created_at,
 released_at, undo TEXT NOT NULL DEFAULT '[]')` (`undo` is engine schema step 2; a stored
@@ -1199,7 +1243,7 @@ See Q3. Formally, for one rebase with pending set `P` (before release), undo ima
 
 | step | store operations |
 |---|---|
-| undo all | `U` writes (restore each pre-image) |
+| undo all | `U + V` writes, where `V` is the number of nonempty preimages in unique-constrained tables (preclear then restore) |
 | install | `C` changes; per upsert: 1 wire decode, 1 wire encode, 1 SQLite-row encode; one multi-row write per consecutive same-table run/chunk; per tombstone: 1 write; per purge: 1 statement per table |
 | settle | `|P|` map lookups; `|R|` releases; one notice insert per rejected/unknown |
 | replay all | `Σ_{m∈P∖R} H(m)` handler operations + `|P∖R|` undo writes |
@@ -1271,10 +1315,15 @@ The §15 catalog specifies the notice disposition of each error. Request failure
 sync status; they never append mutation notices. Rejection during local replay keeps the
 entry queued without optimistic effects and without a new notice until authoritative settlement.
 
-#### 9.6 Rebuild
+#### 9.6 Local shape migration and background refresh
 
-INV-CLI-12. After a rebuild the next pull is from a null cursor (the installed set replays
-pending on top and recaptures undo).
+INV-CLI-18/19. Stored per-table manifests contain column names/kinds/nullability, unique sets
+and SQLite table DDL. Pure nullable additions use `ALTER TABLE ADD COLUMN`; other compatible
+changes use a transactional copy-rebuild. Pending undo is read using stored physical kinds,
+not the new application codec. New handlers run before the database is served to tabs.
+The next pull uses a null cursor while retained rows keep serving offline reads. `echo_staged`
+and the existing atomic resnapshot install (INV-CLI-10) handle the download and replacement.
+The legacy fallback still empties every replica table and resets the cursor to null.
 
 ### Open Questions
 
@@ -1742,7 +1791,7 @@ SQLite DDL, the wire codec, `dataHash` and `indexHash` (§3). The server never a
 its own. The app's migrations are generated from the committed manifest snapshot and reviewed;
 at startup the server runs the engine's migrations, the app's migrations, attaches change
 capture to every registry table, and compares the live catalog with the registry. On any
-mismatch it refuses to serve. The client rebuilds its replica from a `dataHash` change (§9.6).
+mismatch it refuses to serve. The client migrates its replica on a `dataHash` change (§9.6).
 
 ### Invariant digest
 
@@ -1872,7 +1921,7 @@ rows written before it are unstamped until a pull acks them (INV-GC-3).
 The leader's `migrate` (`SqliteSyncStorage`) creates the engine tables, migrates the outbox
 forward (the `undo` column is added to a database created by the first outbox DDL, pending rows
 kept), and compares `replica_data_hash` / `replica_table_ddl` / `replica_index_hash` with the
-registry (INV-CLI-12).
+registry (INV-CLI-18/19). Per-table manifests guide local migration without a developer migration API.
 
 ## 14. Telemetry
 
@@ -2207,7 +2256,7 @@ batches, page limits and retention against them.
   Byte-budget retries repeat candidate reads inside the same snapshot; one HTTP request now
   carries multiple pages, not one database snapshot.
 - INV-PERF-4: Per install (§9.4, Q3): one SQLite transaction holding the storage's single permit
-  for `U` undo writes + batched `C` change writes + `Σ H(m)` replay operations + `|P∖R|` outbox undo
+  for `U + V` undo writes (§9.4) + batched `C` change writes + `Σ H(m)` replay operations + `|P∖R|` outbox undo
   updates; one `clearAll` statement per replica table when the set started from null. For the
   increment fixture below (500 upserts/page), no settlements and a non-null cursor: exactly `8 + ceil(C/500) + 9P`
   statements, including staged read, bookkeeping and controls. `Engine.pull` additionally
@@ -2418,6 +2467,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 ### Retired rules
 
 - **Retired (2026-10-27):** Global catalog snapshot deferral (2026-10-21); independently versioned catalogs now ship under INV-TBL-11, INV-PULL-19, INV-CLI-17, INV-BRW-16 and INV-SCH-11.
+- **Retired (2026-10-27), INV-CLI-12:** Every shape/DDL change empties the whole replica; per-table migration and background refresh supersede it (INV-CLI-18/19), except the one-time legacy fallback.
 - **Retired (2026-10-27):** Constructor-based handler provenance, message-prefix conflict retries and blanket SQL-defect transient handling; stage-owned boundaries supersede them (INV-MUT-3/5, INV-PUSH-3).
 - **Retired (2026-10-26):** Hard 1 MiB rejection of indivisible pull data (former INV-PULL-18); minimum candidates now exceed the target rather than strand accepted data.
 - **Retired (2026-10-25):** One SQLite statement per installed upsert (former INV-PERF-4 cost); consecutive same-table runs now use parameter-bounded multi-row upserts (§9.4), with unchanged atomicity and row order.
@@ -2517,11 +2567,13 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-CLI-9 | covered | `Simulation.test` "a known-table row missing declared keys is server-outdated: no ack, cursor or staging change"; `version-gate.e2e` "a newer client preserves valid staging on server-outdated and converges without rebuilding when the server catches up"; `SyncLoop.test` "a pull that fails with MalformedChange is retried with backoff and never halts push" |
 | INV-CLI-10 | covered | `Simulation.test` "ResnapshotRequired after a suspended pull keeps seqs, pushedThrough and cursor written meanwhile"; `gc.test` "a page set interrupted mid row walk whose position GC passed must resnapshot instead of resuming" |
 | INV-CLI-11 | covered | `SqliteRowStore.test` "a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError"; `SqliteSyncStorage.test` "resuming corrupt staged JSON or a non-string continuation dies naming echo_staged" |
-| INV-CLI-12 | covered | `SqliteSyncStorage.test` "an index-only change keeps rows and cursor; a data-shape change rebuilds and resets them together", "a data-shape migration interrupted at any scheduler boundary leaves the old replica or the new one, never a mix" |
+| INV-CLI-12 | withdrawn | Replaced by INV-CLI-18/19; retained only as the legacy fallback (§9.6). |
 | INV-CLI-13 | covered | `version-gate.e2e` "unknown-table changes must not stall an old client or be lost after its registry update" |
 | INV-CLI-14 | covered | `expiry.e2e` "an epoch rotation resnapshots without losing pushed or unpushed pending mutations; released intent stays lost with the backup"; `Simulation.test` "restoring an earlier log and ledger cannot strand pending intent or mix replicas across epochs", "late push and pull responses from a restored epoch cannot release pending intent or install old rows"; `SyncLoop.test` "a discovered or resumed epoch resnapshot delivers pending intent without an external wake"; `Transport.test` "an epoch-refused pokes connection wakes pull even when the restored server has no new writes" |
 | INV-CLI-15 | covered | `SqliteSyncStorage.test` "queued transactions, reads and pending counts progress before a releasing caller can reenter", "cancelling queued head, middle and tail work never runs it or releases the active transaction", "interruption at every admission handoff boundary leaves transactions atomic and admission usable" |
 | INV-CLI-16 | covered | `streamed-pull.e2e` "a truncated stream resumes after the last durable page when the engine is reconstructed", "an old unary server cannot make a streaming client certify completion or discard durable staging", "a stalled pull consumer backpressures page production and cancellation releases the server stream"; additionally `stream-resume.sh` checks real HTTP abort, offline OPFS reload and complete resumed data |
+| INV-CLI-18 | covered | `SqliteSyncStorage.test` "index changes preserve rows and compatible shape changes preserve the offline base", "a nullable addition keeps stripped old-client rows offline and a null-cursor refresh repairs them", "incompatible tables empty independently while drops and nullable relaxations retain exact rows" |
+| INV-CLI-19 | covered | `SqliteSyncStorage.test` "migration rebases offline edits with new handlers and rejection restores a new-shape undo image", "a pending unique-value swap survives migration, refresh and authoritative rejection", "incompatible catalog reads defer only dependent migration replay and never swallow handler defects", "stored physical undo survives codec changes and legacy replicas adopt manifests or rebuild once", "a data-shape migration interrupted at any scheduler boundary leaves the old replica or the new one, never a mix" |
 | INV-LOOP-1 | covered | `SyncLoop.test` "a transient push failure is retried with backoff and clears once a cycle succeeds"; `Leader.test` "requestSync during backoff runs the next cycle at once and leaves a halted push halted" |
 | INV-LOOP-2 | covered | `SyncLoop.test` "lastSyncedAt stays null after a cycle whose pull failed, and is set by the first cycle that installs", "a stopped push that processed later entries cannot advance lastSyncedAt or halt push"; `Leader.test` "a push whose response is lost keeps the entry pending until the pull installs its ack, and that cycle sets no lastSyncedAt" |
 | INV-LOOP-3 | covered | `SyncLoop.test` "an integrity error halts push for good while pull keeps running"; supplementary browser scenarios cover handover and pending export |
@@ -2610,6 +2662,7 @@ machine-verifiable literal test-title citations.
 | NDJSON decoder | default 16,777,216 JavaScript string code units per line/buffer including RPC framing; distinct from pull byte target | pinned Effect `RpcSerialization` | no engine option |
 | streaming RPC queues | server: 1 encoded message; pull client: 1 decoded page; one page per chunk; excludes HTTP/runtime/parser buffers | `rpc.ts`, `Transport.ts` | no |
 | staged resume read | at most 1 metadata row per request; full payload set read once at install (INV-PERF-8) | `SqliteSyncStorage.ts`, `Engine.ts` | no |
+| shape migration refresh | one null-cursor snapshot after any data/DDL change; push deferred until install | `SqliteSyncStorage.ts`, `Engine.ts`, §9.6 | no |
 | SQLite upsert batch | at most `floor(32766 / columnCount)` rows, never across page/table/delete/purge boundaries at install | `SqliteRowStore.ts`, `Engine.ts` | pinned wasm parameter limit, not a tuning option |
 | server `heartbeatInterval` (pokes and presence) | 15 s | `rpc.ts` | yes; must stay below clients' `idleTimeout` |
 | client `idleTimeout` (pokes stream, presence stream, presence send) | 45 s | `SyncLoop.ts`, `Presence.ts` | yes; must exceed `heartbeatInterval` |

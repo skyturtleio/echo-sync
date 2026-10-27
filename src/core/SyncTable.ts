@@ -90,8 +90,8 @@ export interface TableManifest {
   /** Declared unique column sets (column names, in declaration order). Part of `indexHash`. */
   readonly unique: ReadonlyArray<ReadonlyArray<string>>
   /**
-   * Hash of the storage shape (table name; column names, kinds, nullability). Changes ⇒ replica
-   * rebuild. Refinements, brands and nested JSON schemas are validation, not storage, and do not
+   * Hash of the storage shape (table name; column names, kinds, nullability). Changes ⇒ local
+   * migration and background refresh. Refinements, brands and nested JSON schemas are validation, not storage, and do not
    * contribute (INV-TBL-3); neither do indexes.
    */
   readonly dataHash: string

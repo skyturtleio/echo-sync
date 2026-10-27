@@ -99,8 +99,10 @@ const device = Effect.fnUntraced(function* (
       yield* Layer.build(SqliteClient.layerMemory({ installReactivityHooks: true })),
       SqliteClient.SqliteClient
     )
-  yield* SqliteSyncStorage.migrate(tables).pipe(Effect.provideService(SqlClient, sqlite))
   const storage = yield* SqliteSyncStorage.make(sqlite, tables)
+  yield* SqliteSyncStorage.migrate(tables, Engine.replayMigrated({ storage, mutations, actor })).pipe(
+    Effect.provideService(SqlClient, sqlite)
+  )
   const engine = yield* Engine.make({ clientId, actor, registry: tables, storage, mutations, transport })
   return { sqlite, storage, engine }
 })
@@ -154,11 +156,20 @@ describe.skipIf(!pgAvailable)("two-direction version gate (SPEC §0.2), real Pos
         )
         expect(legacy).toBeInstanceOf(Protocol.ClientOutdated)
         expect(yield* pg`SELECT client_id FROM echo_sync.clients WHERE client_id = 'legacy'`).toEqual([])
-        // Updating the registry changes the data hash, resetting the old cursor before the new
-        // engine pulls the snapshot that contains the previously skipped table.
+        // A new registry retains offline rows and the installed cursor, then requests a
+        // null-cursor snapshot to recover both the skipped table and stripped backfill.
+        const installedCursor = (yield* storage.meta).cursor
         const updated = yield* device(newRegistry, transport, sqlite)
-        expect((yield* updated.storage.meta).cursor).toBeNull()
+        expect(yield* updated.storage.meta).toMatchObject({ cursor: installedCursor, resnapshot: true })
+        expect(yield* updated.storage.rows.scan(extendedItems)).toEqual([
+          { id: "old-write", access_scope_id: "s1", body: "works", extra_note: null },
+          { id: "server", access_scope_id: "s1", body: "visible", extra_note: null }
+        ])
         yield* updated.engine.pull
+        expect(yield* updated.storage.rows.scan(extendedItems)).toEqual([
+          { id: "old-write", access_scope_id: "s1", body: "works", extra_note: null },
+          { id: "server", access_scope_id: "s1", body: "visible", extra_note: "new" }
+        ])
         expect(yield* updated.storage.rows.scan(Notes)).toEqual([
           { id: "unknown", access_scope_id: "s1", body: "new table" }
         ])

@@ -13,16 +13,21 @@ const key = (table: SyncTable.AnySyncTable) => `catalog:${table.name}`
 export const open = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry) =>
   sql.withTransaction(
     Effect.gen(function* () {
+      const incompatible = new Set<string>()
       for (const table of registry.catalogs) {
         yield* sql.unsafe(`DROP TABLE IF EXISTS "${table.name}__next"`)
         const [exists] = yield* sql`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = ${table.name}`
         if (exists === undefined) {
           yield* sql.unsafe(table.sqlite.createTable)
           for (const ddl of table.sqlite.createIndexes) yield* sql.unsafe(ddl)
+          // An empty initialized catalog has the current shape, but no downloaded version.
+          yield* sql`INSERT INTO echo_meta (key, value) VALUES (${`${key(table)}:shape`}, ${table.manifest.dataHash})
+            ON CONFLICT (key) DO UPDATE SET value = excluded.value`
         } else {
           const [shape] = yield* sql<{
             value: string
           }>`SELECT value FROM echo_meta WHERE key = ${`${key(table)}:shape`}`
+          if (shape?.value !== table.manifest.dataHash) incompatible.add(table.name)
           const [indexes] = yield* sql<{
             value: string
           }>`SELECT value FROM echo_meta WHERE key = ${`${key(table)}:indexes`}`
@@ -36,6 +41,7 @@ export const open = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry) 
           }
         }
       }
+      return incompatible
     })
   )
 

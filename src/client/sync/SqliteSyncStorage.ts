@@ -19,6 +19,7 @@ import { isSqlError, type SqlError } from "effect/sql/SqlError"
 import { type Errors, Ids, Mutation, Protocol, type Registry, Store, SyncTable } from "echo-sync"
 import * as Outbox from "../Outbox.ts"
 import * as SqliteRowStore from "../SqliteRowStore.ts"
+import * as Catalogs from "./Catalogs.ts"
 import type { LocalChange, Revision } from "../Provenance.ts"
 import type * as Engine from "./Engine.ts"
 import { randomUUIDv4 } from "../Crypto.ts"
@@ -70,35 +71,53 @@ const decodeTables = decode(StoredTables, "echo_meta")
 const encodeTables = encode(StoredTables)
 const q = (name: string) => `"${Str.replaceAll('"', '""')(name)}"`
 
+const StoredManifests = Schema.fromJsonString(
+  Schema.Array(
+    Schema.Struct({
+      name: Schema.String,
+      columns: Schema.Array(
+        Schema.Struct({
+          name: Schema.String,
+          kind: Schema.Literals(["text", "integer", "double", "boolean", "timestamp", "json"]),
+          nullable: Schema.Boolean
+        })
+      ),
+      unique: Schema.Array(Schema.Array(Schema.String)),
+      ddl: Schema.String
+    })
+  )
+)
+const decodeManifests = decode(StoredManifests, "echo_meta")
+const encodeManifests = encode(StoredManifests)
+const encodeJson = encode(Schema.fromJsonString(Schema.Json))
+
 /**
  * Brings the leader's database in line with `registry` (SPEC §9.6, §13.4) in ONE SQLite transaction:
  * the outbox, the engine's tables, the replica tables, and the bookkeeping that describes them.
  *
- * The registry's manifest hashes live in `echo_meta` under `replica_tables`, `replica_data_hash`,
- * `replica_index_hash` and `replica_table_ddl` (a hash of the tables' SQLite DDL); this function is
- * their only writer.
- * - First run: create every replica table and index.
- * - `dataHash` or the table DDL changed (core hashes a `unique` constraint as index shape, but it
- *   lives in CREATE TABLE, which SQLite cannot alter): drop the previous replica tables, recreate
- *   them empty, and in the same transaction reset what described the old replica: `cursor` to `null`, `resnapshot` off, staged
- *   pages deleted, pending undo images emptied (they pre-image rows that no longer exist). The outbox,
- *   `pushedThrough` and notices are kept. A crash at any point therefore leaves either the old tables
- *   with the old cursor or the new tables with a `null` cursor, never a mix. Returns `rebuilt: true`.
- * - Otherwise, if `indexHash` changed: drop and recreate the declared indexes; rows and cursor stay.
+ * Stored per-table manifests let compatible tables retain their base while an ordinary resnapshot
+ * downloads replacements. Undo uses the old physical shape before constraints change; `replay`
+ * runs the new handlers and recaptures undo before commit. Leaders always supply it; storage-only
+ * callers may omit it only when no pending intent needs replay. No callbacks escape the transaction.
+ * Legacy replicas without manifests retain the one-time full-rebuild fallback. Index-only changes
+ * keep rows/cursor and do not refresh. `rebuilt` reports a data/DDL change, including local migration.
  */
-export const migrate = (
-  registry: Registry.SyncRegistry
-): Effect.Effect<{ readonly rebuilt: boolean }, SqlError, SqlClient.SqlClient> =>
+export const migrate = <E = never>(
+  registry: Registry.SyncRegistry,
+  replay?: (incompatibleCatalogs: ReadonlySet<string>) => Effect.Effect<void, E>
+): Effect.Effect<{ readonly rebuilt: boolean }, SqlError | E, SqlClient.SqlClient> =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient
     return yield* sql.withTransaction(
       Effect.gen(function* () {
         // Engine tables first (versioned forward steps), in this same transaction.
         yield* Outbox.migrate
+        // Replayed handlers may read newly declared catalogs before downloads start.
+        const incompatibleCatalogs = yield* Catalogs.open(sql, registry)
         const meta = new Map(
           Arr.map(
             yield* sql<{ readonly key: string; readonly value: string }>`
-            SELECT key, value FROM echo_meta WHERE key IN ('replica_tables', 'replica_data_hash', 'replica_index_hash', 'replica_table_ddl')`,
+            SELECT key, value FROM echo_meta WHERE key IN ('replica_tables', 'replica_data_hash', 'replica_index_hash', 'replica_table_ddl', 'replica_manifests')`,
             (r) => [r.key, r.value] as const
           )
         )
@@ -122,7 +141,134 @@ export const migrate = (
           previous !== undefined &&
           (meta.get("replica_data_hash") !== registry.dataHash || meta.get("replica_table_ddl") !== tableDdl)
 
-        if (previous === undefined || rebuilt) {
+        const manifestText = meta.get("replica_manifests")
+        if (rebuilt && manifestText !== undefined) {
+          const manifests = yield* decodeManifests(manifestText)
+          const old = new Map(Arr.map(manifests, (m) => [m.name, m] as const))
+          const recreated = new Set<string>()
+          const pending = yield* sql<{
+            readonly undo: string
+          }>`SELECT undo FROM echo_outbox WHERE released_at IS NULL ORDER BY seq DESC`
+          // Restore before changing constraints. A new unique set may accept the optimistic
+          // rows but reject their base, or vice versa. Never undo through the new constraints.
+          for (const entry of pending) {
+            const images = yield* decodeUndo(entry.undo)
+            // A valid pending swap can have preimages that conflict with its current rows.
+            // Remove the whole write set before restoring its valid baseline.
+            for (const image of images) yield* sql.unsafe(`DELETE FROM ${q(image.table)} WHERE id = ?`, [image.id])
+            for (const image of Arr.reverse(images)) {
+              if (Option.isSome(image.before)) {
+                const manifest = old.get(image.table)
+                if (manifest === undefined) return yield* Effect.die(new Error(`unknown undo table ${image.table}`))
+                const before = image.before.value
+                const values: Array<SyncTable.SqliteValue> = []
+                for (const column of manifest.columns) {
+                  const value = before[column.name]
+                  if (value === null) values.push(null)
+                  else if (column.kind === "json" && value !== undefined) values.push(yield* encodeJson(value))
+                  else if (typeof value === "boolean") values.push(value ? 1 : 0)
+                  else if (typeof value === "number" || typeof value === "string") values.push(value)
+                  else return yield* Effect.die(new Error(`invalid undo column ${image.table}.${column.name}`))
+                }
+                const names = Arr.map(manifest.columns, (c) => c.name)
+                yield* sql.unsafe(
+                  `INSERT INTO ${q(image.table)} (${Arr.join(Arr.map(names, q), ",")}) VALUES (${Arr.join(
+                    Arr.map(values, () => "?"),
+                    ","
+                  )})`,
+                  values
+                )
+              }
+            }
+          }
+          for (const manifest of manifests) {
+            if (Option.isNone(registry.get(manifest.name))) yield* sql.unsafe(`DROP TABLE ${q(manifest.name)}`)
+          }
+          for (const table of registry.tables) {
+            const was = old.get(table.name)
+            if (was?.ddl === table.sqlite.createTable) continue
+            const oldColumns = new Map(Arr.map(was?.columns ?? [], (c) => [c.name, c] as const))
+            const added = Arr.filter(table.columns, (c) => !oldColumns.has(c.name))
+            const removed = Arr.some(was?.columns ?? [], (c) => !Arr.some(table.columns, (n) => n.name === c.name))
+            const compatible =
+              was !== undefined &&
+              !(removed && added.length > 0) &&
+              Arr.every(table.columns, (c) => {
+                const before = oldColumns.get(c.name)
+                return before === undefined ? c.nullable : before.kind === c.kind && (!before.nullable || c.nullable)
+              })
+            const additive =
+              compatible &&
+              !removed &&
+              added.length > 0 &&
+              SyncTable.canonicalJson(was.unique) === SyncTable.canonicalJson(table.manifest.unique) &&
+              Arr.every(was.columns, (c) =>
+                Arr.some(table.columns, (n) => n.name === c.name && n.nullable === c.nullable)
+              )
+            if (additive) {
+              for (const column of added) {
+                const type =
+                  column.kind === "double"
+                    ? "REAL"
+                    : column.kind === "text" || column.kind === "json"
+                      ? "TEXT"
+                      : "INTEGER"
+                yield* sql.unsafe(
+                  `ALTER TABLE ${q(table.name)} ADD COLUMN ${q(column.name)} ${type}${column.kind === "boolean" ? ` CHECK (${q(column.name)} IN (0, 1))` : ""}`
+                )
+              }
+              continue
+            }
+            // SQLite copy-rebuilds constraints and dropped columns without decoding old rows
+            // through the new application codec. Only a constraint failure discards this table.
+            recreated.add(table.name)
+            if (was !== undefined) yield* sql.unsafe(`ALTER TABLE ${q(table.name)} RENAME TO __echo_migrating`)
+            yield* sql.unsafe(table.sqlite.createTable)
+            if (compatible) {
+              yield* sql
+                .unsafe(
+                  `INSERT INTO ${q(table.name)} (${Arr.join(
+                    Arr.map(table.columns, (c) => q(c.name)),
+                    ","
+                  )}) SELECT ${Arr.join(
+                    Arr.map(table.columns, (c) => (oldColumns.has(c.name) ? q(c.name) : "NULL")),
+                    ","
+                  )} FROM __echo_migrating`
+                )
+                .pipe(
+                  Effect.catchIf(
+                    (error) => error.reason._tag === "ConstraintError" || error.reason._tag === "UniqueViolation",
+                    () => Effect.void
+                  )
+                )
+            }
+            if (was !== undefined) yield* sql`DROP TABLE __echo_migrating`
+          }
+          // Pure nullable additions need no index rebuild. If indexes changed in the same
+          // deploy, refresh those on unchanged tables as well as copy-rebuilt tables.
+          const indexed = Arr.filter(
+            registry.tables,
+            (t) => recreated.has(t.name) || meta.get("replica_index_hash") !== registry.indexHash
+          )
+          const indexes = yield* sql<{
+            readonly name: string
+          }>`SELECT name FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL AND ${sql.in(
+            "tbl_name",
+            Arr.map(indexed, (t) => t.name)
+          )}`
+          for (const { name } of indexes) yield* sql.unsafe(`DROP INDEX ${q(name)}`)
+          for (const table of indexed) for (const ddl of table.sqlite.createIndexes) yield* sql.unsafe(ddl)
+          const stored = yield* sql<{ readonly value: string }>`SELECT value FROM echo_meta WHERE key = 'sync_meta'`
+          const current = stored[0] === undefined ? initialMeta : yield* decodeMeta(stored[0].value)
+          yield* put("sync_meta", yield* encodeMeta({ ...current, resnapshot: true }))
+          yield* sql`DELETE FROM echo_staged`
+          yield* sql`UPDATE echo_outbox SET undo = '[]' WHERE released_at IS NULL`
+          if (pending.length > 0) {
+            if (replay === undefined)
+              return yield* Effect.die(new Error("schema migration with pending intent requires replay"))
+            yield* replay(incompatibleCatalogs)
+          }
+        } else if (previous === undefined || rebuilt) {
           for (const name of previous === undefined ? [] : yield* decodeTables(previous)) {
             yield* sql.unsafe(`DROP TABLE IF EXISTS ${q(name)}`)
           }
@@ -150,6 +296,17 @@ export const migrate = (
         yield* put("replica_data_hash", registry.dataHash)
         yield* put("replica_table_ddl", tableDdl)
         yield* put("replica_index_hash", registry.indexHash)
+        yield* put(
+          "replica_manifests",
+          yield* encodeManifests(
+            Arr.map(registry.tables, (t) => ({
+              name: t.name,
+              columns: t.manifest.columns,
+              unique: t.manifest.unique,
+              ddl: t.sqlite.createTable
+            }))
+          )
+        )
         return { rebuilt }
       })
     )
