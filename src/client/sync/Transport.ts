@@ -22,21 +22,27 @@
  */
 import { Array as Arr, Cause, Context, Effect, Layer, Predicate, Schema, type Scope, Stream } from "effect"
 import { FetchHttpClient, type Headers, HttpClient, HttpClientError, HttpClientRequest } from "effect/http"
-import { RpcClient, RpcClientError, RpcSerialization } from "effect/rpc"
+import type { RpcClientError } from "effect/rpc"
+import { RpcClient, RpcSerialization } from "effect/rpc"
 import { type AccessScope, type Ids, Protocol } from "echo-sync"
 import type * as Presence from "./Presence.ts"
 import type * as Engine from "./Engine.ts"
-import { CredentialsUnavailable, PullProtocolError, PushIntegrityError, type PullReason } from "./SyncFailure.ts"
+import {
+  CredentialsUnavailable,
+  PullProtocolError,
+  PushIntegrityError,
+  type PullReason,
+  type PushReason
+} from "./SyncFailure.ts"
 
 /**
  * Lift only an actual HTTP status failure. Fetch rejections are nested in TransportError,
  * never inspected for engine-shaped causes.
  */
-const lift = <E extends { readonly _tag: string }>(
+const lift = <E extends Exclude<PushReason | PullReason | PresenceError, RpcClientError.RpcClientError>>(
   error: E | RpcClientError.RpcClientError
 ): E | RpcClientError.RpcClientError | Protocol.Unauthorized => {
-  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Only this RPC implementation's errors cross the infrastructure boundary, not same-identifier classes.
-  if (!(error instanceof RpcClientError.RpcClientError) || error.reason._tag !== "HttpError") return error
+  if (error._tag !== "RpcClientError" || error.reason._tag !== "HttpError") return error
   const http = error.reason.cause
   if (
     http instanceof HttpClientError.StatusCodeError &&

@@ -1,15 +1,14 @@
 import * as PgTypes from "@effect/sql-pg/PgTypes"
 import { Array as Arr, Cause, Data, Effect, Option, Result, Schedule, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
-import { isSqlError, type SqlError } from "effect/sql/SqlError"
+import type { SqlError } from "effect/sql/SqlError"
 import { Errors, Ids, Mutation, Protocol, Store } from "echo-sync"
-import { isConflictUnavailable } from "./rowStore.ts"
+import { isConflictUnavailable, unavailable } from "./rowStore.ts"
 import { isCleanupFailure, withTransaction } from "./transaction.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
 type MutationOutcome = Mutation.MutationOutcome
 const MutationOutcomeJson = Schema.toCodecJson(Mutation.MutationOutcome)
-const isRejection = Schema.is(Mutation.MutationRejection)
 
 /** A push outcome and the ledger position it was recorded at (SPEC §5). */
 export interface Processed {
@@ -72,23 +71,45 @@ const transient = (envelope: Envelope, error: SqlError | Errors.StoreUnavailable
   new MutationTransient({
     clientId: envelope.clientId,
     mutationId: envelope.mutationId,
-    message: isSqlError(error) ? `${error.reason._tag}: ${error.message}` : error.message
+    message: error._tag === "SqlError" ? `${error.reason._tag}: ${error.message}` : error.message
   })
 
-/** What a mutation body may fail with: core's rejections and transients, or raw SQL. */
+/**
+ * Closed, trusted low-level body channel: engine rejections/transients (e.g. Mutation.run's
+ * classified output), or raw SQL failures. Arbitrary handler errors must go through
+ * Mutation.run and its declared domain codec; engine-shaped domain values are not accepted
+ * here as unclassified application failures. Defects and interruption stay in the cause.
+ */
 export type BodyError = Mutation.MutationRejection | Errors.StoreUnavailable | SqlError
 
 type AttemptError = BodyError | ClientForbidden
 
-const isConflict = (error: unknown) =>
-  (isSqlError(error) &&
+/** Body SQL constraints can reject; SQL outside this savepoint remains an attempt failure. */
+const normalizeBodyCause = (
+  cause: Cause.Cause<BodyError>
+): Cause.Cause<Mutation.MutationRejection | Errors.StoreUnavailable> =>
+  Cause.map(cause, (error) => {
+    if (error._tag !== "SqlError") return error
+    if (
+      !error.reason.isRetryable &&
+      (error.reason._tag === "ConstraintError" || error.reason._tag === "UniqueViolation")
+    ) {
+      return new Errors.ConstraintViolated({
+        kind: error.reason._tag === "UniqueViolation" ? "unique" : "other",
+        constraint: error.reason._tag === "UniqueViolation" ? error.reason.constraint : null,
+        message: error.message
+      })
+    }
+    return unavailable(error)
+  })
+
+const isConflict = (error: AttemptError) =>
+  (error._tag === "SqlError" &&
     (error.reason._tag === "SerializationError" ||
       error.reason._tag === "DeadlockError" ||
       error.reason._tag === "UniqueViolation")) ||
-  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Retry only nominal infrastructure failures, not structural domain lookalikes.
-  (error instanceof Errors.StoreUnavailable && isConflictUnavailable(error)) ||
-  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve nominal constraint classification during retries.
-  (error instanceof Errors.ConstraintViolated && error.kind === "unique")
+  (error._tag === "StoreUnavailable" && isConflictUnavailable(error)) ||
+  (error._tag === "ConstraintViolated" && error.kind === "unique")
 
 /** A reason that makes the attempt a defect (INV-MUT-3 precedence: defect > transient > rejection). */
 const isDefectReason = (r: Cause.Reason<unknown>) =>
@@ -123,37 +144,20 @@ const asRejection = (
   cause: Cause.Cause<AttemptError>,
   uniqueExhausted = false
 ): Mutation.MutationRejection | undefined => {
-  const errors = Arr.flatMap(cause.reasons, (r) => {
-    if (!Cause.isFailReason(r)) return []
+  let first: Mutation.MutationRejection | undefined
+  for (const r of cause.reasons) {
+    if (!Cause.isFailReason(r)) return undefined
     const error = r.error
     if (
-      isSqlError(error) &&
-      !error.reason.isRetryable &&
-      (error.reason._tag === "ConstraintError" || (uniqueExhausted && error.reason._tag === "UniqueViolation"))
-    ) {
-      return [
-        new Errors.ConstraintViolated({
-          kind: error.reason._tag === "UniqueViolation" ? "unique" : "other",
-          constraint: error.reason._tag === "UniqueViolation" ? error.reason.constraint : null,
-          message: error.message
-        })
-      ]
-    }
-    return [error]
-  })
-  const [first] = errors
-  return errors.length === cause.reasons.length &&
-    first !== undefined &&
-    isRejection(first) &&
-    Arr.every(
-      errors,
-      (error) =>
-        isRejection(error) &&
-        // oxlint-disable-next-line effecttsgo/instance-of-schema -- Structural rejection validation above does not change nominal retry eligibility.
-        (uniqueExhausted || !(error instanceof Errors.ConstraintViolated && error.kind === "unique"))
+      error._tag === "SqlError" ||
+      error._tag === "StoreUnavailable" ||
+      error._tag === "ClientForbidden" ||
+      (!uniqueExhausted && error._tag === "ConstraintViolated" && error.kind === "unique")
     )
-    ? first
-    : undefined
+      return undefined
+    first ??= error
+  }
+  return first
 }
 
 /**
@@ -182,25 +186,16 @@ const classify = (
     )
   )
   if (Arr.some(cause.reasons, isDefectReason)) return die
-  const failure = Option.getOrUndefined(
-    Arr.findFirst(
-      Arr.map(cause.reasons, (r) =>
-        Cause.isFailReason(r)
-          ? r.error
-          : Cause.isDieReason(r) && isCleanupFailure(r.defect)
-            ? r.defect.cause
-            : undefined
-      ),
-      // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve the nominal infrastructure/domain failure boundary.
-      (e) => isSqlError(e) || e instanceof Errors.StoreUnavailable
-    )
-  )
-  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve the nominal infrastructure/domain failure boundary.
-  if (isSqlError(failure) || failure instanceof Errors.StoreUnavailable) {
-    return Effect.fail(transient(envelope, failure))
+  for (const r of cause.reasons) {
+    if (Cause.isFailReason(r) && (r.error._tag === "StoreUnavailable" || r.error._tag === "SqlError")) {
+      return Effect.fail(transient(envelope, r.error))
+    }
+    if (Cause.isDieReason(r) && isCleanupFailure(r.defect)) {
+      return Effect.fail(transient(envelope, r.defect.cause))
+    }
   }
   for (const r of cause.reasons) {
-    if (Cause.isFailReason(r) && r.error instanceof ClientForbidden) return Effect.fail(r.error)
+    if (Cause.isFailReason(r) && r.error._tag === "ClientForbidden") return Effect.fail(r.error)
   }
   return die
 }
@@ -350,7 +345,11 @@ export const runMutation = <R>(
           Effect.as<MutationOutcome>({ _tag: "Applied" }),
           // A rejection combined with anything else (e.g. a defect in a finalizer) is not a
           // rejection: it must not be ledgered as one.
-          Effect.catchCause((cause) => {
+          Effect.catchCause((bodyCause) => {
+            // Preserve the original typed values beside defects/interruption, too. Cleanup's
+            // private provenance envelope must reach classify intact, never become a rejection.
+            if (!Arr.every(bodyCause.reasons, Cause.isFailReason)) return Effect.failCause(bodyCause)
+            const cause = normalizeBodyCause(bodyCause)
             const rejection = asRejection(cause, rejectionToRecord !== undefined)
             bodyUniqueRejection = rejection === undefined && asRejection(cause, true) !== undefined
             return rejection === undefined

@@ -6,8 +6,10 @@
 /// <reference lib="webworker" />
 import * as BrowserCrypto from "@effect/platform-browser/BrowserCrypto"
 import * as Arr from "effect/Array"
+import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Data from "effect/Data"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Hex from "effect/encoding/Hex"
@@ -185,10 +187,13 @@ const request = Effect.fnUntraced(function* (
               resume(Effect.succeed(false))
               return undefined
             }
-            // oxlint-disable-next-line effecttsgo/new-promise -- Web Locks holds ownership until its callback's Promise settles; release resolves that exact Promise.
-            const held = new Promise<void>((resolve) => {
-              release = resolve
-            })
+            // Install ownership synchronously, even if delivery to the acquiring fiber is stalled.
+            const released = Deferred.makeUnsafe<void>()
+            release = () => {
+              Deferred.doneUnsafe(released, Effect.void)
+            }
+            // The release cell owns this wait, not the acquisition's signal or scheduler.
+            const held = Effect.runPromiseWith(Context.empty())(Deferred.await(released))
             resume(Effect.succeed(true))
             return held
           })

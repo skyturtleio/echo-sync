@@ -156,6 +156,44 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
     }).pipe(Effect.provide(TestDatabase))
   )
 
+  it.live("declared engine-shaped domain errors are ledgered without infrastructure retries", () =>
+    Effect.gen(function* () {
+      const domainErrors = [
+        new Errors.StoreUnavailable({ message: "domain outage", reason: "SerializationConflict" }),
+        new Errors.ConstraintViolated({ kind: "unique", constraint: "domain", message: "domain conflict" }),
+        sqlDefect
+      ]
+      for (const [index, error] of domainErrors.entries()) {
+        let attempts = 0
+        const mutation = Mutation.make("domain", {
+          args: Schema.Struct({}),
+          error: Schema.Union([Errors.StoreUnavailable, Errors.ConstraintViolated, SqlError]),
+          handler: () =>
+            Effect.suspend(() => {
+              attempts++
+              return Effect.fail(error)
+            })
+        })
+        const envelope = env(`domain-${index}`, BigInt(index + 1))
+        const result = yield* runMutation(
+          envelope,
+          Effect.andThen(appendEffect("x"), storedBody(mutation, {})),
+          fastRetry
+        )
+        assert.strictEqual(attempts, 1)
+        assert.strictEqual(result.outcome._tag, "Rejected")
+        if (result.outcome._tag !== "Rejected") return yield* Effect.die("missing rejection")
+        assert.strictEqual(result.outcome.error._tag, "DomainError")
+        if (result.outcome.error._tag !== "DomainError") return yield* Effect.die("wrong rejection")
+        assert.deepInclude(result.outcome.error.error, { _tag: error._tag })
+        assert.strictEqual(yield* counterBody, "")
+        assert.deepStrictEqual(yield* runMutation(envelope, appendEffect("not run")), result)
+      }
+      assert.deepStrictEqual(yield* ledgerIds, ["domain-0", "domain-1", "domain-2"])
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Disposable database test root.
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
   it.live("a mutation body dying with the actual SqlError class remains a defect and rolls back", () =>
     Effect.gen(function* () {
       let attempts = 0
@@ -692,6 +730,35 @@ describe.skipIf(!pgAvailable)("mutation ledger (SPEC §5)", () => {
       assert.isTrue(diedWithBug(exit))
       assert.deepStrictEqual(yield* ledgerIds, [])
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
+    }).pipe(Effect.provide(TestDatabase))
+  )
+
+  it.live("SQL normalization preserves interruption beside a conflict in either cause order without retry", () =>
+    Effect.gen(function* () {
+      for (const reversed of [false, true]) {
+        let attempts = 0
+        let failure: SqlError | undefined
+        const body = Effect.suspend(() => {
+          attempts++
+          return Effect.flatMap(Effect.orDie(Effect.flip(serializationFailure)), (conflict) => {
+            failure = conflict
+            const reasons = [Cause.makeFailReason(conflict), Cause.makeInterruptReason(123)]
+            return Effect.failCause(Cause.fromReasons(reversed ? Arr.reverse(reasons) : reasons))
+          })
+        })
+        const exit = yield* Effect.exit(runMutation(env("interrupted", 1n), body, fastRetry))
+        assert.strictEqual(attempts, 1)
+        assert.isTrue(Exit.isFailure(exit))
+        if (exit._tag === "Failure") {
+          assert.isTrue(Cause.hasInterrupts(exit.cause))
+          assert.isTrue(Cause.hasDies(exit.cause))
+          assert.isFalse(Cause.hasFails(exit.cause))
+          assert.isTrue(Arr.some(exit.cause.reasons, (r) => Cause.isDieReason(r) && r.defect === failure))
+          assert.strictEqual(exit.cause.reasons.length, 2)
+        }
+        assert.deepStrictEqual(yield* ledgerIds, [])
+      }
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Disposable database test root.
     }).pipe(Effect.provide(TestDatabase))
   )
 

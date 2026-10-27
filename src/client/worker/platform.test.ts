@@ -100,6 +100,31 @@ it.live("a granted lock stays owned by its scope or cancelled attempt despite sc
   )
 )
 
+it.live("closing the owner scope releases a granted lock while acquisition delivery is stalled", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const name = `test:${yield* randomUUIDv4}`
+      const owner = yield* Effect.acquireRelease(Scope.make(), (scope) => Scope.close(scope, Exit.void))
+      const driver = pausingScheduler()
+      const fiber = yield* Effect.forkChild(Platform.holdLock(name).pipe(Scope.provide(owner))).pipe(
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Stall only acquisition delivery, not the scope owner or native release bridge.
+        Effect.provideService(Scheduler.Scheduler, driver.scheduler)
+      )
+      driver.flush()
+      driver.arm()
+      yield* Effect.repeat(Effect.sleep(1), { until: driver.paused, times: 1000 })
+      expect(driver.paused()).toBe(true)
+      expect(yield* Platform.isLockHeld(name)).toBe(true)
+      yield* Scope.close(owner, Exit.void)
+      yield* waitUntil(Effect.map(Effect.orDie(Platform.isLockHeld(name)), (held) => !held))
+      expect(yield* Effect.scoped(Platform.tryHoldLock(name))).toBe(true)
+      driver.disarm()
+      driver.flush()
+      yield* Fiber.join(fiber)
+    })
+  )
+)
+
 it.live("a deadline after native grant releases the lock while its caller scope remains open", () =>
   Effect.scoped(
     Effect.gen(function* () {

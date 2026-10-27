@@ -1,13 +1,7 @@
 import { Array as Arr, Cause, Data, DateTime, Effect, Option, Random, Schema } from "effect"
 import type { PrincipalId } from "./AccessScope.ts"
-import {
-  ConstraintViolated,
-  InvalidRow,
-  RowAlreadyExists,
-  RowNotFound,
-  ScopeForbidden,
-  StoreUnavailable
-} from "./Errors.ts"
+import type { StoreUnavailable } from "./Errors.ts"
+import { ConstraintViolated, InvalidRow, RowAlreadyExists, RowNotFound, ScopeForbidden } from "./Errors.ts"
 import { ClientId, MutationId, Seq } from "./Ids.ts"
 import * as Store from "./Store.ts"
 import type { EchoStore } from "./Store.ts"
@@ -130,7 +124,11 @@ export type PureSchema = Schema.Top & { readonly DecodingServices: never; readon
 /** What a registry needs from a mutation, with its types erased. */
 export interface AnyMutation {
   readonly name: string
-  /** Decode `args` (JSON), run the handler, classify failures. Transaction boundaries are the caller's. */
+  /**
+   * Decode args, run the handler and classify its failures into this closed engine channel.
+   * Application errors must be encoded inside DomainError, never passed through as engine errors.
+   * Transaction boundaries are the caller's.
+   */
   readonly execute: (
     ctx: MutationContext,
     args: Schema.Json
@@ -360,8 +358,7 @@ export const runHandler = (
     const rejection = yield* run(mutations, envelope, ctx).pipe(
       Effect.as(Option.none<MutationRejection>()),
       Effect.catch((error) =>
-        // oxlint-disable-next-line effecttsgo/instance-of-schema -- Preserve the nominal infrastructure-failure boundary.
-        error instanceof StoreUnavailable ? Effect.fail(error) : Effect.succeed(Option.some(error))
+        error._tag === "StoreUnavailable" ? Effect.fail(error) : Effect.succeed(Option.some(error))
       )
     )
     return { undo: yield* instance.touched, rejection }

@@ -71,7 +71,7 @@ import {
 } from "./messages.ts"
 import * as Platform from "./platform.ts"
 import * as LeaderRoute from "./LeaderRoute.ts"
-import { TabPlatform } from "./TabPlatform.ts"
+import { type LeaderMethodError, TabPlatform } from "./TabPlatform.ts"
 import { randomUUIDv4 } from "../Crypto.ts"
 import { cappedExponential } from "../sync/Backoff.ts"
 
@@ -209,9 +209,8 @@ type SubscribeSnapshotFn = <A extends Mutation.PureSchema, S extends Mutation.Pu
   args: A["Type"]
 ) => Stream.Stream<Snapshot<S["Type"]>, SubscribeError>
 
-const isLeaderLost = (e: unknown): e is LeaderUnavailable =>
-  // oxlint-disable-next-line effecttsgo/instance-of-schema -- Retry only engine-created handovers, not independently declared errors sharing the schema identifier.
-  e instanceof LeaderUnavailable && e.reason === "LeaderLost"
+const isLeaderLost = (e: LeaderMethodError | LeaderUnavailable): e is LeaderUnavailable =>
+  e._tag === "LeaderUnavailable" && e.reason === "LeaderLost"
 
 // No tight loop while the old connection is not yet marked lost: the next attempt waits for a new leader.
 const lostBackoff = Schedule.spaced("50 millis")
@@ -220,7 +219,7 @@ const lostBackoff = Schedule.spaced("50 millis")
  * Only a cause whose failures are all `LeaderLost` and that has no defect is a handover (INV-BRW-4): a
  * defect means the leader died of a bug, which a silent resubscription would hide.
  */
-const isHandover = <E>(cause: Cause.Cause<E>): boolean =>
+const isHandover = <E extends LeaderMethodError>(cause: Cause.Cause<E | LeaderUnavailable>): boolean =>
   Cause.hasFails(cause) &&
   Arr.every(
     cause.reasons,
@@ -231,7 +230,7 @@ const isHandover = <E>(cause: Cause.Cause<E>): boolean =>
  * Re-open `open` on the next leader whenever it ends with a handover, emitting nothing in between. Every other
  * cause passes through unchanged: `Stream.catchIf` would re-fail the bare error and drop a defect beside it.
  */
-const resubscribing = <A, E>(
+const resubscribing = <A, E extends LeaderMethodError>(
   open: Stream.Stream<A, E | LeaderUnavailable>
 ): Stream.Stream<A, E | LeaderUnavailable> => {
   const loop: Stream.Stream<A, E | LeaderUnavailable> = open.pipe(

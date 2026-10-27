@@ -8,10 +8,10 @@ import * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Stream from "effect/Stream"
-import { RpcClientError } from "effect/rpc/RpcClientError"
+import type { RpcClientError } from "effect/rpc/RpcClientError"
 import * as Telemetry from "../../internal/Telemetry.ts"
 import { type LeaderInfo, LeaderUnavailable } from "./LeaderRpcs.ts"
-import type { LeaderConnection } from "./TabPlatform.ts"
+import type { LeaderConnection, LeaderMethodError } from "./TabPlatform.ts"
 
 type RoutedConnection = {
   readonly [K in keyof LeaderConnection]: LeaderConnection[K] extends (
@@ -69,12 +69,12 @@ const routeClient = (
   client: LeaderConnection,
   unavailable: (error: RpcClientError) => LeaderUnavailable
 ): RoutedConnection => {
-  const normalize = <E>(error: E | RpcClientError): E | LeaderUnavailable =>
-    // oxlint-disable-next-line effecttsgo/instance-of-schema -- Only the concrete RPC method channel is inspected, never application callback errors.
-    error instanceof RpcClientError ? unavailable(error) : error
-  const call = <A, E>(self: Effect.Effect<A, E | RpcClientError>) =>
+  // Only declared RPC method failures enter here; arbitrary withLeader callback errors do not.
+  const normalize = <E extends LeaderMethodError>(error: E | RpcClientError): E | LeaderUnavailable =>
+    error._tag === "RpcClientError" ? unavailable(error) : error
+  const call = <A, E extends LeaderMethodError>(self: Effect.Effect<A, E | RpcClientError>) =>
     Effect.catchCause(self, (cause) => Effect.failCause(Cause.map(cause, normalize<E>)))
-  const stream = <A, E>(self: Stream.Stream<A, E | RpcClientError>) =>
+  const stream = <A, E extends LeaderMethodError>(self: Stream.Stream<A, E | RpcClientError>) =>
     Stream.catchCause(self, (cause) => Stream.failCause(Cause.map(cause, normalize<E>)))
   return {
     exec: (input) => call(client.exec(input)),

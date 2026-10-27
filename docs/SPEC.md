@@ -515,6 +515,14 @@ was recorded at. The ledger is what makes a push idempotent and what a pull acks
   recorded, and every domain failure in the cause MUST encode or the run dies. Declared domain
   values, including actual engine error instances, MUST follow domain encoding, not constructor
   inference. An error the mutation did not declare is a defect, never a `DomainError`.
+  `AnyMutation.execute` and the low-level ledger `BodyError` are closed, already-classified
+  engine channels, not ingress for arbitrary application failures. Raw body SQL failures are
+  normalized inside the body savepoint; SQL failures from ledger bookkeeping remain attempt
+  failures and MUST NOT become permanent body rejections.
+
+  **Rationale (2026-10-27):** Stage-owned domain encoding makes downstream tag discrimination
+  sound without constructor-based provenance guesses. Normalizing SQL only at the body boundary
+  prevents an infrastructure constraint failure from being recorded as a handler rejection.
 - INV-MUT-4: A rejected mutation MUST leave none of its writes behind (body in a savepoint) and
   MUST be ledgered with its outcome and a position.
 - INV-MUT-5: Retry on conflict: an attempt whose cause holds no defect or interruption and holds
@@ -1492,6 +1500,8 @@ replica.
 
   **Rationale (2026-10-27):** Concrete RPC methods own transport failures; callback-wide
   classification incorrectly reinterpreted application errors with the same constructor.
+  Normalization and handover recovery accept only the closed declared method-error unions,
+  not unknown failures; constructor identity is not required to distinguish those channels.
 
   **Rationale (2026-10-22):** Cause-preserving recovery was chosen because `Stream.catchIf`
   re-fails nonmatching errors bare and could drop a defect beside `LeaderLost`; resubscription
@@ -1564,6 +1574,11 @@ conservative refresh is preferable, including for own mutations later reconciled
   scope owns the lock until it closes; later interruption of an enclosing fiber does not revoke
   that ownership. Waiting MUST remain interruptible; shared release watchers MUST release in
   the native callback, not in a later Effect continuation.
+
+  **Rationale (2026-10-27):** A synchronously installed Deferred release cell supplies Web
+  Locks' holding Promise through `Effect.runPromiseWith(Context.empty())`. This service-free bridge uses the default
+  scheduler and no acquisition AbortSignal: successful scope ownership must outlive that caller,
+  and a stalled acquisition scheduler must not prevent release.
 
   **Rationale (2026-10-26):** An adversarial scheduler reproduced granted locks retained after
   interrupted fibers completed. A pre-registered ownership cell closes the grant-to-finalizer
@@ -2385,7 +2400,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-MUT-2 | partial | `Transport.test` "a processed push returns core's result; a rejection keeps its class and fields" (closedness of the set is type-level only) |
 | INV-MUT-3 | covered | `Mutation.test` "a domain failure combined with a defect dies with the defect, never a Rejected outcome", "StoreUnavailable alongside a domain failure stays transient, never a permanent rejection", "an unencodable domain failure next to a valid one dies, in either order, never a DomainError", "engine error instances declared by a handler remain domain errors, not store or argument failures", "store-origin failures retain adjacent defects and interruption in either cause order", "handlers can recover a store reason without treating a domain lookalike as store-origin"; `ledger.test` "a rejection combined with a defect is not ledgered as an ordinary rejection", "a mutation body dying with the actual SqlError class remains a defect and rolls back", "failed rollback cannot ledger a rejection or hide an application SqlError defect"; `rpc.test` "RPC failure mapping never erases interruption or defects beside SQL and binding failures" |
 | INV-MUT-4 | covered | `ledger.test` "a rejected mutation records its outcome and leaves none of its writes behind", "a mutation body dying with the actual SqlError class remains a defect and rolls back", "failed rollback cannot ledger a rejection or hide an application SqlError defect" |
-| INV-MUT-5 | covered | `ledger.test` "a unique violation from a stale snapshot retries to Applied instead of stopping the batch transient", "a conflict combined with a rejection is retried, and the retry's outcome is ledgered (transient beats rejection)", "a conflict combined with a programmer defect dies without retry (defect beats transient)", "conflict retries use structured store reasons, never diagnostic prefixes" |
+| INV-MUT-5 | covered | `ledger.test` "a unique violation from a stale snapshot retries to Applied instead of stopping the batch transient", "a conflict combined with a rejection is retried, and the retry's outcome is ledgered (transient beats rejection)", "a conflict combined with a programmer defect dies without retry (defect beats transient)", "conflict retries use structured store reasons, never diagnostic prefixes", "declared engine-shaped domain errors are ledgered without infrastructure retries", "SQL normalization preserves interruption beside a conflict in either cause order without retry" |
 | INV-MUT-6 | covered | `ledger.test` "a persistent unique violation is ledgered with a position instead of blocking later mutations", "a check constraint is rejected immediately without retries or partial writes" |
 | INV-MUT-7 | covered | `ledger.test` "seq < 1 is a malformed envelope: not executed, not recorded, not answered as clientExpired" |
 | INV-MUT-8 | covered | `Mutation.test` "the seeded random is a function of (clientId, mutationId), so a rebase replays identically"; `scope-create.e2e` "pull must not replace the writer timestamp with push time" |
@@ -2473,7 +2488,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-BRW-11 | partial | Browser scenarios cover OPFS handles held for 4 s and past the 10 s bound; no literal test-title citation |
 | INV-BRW-12 | covered | `Leader.test` "snapshot provenance requires every incorporated local receipt and never certifies a rollback or an unknown gap", "every emission of a query is one snapshot: two tables written together never disagree" |
 | INV-BRW-13 | covered | `Leader.test` "snapshot provenance requires every incorporated local receipt and never certifies a rollback or an unknown gap", "reconnecting pull and rejection remain refresh-required between local commits even when their notifications coalesce", "snapshot resubscription after leader loss cannot reuse the old lifetime's local receipts" |
-| INV-BRW-14 | covered | `platform.test` "a granted lock stays owned by its scope or cancelled attempt despite scheduler delays", "a deadline after native grant releases the lock while its caller scope remains open", "interrupting a caller after lock acquisition cannot revoke ownership from its still-open scope", "an interrupted lock wait leaves the queue and never acquires the lock afterwards", "a lock wait that reaches its deadline as the holder lets go either holds the lock or leaves nothing held or queued" |
+| INV-BRW-14 | covered | `platform.test` "a granted lock stays owned by its scope or cancelled attempt despite scheduler delays", "closing the owner scope releases a granted lock while acquisition delivery is stalled", "a deadline after native grant releases the lock while its caller scope remains open", "interrupting a caller after lock acquisition cannot revoke ownership from its still-open scope", "an interrupted lock wait leaves the queue and never acquires the lock afterwards", "a lock wait that reaches its deadline as the holder lets go either holds the lock or leaves nothing held or queued" |
 | INV-BRW-15 | covered | `OpfsSqlite.test` "a failed OPFS pool open releases partial handles and late siblings without waiting for them", "interrupting OPFS startup finishes before native acquisition and closes its late handle", "closing an OPFS pool during growth closes late handles and never grows the closed pool", "an OPFS header initialization failure closes its handle and earlier pool files"; supplementary Chromium controls in `examples/browser-spike/opfs-lifetime.sh` |
 | INV-SCH-1 | partial | `Migrate.test` "a NOT NULL column without a default is added nullable with the SPEC §13 TODO, never SET NOT NULL", "nullable literal unions generate TEXT and an old JSON manifest requires a manual kind migration"; destructive and safe DDL groups need individual citations |
 | INV-SCH-2 | covered | `Migrate.test` "an intent naming something the diff does not contain is refused, not ignored", "a combined table and column rename is one table TODO and one column TODO, no DDL, no intent error", "an index on a renamed column is a TODO; unrelated changes in the same table stay DDL" |

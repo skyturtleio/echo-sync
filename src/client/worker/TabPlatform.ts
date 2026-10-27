@@ -77,6 +77,13 @@ export interface LeaderConnection {
   >
 }
 
+/** Closed failures declared by leader methods, before route-owned connection loss is added. */
+export type LeaderMethodError = Exclude<
+  | Effect.Error<ReturnType<LeaderConnection[keyof LeaderConnection]>>
+  | Stream.Error<ReturnType<LeaderConnection[keyof LeaderConnection]>>,
+  RpcClientError
+>
+
 export interface TabPlatform {
   readonly capability: () => { readonly unsupported: string | undefined; readonly sharedWorker: boolean }
   readonly holdLock: (name: string) => Effect.Effect<void, Platform.LockError, Scope.Scope>
