@@ -36,22 +36,22 @@ export const seededRandom = (clientId: ClientId, mutationId: MutationId): Random
 // Rejections and outcomes (Schema-encodable: they travel in push results and acks)
 // ---------------------------------------------------------------------------------------------
 
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class UnknownMutation extends Schema.TaggedError<UnknownMutation>()("UnknownMutation", {
-  // oxlint-disable-next-line effecttsgo/error-payload-shadows-name -- name is identity payload; _tag is the discriminant. Preserve wire/durable compatibility.
-  name: Schema.String
+export class UnknownMutation extends Schema.TaggedError<UnknownMutation, {}>()("UnknownMutation", {
+  mutationName: Schema.String
 }) {}
 
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class ArgsDecodeFailed extends Schema.TaggedError<ArgsDecodeFailed>()("ArgsDecodeFailed", {
-  // oxlint-disable-next-line effecttsgo/error-payload-shadows-name -- name is identity payload; _tag is the discriminant. Preserve wire/durable compatibility.
-  name: Schema.String,
+/** Retain the durable/wire key without shadowing Error.name in decoded errors. */
+export const UnknownMutationCodec = UnknownMutation.pipe(Schema.encodeKeys({ mutationName: "name" }))
+
+export class ArgsDecodeFailed extends Schema.TaggedError<ArgsDecodeFailed, {}>()("ArgsDecodeFailed", {
+  mutationName: Schema.String,
   message: Schema.String
 }) {}
 
+export const ArgsDecodeFailedCodec = ArgsDecodeFailed.pipe(Schema.encodeKeys({ mutationName: "name" }))
+
 /** A domain error declared by the mutation, JSON-encoded with that mutation's `error` schema. */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class DomainError extends Schema.TaggedError<DomainError>()("DomainError", {
+export class DomainError extends Schema.TaggedError<DomainError, {}>()("DomainError", {
   mutation: Schema.String,
   error: Schema.Json
 }) {}
@@ -60,21 +60,19 @@ export class DomainError extends Schema.TaggedError<DomainError>()("DomainError"
  * Terminal (SPEC §11): the server answered a `seq ≤` its expiry floor for this client. The
  * mutation was processed at some point; its outcome is unknown, its effect (if any) is installed.
  */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class ClientExpired extends Schema.TaggedError<ClientExpired>()("ClientExpired", {
+export class ClientExpired extends Schema.TaggedError<ClientExpired, {}>()("ClientExpired", {
   mutationId: MutationId
 }) {}
 
 /** The writer clock is too far ahead; no handler writes were applied (SPEC §5). */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class ClockSkew extends Schema.TaggedError<ClockSkew>()("ClockSkew", {
+export class ClockSkew extends Schema.TaggedError<ClockSkew, {}>()("ClockSkew", {
   createdAt: Schema.Number,
   serverNow: Schema.Number
 }) {}
 
 export const MutationRejection = Schema.Union([
-  UnknownMutation,
-  ArgsDecodeFailed,
+  UnknownMutationCodec,
+  ArgsDecodeFailedCodec,
   RowNotFound,
   RowAlreadyExists,
   ScopeForbidden,
@@ -102,8 +100,7 @@ export const MutationEnvelope = Schema.Struct({
 export type MutationEnvelope = typeof MutationEnvelope.Type
 
 /** Client-only rejection after bounded short-prefix transient answers; never ledgered. */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class TransientExhausted extends Schema.TaggedError<TransientExhausted>()("TransientExhausted", {
+export class TransientExhausted extends Schema.TaggedError<TransientExhausted, {}>()("TransientExhausted", {
   attempts: Schema.Number,
   message: Schema.String
 }) {}
@@ -217,7 +214,7 @@ export const make = <const Name extends string, A extends PureSchema, E extends 
     handler: options.handler,
     execute: (ctx, args) =>
       decodeArgs(args).pipe(
-        Effect.mapError((e) => new ArgsDecodeFailed({ name, message: e.message })),
+        Effect.mapError((e) => new ArgsDecodeFailed({ mutationName: name, message: e.message })),
         Effect.flatMap((decoded) =>
           Effect.suspend(() => options.handler({ ...ctx, store: Store.forMutation(ctx.store) }, decoded)).pipe(
             Effect.catchCause(classify)
@@ -255,7 +252,7 @@ export const run = (
 ): Effect.Effect<void, MutationRejection | StoreUnavailable> => {
   const mutation = registry.mutations.get(envelope.name)
   return mutation === undefined
-    ? Effect.fail(new UnknownMutation({ name: envelope.name }))
+    ? Effect.fail(new UnknownMutation({ mutationName: envelope.name }))
     : mutation.execute(ctx, envelope.args)
 }
 
@@ -264,15 +261,13 @@ export const run = (
 // ---------------------------------------------------------------------------------------------
 
 /** `decodeNotice` was given a notice of another mutation, or one its schemas cannot decode. */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class NoticeMismatch extends Schema.TaggedError<NoticeMismatch>()("NoticeMismatch", {
+export class NoticeMismatch extends Data.TaggedError("NoticeMismatch")<{
   /** The mutation decoded against. */
-  mutation: Schema.String,
+  readonly expectedMutationName: string
   /** The envelope's mutation name. */
-  // oxlint-disable-next-line effecttsgo/error-payload-shadows-name -- name is identity payload; _tag is the discriminant. Preserve wire/durable compatibility.
-  name: Schema.String,
-  message: Schema.String
-}) {}
+  readonly actualMutationName: string
+  readonly message: string
+}> {}
 
 /** A `DomainError` whose payload is decoded with its mutation's `error` schema. */
 export interface TypedDomainError<Name extends string, E> {
@@ -307,7 +302,7 @@ export const decodeNotice = <Name extends string, A extends PureSchema, E extend
 ): Effect.Effect<DecodedNotice<Name, A["Type"], E["Type"]>, NoticeMismatch> =>
   Effect.gen(function* () {
     const mismatch = (message: string) =>
-      new NoticeMismatch({ mutation: mutation.name, name: notice.envelope.name, message })
+      new NoticeMismatch({ expectedMutationName: mutation.name, actualMutationName: notice.envelope.name, message })
     if (notice.envelope.name !== mutation.name) {
       return yield* mismatch(`a notice of "${notice.envelope.name}" cannot be decoded as "${mutation.name}"`)
     }

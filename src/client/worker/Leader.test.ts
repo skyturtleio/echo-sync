@@ -21,7 +21,7 @@ import {
   String as Str
 } from "effect"
 import * as Reactivity from "effect/reactivity/Reactivity"
-import { RpcClientError, RpcTest } from "effect/rpc"
+import { RpcClientError, RpcSchema, RpcTest } from "effect/rpc"
 import * as Schedule from "effect/Schedule"
 import * as SqlClient from "effect/sql/SqlClient"
 import { AccessScope, Ids, Mutation, Protocol, Query, Registry, ScopeGrants, type Store, SyncTable } from "echo-sync"
@@ -281,6 +281,38 @@ const collect = <A, E>(stream: Stream.Stream<A, E>) =>
     const next = Queue.take(emissions).pipe(Effect.timeout("5 seconds"))
     return { emissions, next }
   })
+
+it.effect("worker error codecs preserve legacy name fields and restore standard Error names", () =>
+  Effect.gen(function* () {
+    for (const method of ["subscribe", "subscribeSnapshot"] as const) {
+      const rpc = LeaderRpcs.requests.get(method)
+      if (rpc === undefined || !RpcSchema.isStreamSchema(rpc.successSchema)) throw new Error("expected stream RPC")
+      const queries = Schema.fromJsonString(rpc.successSchema.error)
+      for (const json of [
+        '{"_tag":"UnknownQuery","name":"todos.missing"}',
+        '{"_tag":"QueryArgsDecodeFailed","name":"docs.search","message":"expected text"}'
+      ]) {
+        const error = yield* Schema.decodeUnknownEffect(queries)(json)
+        if (error._tag !== "UnknownQuery" && error._tag !== "QueryArgsDecodeFailed") throw error
+        expect(error.queryName).toBe(error._tag === "UnknownQuery" ? "todos.missing" : "docs.search")
+        expect(error.name).toBe(error._tag)
+        expect(yield* Schema.encodeEffect(queries)(error)).toBe(json)
+      }
+    }
+    const enqueue = LeaderRpcs.requests.get("enqueue")
+    if (enqueue === undefined) throw new Error("expected enqueue RPC")
+    const rejected = Schema.fromJsonString(enqueue.errorSchema)
+    const json =
+      '{"_tag":"LocallyRejected","name":"raw.add","error":{"_tag":"ArgsDecodeFailed","name":"raw.add","message":"expected id"}}'
+    const error = yield* Schema.decodeUnknownEffect(rejected)(json)
+    if (error._tag !== "LocallyRejected") throw error
+    expect(error.name).toBe("LocallyRejected")
+    expect(error.mutationName).toBe("raw.add")
+    expect(error.error).toBeInstanceOf(Mutation.ArgsDecodeFailed)
+    expect(error.error.name).toBe("ArgsDecodeFailed")
+    expect(yield* Schema.encodeEffect(rejected)(error)).toBe(json)
+  })
+)
 
 it.live(
   "a query re-emits after a write to a table only its latest run read, and not after one it stopped reading",
@@ -671,8 +703,10 @@ it.live("mutate rejects excess args before enqueue rather than silently saving a
       const error = yield* Effect.flip(attempt)
       expect(error._tag).toBe("LocallyRejected")
       if (error._tag !== "LocallyRejected") throw error
+      expect(error.name).toBe("LocallyRejected")
       expect(error.error._tag).toBe("ArgsDecodeFailed")
       if (error.error._tag !== "ArgsDecodeFailed") throw error.error
+      expect(error.mutationName).toBe(error.error.mutationName)
       expect(error.error.message).toContain("typo")
     }
     expect(yield* count("echo_outbox")).toBe(0)

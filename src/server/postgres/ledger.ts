@@ -1,5 +1,5 @@
 import * as PgTypes from "@effect/sql-pg/PgTypes"
-import { Array as Arr, Cause, Effect, Option, Schedule, Schema } from "effect"
+import { Array as Arr, Cause, Data, Effect, Option, Result, Schedule, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import { isSqlError, type SqlError } from "effect/sql/SqlError"
 import { Errors, Ids, Mutation, Protocol, Store } from "echo-sync"
@@ -22,12 +22,11 @@ export interface Processed {
  * lost connection, unclassified database error, or a COMMIT whose reply was lost (in which case
  * it may in fact be recorded). The client resubmits from this mutation; dedup makes that safe.
  */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class MutationTransient extends Schema.TaggedError<MutationTransient>()("MutationTransient", {
-  clientId: Schema.String,
-  mutationId: Schema.String,
-  message: Schema.String
-}) {}
+export class MutationTransient extends Data.TaggedError("MutationTransient")<{
+  readonly clientId: string
+  readonly mutationId: string
+  readonly message: string
+}> {}
 
 /**
  * `seq < 1` (INV-MUT-7) is refused at request level with core's `MalformedEnvelope`: nothing
@@ -47,10 +46,9 @@ const checkEnvelope = (clientId: string, mutationId: string, seq: bigint) =>
     : Effect.void
 
 /** The client id is registered to a different principal. */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class ClientForbidden extends Schema.TaggedError<ClientForbidden>()("ClientForbidden", {
-  clientId: Schema.String
-}) {}
+export class ClientForbidden extends Data.TaggedError("ClientForbidden")<{
+  readonly clientId: string
+}> {}
 
 export interface Envelope {
   readonly principalId: string
@@ -202,7 +200,6 @@ const classify = (
     return Effect.fail(transient(envelope, failure))
   }
   for (const r of cause.reasons) {
-    // oxlint-disable-next-line effecttsgo/instance-of-schema -- Client binding failures originate here, not in structurally similar domain errors.
     if (Cause.isFailReason(r) && r.error instanceof ClientForbidden) return Effect.fail(r.error)
   }
   return die
@@ -422,10 +419,12 @@ export const runBatch = <R>(
         { principalId, clientId, mutationId: item.mutationId, seq: item.seq },
         item.body,
         options
-      ).pipe(Effect.catchTag("MutationTransient", (error) => Effect.succeed(error)))
-      // oxlint-disable-next-line effecttsgo/instance-of-schema -- Discriminate the actual caught transient from successful processed values without structural validation.
-      if (result instanceof MutationTransient) return { processed, stopped: result }
-      processed.push({ mutationId: item.mutationId, ...result })
+      ).pipe(
+        Effect.map(Result.succeed),
+        Effect.catchTag("MutationTransient", (error) => Effect.succeed(Result.fail(error)))
+      )
+      if (Result.isFailure(result)) return { processed, stopped: result.failure }
+      processed.push({ mutationId: item.mutationId, ...result.success })
     }
     return { processed, stopped: null }
   }).pipe(Telemetry.boundary)

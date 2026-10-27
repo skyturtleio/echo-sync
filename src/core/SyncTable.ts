@@ -1,7 +1,7 @@
+import type { DateTime } from "effect"
 import {
   Array as Arr,
   Data,
-  DateTime,
   Option,
   Predicate,
   Record as Rec,
@@ -319,19 +319,8 @@ const classify = (ast: SchemaAST.AST): Classified | string => {
 }
 
 const TimestampMillis = Schema.Int.check(Schema.isBetween({ minimum: minTimestampMillis, maximum: maxTimestampMillis }))
-const DateFromWire = TimestampMillis.pipe(
-  Schema.decodeTo(Schema.Date, {
-    // oxlint-disable-next-line effecttsgo/global-date -- This public codec must decode to a native Date, not DateTime.
-    decode: SchemaGetter.transform((ms: number) => new globalThis.Date(ms)),
-    encode: SchemaGetter.transform((d: globalThis.Date) => d.getTime())
-  })
-)
-const UtcFromWire = TimestampMillis.pipe(
-  Schema.decodeTo(Schema.DateTimeUtc, {
-    decode: SchemaGetter.transform((ms: number) => DateTime.makeUnsafe(ms)),
-    encode: SchemaGetter.transform((utc: DateTime.Utc) => DateTime.toEpochMillis(utc))
-  })
-)
+const DateFromWire = TimestampMillis.pipe(Schema.decodeTo(Schema.DateFromMillis))
+const UtcFromWire = TimestampMillis.pipe(Schema.decodeTo(Schema.DateTimeUtcFromMillis))
 
 /**
  * Field value ↔ wire value. The whole field schema stays the decoding target, so its own
@@ -360,13 +349,7 @@ const PgInteger = Schema.BigInt.pipe(
     encode: SchemaGetter.transform((n: number) => BigInt(n))
   })
 )
-const PgTimestamp = Schema.Date.pipe(
-  Schema.decodeTo(TimestampMillis, {
-    decode: SchemaGetter.transform((d: globalThis.Date) => d.getTime()),
-    // oxlint-disable-next-line effecttsgo/global-date -- The SQL driver's timestamptz binding requires a native Date.
-    encode: SchemaGetter.transform((ms: number) => new globalThis.Date(ms))
-  })
-)
+const PgTimestamp = Schema.flip(DateFromWire)
 
 const sqliteCodec = (kind: ColumnKind): Schema.Constraint => {
   switch (kind) {

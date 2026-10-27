@@ -725,7 +725,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
             for (const [field, value] of built.eq) eq.push(yield* toKeyValue(table, field, value))
             const encodedCursors: { after?: ReadonlyArray<KeyValue>; before?: ReadonlyArray<KeyValue> } = {}
             for (const side of ["after", "before"] as const) {
-              // oxlint-disable-next-line effecttsgo/prefer-effect-record -- Optional cursor keys are not a total Record; presence differs from an explicit undefined value.
+              // oxlint-disable-next-line effecttsgo/prefer-effect-record -- Optional cursor keys form a partial object, not the total Record accepted by Record.has.
               if (!Object.hasOwn(cursors, side)) continue
               const cursor: unknown = cursors[side]
               const values: Array<KeyValue> = []

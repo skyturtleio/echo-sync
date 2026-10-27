@@ -1,4 +1,4 @@
-import { Array as Arr, Effect, Option, Schema } from "effect"
+import { Array as Arr, Data, Effect, Option } from "effect"
 import * as PgMigrator from "@effect/sql-pg/PgMigrator"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { Registry, SyncTable } from "echo-sync"
@@ -45,11 +45,10 @@ export const migrate = Effect.gen(function* () {
  * `echo_sync.log.table_name` is the unqualified table name (the SyncTable name on the wire), so
  * two synced tables with one name in different schemas would be indistinguishable.
  */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class TableNameConflict extends Schema.TaggedError<TableNameConflict>()("TableNameConflict", {
-  table: Schema.String,
-  existingSchema: Schema.String
-}) {}
+export class TableNameConflict extends Data.TaggedError("TableNameConflict")<{
+  readonly table: string
+  readonly existingSchema: string
+}> {}
 
 /**
  * Starts change capture on a SyncTable's relation: `table.name` in `options.schema`, or resolved

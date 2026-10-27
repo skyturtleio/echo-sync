@@ -251,7 +251,7 @@ it.effect("a processed push returns core's result; a rejection keeps its class a
             results: Arr.map(req.mutations, (m) => ({
               mutationId: m.mutationId,
               position,
-              outcome: { _tag: "Rejected" as const, error: new Mutation.UnknownMutation({ name: m.name }) }
+              outcome: { _tag: "Rejected" as const, error: new Mutation.UnknownMutation({ mutationName: m.name }) }
             }))
           })
       }),
@@ -261,7 +261,7 @@ it.effect("a processed push returns core's result; a rejection keeps its class a
     expect(Arr.map(results, (r) => [r.mutationId, r.position, r.outcome._tag])).toEqual([["m1", 7n, "Rejected"]])
     const outcome = results[0]?.outcome
     expect(outcome?._tag === "Rejected" ? outcome.error : undefined).toEqual(
-      new Mutation.UnknownMutation({ name: "todo.add" })
+      new Mutation.UnknownMutation({ mutationName: "todo.add" })
     )
   }).pipe(Effect.scoped)
 )
@@ -834,7 +834,8 @@ it.live("a fetch failure with a same-identifier foreign schema class stays netwo
   Effect.gen(function* () {
     const fixture = yield* credentials
     const foreign = new ForeignCredentials({ message: "foreign credential-shaped fetch rejection" })
-    expect(Schema.is(SyncFailure.CredentialsUnavailable)(foreign)).toBe(true)
+    expect(foreign._tag).toBe("CredentialsUnavailable")
+    expect(foreign).not.toBeInstanceOf(SyncFailure.CredentialsUnavailable)
     const fetch = Object.assign(() => Promise.reject(foreign), { preconnect: globalThis.fetch.preconnect })
     expect((yield* errorOf({ ...fixture, fetch }))?.kind).toBe("network")
   }).pipe(Effect.scoped)

@@ -198,7 +198,7 @@ describe.skipIf(!pgAvailable)("pull byte safety", () => {
       if (delivered?._tag !== "Rejected" || delivered.error._tag !== "UnknownMutation") {
         return assert.fail("expected UnknownMutation outcome")
       }
-      assert.strictEqual(delivered.error.name, outcome.error.name)
+      assert.strictEqual(delivered.error.mutationName, outcome.error.name)
       // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Test root owns the disposable database until test completion.
     }).pipe(Effect.provide(TestDatabase))
   )

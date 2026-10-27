@@ -119,12 +119,13 @@ export interface Transport {
 }
 
 /** The handler rejected the mutation against the local replica; nothing was saved. */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class LocallyRejected extends Schema.TaggedError<LocallyRejected>()("LocallyRejected", {
-  // oxlint-disable-next-line effecttsgo/error-payload-shadows-name -- name is identity payload; _tag is the discriminant. Preserve wire/durable compatibility.
-  name: Schema.String,
+export class LocallyRejected extends Schema.TaggedError<LocallyRejected, {}>()("LocallyRejected", {
+  mutationName: Schema.String,
   error: Mutation.MutationRejection
 }) {}
+
+/** Preserve the worker protocol's name field, including nested durable rejection codecs. */
+export const LocallyRejectedCodec = LocallyRejected.pipe(Schema.encodeKeys({ mutationName: "name" }))
 
 // ---------------------------------------------------------------------------------------------
 // Running a handler (shared with the reference server)
@@ -416,7 +417,7 @@ export const make = (options: {
             const createdAt = yield* Clock.currentTimeMillis
             const run = yield* runHandler(storage.rows, options.mutations, options.actor, envelope, createdAt)
             if (Option.isSome(run.rejection)) {
-              return yield* new LocallyRejected({ name, error: run.rejection.value })
+              return yield* new LocallyRejected({ mutationName: name, error: run.rejection.value })
             }
             yield* storage.appendPending({ envelope, createdAt, undo: run.undo })
             yield* Telemetry.annotate({ "echo.result": "saved" })

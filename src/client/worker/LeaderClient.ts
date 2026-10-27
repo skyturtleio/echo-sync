@@ -293,8 +293,8 @@ export const tabApi = (calls: LeaderCalls, tuning: TabApiOptions = {}) => {
         Effect.mapError(
           (e) =>
             new LocallyRejected({
-              name: mutation.name,
-              error: new Mutation.ArgsDecodeFailed({ name: mutation.name, message: e.message })
+              mutationName: mutation.name,
+              error: new Mutation.ArgsDecodeFailed({ mutationName: mutation.name, message: e.message })
             })
         )
       )

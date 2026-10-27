@@ -4,7 +4,7 @@
  * Transport failures retain their original tags. The RPC-derived unions make additions require a
  * catalog mapping; whole-cause precedence remains separate from each error's meaning (SPEC §15).
  */
-import { Array as Arr, Cause, Match, Option, Schema } from "effect"
+import { Array as Arr, Cause, Data, Match, Option, Schema } from "effect"
 import type { Outcome } from "../../internal/Telemetry.ts"
 import type { Rpc, RpcClientError, RpcGroup } from "effect/rpc"
 import { type Errors, Protocol } from "echo-sync"
@@ -14,40 +14,35 @@ import { failureMeaning } from "../../internal/ErrorCatalog.ts"
  * `syncHeaders` raised (a defect: its error channel is `never`) while the leader was preparing a
  * request (INV-LOOP-8 Credentials). Local and transient, like a network failure: nothing was sent.
  */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class CredentialsUnavailable extends Schema.TaggedError<CredentialsUnavailable>()("CredentialsUnavailable", {
-  message: Schema.String
-}) {}
+export class CredentialsUnavailable extends Data.TaggedError("CredentialsUnavailable")<{
+  readonly message: string
+}> {}
 
 /** The push batch cannot be sent as is, or the server ended it with a defect. Fatal. */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class PushIntegrityError extends Schema.TaggedError<PushIntegrityError>()("PushIntegrityError", {
-  reason: Schema.Literals(["invalidPayload", "serverDefect"]),
-  message: Schema.String
-}) {}
+export class PushIntegrityError extends Data.TaggedError("PushIntegrityError")<{
+  readonly reason: "invalidPayload" | "serverDefect"
+  readonly message: string
+}> {}
 
 /** The pull call ended in a defect. Transient: nothing was installed. */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class PullProtocolError extends Schema.TaggedError<PullProtocolError>()("PullProtocolError", {
-  message: Schema.String
-}) {}
+export class PullProtocolError extends Data.TaggedError("PullProtocolError")<{
+  readonly message: string
+}> {}
 
 /**
  * A pull change for a table this client knows does not decode with that table's schema. The
  * install transaction fails as a whole (no rows, acks, cursor or staging change). Per INV-CLI-9
  * and SPEC §10 it is a transient pull failure: the sync loop retries with backoff, never halts.
  */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class MalformedChange extends Schema.TaggedError<MalformedChange>()("MalformedChange", {
-  table: Schema.String,
-  message: Schema.String
-}) {}
+export class MalformedChange extends Data.TaggedError("MalformedChange")<{
+  readonly table: string
+  readonly message: string
+}> {}
 
 /** A known table's server payload lacks a declared wire column. Retry, never rebuild. */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class ServerOutdated extends Schema.TaggedError<ServerOutdated>()("ServerOutdated", {
-  table: Schema.String
-}) {}
+export class ServerOutdated extends Data.TaggedError("ServerOutdated")<{
+  readonly table: string
+}> {}
 
 /**
  * Why a push failed in the transport:

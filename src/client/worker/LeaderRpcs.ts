@@ -6,14 +6,13 @@
 import * as Schema from "effect/Schema"
 import { Rpc, RpcGroup } from "effect/rpc"
 import { AccessScope, Errors, Ids, Mutation, Protocol, Query } from "echo-sync"
-import { LocallyRejected } from "../sync/Engine.ts"
+import { LocallyRejectedCodec } from "../sync/Engine.ts"
 import { Notice } from "../sync/SqliteSyncStorage.ts"
 import { SyncStatus } from "../sync/SyncLoop.ts"
 import { LocalChange, Revision } from "../Provenance.ts"
 
 /** A SQLite statement failed inside the leader. The transaction (if any) was rolled back. */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class SqlFailure extends Schema.TaggedError<SqlFailure>()("SqlFailure", {
+export class SqlFailure extends Schema.TaggedError<SqlFailure, {}>()("SqlFailure", {
   message: Schema.String
 }) {}
 
@@ -23,8 +22,7 @@ export class SqlFailure extends Schema.TaggedError<SqlFailure>()("SqlFailure", {
  * is safe to retry; `exec` is only safe to retry if the statement is.
  * `Reset`: `resetReplica` closed this tab client (INV-BRW-7); terminal, never retried. Build a new client.
  */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class LeaderUnavailable extends Schema.TaggedError<LeaderUnavailable>()("LeaderUnavailable", {
+export class LeaderUnavailable extends Schema.TaggedError<LeaderUnavailable, {}>()("LeaderUnavailable", {
   reason: Schema.Literals(["LeaderLost", "LeaderFailed", "Unsupported", "SecondaryTabWithoutRouter", "Reset"]),
   message: Schema.String
 }) {}
@@ -39,16 +37,13 @@ export type Rows = typeof Rows.Type
  * `exec` on a leader started without `allowRawExec` (INV-BRW-6): raw writes bypass the outbox and
  * break the replica invariant, so only the dev harness enables it.
  */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class RawExecDisabled extends Schema.TaggedError<RawExecDisabled>()("RawExecDisabled", {}) {}
+export class RawExecDisabled extends Schema.TaggedError<RawExecDisabled, {}>()("RawExecDisabled", {}) {}
 
 /** This leader was started without a `syncUrl`: a local-only replica, nothing syncs. */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class SyncDisabled extends Schema.TaggedError<SyncDisabled>()("SyncDisabled", {}) {}
+export class SyncDisabled extends Schema.TaggedError<SyncDisabled, {}>()("SyncDisabled", {}) {}
 
 /** This tab already has an open `presence` stream for the room (one entry per tab per room, SPEC §10.3). */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class PresenceAlreadyOpen extends Schema.TaggedError<PresenceAlreadyOpen>()("PresenceAlreadyOpen", {
+export class PresenceAlreadyOpen extends Schema.TaggedError<PresenceAlreadyOpen, {}>()("PresenceAlreadyOpen", {
   room: Schema.String
 }) {}
 
@@ -133,7 +128,7 @@ export class LeaderRpcs extends RpcGroup.make(
   Rpc.make("enqueue", {
     payload: { envelope: OutboxEnvelope },
     success: Enqueued,
-    error: Schema.Union([SqlFailure, LocallyRejected])
+    error: Schema.Union([SqlFailure, LocallyRejectedCodec])
   }),
   /**
    * A registered query (INV-BRW-6), by name with its encoded args. Emits the encoded result of a run,
@@ -145,8 +140,8 @@ export class LeaderRpcs extends RpcGroup.make(
     success: Schema.Json,
     error: Schema.Union([
       SqlFailure,
-      Query.UnknownQuery,
-      Query.QueryArgsDecodeFailed,
+      Query.UnknownQueryCodec,
+      Query.QueryArgsDecodeFailedCodec,
       Errors.RowNotFound,
       Errors.ScopeForbidden,
       Errors.InvalidRow
@@ -159,8 +154,8 @@ export class LeaderRpcs extends RpcGroup.make(
     success: Schema.Struct({ value: Schema.Json, revision: Revision }),
     error: Schema.Union([
       SqlFailure,
-      Query.UnknownQuery,
-      Query.QueryArgsDecodeFailed,
+      Query.UnknownQueryCodec,
+      Query.QueryArgsDecodeFailedCodec,
       Errors.RowNotFound,
       Errors.ScopeForbidden,
       Errors.InvalidRow

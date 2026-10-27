@@ -13,7 +13,6 @@ import * as Exit from "effect/Exit"
 import * as Hex from "effect/encoding/Hex"
 import * as Option from "effect/Option"
 import * as Schedule from "effect/Schedule"
-import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as Str from "effect/String"
@@ -147,14 +146,12 @@ export const storageCall = <A>(operation: string, run: () => Promise<A>): Effect
   Effect.tryPromise({ try: run, catch: (cause) => new BrowserStorageError({ operation, cause }) })
 
 /** The Web Locks API rejected a request for a reason other than our own cancellation. */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class LockError extends Schema.TaggedError<LockError>()("LockError", {
-  // oxlint-disable-next-line effecttsgo/error-payload-shadows-name -- name is identity payload; _tag is the discriminant. Preserve wire/durable compatibility.
-  name: Schema.String,
-  message: Schema.String
-}) {}
+export class LockError extends Data.TaggedError("LockError")<{
+  readonly lockName: string
+  readonly message: string
+}> {}
 
-const lockError = (name: string, cause: unknown) => new LockError({ name, message: describe(cause) })
+const lockError = (lockName: string, cause: unknown) => new LockError({ lockName, message: describe(cause) })
 
 /**
  * Register ownership before requesting a lock. The native callback transfers its release function

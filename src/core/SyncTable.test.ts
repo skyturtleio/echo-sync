@@ -1,4 +1,4 @@
-import { Array as Arr, DateTime, Effect, Option, Schema, SchemaGetter } from "effect"
+import { Array as Arr, DateTime, Effect, Exit, Option, Schema, SchemaGetter } from "effect"
 import { describe, expect, it } from "@effect/vitest"
 import { afterAll, beforeAll } from "vitest"
 import { AccessScopeId } from "./AccessScope.ts"
@@ -138,6 +138,40 @@ const expectSameRows = (actual: ReadonlyArray<Row>) => {
 }
 
 describe("SyncTable codec round-trip", () => {
+  it.effect(
+    "timestamp codecs reject out-of-range and non-integer milliseconds in both directions and retain Date refinements",
+    () =>
+      Effect.gen(function* () {
+        for (const column of Everything.columns) {
+          if (column.field !== "date" && column.field !== "utc") continue
+          for (const ms of [SyncTable.minTimestampMillis, -1, 0, 1, SyncTable.maxTimestampMillis]) {
+            const value = yield* Schema.decodeEffect(column.wire)(ms)
+            expect(yield* Schema.encodeEffect(column.wire)(value)).toBe(ms)
+            expect(yield* Schema.encodeEffect(column.sqlite)(ms)).toBe(ms)
+            const binding = yield* Schema.encodeEffect(column.postgres)(ms)
+            expect(Schema.is(Schema.Date)(binding)).toBe(true)
+            expect(yield* Schema.decodeEffect(column.postgres)(binding)).toBe(ms)
+          }
+          for (const ms of [SyncTable.minTimestampMillis - 1, SyncTable.maxTimestampMillis + 1, 0.5, NaN, Infinity]) {
+            expect(Exit.isFailure(yield* Effect.exit(Schema.decodeUnknownEffect(column.wire)(ms)))).toBe(true)
+            yield* Effect.flip(Schema.encodeEffect(column.postgres)(ms))
+            yield* Effect.flip(Schema.encodeEffect(column.sqlite)(ms))
+          }
+          const tooEarly = yield* Schema.decodeEffect(Schema.DateFromMillis)(SyncTable.minTimestampMillis - 1)
+          yield* Effect.flip(Schema.decodeEffect(column.postgres)(tooEarly))
+          yield* Effect.flip(
+            Schema.encodeEffect(column.wire)(
+              column.field === "date" ? tooEarly : DateTime.makeUnsafe(SyncTable.minTimestampMillis - 1)
+            )
+          )
+        }
+        for (const row of rows) {
+          const wire = yield* Schema.encodeEffect(Everything.wire)(row)
+          yield* Effect.flip(Schema.decodeEffect(Everything.wire)({ ...wire, past: 4_102_444_800_000 }))
+        }
+      })
+  )
+
   it.effect("the wire form (JSON text, as sent over HTTP) returns every field unchanged", () =>
     Effect.gen(function* () {
       const codec = Schema.fromJsonString(Everything.wire)

@@ -372,10 +372,19 @@ command-based LSP configuration. Effect's packaged tsrs/Oxlint integrations do n
 
 No correctness or anti-pattern rule is globally disabled. Generic helpers preserve their actual
 error channels rather than erasing them to `unknown`; telemetry classifiers cannot widen the
-observed operation's error type. Declaration-local exceptions preserve public errors' structural
-assignability and existing `name` identity payloads (their discriminant is `_tag`). Internal
-testing errors use nominal brands. Changing a public error's type or encoded fields merely to
-satisfy a heuristic would be a separate API design change.
+observed operation's error type. Schema-backed engine errors declare structural intent explicitly
+with the second generic `{}`; local-only failures use `Data.TaggedError` rather than exposing
+unused schema capabilities. Internal testing errors use nominal brands. These are typing and
+responsibility choices, not execution provenance: store-origin failures still require the
+stage-owned `StoreOperationFailure` envelope.
+
+Error identity payloads no longer shadow `Error.name`: use `mutationName`, `queryName`,
+`lockName`, or `NoticeMismatch.expectedMutationName` / `actualMutationName`. The five serialized
+errors expose `*Codec` companions using native `Schema.encodeKeys` to retain encoded `name`;
+engine RPC and durable unions already use them. Use those codecs for legacy standalone data,
+not the renamed class's untransformed schema. Existing outcomes/notices and worker payloads need
+no migration. The 15 local-only errors no longer expose Schema constructors/decoders; consumers
+that used those incidental capabilities must supply their own boundary schema.
 
 Line-local anti-pattern exceptions identify real composition roots: test/fixture runtimes,
 administrative runners, per-tab RPC servers and browser telemetry roots. Encapsulated Web Crypto
@@ -389,6 +398,8 @@ work. Platform APIs remain at actual host boundaries: browser workers, Web Locks
 events and external browser drivers still have their native contracts. Line-local explanations
 identify those boundaries and synchronous wire/source-inspection oracles; converting a native
 host contract into a new engine abstraction purely for lint is not the goal.
+Timestamp codecs compose Effect's native millisecond conversions with the existing portable
+bounds; native Date interoperability is preserved without custom conversion or precision code.
 
 The plugin explicitly allows only the unstable Effect module families already used by the
 engine/harness (SQL, RPC, HTTP, workers, reactivity, Crypto and their platform packages). New

@@ -1,4 +1,4 @@
-import { Array as Arr, Cause, DateTime, Effect, Option, Schema, SchemaGetter } from "effect"
+import { Array as Arr, Cause, DateTime, Effect, Option, Schema, SchemaGetter, String as Str } from "effect"
 import { describe, expect, it } from "@effect/vitest"
 import { AccessScopeId, PrincipalId } from "./AccessScope.ts"
 import { RowNotFound, ScopeForbidden, StoreUnavailable } from "./Errors.ts"
@@ -60,6 +60,25 @@ const makeStore = () => {
     now: DateTime.makeUnsafe(0)
   }).store
 }
+
+it.effect("legacy rejection names round-trip unchanged without replacing Error.name", () =>
+  Effect.gen(function* () {
+    const codec = Schema.fromJsonString(Mutation.MutationOutcome)
+    for (const json of [
+      '{"_tag":"Rejected","error":{"_tag":"UnknownMutation","name":"todos.missing"}}',
+      '{"_tag":"Rejected","error":{"_tag":"ArgsDecodeFailed","name":"todos.edit","message":"invalid title"}}'
+    ]) {
+      const outcome = yield* Schema.decodeUnknownEffect(codec)(json)
+      if (outcome._tag !== "Rejected") throw new Error("expected rejection")
+      const error = outcome.error
+      if (error._tag !== "UnknownMutation" && error._tag !== "ArgsDecodeFailed") throw error
+      expect(error.mutationName).toBe(error._tag === "UnknownMutation" ? "todos.missing" : "todos.edit")
+      expect(error.name).toBe(error._tag)
+      expect(Str.split(error.stack ?? "", "\n")[0]).toContain(error._tag)
+      expect(yield* Schema.encodeEffect(codec)(outcome)).toBe(json)
+    }
+  })
+)
 
 describe("mutation args evolve without breaking queued intents (SPEC §5)", () => {
   it.effect(
@@ -196,7 +215,7 @@ describe("mutation outcome classification over the whole cause (SPEC §5)", () =
       for (const error of [
         new StoreUnavailable({ message: "SerializationError: domain" }),
         new RowNotFound({ table: "domain", id: "x" }),
-        new Mutation.ArgsDecodeFailed({ name: "domain", message: "domain" })
+        new Mutation.ArgsDecodeFailed({ mutationName: "domain", message: "domain" })
       ]) {
         const mutation = Mutation.make("domain", {
           args: Schema.Struct({}),
@@ -405,14 +424,16 @@ describe("decodeNotice types a stored notice by its mutation (SPEC §9.5)", () =
   it.effect(
     "a notice of one mutation decoded against another, or one its schemas cannot read, is NoticeMismatch, never a value or a defect",
     Effect.fnUntraced(function* () {
-      const cases: ReadonlyArray<[string, Effect.Effect<unknown, Mutation.NoticeMismatch>]> = [
+      const cases: ReadonlyArray<[string, string, Effect.Effect<unknown, Mutation.NoticeMismatch>]> = [
         [
           "archive's OutcomeUnknown as touch (its args would decode)",
+          "todos.touch",
           Mutation.decodeNotice(touch, { _tag: "OutcomeUnknown", envelope })
         ],
-        ["archive's rejection as touch", Mutation.decodeNotice(touch, rejected(forbidden))],
+        ["archive's rejection as touch", "todos.touch", Mutation.decodeNotice(touch, rejected(forbidden))],
         [
           "args of another shape under the right name",
+          "todos.archive",
           Mutation.decodeNotice(archive, {
             _tag: "OutcomeUnknown",
             envelope: { ...envelope, args: { id: "t1", at: 5 } }
@@ -420,6 +441,7 @@ describe("decodeNotice types a stored notice by its mutation (SPEC §9.5)", () =
         ],
         [
           "a domain payload outside the error schema",
+          "todos.archive",
           Mutation.decodeNotice(
             archive,
             rejected(new Mutation.DomainError({ mutation: "todos.archive", error: { _tag: "Gone" } }))
@@ -427,17 +449,21 @@ describe("decodeNotice types a stored notice by its mutation (SPEC §9.5)", () =
         ],
         [
           "a domain error recorded for another mutation",
+          "todos.archive",
           Mutation.decodeNotice(
             archive,
             rejected(new Mutation.DomainError({ mutation: "todos.touch", error: { _tag: "Locked", by: "u" } }))
           )
         ]
       ]
-      for (const [label, effect] of cases) {
+      for (const [label, expectedMutationName, effect] of cases) {
         const error = yield* mismatchOf(effect).pipe(
           Effect.catchCause((cause) => Effect.die(new Error(`${label}: ${Cause.pretty(cause)}`)))
         )
         expect(error).toBeInstanceOf(Mutation.NoticeMismatch)
+        expect(error.name).toBe("NoticeMismatch")
+        expect(error.expectedMutationName).toBe(expectedMutationName)
+        expect(error.actualMutationName).toBe("todos.archive")
       }
     })
   )

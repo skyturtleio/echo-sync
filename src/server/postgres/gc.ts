@@ -1,4 +1,4 @@
-import { Array as Arr, DateTime, Duration, Effect, Schema } from "effect"
+import { Array as Arr, Data, DateTime, Duration, Effect } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
@@ -33,11 +33,10 @@ export const collectGarbage = Effect.fnUntraced(function* (retention: Duration.I
 }, Telemetry.boundary)
 
 /** `expireLedger` was constructed with a retention below `minimumLedgerRetention`. */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class LedgerRetentionTooShort extends Schema.TaggedError<LedgerRetentionTooShort>()("LedgerRetentionTooShort", {
-  retentionMillis: Schema.Number,
-  minimumMillis: Schema.Number
-}) {}
+export class LedgerRetentionTooShort extends Data.TaggedError("LedgerRetentionTooShort")<{
+  readonly retentionMillis: number
+  readonly minimumMillis: number
+}> {}
 
 /**
  * Twice the client's released-row window (SPEC §9, 24 h), with margin for a paused tab's clock. A

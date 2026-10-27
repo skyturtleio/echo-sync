@@ -17,10 +17,10 @@
  * next reset (answering `Done` without a pending count) completes the removal, and a leader then starts on a
  * fresh replica with a new clientId.
  */
+import * as Data from "effect/Data"
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
-import * as Schema from "effect/Schema"
 import { isFromLeader, type ResetOutcome, type ResetSignal, type ToLeader } from "./messages.ts"
 import * as Platform from "./platform.ts"
 
@@ -28,16 +28,13 @@ import * as Platform from "./platform.ts"
  * A leader still held the identity's leader lock after `closeTimeout` (a tab that did not honour the reset
  * signal: an old build, a frozen tab); nothing was touched.
  */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class ReplicaInUse extends Schema.TaggedError<ReplicaInUse>()("ReplicaInUse", {}) {}
+export class ReplicaInUse extends Data.TaggedError("ReplicaInUse")<{}> {}
 
 /** The outbox holds `count` unreleased mutations and `discardPending` was not set; nothing was deleted. */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class PendingWrites extends Schema.TaggedError<PendingWrites>()("PendingWrites", { count: Schema.Int }) {}
+export class PendingWrites extends Data.TaggedError("PendingWrites")<{ readonly count: number }> {}
 
 /** The reset could not run or did not finish (unsupported browser, invalid identity, an OPFS error). */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class ResetFailed extends Schema.TaggedError<ResetFailed>()("ResetFailed", { message: Schema.String }) {}
+export class ResetFailed extends Data.TaggedError("ResetFailed")<{ readonly message: string }> {}
 
 export interface ResetReplicaConfig extends Platform.ReplicaIdentity {
   /** The same factory the app passes to `LeaderClient.make`. */

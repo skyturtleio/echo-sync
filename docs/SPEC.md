@@ -49,6 +49,10 @@ coverage without a verifiable literal title remains explicit debt instead of a f
 and usable by other implementations; round trips alone would accept both sides drifting
 together. Unsupported schema shapes or invalid branch samples fail rather than losing coverage.
 
+**Rationale (2026-10-27):** Error identity payloads now decode to `mutationName` rather than
+shadowing `Error.name`. Regenerated vectors change only their decoded `value` projections;
+all compact `json` bytes remain identical, so this is a source API change, not a wire revision.
+
 ### 0.2 Versioning
 
 - **Wire version.** `Protocol.wireVersion` is `2`. Every `push` and `pull` request carries
@@ -354,6 +358,10 @@ milliseconds and MUST lie in `[−210 866 803 200 000, 8 640 000 000 000 000]` (
 lower bound to the JS `Date` upper bound). An integer column crosses the wire as a JS `number`
 (`Number(bigint)`), so a value beyond 2^53 written by a script is not exact on the wire.
 
+**Rationale (2026-10-27):** Compose Effect's native `DateFromMillis`, `DateTimeUtcFromMillis`
+and flipped codecs with the existing integer/range checks instead of handwritten conversions.
+Domain Date/DateTime types, PostgreSQL Date bindings, millisecond precision and hashes are unchanged.
+
 **Hashes.** `dataHash` and `indexHash` are FNV-1a 64 over the canonical JSON of the manifest's
 data part (name, sorted columns with kind and nullability) and index part (indexes, unique
 sets). The
@@ -593,7 +601,7 @@ clients under the existing version policy instead of imposing a new engine versi
 - INV-MUT-18: `Mutation.make` MUST default `onExcessProperty` to `"error"` for args
   encoding and decoding, including nested structs and record values. Unknown keys not covered
   by declared fields/index signatures MUST fail before the handler. The tab's `mutate` MUST
-  fail `LocallyRejected{error: ArgsDecodeFailed{name, message}}` before enqueue/upload;
+  fail `LocallyRejected{error: ArgsDecodeFailed{mutationName, message}}` before enqueue/upload;
   registry decoding on the server MUST yield a ledgered `Rejected{ArgsDecodeFailed}`, not
   Applied or a transient response. Messages retain the schema's offending-key path.
   Explicit `onExcessProperty: "ignore"` restores stripping on both sides. Schema's empty
@@ -1960,6 +1968,20 @@ the count keys. Changes to these lists must also update the corresponding prose 
   enqueue rejection and a ledgered rejection inside a successful response. Request failures
   do not append retained mutation notices. A ledgered rejection does not by itself change a
   successful batch's `echo.outcome` to `rejected`. Whole-cause precedence remains §10/§14.
+- INV-ERR-5: Identity payloads MUST NOT shadow `Error.name`. Decoded `UnknownMutation`,
+  `ArgsDecodeFailed` and `LocallyRejected` expose `mutationName`; decoded `UnknownQuery` and
+  `QueryArgsDecodeFailed` expose `queryName`. Their `*Codec` companions and engine serialization
+  unions MUST retain the legacy encoded key `name`, including nested rejections and old durable
+  outcomes/notices. Local `LockError` exposes `lockName`; `NoticeMismatch` exposes
+  `expectedMutationName` and `actualMutationName`. Error tags and standard error names remain
+  the class identity.
+
+  **Rationale (2026-10-27):** An own `name` payload replaced the standard Error name and stack
+  heading with a query, mutation or lock identifier. Native `Schema.encodeKeys` separates decoded
+  diagnostic identity from encoded compatibility; retaining the collision or renaming durable
+  fields was rejected. Schema-backed errors explicitly retain structural typing via `<Self, {}>`;
+  15 local-only errors use `Data.TaggedError`, dropping unused schema capabilities, not tags or
+  failure policy. Neither class identity nor phantom brands establish execution provenance (§5).
 
 ### Details
 
@@ -1992,6 +2014,14 @@ code: its `reason` projects to the existing store codes below. Recover through
 retain provenance. PostgreSQL `StoreUnavailable` retains the original SQL error as a
 non-schema diagnostic cause, never as a retry discriminator.
 
+The catalog's fields below are decoded/source fields. For the five errors in INV-ERR-5,
+`*Codec` companions map their renamed identity field to encoded `name`; the class itself is
+the decoded constructor/schema, not the legacy codec. The local-only Data errors are
+`NoticeMismatch`, the five `SyncFailure` wrappers, the three reset errors, `LockError`,
+`MutationTransient`, `ClientForbidden`, `LedgerRetentionTooShort`, `TableNameConflict` and
+`Drift`. They no longer provide Schema class construction/decoding APIs; reset's separate
+worker-outcome schemas remain unchanged.
+
 | code (`_tag` unless marked `name`) | fields | raised by | push halt / recovery | retained notice or app failure/status | telemetry outcome at observation point |
 |---|---|---|---|---|---|
 | `ResnapshotRequired` | `reason: gcHorizon \| unknownCursor \| staleContinuation, epoch?: string` | all sync RPCs (history fence); pull (retention/continuation) | no; with epoch: reset history and resnapshot preserving intent (INV-CLI-14); without: INV-CLI-10; pokes wakes pull, presence retries | —; unhandled initial pull failure: status(server); history refusal never exhausts intent | `resnapshot` on failed sync RPC/pull and successful client pull recovery; handled client push refusal `stopped` |
@@ -2000,8 +2030,8 @@ non-schema diagnostic cause, never as a retry discriminator.
 | `MalformedEnvelope` | `clientId, mutationId, message` | server push | halt | —; Halted | `halted` |
 | `ServerUnavailable` | `message` | server pull/pokes/presence | no; retry | —; status(unavailable), presence rejoins | `unavailable` on sync RPC/client sync |
 | `Forbidden` | `room` | server presence | no; end presence subscription | —; method/stream failure | —; no presence-operation span |
-| `UnknownMutation` | `name` | core registry lookup | no | Rejected when settled; LocallyRejected at enqueue | batch result; local enqueue `rejected` |
-| `ArgsDecodeFailed` | `name, message` | core mutation decode | no | Rejected when settled; LocallyRejected at enqueue | batch result; local enqueue `rejected` |
+| `UnknownMutation` | `mutationName` (encoded `name`) | core registry lookup | no | Rejected when settled; LocallyRejected at enqueue | batch result; local enqueue `rejected` |
+| `ArgsDecodeFailed` | `mutationName, message` (encoded `name, message`) | core mutation decode | no | Rejected when settled; LocallyRejected at enqueue | batch result; local enqueue `rejected` |
 | `RowNotFound` | `table, id` | core store | no | Rejected when settled; LocallyRejected at enqueue | batch result; local enqueue `rejected` |
 | `RowAlreadyExists` | `table, id` | core store | no | Rejected when settled; LocallyRejected at enqueue | batch result; local enqueue `rejected` |
 | `ScopeForbidden` | `scopeId, required, held` | core authorization | no | Rejected when settled; LocallyRejected at enqueue | batch result; local enqueue `rejected` |
@@ -2013,9 +2043,9 @@ non-schema diagnostic cause, never as a retry discriminator.
 | `TransientExhausted` | `attempts, message` | client after 8 short-prefix answers | no; release through rebase and continue | Rejected; message `the server stopped the push batch at a transient failure` | exhausting batch `stopped`; not a server outcome |
 | `StoreUnavailable` | `message, reason?: SerializationConflict \| Deadlock \| Unavailable` | core storage | no; retry | —; status(server) or failed enqueue | `server` on client sync/enqueue; server batch stops |
 | `CorruptStorage` | `table, id, cause` | core stored-data decode | halt if push defect; pull retries | —; defect | `defect` |
-| `UnknownQuery` | `name` | client query lookup | no | —; method/stream failure | — |
-| `QueryArgsDecodeFailed` | `name, message` | client query decode | no | —; method/stream failure | — |
-| `NoticeMismatch` | `mutation, name, message` | client notice decode | no | —; decode failure | — |
+| `UnknownQuery` | `queryName` (encoded `name`) | client query lookup | no | —; method/stream failure | — |
+| `QueryArgsDecodeFailed` | `queryName, message` (encoded `name, message`) | client query decode | no | —; method/stream failure | — |
+| `NoticeMismatch` | `expectedMutationName, actualMutationName, message` | client notice decode | no | —; decode failure | — |
 | `DuplicateMutation` (name) | `message` | core registry construction | not running | —; thrown Error | — |
 | `DuplicateQuery` (name) | `message` | core registry construction | not running | —; thrown Error | — |
 | `SyncTableDeclarationError` (name) | `message` | core table declaration | not running | —; thrown Error | — |
@@ -2031,7 +2061,7 @@ non-schema diagnostic cause, never as a retry discriminator.
 | `MalformedChange` | `table, message` | client pull decode | no; retry | —; status(server) | `malformed` |
 | `ServerOutdated` | `table` | client pull decode | no; retry, keep staging | —; status(server-outdated) | `server-outdated` |
 | `RpcClientError` | `reason` (Effect RPC transport detail) | client dependency boundary | no; retry after lifting credentials/HTTP auth | —; status(network) | `network` |
-| `LocallyRejected` | `name, error: MutationRejection` | client enqueue | no; nothing saved | —; enqueue failure | `rejected` |
+| `LocallyRejected` | `mutationName, error: MutationRejection` (encoded `name, error`) | client enqueue | no; nothing saved | —; enqueue failure | `rejected` |
 | `SqlFailure` | `message` | leader SQLite boundary | no direct loop effect | —; method/stream failure | — |
 | `LeaderUnavailable` | `reason: LeaderLost \| LeaderFailed \| Unsupported \| SecondaryTabWithoutRouter \| Reset, message` | tab routing | no direct loop effect; §12 recovery | —; method/stream failure | —; handover result separately `elected`/`lost` |
 | `RawExecDisabled` | — | leader raw SQL gate | no | —; method/stream failure | — |
@@ -2041,7 +2071,7 @@ non-schema diagnostic cause, never as a retry discriminator.
 | `PendingWrites` | `count` | reset worker | no direct loop effect | —; reset failure, nothing deleted | — |
 | `ResetFailed` | `message` | reset worker/tab | no direct loop effect | —; reset failure | — |
 | `BrowserStorageError` | `operation, cause` | browser storage boundary | candidate cannot serve if startup fails | —; surfaced via LeaderUnavailable/ResetFailed | —; depends on enclosing boundary |
-| `LockError` | `name, message` | browser Web Locks | candidate/route operation fails | —; substrate failure or mapped LeaderUnavailable | election `server` if election fails typed |
+| `LockError` | `lockName, message` | browser Web Locks | candidate/route operation fails | —; substrate failure or mapped LeaderUnavailable | election `server` if election fails typed |
 
 #### 15.2 Diagnostic reasons and projections
 
@@ -2333,7 +2363,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-ID-3 | untested | — |
 | INV-ID-4 | covered | `Outbox.test` "an enqueue retried after its original was released returns the original seq and is not pending"; `ledger.test` "a resubmitted envelope (lost response) returns the recorded outcome and position without re-executing" |
 | INV-ID-5 | covered | `ledger.test` "a client id registered to one principal is refused to another"; `session-switch.e2e` "a fresh replica first synced under another principal's session binds no client, ledgers nothing and installs none of its data" |
-| INV-TBL-1 | covered | `SyncTable.test` "rejects a bare Schema.Number instead of guessing integer or double", "rejects leaves with no portable column (bigint, binary, enum, optional key)", "SQLite stores and returns every supported leaf type unchanged (boundaries, nulls, empty strings)", "Postgres stores and returns every supported leaf type unchanged (boundaries, nulls, empty strings)"; `Migrate.test` "nullable literal unions generate TEXT and an old JSON manifest requires a manual kind migration" |
+| INV-TBL-1 | covered | `SyncTable.test` "rejects a bare Schema.Number instead of guessing integer or double", "rejects leaves with no portable column (bigint, binary, enum, optional key)", "SQLite stores and returns every supported leaf type unchanged (boundaries, nulls, empty strings)", "Postgres stores and returns every supported leaf type unchanged (boundaries, nulls, empty strings)", "timestamp codecs reject out-of-range and non-integer milliseconds in both directions and retain Date refinements"; `Migrate.test` "nullable literal unions generate TEXT and an old JSON manifest requires a manual kind migration" |
 | INV-TBL-2 | covered | `Store.test` "the reference orders text by code point, NULL first ascending, id as tiebreak"; `SqliteRowStore.test` "range returns exactly core's reference rows in core's reference order (seeded random plans)" |
 | INV-TBL-3 | covered | `SyncTable.test` "does not change when only indexes change (adding an index must not force a re-download)", "does not change for documentation annotations or field order", "ignores refinements, brands and nested JSON schemas: validation is not storage (SPEC §3)", "changes when the storage shape changes (nullability, column kind, column set, table name)" |
 | INV-TBL-4 | covered | `Simulation.test` "a pulled row is stored in canonical wire form (excess columns dropped, values normalized)"; `scopes.test` "pulled rows are the wire form: epoch-ms timestamps, and no column the SyncTable does not declare (INV-TBL-4)" |
@@ -2465,6 +2495,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-ERR-2 | partial | `SqliteRowStore.test` "a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError"; `rowstore-codecs.test` "range codecs run only on execution, validate limits first, and retain contextual defects without SQL", "writes encode current rows on each execution and reject missing nullable fields before SQL"; `perf-install.test` "batched replica upserts keep the last duplicate and split before SQLite's parameter limit"; OPFS diagnostic coverage is in browser scenarios only |
 | INV-ERR-3 | covered | `vocabularies.test` "telemetry, wire errors and client failure or notice vocabularies cannot drift from SPEC §14–15", "a wire error without a catalog mapping cannot compile" (also checked by `tsc --noEmit`) |
 | INV-ERR-4 | covered | `observability.e2e` "request failures append no notices and ledgered rejections keep successful batch outcomes", "batch telemetry agrees with the loop's whole-cause decision, not the first failure" |
+| INV-ERR-5 | covered | `Mutation.test` "legacy rejection names round-trip unchanged without replacing Error.name", "a notice of one mutation decoded against another, or one its schemas cannot read, is NoticeMismatch, never a value or a defect"; `Leader.test` "worker error codecs preserve legacy name fields and restore standard Error names"; `platform.test` "a Web Locks rejection surfaces as LockError instead of hanging" |
 | INV-PERF-1 | covered | `ordering.test` "without the trigger's advisory lock that reader skips the earlier writer (the ordering check can fail)" (the lock is held; its throughput consequence is not measured) |
 | INV-PERF-2 | covered | `perf-postgres.test` "a pushed mutation adds only its N reads and M writes to the fixed ledger cost" |
 | INV-PERF-3 | covered | `perf-postgres.test` "empty, log and scope-walk pages retain their derived statement and returned-row budgets" |

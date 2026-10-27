@@ -16,7 +16,7 @@
  * (`indnkeyatts`) are compared, never `INCLUDE` payload. Extra live columns and indexes
  * are allowed. The engine's own tables are not checked.
  */
-import { Array as Arr, Effect, Option, Record as Rec, Schema } from "effect"
+import { Array as Arr, Data, Effect, Option, Record as Rec, Schema } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { Registry, SyncTable } from "echo-sync"
 import * as Telemetry from "../../internal/Telemetry.ts"
@@ -24,8 +24,7 @@ import * as Telemetry from "../../internal/Telemetry.ts"
 export const Mismatch = Schema.Struct({ table: Schema.String, problem: Schema.String })
 export type Mismatch = typeof Mismatch.Type
 
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class Drift extends Schema.TaggedError<Drift>()("Drift", { mismatches: Schema.Array(Mismatch) }) {
+export class Drift extends Data.TaggedError("Drift")<{ readonly mismatches: ReadonlyArray<Mismatch> }> {
   override get message() {
     return `schema drift (refusing to serve):\n${Arr.join(
       Arr.map(this.mismatches, (m) => `  ${m.table}: ${m.problem}`),

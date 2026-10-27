@@ -8,19 +8,20 @@ import type { EchoStore, ReadError, ReadStore } from "./Store.ts"
  * one read transaction and re-runs it when a table the latest run read changes.
  */
 
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class UnknownQuery extends Schema.TaggedError<UnknownQuery>()("UnknownQuery", {
-  // oxlint-disable-next-line effecttsgo/error-payload-shadows-name -- name is identity payload; _tag is the discriminant. Preserve wire/durable compatibility.
-  name: Schema.String
+export class UnknownQuery extends Schema.TaggedError<UnknownQuery, {}>()("UnknownQuery", {
+  queryName: Schema.String
 }) {}
 
+/** Worker RPC retains its encoded name key; decoded Error.name identifies the error class. */
+export const UnknownQueryCodec = UnknownQuery.pipe(Schema.encodeKeys({ queryName: "name" }))
+
 /** The args a tab sent do not decode with the query's `args` schema: a bug in the caller. */
-// oxlint-disable-next-line effecttsgo/schema-class-missing-brand -- Public errors retain structural assignability for consumers.
-export class QueryArgsDecodeFailed extends Schema.TaggedError<QueryArgsDecodeFailed>()("QueryArgsDecodeFailed", {
-  // oxlint-disable-next-line effecttsgo/error-payload-shadows-name -- name is identity payload; _tag is the discriminant. Preserve wire/durable compatibility.
-  name: Schema.String,
+export class QueryArgsDecodeFailed extends Schema.TaggedError<QueryArgsDecodeFailed, {}>()("QueryArgsDecodeFailed", {
+  queryName: Schema.String,
   message: Schema.String
 }) {}
+
+export const QueryArgsDecodeFailedCodec = QueryArgsDecodeFailed.pipe(Schema.encodeKeys({ queryName: "name" }))
 
 /** What a registry needs from a query, with its types erased. */
 export interface AnyQuery {
@@ -61,7 +62,7 @@ export const make = <const Name extends string, A extends PureSchema, S extends 
     handler: options.handler,
     execute: (db, args) =>
       decodeArgs(args).pipe(
-        Effect.mapError((e) => new QueryArgsDecodeFailed({ name, message: e.message })),
+        Effect.mapError((e) => new QueryArgsDecodeFailed({ queryName: name, message: e.message })),
         Effect.flatMap((decoded) => options.handler(db, decoded)),
         Effect.flatMap((result) => Effect.orDie(encodeSuccess(result)))
       )
@@ -100,5 +101,5 @@ export const run = (
 ): Effect.Effect<Schema.Json, UnknownQuery | QueryArgsDecodeFailed | ReadError> => {
   const query = registry.queries.get(name)
   const reads: ReadStore = { get: db.get, query: db.query, scan: db.scan }
-  return query === undefined ? Effect.fail(new UnknownQuery({ name })) : query.execute(reads, args)
+  return query === undefined ? Effect.fail(new UnknownQuery({ queryName: name })) : query.execute(reads, args)
 }

@@ -219,6 +219,8 @@ it.live("a Web Locks rejection surfaces as LockError instead of hanging", () =>
     // Lock names starting with "-" are reserved; the API rejects the request.
     const error = yield* Effect.scoped(Platform.holdLock("-reserved")).pipe(Effect.flip)
     expect(error._tag).toBe("LockError")
+    expect(error.lockName).toBe("-reserved")
+    expect(error.name).toBe("LockError")
   })
 )
 

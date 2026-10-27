@@ -202,7 +202,7 @@
             "_tag": "Rejected",
             "error": {
               "_tag": "UnknownMutation",
-              "name": "9007199254740993"
+              "mutationName": "9007199254740993"
             }
           }
         }
@@ -223,7 +223,7 @@
             "_tag": "Rejected",
             "error": {
               "_tag": "ArgsDecodeFailed",
-              "name": "9007199254740993",
+              "mutationName": "9007199254740993",
               "message": "9007199254740993"
             }
           }
