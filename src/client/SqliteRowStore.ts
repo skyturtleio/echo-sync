@@ -14,7 +14,8 @@
 import { Array as Arr, Effect, Option, Schema, String as Str } from "effect"
 import type * as SqlClient from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
-import { Errors, ScopeGrants, type Registry, Store, type SyncTable } from "echo-sync"
+import { Errors, ScopeGrants, type Registry, Store, SyncTable } from "echo-sync"
+import * as Aggregate from "../internal/Aggregate.ts"
 import * as Keyset from "../internal/Keyset.ts"
 
 type Table = SyncTable.AnySyncTable
@@ -112,115 +113,136 @@ export const make = (sql: SqlClient.SqlClient, registry: Registry.SyncRegistry):
       Effect.flatMap((rows) => decodeRows(table, rows))
     )
 
+  const write: Store.ReplicaRowStore["write"] = (table, id, row) =>
+    Option.isNone(row)
+      ? Effect.asVoid(unavailable(sql.unsafe(`DELETE FROM ${q(table.name)} WHERE "id" = ?`, [id])))
+      : Effect.gen(function* () {
+          const plan = upsertFor(table)
+          const stored = yield* plan
+            .encode({ ...row.value, id })
+            .pipe(
+              Effect.catch((cause) =>
+                Effect.die(new Error(`SqliteRowStore.write: cannot encode "${table.name}" row "${id}"`, { cause }))
+              )
+            )
+          yield* writeStatement(
+            sql.unsafe(
+              plan.statement(1),
+              Arr.map(plan.names, (n) => stored[n] ?? null)
+            )
+          )
+        })
+
+  const writeMany: Store.ReplicaRowStore["writeMany"] = Effect.fnUntraced(function* (table, rows) {
+    const plan = upsertFor(table)
+    for (let offset = 0; offset < rows.length; offset += plan.batchSize) {
+      const stored = yield* plan.encodeMany(rows.slice(offset, offset + plan.batchSize)).pipe(
+        Effect.catch((cause) =>
+          Effect.die(
+            new Error(`SqliteRowStore.writeMany: cannot encode "${table.name}" batch starting at row ${offset}`, {
+              cause
+            })
+          )
+        )
+      )
+      yield* writeStatement(
+        sql.unsafe(
+          plan.statement(stored.length),
+          Arr.flatMap(stored, (row) => Arr.map(plan.names, (n) => row[n] ?? null))
+        )
+      )
+    }
+  })
+
+  const predicates = (table: Table, plan: Store.IndexRangePlan) =>
+    Effect.gen(function* () {
+      // Validated first: the limit is then a safe integer, written into the SQL text.
+      yield* Store.checkLimit(plan.limit)
+      const where: Array<string> = []
+      const params: Array<Value> = []
+      for (const [i, value] of plan.eq.entries()) {
+        const column = plan.index.key[i]
+        if (column === undefined) return yield* Effect.die(new Error(`range: eq longer than index ${plan.index.name}`))
+        if (value === null) where.push(`${q(column.name)} IS NULL`)
+        else {
+          params.push(yield* bind(table, column, value))
+          where.push(`${q(column.name)} = ?`)
+        }
+      }
+      const ranged = plan.index.key[plan.eq.length]
+      if (ranged !== undefined) {
+        for (const [bound, strict, loose] of [
+          [plan.lower, ">", ">="],
+          [plan.upper, "<", "<="]
+        ] as const) {
+          if (Option.isNone(bound)) continue
+          params.push(yield* bind(table, ranged, bound.value.value))
+          // A comparison against a bound never matches NULL, as `planMatches` requires.
+          where.push(`${q(ranged.name)} ${bound.value.inclusive ? loose : strict} ?`)
+        }
+      }
+      const bindings: Array<{ readonly column: SyncTable.Column; readonly value: Store.KeyValue }> = []
+      where.push(
+        ...Keyset.predicates(plan, (column, value) => {
+          bindings.push({ column, value })
+          return `?${params.length + bindings.length}`
+        })
+      )
+      for (const { column, value } of bindings) params.push(yield* bind(table, column, value))
+      if (plan.text !== undefined) {
+        params.push(plan.text.needle)
+        where.push(`instr(t.${q(plan.text.column.name)}, ?) > 0`)
+      }
+      if (Option.isSome(plan.readableBy)) {
+        // Readable: a grant for one of the principals on the row's scope (any role satisfies
+        // reader), found through scope_grants' unique (access_scope_id, principal_id).
+        params.push(...plan.readableBy.value)
+        where.push(
+          `EXISTS (SELECT 1 FROM ${q(ScopeGrants.ScopeGrants.name)} AS g WHERE g."access_scope_id" = t."access_scope_id" AND g."principal_id" IN (${Arr.join(
+            Arr.map(plan.readableBy.value, () => "?"),
+            ", "
+          )}))`
+        )
+      }
+      return { where: where.length === 0 ? "" : ` WHERE ${Arr.join(where, " AND ")}`, params }
+    })
+
   return {
     read: (table, id) =>
       select(table, ` WHERE "id" = ?`, [id], `"id"`).pipe(Effect.map((rows) => Option.fromNullishOr(rows[0]))),
-
-    write: (table, id, row) =>
-      Option.isNone(row)
-        ? Effect.asVoid(unavailable(sql.unsafe(`DELETE FROM ${q(table.name)} WHERE "id" = ?`, [id])))
-        : Effect.gen(function* () {
-            const plan = upsertFor(table)
-            const stored = yield* plan
-              .encode({ ...row.value, id })
-              .pipe(
-                Effect.catch((cause) =>
-                  Effect.die(new Error(`SqliteRowStore.write: cannot encode "${table.name}" row "${id}"`, { cause }))
-                )
-              )
-            yield* writeStatement(
-              sql.unsafe(
-                plan.statement(1),
-                Arr.map(plan.names, (n) => stored[n] ?? null)
-              )
-            )
-          }),
-
-    writeMany: Effect.fnUntraced(function* (table, rows) {
-      const plan = upsertFor(table)
-      for (let offset = 0; offset < rows.length; offset += plan.batchSize) {
-        const stored = yield* plan.encodeMany(rows.slice(offset, offset + plan.batchSize)).pipe(
-          Effect.catch((cause) =>
-            Effect.die(
-              new Error(`SqliteRowStore.writeMany: cannot encode "${table.name}" batch starting at row ${offset}`, {
-                cause
-              })
-            )
-          )
-        )
-        yield* writeStatement(
-          sql.unsafe(
-            plan.statement(stored.length),
-            Arr.flatMap(stored, (row) => Arr.map(plan.names, (n) => row[n] ?? null))
-          )
-        )
-      }
-    }),
-
-    range: (table, plan) =>
+    write,
+    writeMany,
+    range: (table, plan, columns) =>
       Effect.gen(function* () {
-        // Validated first: the limit is then a safe integer, written into the SQL text.
-        yield* Store.checkLimit(plan.limit)
-        const where: Array<string> = []
-        const params: Array<Value> = []
-        for (const [i, value] of plan.eq.entries()) {
-          const column = plan.index.key[i]
-          if (column === undefined)
-            return yield* Effect.die(new Error(`range: eq longer than index ${plan.index.name}`))
-          if (value === null) where.push(`${q(column.name)} IS NULL`)
-          else {
-            params.push(yield* bind(table, column, value))
-            where.push(`${q(column.name)} = ?`)
-          }
-        }
-        const ranged = plan.index.key[plan.eq.length]
-        if (ranged !== undefined) {
-          for (const [bound, strict, loose] of [
-            [plan.lower, ">", ">="],
-            [plan.upper, "<", "<="]
-          ] as const) {
-            if (Option.isNone(bound)) continue
-            params.push(yield* bind(table, ranged, bound.value.value))
-            // A comparison against a bound never matches NULL, as `planMatches` requires.
-            where.push(`${q(ranged.name)} ${bound.value.inclusive ? loose : strict} ?`)
-          }
-        }
-        const bindings: Array<{ readonly column: SyncTable.Column; readonly value: Store.KeyValue }> = []
-        where.push(
-          ...Keyset.predicates(plan, (column, value) => {
-            bindings.push({ column, value })
-            return `?${params.length + bindings.length}`
-          })
-        )
-        for (const { column, value } of bindings) params.push(yield* bind(table, column, value))
-        if (plan.text !== undefined) {
-          params.push(plan.text.needle)
-          where.push(`instr(t.${q(plan.text.column.name)}, ?) > 0`)
-        }
-        if (Option.isSome(plan.readableBy)) {
-          // Readable: a grant for one of the principals on the row's scope (any role satisfies
-          // reader), found through scope_grants' unique (access_scope_id, principal_id).
-          params.push(...plan.readableBy.value)
-          where.push(
-            `EXISTS (SELECT 1 FROM ${q(ScopeGrants.ScopeGrants.name)} AS g WHERE g."access_scope_id" = t."access_scope_id" AND g."principal_id" IN (${Arr.join(
-              Arr.map(plan.readableBy.value, () => "?"),
-              ", "
-            )}))`
-          )
-        }
+        const { where, params } = yield* predicates(table, plan)
         const dir = plan.order === "asc" ? "ASC NULLS FIRST" : "DESC NULLS LAST"
-        return yield* select(
-          table,
-          where.length === 0 ? "" : ` WHERE ${Arr.join(where, " AND ")}`,
-          params,
-          Arr.join(
-            Arr.map(plan.index.key, (c) => `t.${q(c.name)} ${dir}`),
-            ", "
-          ),
-          Option.match(plan.limit, { onNone: () => "", onSome: (n) => ` LIMIT ${n}` })
+        const order = Arr.join(
+          Arr.map(plan.index.key, (c) => `t.${q(c.name)} ${dir}`),
+          ", "
         )
+        const limit = Option.match(plan.limit, { onNone: () => "", onSome: (n) => ` LIMIT ${n}` })
+        if (columns === undefined) return yield* select(table, where, params, order, limit)
+        const names = Arr.join(
+          Arr.map(columns, (c) => `t.${q(c.name)}`),
+          ", "
+        )
+        const rows = yield* unavailable(
+          sql.unsafe(`SELECT ${names} FROM ${q(table.name)} AS t${where} ORDER BY ${order}${limit}`, params)
+        )
+        const codec = SyncTable.projectedDialect(columns, "sqlite")
+        return yield* Effect.forEach(rows, (row) => Store.decodeStored(codec, table.name, row))
       }),
-
+    aggregate: (table, plan, sums) =>
+      Effect.gen(function* () {
+        const { where, params } = yield* predicates(table, { ...plan, limit: Option.none() })
+        const rows = yield* unavailable(
+          sql.unsafe<Record<string, unknown>>(
+            `SELECT ${Aggregate.selectList(sums, "sqlite")} FROM ${q(table.name)} AS t${where}`,
+            params
+          )
+        )
+        return yield* Aggregate.decode(table, sums, rows[0] ?? {})
+      }),
     scan: (table) => select(table, "", [], `"id"`),
 
     purgeScope: (scopeId) =>

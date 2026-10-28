@@ -94,7 +94,9 @@ it.effect("catalog swaps reemit global queries without grants and survive scoped
       liveRuns(reactivity, (watch) =>
         storage.transaction(
           Effect.gen(function* () {
-            const rows = yield* store.query(Airport).withIndex("by_name").collect
+            const base = store.query(Airport).withIndex("by_name")
+            const rows = yield* base.select("name").collect
+            expect((yield* base.aggregate({ sum: [] })).count).toBe(rows.length)
             yield* watch([Airport.name])
             return Arr.map(rows, (row) => row.name)
           })

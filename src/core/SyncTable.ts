@@ -103,6 +103,7 @@ export interface TableManifest {
 export interface AnySyncTable {
   readonly name: string
   readonly kind: "sync" | "catalog"
+  readonly fields: Schema.Struct.Fields
   readonly wire: Schema.Codec<{ readonly id: string; readonly accessScopeId?: AccessScopeId }, EncodedRow>
   readonly columns: ReadonlyArray<Column>
   readonly indexes: { readonly [name: string]: Index }
@@ -429,6 +430,57 @@ const quote = (sqlName: string): string => `"${sqlName}"`
 const derived = <T, E>(schema: Schema.Constraint): Schema.Codec<T, E> =>
   // oxlint-disable-next-line typescript/consistent-type-assertions -- derived-schema edge, see doc comment
   schema as unknown as Schema.Codec<T, E>
+
+/** Selected column codecs, without invoking or validating any unselected field. */
+export const projectedDialect = (columns: ReadonlyArray<Column>, dialect: "sqlite" | "postgres") =>
+  Schema.Struct(Rec.fromIterableWith(columns, (column) => [column.name, column[dialect]]))
+
+/** Same derived-schema edge as full rows: selected fields retain their original wire codecs. */
+export const projection = <T extends AnySyncTable, const F extends ReadonlyArray<keyof T["wire"]["Type"] & string>>(
+  table: T,
+  fields: F
+): Schema.Codec<Selected<T["wire"]["Type"], F>, EncodedRow> => {
+  const columns = Arr.filter(table.columns, (column) => Arr.some(fields, (field) => field === column.field))
+  return derived(
+    Schema.Struct(Rec.fromIterableWith(columns, (column) => [column.field, column.wire])).pipe(
+      Schema.encodeKeys(Rec.fromIterableWith(columns, (column) => [column.field, column.name]))
+    )
+  )
+}
+
+export type NumericField<T extends AnySyncTable> = {
+  [K in keyof T["fields"] & string]: NonNullable<T["fields"][K]["Encoded"]> extends number ? K : never
+}[keyof T["fields"] & string]
+
+/** A union-valued argument names only one of its possible keys at runtime. */
+type LiteralKey<K, Whole = K> = K extends unknown ? ([Whole] extends [K] ? K : never) : never
+type GuaranteedKeys<F extends ReadonlyArray<string>> = F extends readonly [
+  infer H extends string,
+  ...infer Tail extends ReadonlyArray<string>
+]
+  ? LiteralKey<H> | GuaranteedKeys<Tail>
+  : never
+
+/** Literal tuples guarantee their keys; dynamic lists and union-valued keys are optional. */
+export type Selected<A, F extends ReadonlyArray<keyof A & string>> = F extends unknown
+  ? Pick<A, Extract<GuaranteedKeys<F>, keyof A>> & Partial<Pick<A, Exclude<F[number], GuaranteedKeys<F>>>>
+  : never
+
+export interface AggregateResult<F extends ReadonlyArray<string>> {
+  readonly count: number
+  readonly sum: Selected<{ readonly [P in F[number]]: number | null }, F>
+}
+
+/** The requested field set is the exact key set of the aggregate result. */
+export const aggregateResult = <const F extends ReadonlyArray<string>>(
+  fields: F
+): Schema.Codec<AggregateResult<F>, unknown> =>
+  derived(
+    Schema.Struct({
+      count: Schema.Number,
+      sum: Schema.Struct(Rec.fromIterableWith(fields, (field) => [field, Schema.NullOr(Schema.Number)]))
+    })
+  )
 
 /** Canonical JSON: object keys sorted, no whitespace. */
 export const canonicalJson = (json: Schema.Json): string => {

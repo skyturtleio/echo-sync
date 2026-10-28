@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Array as Arr, Cause, Effect, Exit, Option, String as Str } from "effect"
+import { Array as Arr, Cause, Effect, Exit, Option, Record as Rec, String as Str } from "effect"
 import { Store } from "../index.ts"
 import * as Conformance from "./Conformance.ts"
 import * as MemoryStore from "./MemoryStore.ts"
@@ -12,6 +12,24 @@ const register = (checks: ReadonlyArray<Conformance.Check<never>>) => {
     ) {
       it.effect(
         "keyset pages preserve ties, direction, nulls and cursor boundaries across intervening inserts",
+        run,
+        60_000
+      )
+    } else if (
+      check.name ===
+      "projected pages and aggregates preserve authorized predicates, codecs, nulls and independent cursor branches"
+    ) {
+      it.effect(
+        "projected pages and aggregates preserve authorized predicates, codecs, nulls and independent cursor branches",
+        run,
+        60_000
+      )
+    } else if (
+      check.name ===
+      "aggregate integer bounds reject unsafe cancellation while zero, null and finite fractions remain distinct"
+    ) {
+      it.effect(
+        "aggregate integer bounds reject unsafe cancellation while zero, null and finite fractions remain distinct",
         run,
         60_000
       )
@@ -67,6 +85,32 @@ describe("MemoryStore conforms to ReplicaRowStore (the reference semantics)", ()
   )
 })
 
+for (const broken of ["unscoped", "null-as-zero"] as const) {
+  mustCatch(
+    broken,
+    Arr.filter(
+      Conformance.rowStore(
+        Effect.sync(() => {
+          const store = MemoryStore.make()
+          const rows: Store.RowStore = {
+            ...store,
+            aggregate: (table, plan, sums) =>
+              Effect.map(
+                store.aggregate(table, broken === "unscoped" ? { ...plan, readableBy: Option.none() } : plan, sums),
+                (result) =>
+                  broken === "null-as-zero" ? { ...result, sum: Rec.map(result.sum, (n) => n ?? 0) } : result
+              )
+          }
+          return { rows, transaction: store.transaction }
+        })
+      ),
+      (check) =>
+        check.name ===
+        "projected pages and aggregates preserve authorized predicates, codecs, nulls and independent cursor branches"
+    )
+  )
+}
+
 /** MemoryStore whose range reads `rewrite(plan)` and applies the readable-scope filter afterwards. */
 const filtersAfter = (rewrite: (plan: Store.IndexRangePlan) => Store.IndexRangePlan) =>
   Effect.sync((): Conformance.RowStoreSubject => {
@@ -120,7 +164,8 @@ const asyncStore = (broken: boolean) =>
       rows: {
         read: (table, id) => io(store.read(table, id)),
         write: (table, id, row) => io(store.write(table, id, row)),
-        range: (table, plan) => io(store.range(table, plan)),
+        range: (table, plan, columns) => io(store.range(table, plan, columns)),
+        aggregate: (table, plan, sums) => io(store.aggregate(table, plan, sums)),
         scan: (table) => io(store.scan(table))
       },
       transaction: (self) =>

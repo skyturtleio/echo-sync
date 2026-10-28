@@ -2,7 +2,8 @@ import * as PgTypes from "@effect/sql-pg/PgTypes"
 import { Array as Arr, Effect, Option, Schema, String as Str } from "effect"
 import { SqlClient } from "effect/sql/SqlClient"
 import type { SqlError } from "effect/sql/SqlError"
-import { Errors, ScopeGrants, Store, type SyncTable } from "echo-sync"
+import { Errors, ScopeGrants, Store, SyncTable } from "echo-sync"
+import * as Aggregate from "../../internal/Aggregate.ts"
 import * as Keyset from "../../internal/Keyset.ts"
 import * as Telemetry from "../../internal/Telemetry.ts"
 
@@ -88,100 +89,101 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
         : sql.unsafe<Record<string, unknown>>(statement(rel), params).pipe(Telemetry.boundary)
     }
 
-    const rowStore: Store.RowStore = {
-      read: (table, id) =>
-        Effect.flatMap(
-          query(table, (rel) => `SELECT ${selectList(table)} FROM ${rel} WHERE "id" = $1`, [id]).pipe(
-            Effect.mapError(unavailable)
-          ),
-          (rows) =>
-            rows[0] === undefined ? Effect.succeed(Option.none()) : Effect.map(decodeRow(table, rows[0]), Option.some)
+    const read: Store.RowStore["read"] = (table, id) =>
+      Effect.flatMap(
+        query(table, (rel) => `SELECT ${selectList(table)} FROM ${rel} WHERE "id" = $1`, [id]).pipe(
+          Effect.mapError(unavailable)
         ),
-      write: (table, id, row) =>
-        Effect.gen(function* () {
-          if (Option.isNone(row))
-            return yield* Effect.asVoid(query(table, (rel) => `DELETE FROM ${rel} WHERE "id" = $1`, [id]))
-          const stored = yield* Schema.encodeEffect(table.postgres.row)(row.value).pipe(
-            Effect.catch((cause) =>
-              Effect.die(new Error(`RowStore.write: cannot encode "${table.name}" row "${id}"`, { cause }))
-            )
+        (rows) =>
+          rows[0] === undefined ? Effect.succeed(Option.none()) : Effect.map(decodeRow(table, rows[0]), Option.some)
+      )
+    const write: Store.RowStore["write"] = (table, id, row) =>
+      Effect.gen(function* () {
+        if (Option.isNone(row))
+          return yield* Effect.asVoid(query(table, (rel) => `DELETE FROM ${rel} WHERE "id" = $1`, [id]))
+        const stored = yield* Schema.encodeEffect(table.postgres.row)(row.value).pipe(
+          Effect.catch((cause) =>
+            Effect.die(new Error(`RowStore.write: cannot encode "${table.name}" row "${id}"`, { cause }))
           )
-          const params = Arr.map(table.columns, (c) => parameter(c, stored[c.name] ?? null))
-          const names = Arr.map(table.columns, (c) => q(c.name))
-          yield* query(
-            table,
-            (rel) => `INSERT INTO ${rel} (${Arr.join(names, ", ")}) VALUES (${Arr.join(
-              Arr.map(names, (_, i) => `$${i + 1}`),
-              ", "
-            )})
+        )
+        const params = Arr.map(table.columns, (c) => parameter(c, stored[c.name] ?? null))
+        const names = Arr.map(table.columns, (c) => q(c.name))
+        yield* query(
+          table,
+          (rel) => `INSERT INTO ${rel} (${Arr.join(names, ", ")}) VALUES (${Arr.join(
+            Arr.map(names, (_, i) => `$${i + 1}`),
+            ", "
+          )})
              ON CONFLICT ("id") DO UPDATE SET ${Arr.join(
                Arr.map(names, (n) => `${n} = EXCLUDED.${n}`),
                ", "
              )}`,
-            params
-          )
-        }).pipe(
-          Effect.mapError((error) =>
-            error.reason._tag === "UniqueViolation" || error.reason._tag === "ConstraintError"
-              ? new Errors.ConstraintViolated({
-                  kind: error.reason._tag === "UniqueViolation" ? "unique" : "other",
-                  constraint: error.reason._tag === "UniqueViolation" ? error.reason.constraint : null,
-                  message: error.message
-                })
-              : unavailable(error)
-          )
-        ),
-      range: Effect.fnUntraced(function* (table, plan) {
-        yield* Store.checkLimit(plan.limit)
-        const where: Array<string> = []
-        const params: Array<unknown> = []
-        for (const [i, value] of plan.eq.entries()) {
-          const c = plan.index.key[i]
-          if (c === undefined) return yield* Effect.die(new Error(`range: eq longer than index ${plan.index.name}`))
-          if (value === null) where.push(`${q(c.name)} IS NULL`)
-          else {
-            params.push(yield* bindColumn(table, c, value))
-            where.push(`${q(c.name)} = $${params.length}`)
-          }
-        }
-        const ranged = plan.index.key[plan.eq.length]
-        for (const [bound, strict, loose] of [
-          [plan.lower, ">", ">="],
-          [plan.upper, "<", "<="]
-        ] as const) {
-          if (Option.isSome(bound) && ranged !== undefined) {
-            params.push(yield* bindColumn(table, ranged, bound.value.value))
-            where.push(`${q(ranged.name)} ${bound.value.inclusive ? loose : strict} $${params.length}`)
-          }
-        }
-        const bindings: Array<{ readonly column: SyncTable.Column; readonly value: Store.KeyValue }> = []
-        where.push(
-          ...Keyset.predicates(plan, (column, value) => {
-            bindings.push({ column, value })
-            return `$${params.length + bindings.length}`
-          })
+          params
         )
-        for (const { column, value } of bindings) params.push(yield* bindColumn(table, column, value))
-        if (plan.text !== undefined) {
-          params.push(plan.text.needle)
-          where.push(`strpos(t.${q(plan.text.column.name)}, $${params.length}) > 0`)
+      }).pipe(
+        Effect.mapError((error) =>
+          error.reason._tag === "UniqueViolation" || error.reason._tag === "ConstraintError"
+            ? new Errors.ConstraintViolated({
+                kind: error.reason._tag === "UniqueViolation" ? "unique" : "other",
+                constraint: error.reason._tag === "UniqueViolation" ? error.reason.constraint : null,
+                message: error.message
+              })
+            : unavailable(error)
+        )
+      )
+    const predicates = Effect.fnUntraced(function* (table: SyncTable.AnySyncTable, plan: Store.IndexRangePlan) {
+      yield* Store.checkLimit(plan.limit)
+      const where: Array<string> = []
+      const params: Array<unknown> = []
+      for (const [i, value] of plan.eq.entries()) {
+        const c = plan.index.key[i]
+        if (c === undefined) return yield* Effect.die(new Error(`range: eq longer than index ${plan.index.name}`))
+        if (value === null) where.push(`${q(c.name)} IS NULL`)
+        else {
+          params.push(yield* bindColumn(table, c, value))
+          where.push(`${q(c.name)} = $${params.length}`)
         }
-        if (Option.isSome(plan.readableBy)) {
-          // Readable: a grant for one of the principals on the row's scope (any role satisfies
-          // reader), through scope_grants' unique (access_scope_id, principal_id), in this snapshot.
-          const grants = relation(ScopeGrants.ScopeGrants)
-          if (grants === undefined) return yield* Effect.die("RowStore: scope_grants is not mapped to a schema")
-          params.push([...plan.readableBy.value])
-          where.push(
-            `EXISTS (SELECT 1 FROM ${grants} AS g WHERE g."access_scope_id" = t."access_scope_id" AND g."principal_id" = ANY($${params.length}::text[]))`
-          )
+      }
+      const ranged = plan.index.key[plan.eq.length]
+      for (const [bound, strict, loose] of [
+        [plan.lower, ">", ">="],
+        [plan.upper, "<", "<="]
+      ] as const) {
+        if (Option.isSome(bound) && ranged !== undefined) {
+          params.push(yield* bindColumn(table, ranged, bound.value.value))
+          where.push(`${q(ranged.name)} ${bound.value.inclusive ? loose : strict} $${params.length}`)
         }
-        let limit = ""
-        if (Option.isSome(plan.limit)) {
-          const n = plan.limit.value
-          params.push(n)
-          limit = ` LIMIT $${params.length}`
-        }
+      }
+      const bindings: Array<{ readonly column: SyncTable.Column; readonly value: Store.KeyValue }> = []
+      where.push(
+        ...Keyset.predicates(plan, (column, value) => {
+          bindings.push({ column, value })
+          return `$${params.length + bindings.length}`
+        })
+      )
+      for (const { column, value } of bindings) params.push(yield* bindColumn(table, column, value))
+      if (plan.text !== undefined) {
+        params.push(plan.text.needle)
+        where.push(`strpos(t.${q(plan.text.column.name)}, $${params.length}) > 0`)
+      }
+      if (Option.isSome(plan.readableBy)) {
+        // Readable: a grant for one of the principals on the row's scope (any role satisfies
+        // reader), through scope_grants' unique (access_scope_id, principal_id), in this snapshot.
+        const grants = relation(ScopeGrants.ScopeGrants)
+        if (grants === undefined) return yield* Effect.die("RowStore: scope_grants is not mapped to a schema")
+        params.push([...plan.readableBy.value])
+        where.push(
+          `EXISTS (SELECT 1 FROM ${grants} AS g WHERE g."access_scope_id" = t."access_scope_id" AND g."principal_id" = ANY($${params.length}::text[]))`
+        )
+      }
+      return { where: where.length > 0 ? ` WHERE ${Arr.join(where, " AND ")}` : "", params }
+    })
+    const rowStore: Store.RowStore = {
+      read,
+      write,
+      range: Effect.fnUntraced(function* (table, plan, columns) {
+        const { where, params } = yield* predicates(table, plan)
+        const limit = Option.match(plan.limit, { onNone: () => "", onSome: (n) => ` LIMIT ${n}` })
         const dir = plan.order === "asc" ? "ASC NULLS FIRST" : "DESC NULLS LAST"
         const order = Arr.join(
           Arr.map(plan.index.key, (c) => `t.${q(c.name)} ${dir}`),
@@ -190,10 +192,28 @@ export const make = (schemaOf: ReadonlyMap<string, string>): Effect.Effect<Store
         const rows = yield* query(
           table,
           (rel) =>
-            `SELECT ${selectList(table, "t")} FROM ${rel} AS t${where.length > 0 ? ` WHERE ${Arr.join(where, " AND ")}` : ""} ORDER BY ${order}${limit}`,
+            `SELECT ${
+              columns === undefined
+                ? selectList(table, "t")
+                : Arr.join(
+                    Arr.map(columns, (c) => `t.${q(c.name)}`),
+                    ", "
+                  )
+            } FROM ${rel} AS t${where} ORDER BY ${order}${limit}`,
           params
         ).pipe(Effect.mapError(unavailable))
-        return yield* decodeAll(table, rows)
+        if (columns === undefined) return yield* decodeAll(table, rows)
+        const codec = SyncTable.projectedDialect(columns, "postgres")
+        return yield* Effect.forEach(rows, (row) => Store.decodeStored(codec, table.name, row))
+      }),
+      aggregate: Effect.fnUntraced(function* (table, plan, sums) {
+        const { where, params } = yield* predicates(table, { ...plan, limit: Option.none() })
+        const rows = yield* query(
+          table,
+          (rel) => `SELECT ${Aggregate.selectList(sums, "postgres")} FROM ${rel} AS t${where}`,
+          params
+        ).pipe(Effect.mapError(unavailable))
+        return yield* Aggregate.decode(table, sums, rows[0] ?? {})
       }),
       scan: (table) =>
         Effect.flatMap(

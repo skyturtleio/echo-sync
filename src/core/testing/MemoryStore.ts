@@ -4,9 +4,10 @@
  * Ordering and range matching come from core's single definition (`Store.planMatches`,
  * `Store.planOrder`, `Store.compareText`), never from JS string comparison.
  */
-import { Array as Arr, Effect, Option, Semaphore } from "effect"
+import { Array as Arr, Effect, Option, Record as Rec, Semaphore } from "effect"
 import { ScopeGrants, Store } from "../index.ts"
 import type { SyncTable } from "../index.ts"
+import * as Aggregate from "../../internal/Aggregate.ts"
 
 export type Tables = Map<string, Map<string, SyncTable.EncodedRow>>
 
@@ -55,13 +56,48 @@ export const make = (initial: Tables = new Map()): MemoryStore => {
       Effect.sync(() => {
         for (const row of rows) tableOf(table.name).set(String(row["id"]), row)
       }),
-    range: (table, plan) =>
+    range: (table, plan, columns) =>
       Effect.andThen(
         Store.checkLimit(plan.limit),
-        Effect.sync(() =>
-          Store.planResult(plan, rowsOf(table.name), tables.get(ScopeGrants.ScopeGrants.name)?.values() ?? [])
-        )
+        Effect.sync(() => {
+          const result = Store.planResult(
+            plan,
+            rowsOf(table.name),
+            tables.get(ScopeGrants.ScopeGrants.name)?.values() ?? []
+          )
+          return columns === undefined
+            ? result
+            : Arr.map(result, (row) => Rec.filter(row, (_, key) => Arr.some(columns, (c) => c.name === key)))
+        })
       ),
+    aggregate: (table, plan, sums) =>
+      Effect.suspend(() => {
+        const readable = Store.planReadable(plan, tables.get(ScopeGrants.ScopeGrants.name)?.values() ?? [])
+        const selected = { ...plan, limit: Option.none<number>() }
+        const totals = Arr.map(sums, () => ({ sum: 0, magnitude: 0, nonnull: 0 }))
+        let count = 0
+        for (const row of tables.get(table.name)?.values() ?? []) {
+          if (!readable(row) || !Store.planMatches(selected, row)) continue
+          count++
+          for (const [i, column] of sums.entries()) {
+            const total = totals[i]
+            const value = row[column.name]
+            if (total === undefined || value === null) continue
+            if (typeof value !== "number")
+              return Effect.die(new Error(`aggregate: invalid stored ${table.name}.${column.field}`))
+            total.sum += value
+            total.magnitude += Math.abs(value)
+            total.nonnull++
+          }
+        }
+        const result: Record<string, unknown> = { __count: count }
+        for (const [i, total] of totals.entries()) {
+          result[`__sum${i}`] = total.sum
+          result[`__magnitude${i}`] = total.magnitude
+          result[`__nonnull${i}`] = total.nonnull
+        }
+        return Aggregate.decode(table, sums, result)
+      }),
     scan: (table) =>
       Effect.sync(() =>
         Arr.sort(rowsOf(table.name), (a: SyncTable.EncodedRow, b: SyncTable.EncodedRow) => {

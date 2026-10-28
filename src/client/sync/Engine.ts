@@ -180,7 +180,8 @@ export const replayMigrated = (context: Context) => (incompatibleCatalogs: Reado
       ...storage.rows,
       read: (table, id) => guard(table, storage.rows.read(table, id)),
       scan: (table) => guard(table, storage.rows.scan(table)),
-      range: (table, plan) => guard(table, storage.rows.range(table, plan))
+      range: (table, plan, columns) => guard(table, storage.rows.range(table, plan, columns)),
+      aggregate: (table, plan, sums) => guard(table, storage.rows.aggregate(table, plan, sums))
     }
     for (const entry of yield* storage.pending) {
       const undo = yield* storage

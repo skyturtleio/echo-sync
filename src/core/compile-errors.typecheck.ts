@@ -23,6 +23,35 @@ const Todos = SyncTable.make(
 export const queries = (db: EchoStore) => [
   db
     .query(Todos)
+    .withIndex("by_project")
+    .aggregate({ sum: ["rank"] }),
+  db.query(Todos).withIndex("by_project").aggregate({ sum: [] }),
+  db.query(Todos).withIndex("by_project").select("id", "at").take(2),
+  db
+    .query(Todos)
+    .withIndex("by_project")
+    // @ts-expect-error timestamps are not numeric storage columns
+    .aggregate({ sum: ["at"] }),
+  db
+    .query(Todos)
+    .withIndex("by_project")
+    // @ts-expect-error text cannot be summed
+    .aggregate({ sum: ["projectId"] }),
+  // @ts-expect-error projection keys must exist
+  db.query(Todos).withIndex("by_project").select("missing"),
+  // @ts-expect-error select requires at least one field
+  db.query(Todos).withIndex("by_project").select(),
+  Effect.map(db.query(Todos).withIndex("by_project").select("id", "at").collect, (rows) => {
+    const row = rows[0]
+    if (row === undefined) return
+    const id: typeof TodoId.Type = row.id
+    const at: Date = row.at
+    // @ts-expect-error an unselected field is absent
+    void row.rank
+    return { id, at }
+  }),
+  db
+    .query(Todos)
     .withIndex("by_project", (q) => q.eq("projectId", null))
     .after({ projectId: null, rank: 2, at: new Date(0), id: TodoId.make("a") }) // oxlint-disable-line effecttsgo/global-date -- Native Date is the decoded cursor type being checked.
     .order("desc")
@@ -72,6 +101,38 @@ export const queries = (db: EchoStore) => [
   // @ts-expect-error id must be the table's branded id
   db.get(Todos, "plain string")
 ]
+
+export const dynamicSelections = (db: EchoStore, field: "id" | "at", sums: ReadonlyArray<"rank">) => {
+  const base = db.query(Todos).withIndex("by_project")
+  return [
+    Effect.map(base.select(field).collect, (rows) => {
+      const row = rows[0]
+      if (row === undefined) return
+      // @ts-expect-error a union-valued key does not guarantee both fields
+      const at: Date = row.at
+      return at
+    }),
+    Effect.map(base.aggregate({ sum: sums }), (result) => {
+      // @ts-expect-error a dynamic array may be empty
+      const rank: number | null = result.sum.rank
+      return rank
+    }),
+    Effect.map(base.aggregate({ sum: ["rank"] }), (result) => {
+      const rank: number | null = result.sum.rank
+      return rank
+    }),
+    Effect.map(base.aggregate({ sum: [] }), (result) => {
+      // @ts-expect-error count-only has no measure keys
+      void result.sum.rank
+    }),
+    Effect.map(base.select("id", field).collect, (rows) => {
+      const row = rows[0]
+      if (row === undefined) return
+      const id: typeof TodoId.Type = row.id
+      return id
+    })
+  ]
+}
 
 class Clock extends Context.Service<Clock, { readonly now: number }>()("test/Clock") {}
 const NeedsService = Schema.String.pipe(

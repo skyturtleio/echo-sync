@@ -94,6 +94,7 @@ export const make = (disk: Disk): Engine.SyncStorage => {
     rows: {
       read: disk.replica.read,
       range: disk.replica.range,
+      aggregate: disk.replica.aggregate,
       scan: disk.replica.scan,
       write: (table, id, row) => Effect.andThen(crashPoint, disk.replica.write(table, id, row)),
       writeMany: (table, rows) =>

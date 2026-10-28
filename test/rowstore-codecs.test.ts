@@ -3,11 +3,11 @@ import "../src/client/testing/nodeWasm.ts"
 import { assert, describe, expect, it } from "@effect/vitest"
 import * as PgClient from "@effect/sql-pg/PgClient"
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
-import { Array as Arr, Cause, Effect, Exit, Layer, Option, Schema } from "effect"
+import { Array as Arr, Cause, DateTime, Effect, Exit, Layer, Option, Schema, SchemaGetter } from "effect"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import { SqlClient } from "effect/sql/SqlClient"
 import { makeCompilerSqlite } from "effect/sql/Statement"
-import { AccessScope, Registry, type Store, SyncTable } from "echo-sync"
+import { AccessScope, Registry, ScopeGrants, Store, SyncTable } from "echo-sync"
 import * as SqliteRowStore from "../src/client/SqliteRowStore.ts"
 import * as PostgresRowStore from "../src/server/postgres/rowStore.ts"
 import { EmptyDatabase, pgAvailable } from "../src/server/postgres/test-support.ts"
@@ -20,6 +20,12 @@ const Items = SyncTable.make(
     accessScopeId: AccessScope.AccessScopeId,
     flag: Schema.Boolean,
     rank: Schema.NullOr(Schema.Int),
+    amount: Schema.Finite.pipe(
+      Schema.decodeTo(Schema.String, {
+        decode: SchemaGetter.transform((n) => String(n)),
+        encode: SchemaGetter.transform((s) => Number(s))
+      })
+    ),
     title: Schema.String,
     at: Schema.DateTimeUtc,
     doc: Schema.Struct({ nested: Schema.Array(Schema.Json) })
@@ -41,6 +47,7 @@ const row = (id: string, rank: number | null): SyncTable.EncodedRow => ({
   access_scope_id: "scope",
   flag: true,
   rank,
+  amount: 1.25,
   title: "keep",
   at: -1234,
   doc: { nested: [true, null, { value: "json" }] }
@@ -63,9 +70,12 @@ for (const dialect of ["sqlite", "postgres"] as const) {
     const store =
       dialect === "sqlite"
         ? SqliteRowStore.make(counter.client, registry)
-        : yield* PostgresRowStore.make(new Map([[Items.name, "public"]])).pipe(
-            Effect.provideService(SqlClient, counter.client)
-          )
+        : yield* PostgresRowStore.make(
+            new Map([
+              [Items.name, "public"],
+              [ScopeGrants.ScopeGrants.name, "public"]
+            ])
+          ).pipe(Effect.provideService(SqlClient, counter.client))
     return { store, counter }
   })
   const database = (dialect === "sqlite" ? SqliteClient.layerMemory({}) : EmptyDatabase).pipe(
@@ -73,6 +83,56 @@ for (const dialect of ["sqlite", "postgres"] as const) {
   )
 
   describe.skipIf(dialect === "postgres" && !pgAvailable)(`${dialect} trusted row codecs`, () => {
+    it.live("projections skip corrupt unselected fields and multiple sums return one SQL row in one execution", () =>
+      Effect.gen(function* () {
+        const { store: rows, counter } = yield* fixture
+        yield* rows.write(Items, "a", Option.some(row("a", 3)))
+        yield* rows.write(Items, "b", Option.some(row("b", null)))
+        yield* counter.client.unsafe(`UPDATE codec_items SET doc = '[]'`)
+        yield* counter.client.unsafe(ScopeGrants.ScopeGrants[dialect].createTable)
+        const actor = AccessScope.PrincipalId.make("actor")
+        const scope = AccessScope.AccessScopeId.make("scope")
+        const grant = yield* Schema.encodeEffect(ScopeGrants.ScopeGrants.wire)({
+          id: ScopeGrants.grantId(scope, actor),
+          accessScopeId: scope,
+          principalId: actor,
+          role: "reader",
+          grantedAt: DateTime.makeUnsafe(0)
+        })
+        yield* rows.write(ScopeGrants.ScopeGrants, String(grant["id"]), Option.some(grant))
+        const { store } = Store.make(rows, {
+          actor: AccessScope.PrincipalId.make("actor"),
+          now: DateTime.makeUnsafe(0),
+          roleFor: () => Effect.succeedNone,
+          claimScope: () => Effect.succeed(false)
+        })
+        const base = store.query(Items).withIndex("by_flag_rank")
+        const projected = base.select("rank", "at", "amount").collect
+        const aggregate = base.aggregate({ sum: ["rank", "amount"] })
+        counter.reset()
+        expect(counter.statements).toEqual([])
+        const selected = yield* projected
+        expect(
+          Arr.map(selected, (r) => ({ rank: r.rank, at: DateTime.toEpochMillis(r.at), amount: r.amount }))
+        ).toEqual([
+          { rank: null, at: -1234, amount: "1.25" },
+          { rank: 3, at: -1234, amount: "1.25" }
+        ])
+        expect(counter.statements).toHaveLength(1)
+        expect(new Set(counter.statements[0]?.columns)).toEqual(new Set(["rank", "at", "amount"]))
+        expect(defect(yield* Effect.exit(base.select("doc").collect)).name).toBe("CorruptStorage")
+        counter.reset()
+        expect(yield* aggregate).toEqual({ count: 2, sum: { rank: 3, amount: 2.5 } })
+        expect(counter.statements).toHaveLength(1)
+        expect(counter.statements[0]?.rows).toBe(1)
+        yield* rows.write(Items, "c", Option.some(row("c", -3)))
+        counter.reset()
+        expect(yield* aggregate).toEqual({ count: 3, sum: { rank: 0, amount: 3.75 } })
+        expect(counter.statements).toHaveLength(1)
+        // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Each case owns its disposable database.
+      }).pipe(Effect.scoped, Effect.provide(database))
+    )
+
     it.live(
       "range codecs run only on execution, validate limits first, and retain contextual defects without SQL",
       () =>

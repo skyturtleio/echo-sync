@@ -183,6 +183,7 @@ const memoryRows = () => {
         else table(t).delete(id)
       }),
     range: (t, p) => Effect.sync(() => Store.planResult(p, table(t).values(), table(ScopeGrants).values())),
+    aggregate: () => Effect.die("aggregate is covered by the cross-store conformance fixture"),
     scan: (t) => Effect.sync(() => [...table(t).values()])
   }
   const snapshot = () => new Map(Arr.map([...data], ([name, m]) => [name, new Map(m)] as const))

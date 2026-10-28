@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Array as Arr, Effect, Exit, Option, String as Str } from "effect"
+import { Array as Arr, Effect, Exit, Option, Record as Rec, String as Str } from "effect"
 import { Ids } from "../../../core/index.ts"
 import type { Store } from "../../../core/index.ts"
 import * as Conformance from "../../../core/testing/Conformance.ts"
@@ -73,7 +73,8 @@ const closeOnReopen = Effect.sync(() => {
         read: (table, id) => live(inner.rows.read(table, id)),
         write: (table, id, row) => live(inner.rows.write(table, id, row)),
         writeMany: (table, rows) => live(inner.rows.writeMany(table, rows)),
-        range: (table, plan) => live(inner.rows.range(table, plan)),
+        range: (table, plan, columns) => live(inner.rows.range(table, plan, columns)),
+        aggregate: (table, plan, sums) => live(inner.rows.aggregate(table, plan, sums)),
         scan: (table) => live(inner.rows.scan(table)),
         purgeScope: (scopeId) => live(inner.rows.purgeScope(scopeId)),
         clearAll: live(inner.rows.clearAll)
@@ -110,6 +111,7 @@ describe("the suite's expectations come from fixtures, not from the subject (SPE
     write: () => Effect.void,
     writeMany: () => Effect.void,
     range: () => Effect.succeed([]),
+    aggregate: (_, __, sums) => Effect.succeed({ count: 0, sum: Rec.fromIterableWith(sums, (c) => [c.field, null]) }),
     scan: () => Effect.succeed([]),
     purgeScope: () => Effect.void,
     clearAll: Effect.void

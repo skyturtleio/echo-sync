@@ -130,8 +130,8 @@ const rowFields = { id: RowId, accessScopeId: AccessScope.AccessScopeId, body: S
 const Flags = SyncTable.make("flags", { ...rowFields })
 const B = SyncTable.make("b", { ...rowFields })
 const C = SyncTable.make("c", { ...rowFields })
-const L = SyncTable.make("l", { ...rowFields })
-const R = SyncTable.make("r", { ...rowFields })
+const L = SyncTable.make("l", { ...rowFields }, { indexes: { by_body: ["body"] } })
+const R = SyncTable.make("r", { ...rowFields }, { indexes: { by_body: ["body"] } })
 const Raw = SyncTable.make("raw", { ...rowFields })
 const Docs = SyncTable.make("docs", { ...rowFields }, { indexes: { by_body: ["body"] } })
 const queryRegistry = Registry.make([Flags, B, C, L, R, Raw, Docs])
@@ -155,11 +155,11 @@ const pair = Query.make("pair", {
   success: Schema.Struct({ l: Schema.Number, r: Schema.Number }),
   handler: (db) =>
     Effect.gen(function* () {
-      const l = yield* db.scan(L)
+      const l = yield* db.query(L).withIndex("by_body").aggregate({ sum: [] })
       // A slow run: a write that could land between the two reads gets the time to do so.
       yield* Effect.sleep("3 millis")
-      const r = yield* db.scan(R)
-      return { l: l.length, r: r.length }
+      const r = yield* db.query(R).withIndex("by_body").select("id").collect
+      return { l: l.count, r: r.length }
     })
 })
 
@@ -196,7 +196,7 @@ const flip = Query.make("flip", {
 const docs = Query.make("docs", {
   args: Schema.Struct({}),
   success: Schema.Number,
-  handler: (db) => Effect.map(db.query(Docs).withIndex("by_body").collect, (rows) => rows.length)
+  handler: (db) => Effect.map(db.query(Docs).withIndex("by_body").aggregate({ sum: [] }), (result) => result.count)
 })
 
 const searchDocs = Query.make("docs.search", {

@@ -885,7 +885,7 @@ it.effect("incompatible catalog reads defer only dependent migration replay and 
     const storage = yield* SqliteSyncStorage.make(sql, oldRegistry)
     const grant = { id: "1:s:me", access_scope_id: "s", principal_id: "me", role: "writer", granted_at: 0 }
     yield* storage.rows.write(ScopeGrants.ScopeGrants, grant.id, Option.some(grant))
-    const ids = ["read", "scan", "range", "other"]
+    const ids = ["read", "scan", "range", "project", "aggregate", "other"]
     for (const id of ids) yield* storage.rows.write(before, id, Option.some({ ...row(id), label: "base" }))
     yield* Catalogs.install(sql, storage, reactivity, airport, "v1", [{ id: "airport", name: "Old" }])
     const old = yield* Engine.make({
@@ -914,7 +914,10 @@ it.effect("incompatible catalog reads defer only dependent migration replay and 
     if (Exit.isFailure(failed))
       expect(Arr.map(Arr.filter(failed.cause.reasons, Cause.isDieReason), (reason) => reason.defect)).toContain(defect)
     expect(yield* storage.rows.scan(before)).toEqual(
-      Arr.map(["other", "range", "read", "scan"], (id) => ({ ...row(id), label: "old-optimistic" }))
+      Arr.map(["aggregate", "other", "project", "range", "read", "scan"], (id) => ({
+        ...row(id),
+        label: "old-optimistic"
+      }))
     )
     const mutations = Mutation.makeRegistry([
       Mutation.make("edit", {
@@ -925,6 +928,8 @@ it.effect("incompatible catalog reads defer only dependent migration replay and 
             if (id === "read") yield* ctx.store.get(expanded, TId.make("airport"))
             if (id === "scan") yield* ctx.store.scan(expanded)
             if (id === "range") yield* ctx.store.query(expanded).withIndex("by_code").collect
+            if (id === "project") yield* ctx.store.query(expanded).withIndex("by_code").select("name").collect
+            if (id === "aggregate") yield* ctx.store.query(expanded).withIndex("by_code").aggregate({ sum: [] })
             yield* ctx.store.patch(after, TId.make(id), { label: "new", n: 99 })
           })
       })
@@ -932,9 +937,11 @@ it.effect("incompatible catalog reads defer only dependent migration replay and 
     yield* migrate(nextRegistry, mutations)
     const next = yield* SqliteSyncStorage.make(sql, nextRegistry)
     expect(Arr.map(yield* next.pending, (pending) => pending.envelope)).toEqual(envelopes)
-    expect(Arr.map(yield* next.pending, (pending) => pending.undo.length)).toEqual([0, 0, 0, 1])
+    expect(Arr.map(yield* next.pending, (pending) => pending.undo.length)).toEqual([0, 0, 0, 0, 0, 1])
     expect(yield* sql`SELECT id, label, n FROM edits ORDER BY id`).toEqual([
+      { id: "aggregate", label: "base", n: null },
       { id: "other", label: "new", n: 99 },
+      { id: "project", label: "base", n: null },
       { id: "range", label: "base", n: null },
       { id: "read", label: "base", n: null },
       { id: "scan", label: "base", n: null }
@@ -959,8 +966,8 @@ it.effect("incompatible catalog reads defer only dependent migration replay and 
         })
       )
     )
-    expect(yield* sql`SELECT count(*) AS n FROM edits WHERE label = 'new' AND n = 99`).toEqual([{ n: 4 }])
-    expect(Arr.map(yield* next.pending, (pending) => pending.undo.length)).toEqual([1, 1, 1, 1])
+    expect(yield* sql`SELECT count(*) AS n FROM edits WHERE label = 'new' AND n = 99`).toEqual([{ n: 6 }])
+    expect(Arr.map(yield* next.pending, (pending) => pending.undo.length)).toEqual([1, 1, 1, 1, 1, 1])
     // oxlint-disable-next-line effecttsgo/strict-effect-provide -- Per-test SQLite composition root.
   }).pipe(Effect.provide(Db))
 )

@@ -21,6 +21,7 @@ import {
 } from "./Errors.ts"
 import { grantId, ScopeGrants } from "./ScopeGrants.ts"
 import * as Search from "./Search.ts"
+import * as SyncTable from "./SyncTable.ts"
 import type { AnySyncTable, Column, EncodedRow, Index, WritableTable } from "./SyncTable.ts"
 
 // ---------------------------------------------------------------------------------------------
@@ -163,6 +164,16 @@ export const checkLimit = (limit: Option.Option<number>): Effect.Effect<void> =>
 // oxlint-disable-next-line effecttsgo/prefer-schema-over-json -- Internal identity key also represents missing values as null; this is not a wire codec.
 const grantPair = (scope: unknown, principal: unknown) => JSON.stringify([scope, principal])
 
+/** Scope membership shared by memory ranges and aggregates; SQL uses an EXISTS semi-join. */
+export const planReadable = (plan: Pick<IndexRangePlan, "readableBy">, grants: Iterable<EncodedRow>) => {
+  const granted = new Set(Array.from(grants, (g) => grantPair(g["access_scope_id"], g["principal_id"])))
+  return (row: EncodedRow) =>
+    Option.match(plan.readableBy, {
+      onNone: () => true,
+      onSome: (principals) => Arr.some(principals, (p) => granted.has(grantPair(row["access_scope_id"], p)))
+    })
+}
+
 /**
  * Reference result of `plan` over `rows` (a table's rows) given `grants` (the `scope_grants`
  * table's rows): match, scope, order, then limit. MemoryStore uses it; SQL stores must agree.
@@ -175,12 +186,7 @@ export const planResult = (
   rows: Iterable<EncodedRow>,
   grants: Iterable<EncodedRow>
 ): ReadonlyArray<EncodedRow> => {
-  const granted = new Set(Array.from(grants, (g) => grantPair(g["access_scope_id"], g["principal_id"])))
-  const readable = (row: EncodedRow) =>
-    Option.match(plan.readableBy, {
-      onNone: () => true,
-      onSome: (principals) => Arr.some(principals, (p) => granted.has(grantPair(row["access_scope_id"], p)))
-    })
+  const readable = planReadable(plan, grants)
   const compare = planOrder(plan)
   const ordered = Arr.sort(
     Arr.filter([...rows], (row) => planMatches(plan, row) && readable(row)),
@@ -234,8 +240,14 @@ export interface RowStore {
   /** Rows matching `plan`: `planResult` (match, readable scope, plan order, limit). */
   readonly range: (
     table: AnySyncTable,
-    plan: IndexRangePlan
+    plan: IndexRangePlan,
+    columns?: ReadonlyArray<Column>
   ) => Effect.Effect<ReadonlyArray<EncodedRow>, StoreUnavailable>
+  readonly aggregate: (
+    table: AnySyncTable,
+    plan: Omit<IndexRangePlan, "limit">,
+    sums: ReadonlyArray<Column>
+  ) => Effect.Effect<SyncTable.AggregateResult<ReadonlyArray<string>>, StoreUnavailable>
   /** All rows, ordered by `id` (code point). For small tables only. */
   readonly scan: (table: AnySyncTable) => Effect.Effect<ReadonlyArray<EncodedRow>, StoreUnavailable>
 }
@@ -327,23 +339,33 @@ export type IndexCursor<T extends AnySyncTable, K extends keyof T["indexes"]> = 
   Extract<IndexFields<T, K>[number] | "id", keyof RowOf<T>>
 >
 
-export interface OrderedQuery<Row, E, Cursor = Row> {
-  /** One literal substring predicate, applied before the limit. A later call replaces it. */
-  readonly contains: (field: TextField<Row>, needle: string) => OrderedQuery<Row, E, Cursor>
-  readonly order: (order: "asc" | "desc") => OrderedQuery<Row, E, Cursor>
-  /** Exclusive full index key, including implicit id, relative to the final order. */
-  readonly after: (cursor: Cursor) => OrderedQuery<Row, E, Cursor>
-  readonly before: (cursor: Cursor) => OrderedQuery<Row, E, Cursor>
+export interface Projection<Row, E> {
   readonly take: (n: number) => Effect.Effect<ReadonlyArray<Row>, E>
   readonly first: Effect.Effect<Option.Option<Row>, E>
   readonly collect: Effect.Effect<ReadonlyArray<Row>, E>
+}
+
+export interface OrderedQuery<Row, E, Cursor = Row, Numeric extends string = never> extends Projection<Row, E> {
+  /** One literal substring predicate, applied before the limit. A later call replaces it. */
+  readonly contains: (field: TextField<Row>, needle: string) => OrderedQuery<Row, E, Cursor, Numeric>
+  readonly order: (order: "asc" | "desc") => OrderedQuery<Row, E, Cursor, Numeric>
+  /** Exclusive full index key, including implicit id, relative to the final order. */
+  readonly after: (cursor: Cursor) => OrderedQuery<Row, E, Cursor, Numeric>
+  readonly before: (cursor: Cursor) => OrderedQuery<Row, E, Cursor, Numeric>
+  readonly select: <const F extends readonly [keyof Row & string, ...Array<keyof Row & string>]>(
+    ...fields: F
+  ) => Projection<SyncTable.Selected<Row, F>, E>
+  /** All matching rows on this branch, including its cursor bounds; no page limit. */
+  readonly aggregate: <const F extends ReadonlyArray<Numeric>>(options: {
+    readonly sum: F
+  }) => Effect.Effect<SyncTable.AggregateResult<F>, E>
 }
 
 export interface TableQuery<T extends AnySyncTable, E> {
   readonly withIndex: <K extends keyof T["indexes"] & string>(
     index: K,
     range?: (q: IndexRangeBuilder<RowOf<T>, IndexFields<T, K>>) => IndexRange
-  ) => OrderedQuery<RowOf<T>, E, IndexCursor<T, K>>
+  ) => OrderedQuery<RowOf<T>, E, IndexCursor<T, K>, SyncTable.NumericField<T>>
 }
 
 /** Errors of reads. Rows in scopes the actor cannot read are skipped by queries. */
@@ -425,13 +447,18 @@ const wrap = <A, E extends StoreError>(effect: Effect.Effect<A, E>) =>
     Effect.failCause(Cause.map(cause, (reason) => new StoreOperationFailure({ reason })))
   )
 
-const mutationQuery = <Row, E extends StoreError, Cursor>(
-  query: OrderedQuery<Row, E, Cursor>
-): OrderedQuery<Row, StoreOperationFailure, Cursor> => ({
+const mutationQuery = <Row, E extends StoreError, Cursor, Numeric extends string>(
+  query: OrderedQuery<Row, E, Cursor, Numeric>
+): OrderedQuery<Row, StoreOperationFailure, Cursor, Numeric> => ({
   contains: (field, needle) => mutationQuery(query.contains(field, needle)),
   order: (order) => mutationQuery(query.order(order)),
   after: (cursor) => mutationQuery(query.after(cursor)),
   before: (cursor) => mutationQuery(query.before(cursor)),
+  select: (...fields) => {
+    const projected = query.select(...fields)
+    return { take: (n) => wrap(projected.take(n)), first: wrap(projected.first), collect: wrap(projected.collect) }
+  },
+  aggregate: (options) => wrap(query.aggregate(options)),
   take: (n) => wrap(query.take(n)),
   first: wrap(query.first),
   collect: wrap(query.collect)
@@ -714,7 +741,7 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
           new IndexRangeBuilder({ eq: [], lower: Option.none(), upper: Option.none() })
         ).state
         type Cursors = { readonly after?: IndexCursor<T, K>; readonly before?: IndexCursor<T, K> }
-        const run = (
+        const prepare = (
           order: "asc" | "desc",
           limit: Option.Option<number>,
           cursors: Cursors,
@@ -806,17 +833,64 @@ export const make = (rows: RowStore, options: StoreOptions): StoreInstance => {
             }
             // The semi-join reads `scope_grants`: a grant change can change this result (INV-BRW-6).
             if (Option.isSome(plan.readableBy)) yield* read(ScopeGrants)
-            return yield* Effect.forEach(yield* rows.range(table, selected), (row) => decode(table, row))
+            return selected
+          })
+        const run = (
+          order: "asc" | "desc",
+          limit: Option.Option<number>,
+          cursors: Cursors,
+          text?: readonly [string, string]
+        ) =>
+          Effect.flatMap(prepare(order, limit, cursors, text), (plan) =>
+            Effect.flatMap(rows.range(table, plan), (rs) => Effect.forEach(rs, (row) => decode(table, row)))
+          )
+        const columnsFor = (fields: ReadonlyArray<string>, numeric: boolean) =>
+          Effect.forEach([...new Set(fields)], (field) => {
+            const column = Option.getOrUndefined(Arr.findFirst(table.columns, (c) => c.field === field))
+            return column === undefined || (numeric && column.kind !== "integer" && column.kind !== "double")
+              ? Effect.fail(
+                  new InvalidRow({
+                    table: table.name,
+                    message: `invalid ${numeric ? "sum" : "projection"} field ${field}`
+                  })
+                )
+              : Effect.succeed(column)
           })
         const ordered = (
           order: "asc" | "desc",
           cursors: Cursors = {},
           text?: readonly [string, string]
-        ): OrderedQuery<RowOf<T>, InvalidRow | StoreUnavailable, IndexCursor<T, K>> => ({
+        ): OrderedQuery<RowOf<T>, InvalidRow | StoreUnavailable, IndexCursor<T, K>, SyncTable.NumericField<T>> => ({
           contains: (field, needle) => ordered(order, cursors, [field, needle]),
           order: (next) => ordered(next, cursors, text),
           after: (cursor) => ordered(order, { ...cursors, after: cursor }, text),
           before: (cursor) => ordered(order, { ...cursors, before: cursor }, text),
+          select: (...fields) => {
+            const selected = (limit: Option.Option<number>) =>
+              Effect.gen(function* () {
+                yield* checkLimit(limit)
+                if (fields.length === 0)
+                  return yield* new InvalidRow({ table: table.name, message: "select requires at least one field" })
+                const columns = yield* columnsFor(fields, false)
+                const plan = yield* prepare(order, limit, cursors, text)
+                const codec = SyncTable.projection(table, fields)
+                return yield* Effect.forEach(yield* rows.range(table, plan, columns), (row) =>
+                  decodeStored(codec, table.name, row)
+                )
+              })
+            return {
+              take: (n) => selected(Option.some(n)),
+              first: selected(Option.some(1)).pipe(Effect.map((rs) => Option.fromNullishOr(rs[0]))),
+              collect: selected(Option.none())
+            }
+          },
+          aggregate: ({ sum }) =>
+            Effect.gen(function* () {
+              const columns = yield* columnsFor(sum, true)
+              const plan = yield* prepare(order, Option.none(), cursors, text)
+              const result = yield* rows.aggregate(table, plan, columns)
+              return yield* decodeStored(SyncTable.aggregateResult(sum), table.name, result)
+            }),
           take: (n) => run(order, Option.some(n), cursors, text),
           first: run(order, Option.some(1), cursors, text).pipe(Effect.map((rs) => Option.fromNullishOr(rs[0]))),
           collect: run(order, Option.none(), cursors, text)

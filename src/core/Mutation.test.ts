@@ -51,6 +51,7 @@ const makeStore = () => {
         else data.delete(id)
       }),
     range: () => Effect.succeed([]),
+    aggregate: () => Effect.die("aggregate is not used by this mutation fixture"),
     scan: () => Effect.sync(() => [...data.values()])
   }
   return Store.make(rows, {

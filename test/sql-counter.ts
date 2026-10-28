@@ -1,4 +1,4 @@
-import { Array as Arr, Effect, Stream } from "effect"
+import { Array as Arr, Effect, Predicate, Record as Rec, Stream } from "effect"
 import * as SqlClient from "effect/sql/SqlClient"
 import type { Connection } from "effect/sql/SqlConnection"
 import type { Compiler } from "effect/sql/Statement"
@@ -9,14 +9,24 @@ import type { Compiler } from "effect/sql/Statement"
  * driver-result SELECTs are not row-counted (none of the budget fixtures uses them). */
 export const countingClient = Effect.fnUntraced(function* (source: SqlClient.SqlClient, compiler: Compiler) {
   const connection = yield* source.reserve
-  const statements: Array<{ sql: string; params: ReadonlyArray<unknown>; rows: number }> = []
+  const statements: Array<{
+    sql: string
+    params: ReadonlyArray<unknown>
+    rows: number
+    columns?: ReadonlyArray<string>
+  }> = []
   const track = <A, E, R>(sql: string, params: ReadonlyArray<unknown>, work: Effect.Effect<A, E, R>) =>
     Effect.suspend(() => {
-      const statement = { sql, params, rows: 0 }
+      const columns: Array<string> = []
+      const statement = { sql, params, rows: 0, columns }
       statements.push(statement)
       return Effect.tap(work, (result) =>
         Effect.sync(() => {
-          if (/^\s*SELECT\b/i.test(sql) && Arr.isArray(result)) statement.rows = result.length
+          if (/^\s*SELECT\b/i.test(sql) && Arr.isArray(result)) {
+            statement.rows = result.length
+            const first = result[0]
+            if (Predicate.isObject(first)) columns.push(...Rec.keys(first))
+          }
         })
       )
     })

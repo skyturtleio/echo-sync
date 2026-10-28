@@ -157,6 +157,39 @@ page subscriptions (even empty pages) retain ordinary table/grant invalidation a
 after writes or revocation. Non-nullable keys use SQL tuple seeks; nullable keys use equivalent
 null-aware predicates. Planner choices and selective text/scope filters can still add work.
 
+### Projected pages and totals
+
+Use `select` to fetch and decode only the fields a screen needs. Configure filters, order and
+cursors before selecting; the projected query exposes `take`, `first` and `collect`.
+Use `aggregate` for a count and multiple sums in one database operation:
+
+```ts
+// Inside an Effect.gen in a registered Query.make handler.
+// Flights declares nullable numeric totalMinutes, picMinutes and nightMinutes columns.
+const base = db.query(Flights)
+  .withIndex("by_scope_date", q => q.eq("accessScopeId", scope))
+const totals = yield* base.aggregate({
+  sum: ["totalMinutes", "picMinutes", "nightMinutes"]
+})
+const ordered = base.order("desc")
+const page = last === undefined ? ordered : ordered.after(last)
+const rows = yield* page.select("id", "accessScopeId", "date", "totalMinutes").take(N)
+return { rows, count: totals.count, totals: totals.sum }
+```
+
+The aggregate counts all matching rows on its branch. Derive it from the uncursored base to
+count the whole filtered result, not just rows after the page cursor. A single registered
+handler gives both reads one snapshot; separate subscriptions do not. Select all index fields
+plus id when the last returned row will become the next cursor.
+
+`aggregate({ sum: [] })` is count-only. Sums ignore null and return null for empty/all-null
+inputs; coalesce to zero in your app when appropriate. Only integer/double storage columns
+can be summed, not timestamps, booleans or JSON. Results are plain numbers, not field brands
+or domain-codec transformations. Integer sums require the sum of absolute inputs to fit a safe
+JavaScript integer; double sums are approximate. Numeric overflow defects rather than silently
+returning an unsafe total. Projection reduces decoding and transfer, not necessarily scanning;
+these are live queries, not cached or incrementally maintained summaries (SPEC §3, §12).
+
 ## 2. Mutations
 
 A mutation is a named handler over `ctx.store` (SPEC §5). It runs optimistically on the client and

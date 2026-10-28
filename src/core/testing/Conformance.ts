@@ -38,7 +38,7 @@ import type { Scope } from "effect"
 import type * as Engine from "../../client/sync/Engine.ts"
 import { AccessScope, Ids, Protocol, ScopeGrants, Store, SyncTable } from "../index.ts"
 import { Errors } from "../index.ts"
-import type { Mutation } from "../index.ts"
+import { Mutation } from "../index.ts"
 
 // ---------------------------------------------------------------------------------------------
 // Subjects and checks
@@ -64,6 +64,7 @@ export interface SyncStorageSubject<E = never> {
 type CheckFailure =
   | ConformanceViolation
   | Store.ReadError
+  | Store.StoreOperationFailure
   | Errors.ConstraintViolated
   | Errors.RowAlreadyExists
   | ReadonlyArray<Item>
@@ -591,6 +592,220 @@ export const search = <R, E>(make: Effect.Effect<RowStoreSubject, E, R>) =>
 export const rowStore = <R, E>(
   make: Effect.Effect<RowStoreSubject, E, R>
 ): ReadonlyArray<Check<R, E | CheckFailure>> => [
+  check(
+    "projected and aggregate mutation reads preserve transient failures and roll back writes on numeric defects",
+    use(make, ({ rows, transaction }) =>
+      Effect.gen(function* () {
+        const fail = violation("mutation query failure")
+        const [grantId, grantRow] = grant(mine, u1, "writer")
+        yield* transaction(
+          Effect.gen(function* () {
+            yield* rows.write(ScopeGrants.ScopeGrants, grantId, Option.some(grantRow))
+            yield* rows.write(
+              Items,
+              "a",
+              Option.some(item("a", { accessScopeId: mine, label: "base", rank: Number.MAX_SAFE_INTEGER }))
+            )
+            yield* rows.write(Items, "b", Option.some(item("b", { accessScopeId: mine, rank: 1 })))
+          })
+        )
+        const unavailable = new Errors.StoreUnavailable({ message: "injected query outage" })
+        for (const mode of ["project", "aggregate", "overflow"] as const) {
+          const observed: Store.RowStore = {
+            ...rows,
+            range: (table, plan, columns) =>
+              mode === "project" ? Effect.fail(unavailable) : rows.range(table, plan, columns),
+            aggregate: (table, plan, sums) =>
+              mode === "aggregate" ? Effect.fail(unavailable) : rows.aggregate(table, plan, sums)
+          }
+          const mutations = Mutation.makeRegistry([
+            Mutation.make("read", {
+              args: Schema.Struct({}),
+              handler: (ctx) =>
+                Effect.gen(function* () {
+                  yield* ctx.store.patch(Items, ItemId.make("a"), { label: "partial" })
+                  const base = ctx.store.query(Items).withIndex("by_score")
+                  if (mode === "project") yield* base.select("label").collect
+                  else yield* base.aggregate({ sum: ["rank"] })
+                })
+            })
+          ])
+          const exit = yield* Effect.exit(
+            transaction(
+              Mutation.runHandler(
+                observed,
+                mutations,
+                u1,
+                {
+                  clientId: Ids.ClientId.make("query-test"),
+                  mutationId: Ids.MutationId.make("read"),
+                  seq: Ids.Seq.make(1),
+                  name: "read",
+                  args: {}
+                },
+                0
+              )
+            )
+          )
+          if (!Exit.isFailure(exit)) return yield* fail("query failure became a mutation rejection or success")
+          if (
+            mode === "overflow"
+              ? !Cause.hasDies(exit.cause)
+              : Option.getOrUndefined(Cause.findErrorOption(exit.cause)) !== unavailable
+          )
+            return yield* fail("query failure lost its original classification")
+          const stored = yield* transaction(rows.read(Items, "a"))
+          if (Option.getOrUndefined(stored)?.["label"] !== "base")
+            return yield* fail("partial write survived query failure")
+        }
+        return 3
+      })
+    )
+  ),
+  check(
+    "projected pages and aggregates preserve authorized predicates, codecs, nulls and independent cursor branches",
+    use(make, ({ rows, transaction }) =>
+      transaction(
+        Effect.gen(function* () {
+          const fail = violation("projection and aggregate")
+          for (const [id, row] of [...GRANTS, grant(mine, AccessScope.Everyone, "reader")])
+            yield* rows.write(ScopeGrants.ScopeGrants, id, Option.some(row))
+          for (const [id, fields] of [
+            [
+              "a",
+              {
+                accessScopeId: mine,
+                label: "keep-a",
+                rank: null,
+                score: 0.5,
+                at: DateTime.toDateUtc(DateTime.makeUnsafe(1234)),
+                data: { tags: ["x"], n: 7 }
+              }
+            ],
+            ["b", { accessScopeId: mine, label: "keep-b", rank: 7, score: 1.25 }],
+            ["c", { accessScopeId: open, label: "keep-c", rank: -2, score: -0.25 }],
+            ["d", { accessScopeId: open, label: "keep-d", rank: null, score: 2 }],
+            ["hidden", { accessScopeId: theirs, label: "keep-0", rank: 9999, score: 9999 }],
+            ["excluded", { accessScopeId: mine, label: "other", rank: 8888, score: 8888 }]
+          ] as const)
+            yield* rows.write(Items, id, Option.some(item(id, fields)))
+          const { store, reads } = Store.make(rows, {
+            actor: u1,
+            now: DateTime.makeUnsafe(0),
+            roleFor: Store.roleFromGrants(rows, u1),
+            claimScope: Store.claimFromGrants(rows)
+          })
+          const base = store
+            .query(Items)
+            .withIndex("by_label_rank", (q) => q.prefix("label", "keep"))
+            .contains("label", "keep-")
+          const totals = base.aggregate({ sum: ["rank", "score", "rank"] })
+          if (canonical(yield* totals) !== canonical({ count: 4, sum: { rank: 5, score: 3.5 } }))
+            return yield* fail("totals include hidden/duplicate rows or mishandle nulls")
+          const projected = base.select("id", "at", "data", "rank", "id")
+          const page = yield* projected.take(1)
+          if (
+            page.length !== 1 ||
+            page[0]?.id !== "a" ||
+            page[0].at?.getTime() !== 1234 ||
+            page[0].rank !== null ||
+            canonical(page[0].data) !== canonical({ tags: ["x"], n: 7 }) ||
+            Rec.keys(page[0]).length !== 4
+          )
+            return yield* fail("projection changed codecs, keys, order or limit")
+          if (
+            Option.getOrUndefined(yield* projected.first)?.id !== "a" ||
+            (yield* projected.collect).length !== 4 ||
+            (yield* projected.take(0)).length !== 0
+          )
+            return yield* fail("projected terminals disagree")
+          const forward = base.after({ label: "keep-b", rank: 7, id: ItemId.make("b") })
+          if (
+            canonical(yield* forward.aggregate({ sum: ["rank", "score"] })) !==
+            canonical({ count: 2, sum: { rank: -2, score: 1.75 } })
+          )
+            return yield* fail("aggregate ignored cursor")
+          if (canonical(yield* forward.select("id").take(1)) !== canonical([{ id: "c" }]))
+            return yield* fail("page disagrees with aggregate membership")
+          const backward = base.order("desc").after({ label: "keep-c", rank: -2, id: ItemId.make("c") })
+          if (
+            canonical(yield* backward.aggregate({ sum: ["rank", "score"] })) !==
+            canonical({ count: 2, sum: { rank: 7, score: 1.75 } })
+          )
+            return yield* fail("descending cursor interpreted as ascending")
+          if (canonical(yield* totals) !== canonical({ count: 4, sum: { rank: 5, score: 3.5 } }))
+            return yield* fail("page branch mutated base")
+          const onlyNull = store.query(Items).withIndex("by_label_rank", (q) => q.eq("label", "keep-d"))
+          if (canonical(yield* onlyNull.aggregate({ sum: ["rank"] })) !== canonical({ count: 1, sum: { rank: null } }))
+            return yield* fail("all-null sum became zero")
+          const empty = base.contains("label", "missing")
+          if (
+            canonical(yield* empty.aggregate({ sum: ["rank", "score"] })) !==
+              canonical({ count: 0, sum: { rank: null, score: null } }) ||
+            Option.isSome(yield* empty.select("id").first)
+          )
+            return yield* fail("empty result lost SQL null semantics")
+          if (
+            canonical(
+              yield* Store.forMutation(store)
+                .query(Items)
+                .withIndex("by_label_rank")
+                .contains("label", "keep-")
+                .aggregate({ sum: [] })
+            ) !== canonical({ count: 4, sum: {} })
+          )
+            return yield* fail("count-only or mutation wrapper lost membership")
+          const dependencies = yield* reads
+          if (!dependencies.has(Items.name) || !dependencies.has(ScopeGrants.ScopeGrants.name))
+            return yield* fail("missing dependencies")
+          yield* rows.write(ScopeGrants.ScopeGrants, ScopeGrants.grantId(open, AccessScope.Everyone), Option.none())
+          if ((yield* totals).count !== 2) return yield* fail("aggregate reused stale grant membership")
+          return 15
+        })
+      )
+    )
+  ),
+  check(
+    "aggregate integer bounds reject unsafe cancellation while zero, null and finite fractions remain distinct",
+    use(make, ({ rows, transaction }) =>
+      transaction(
+        Effect.gen(function* () {
+          const fail = violation("aggregate numeric range")
+          for (const [id, row] of GRANTS) yield* rows.write(ScopeGrants.ScopeGrants, id, Option.some(row))
+          const { store } = Store.make(rows, {
+            actor: u1,
+            now: DateTime.makeUnsafe(0),
+            roleFor: Store.roleFromGrants(rows, u1),
+            claimScope: Store.claimFromGrants(rows)
+          })
+          const base = store.query(Items).withIndex("by_score")
+          yield* rows.write(
+            Items,
+            "a",
+            Option.some(item("a", { accessScopeId: mine, rank: Number.MAX_SAFE_INTEGER, score: 0.125 }))
+          )
+          if ((yield* base.aggregate({ sum: ["rank"] })).sum.rank !== Number.MAX_SAFE_INTEGER)
+            return yield* fail("safe boundary rejected")
+          yield* rows.write(Items, "b", Option.some(item("b", { accessScopeId: mine, rank: -1, score: 0.375 })))
+          const overflow = yield* Effect.exit(base.aggregate({ sum: ["rank"] }))
+          if (!Exit.isFailure(overflow) || !Cause.hasDies(overflow.cause))
+            return yield* fail("unsafe absolute sum accepted")
+          yield* rows.write(Items, "a", Option.some(item("a", { accessScopeId: mine, rank: 1, score: 0.125 })))
+          if (
+            canonical(yield* base.aggregate({ sum: ["rank", "score"] })) !==
+            canonical({ count: 2, sum: { rank: 0, score: 0.5 } })
+          )
+            return yield* fail("zero or fraction changed")
+          yield* rows.write(Items, "a", Option.some(item("a", { accessScopeId: mine, score: Number.MAX_VALUE })))
+          yield* rows.write(Items, "b", Option.some(item("b", { accessScopeId: mine, score: Number.MAX_VALUE })))
+          const infinite = yield* Effect.exit(base.aggregate({ sum: ["score"] }))
+          if (!Exit.isFailure(infinite) || !Cause.hasDies(infinite.cause))
+            return yield* fail("overflow became null or a transient failure")
+          return 4
+        })
+      )
+    )
+  ),
   check(
     "keyset pages preserve ties, direction, nulls and cursor boundaries across intervening inserts",
     use(make, ({ rows, transaction }) =>

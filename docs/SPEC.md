@@ -324,6 +324,29 @@ declare `accessScopeId`; its fields and indexes use the same codecs and query AP
   remain defects, retain the original schema cause, and identify the operation, table and row
   or column; a batched failure identifies its starting row offset and retains the schema issue's
   within-batch path. These failures MUST NOT widen RowStore's typed error channel.
+- INV-TBL-12: `select(...fields)` MUST return only the requested decoded fields, retaining
+  their original codecs, brands and nullability. SQL results MUST contain no unselected
+  column; unselected columns MUST NOT be decoded (predicates/order may still read them).
+  A selection MUST be nonempty; unknown fields fail `InvalidRow`; duplicates collapse.
+  `take`, `first` and `collect` retain the base query's predicates, authorization, ordering,
+  cursors and limits. Selection is terminal: configure the base before selecting fields.
+- INV-TBL-13: `aggregate({ sum: fields })` MUST count every matching readable row exactly
+  once and sum each requested integer/double storage column in one SQL aggregate statement
+  (one unsorted pass in MemoryStore). It MUST preserve all branch predicates, including
+  cursor bounds; it has no limit. An empty field list is count-only. SUM ignores NULL and
+  returns NULL for empty/all-null inputs, otherwise a plain number, without field refinements
+  or decoded-domain transformations. Non-numeric storage fields fail `InvalidRow`.
+  Count MUST be a nonnegative safe integer. Integer sums MUST be exact when the sum of absolute
+  input values is at most `Number.MAX_SAFE_INTEGER`; larger magnitudes MUST defect, even if
+  cancellation makes the final result small. Double sums are finite binary64 approximations,
+  not bit-identical across stores; accumulation order can affect rounding and overflow at
+  extremes. Non-finite results MUST defect, never become NULL or zero. These operations MUST
+  retain table/grant dependencies even for empty results, and catalog reads require no grants.
+
+**Rationale (2026-10-28):** Screen queries need narrow fields and totals without decoding every
+flight or scanning separately for each measure. Reusing the authorized indexed plan keeps page
+and aggregate membership consistent; a conservative absolute-magnitude bound avoids SQLite
+integer overflow and JavaScript intermediate rounding rather than silently returning inexact totals.
 
 **Rationale (2026-10-27):** Effect 4's schema Effect adapters can parse synchronously when
 called, so parser invocation belongs inside the operation, not merely its returned Effect.
@@ -408,6 +431,25 @@ across separate reads; use live subscriptions when page contents must refresh.
 SQL uses native row comparisons for non-nullable keys and a null-aware lexicographic disjunction
 otherwise. Index availability does not guarantee a planner's access path, or bound the work of
 substring/readability filters. Pagination never narrows reactive dependencies to returned ids.
+
+**Projections and aggregates.** `base.select("id", "flightDate").take(30)` returns only
+those fields; `first` returns an Option, and `collect` is unlimited. Include the full index key
+and id yourself if the result will supply a cursor. SQL can filter/order using unselected columns.
+Literal field tuples produce required result keys; dynamic arrays and union-valued arguments
+produce optional keys wherever presence is not statically guaranteed. Partial reads validate
+selected fields, not the whole stored row; corruption in an unselected
+field is not detected. All codecs run lazily and afresh on execution (INV-TBL-10).
+
+`base.aggregate({ sum: ["totalMinutes", "picMinutes"] })` returns
+`{ count, sum: { totalMinutes, picMinutes } }`. Duplicate fields collapse; `sum: []` returns
+`{ count, sum: {} }`. Numeric eligibility uses the field schema's encoded type, with runtime
+validation against the storage kind: timestamps, booleans and JSON are not SUM inputs.
+Integer/double codecs can decode into other domain types; SUM still measures stored numbers.
+Overflow is a contextual defect, not a retryable storage failure or a domain rejection.
+Projection reduces decoding/transfer volume, not necessarily scan work; aggregate is not a
+materialized or incremental summary. Scope filtering uses EXISTS, so multiple readable grants
+never multiply a row. Custom RowStore implementations must implement `aggregate` and the optional
+selected-column argument to `range`; both run inside the caller-owned transaction.
 
 **Search.** Declare `searchText: Search.Text` and ordinary indexes in `SyncTable.make`.
 Set it with `Search.Text.make(Search.normalize(source))` in importers and mutation handlers.
@@ -1739,6 +1781,12 @@ replica: `syncStatus`, `requestSync`, `presence` and `track` fail `SyncDisabled`
 (`tabApi`) adds id generation, `LeaderLost` retry, resubscription and codec work; a UI adapter
 is a translation of the tab API and adds no sync semantics.
 
+For a coherent screen result, a single `Query.make` handler can read totals from an uncursored
+base and a projected page from its ordered/cursored branch, returning `{ rows, count, totals }`.
+Both reads share that execution's snapshot (INV-BRW-6); independently fetched pages or subscriptions
+do not. Calculate `nextCursor` in the app from selected index fields; the engine does not reconcile
+an app's display sort with its pagination index or maintain a historical page snapshot.
+
 `subscribeSnapshot(query, args)` emits `{ value, revision: { epoch, offset } }`; `value` uses
 the query's success codec. Existing `subscribe` continues to emit only data. Revisions are
 replica-wide, not per query, mutation sequences, server positions, or durable timestamps.
@@ -2487,6 +2535,8 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | ID | status | covering test(s) |
 |---|---|---|
 | INV-TBL-11 | covered | `SyncTable.test` "catalog shape changes leave scoped hashes unchanged and catalog mutations cannot compile"; `Catalogs.test` "catalog swaps reemit global queries without grants and survive scoped replica rebuilds and purges" |
+| INV-TBL-12 | covered | `Conformance.test` "projected pages and aggregates preserve authorized predicates, codecs, nulls and independent cursor branches" (shared Memory/SQLite/Postgres fixture); `rowstore-codecs.test` "projections skip corrupt unselected fields and multiple sums return one SQL row in one execution"; compile-errors.typecheck checks field/result types |
+| INV-TBL-13 | covered | `Conformance.test` "projected pages and aggregates preserve authorized predicates, codecs, nulls and independent cursor branches", "aggregate integer bounds reject unsafe cancellation while zero, null and finite fractions remain distinct" (shared Memory/SQLite/Postgres fixtures); `rowstore-codecs.test` "projections skip corrupt unselected fields and multiple sums return one SQL row in one execution"; `Leader.test` "every emission of a query is one snapshot: two tables written together never disagree", "revoking a grant re-emits a live query whose handler only used db.query" |
 | INV-PULL-19 | covered | `catalogs.test` "identical catalog reimports keep their version; committed imports change discovery without capture or redeploy", "catalog HTTP refuses anonymous and wildcard actors, serves immutable authenticated bytes and rejects stale versions"; supplementary `catalogs.sh` poke-driven replacement |
 | INV-CLI-17 | covered | `Catalogs.test` "an interrupted or undecodable catalog fill keeps the published table and version across reopen", "catalog swaps reemit global queries without grants and survive scoped replica rebuilds and purges", "catalog discovery upgrades a previously stripped shape at the same version despite another catalog failing"; supplementary `catalogs.sh` hard-kill OPFS recovery |
 | INV-BRW-16 | covered | `Catalogs.test` "catalog swaps reemit global queries without grants and survive scoped replica rebuilds and purges"; supplementary `catalogs.sh` open-query publication |
@@ -2651,6 +2701,8 @@ machine-verifiable literal test-title citations.
 
 | name | value | where | tunable |
 |---|---|---|---|
+| aggregate count / integer sum absolute magnitude | ≤ 9,007,199,254,740,991; exceeding the bound defects | `Aggregate.ts`, §3 | no |
+| projection fields / aggregate sums | ≥ 1 selected field; ≥ 0 sums; duplicates collapse | `Store.ts`, §3 | caller |
 | catalog shadow fill | ≤ 500 rows per admitted transaction, additionally parameter-bounded by RowStore | `Catalogs.ts` | no |
 | catalog download deadline / retry | 45 s / 5 s; newest discovery supersedes failed versions | client `Catalogs.ts` | no |
 | catalog snapshots | whole canonical JSON array, gzip; one current compressed snapshot per table in server memory; no row/byte cap | server `catalogs.ts` | no |
