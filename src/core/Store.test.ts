@@ -7,7 +7,43 @@ import { ClientId, MutationId } from "./Ids.ts"
 import * as Mutation from "./Mutation.ts"
 import * as Store from "./Store.ts"
 import * as SyncTable from "./SyncTable.ts"
+import { CorruptStorage } from "./Errors.ts"
 import { type Dialect, pgAvailable, postgres, sqlite } from "./test/dialects.ts"
+
+it.effect("corruption diagnostics retain schema paths and render causes without primitive conversion", () =>
+  Effect.gen(function* () {
+    const schema = Schema.Struct({ count: Schema.Number, sum: Schema.Struct({ rank: Schema.Number }) })
+    const exit = yield* Effect.exit(Store.decodeStored(schema, "totals", { count: 0, sum: {} }, "row-7"))
+    if (exit._tag !== "Failure") throw new Error("expected corrupt storage")
+    const reason = exit.cause.reasons[0]
+    if (reason?._tag !== "Die" || !(reason.defect instanceof CorruptStorage)) {
+      throw new Error("expected CorruptStorage defect")
+    }
+    const error = reason.defect
+    expect(Schema.isSchemaError(error.cause)).toBe(true)
+    for (const part of ["totals", "row-7", "sum", "rank", "Missing key"]) {
+      expect(error.message).toContain(part)
+    }
+    // Error serializers can replace prototypes with null while retaining diagnostic fields.
+    const serialized: unknown = Object.assign(Object.create(null), {
+      _tag: "SchemaError",
+      message: "Missing key at sum.rank"
+    })
+    const throwingMessage = new Error()
+    Object.defineProperty(throwingMessage, "message", {
+      get() {
+        throw new Error("cannot render cause")
+      }
+    })
+    for (const cause of [serialized, throwingMessage, undefined, "decode failed"]) {
+      const wrapped = new CorruptStorage({ table: "totals", id: undefined, cause })
+      expect(wrapped.cause).toBe(cause)
+      expect(wrapped.message).toContain('stored data in "totals"')
+      expect(String(wrapped)).toContain("does not decode")
+      if (cause === serialized) expect(wrapped.message).toContain("Missing key at sum.rank")
+    }
+  })
+)
 
 const ItemId = Schema.String.pipe(Schema.brand("ItemId"))
 const Items = SyncTable.make(

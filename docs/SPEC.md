@@ -2128,6 +2128,13 @@ the count keys. Changes to these lists must also update the corresponding prose 
   screen. Trusted SQL row-encoding defects retain their original schema cause and operation,
   table and row/column context; bounded-batch failures retain the starting offset and original
   within-batch issue path (INV-TBL-10), without introducing a typed store error.
+  Rendering `CorruptStorage` preserves readable schema paths when available and never throws
+  because its cause lacks primitive conversion or its diagnostic hooks throw; unavailable
+  cause details use a diagnostic placeholder while the original cause remains attached.
+
+  **Rationale (2026-10-28):** Format unknown causes with Effect's guarded formatter rather
+  than directly reading `Error.message` or coercing with `String`: null-prototype causes and
+  throwing diagnostic hooks must not mask the stored-data failure or its location.
 
   **Rationale (2026-10-23):** Typed wrappers retain the original cause and location because
   a bare `SchemaError` did not identify the stored table or row, while
@@ -2677,7 +2684,7 @@ Rules for the harnesses that produce "covered" (verified against `src/core/testi
 | INV-TEL-5 | partial | `observability.e2e` "RPC request context cannot bypass sanitization for typed failures, defects, SQL spans or tracerLogger events" (the Debug downgrade of interrupted causes is untested) |
 | INV-TEL-6 | covered | `vocabularies.test` "telemetry, wire errors and client failure or notice vocabularies cannot drift from SPEC §14–15" |
 | INV-ERR-1 | covered | `Transport.test` "Unauthorized reason schema matches the closed catalog in SPEC §15", "a server Unauthorized surfaces its diagnostic reason without changing the unauthorized verdict", "HTTP auth refusals before RPC decoding report unauthorized, retry without halting, and keep the pending mutation; other statuses stay network"; `rpc.test` "push, pull and pokes asserting another principal than the session's run no statement or policy and change no row, even for a bound client", "an app authentication refusal carries authenticationRefused through the public RPC surface", "a client bound to another principal carries clientPrincipalMismatch through the public RPC surface", "push, pull and pokes authenticated as * are Unauthorized before they bind or ledger" |
-| INV-ERR-2 | partial | `SqliteRowStore.test` "a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError"; `rowstore-codecs.test` "range codecs run only on execution, validate limits first, and retain contextual defects without SQL", "writes encode current rows on each execution and reject missing nullable fields before SQL"; `perf-install.test` "batched replica upserts keep the last duplicate and split before SQLite's parameter limit"; OPFS diagnostic coverage is in browser scenarios only |
+| INV-ERR-2 | partial | `Store.test` "corruption diagnostics retain schema paths and render causes without primitive conversion"; `SqliteRowStore.test` "a stored row that no longer decodes must die naming its table and row id, not with a bare SchemaError"; `rowstore-codecs.test` "range codecs run only on execution, validate limits first, and retain contextual defects without SQL", "writes encode current rows on each execution and reject missing nullable fields before SQL"; `perf-install.test` "batched replica upserts keep the last duplicate and split before SQLite's parameter limit"; OPFS diagnostic coverage is in browser scenarios only |
 | INV-ERR-3 | covered | `vocabularies.test` "telemetry, wire errors and client failure or notice vocabularies cannot drift from SPEC §14–15", "a wire error without a catalog mapping cannot compile" (also checked by `tsc --noEmit`) |
 | INV-ERR-4 | covered | `observability.e2e` "request failures append no notices and ledgered rejections keep successful batch outcomes", "batch telemetry agrees with the loop's whole-cause decision, not the first failure" |
 | INV-ERR-5 | covered | `Mutation.test` "legacy rejection names round-trip unchanged without replacing Error.name", "a notice of one mutation decoded against another, or one its schemas cannot read, is NoticeMismatch, never a value or a defect"; `Leader.test` "worker error codecs preserve legacy name fields and restore standard Error names"; `platform.test` "a Web Locks rejection surfaces as LockError instead of hanging" |

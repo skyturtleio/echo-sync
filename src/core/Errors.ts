@@ -1,4 +1,4 @@
-import { Data, Schema } from "effect"
+import { Data, Formatter, Schema } from "effect"
 import { AccessScopeId, Role } from "./AccessScope.ts"
 
 /** Transient storage failure (connection, busy, serialization). Never recorded; stops the batch. */
@@ -50,7 +50,7 @@ export class CorruptStorage extends Data.TaggedError("CorruptStorage")<{
 }> {
   override get message(): string {
     const where = this.id === undefined ? `"${this.table}"` : `"${this.table}" row "${this.id}"`
-    const detail = this.cause instanceof Error ? this.cause.message : String(this.cause)
+    const detail = Formatter.format(this.cause)
     return (
       `stored data in ${where} does not decode with its schema (${detail}). Something other than this ` +
       `schema wrote it: a manual edit, a migration, or a schema change shipped without one.`
